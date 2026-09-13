@@ -1,0 +1,8 @@
+{
+  "label": "Banjo-Kazooie: Nuts & Bolts — Europe, user-tested executable",
+  "xexSha256": "d57b15b73490ca8334fb2fc7a53e0b21936a187731fa4f891273f4feaf38d3bc",
+  "xexBytes": 16920576,
+  "desktopCompatibility": "Reported working by the user with the latest release; not reproduced in this checkout.",
+  "androidCompatibility": "Not yet validated",
+  "codegenInput": "assets/default.xex"
+}

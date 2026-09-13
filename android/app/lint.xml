@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- SDL's optional Steam BLE path is disabled: this app declares no Bluetooth
+         permissions, and HIDDeviceManager.initializeBluetooth checks permission
+         before constructing BLE devices. No blanket suppression for app code. -->
+    <issue id="MissingPermission">
+        <ignore path="../../external/rexglue-android/thirdparty/sdl3/android-project/app/src/main/java/org/libsdl/app/HIDDeviceBLESteamController.java" />
+        <ignore path="../../external/rexglue-android/thirdparty/sdl3/android-project/app/src/main/java/org/libsdl/app/HIDDeviceManager.java" />
+    </issue>
+    <!-- The API29 listener is instantiated only on SDK >=29 in SDLActivity. -->
+    <issue id="NewApi">
+        <ignore path="../../external/rexglue-android/thirdparty/sdl3/android-project/app/src/main/java/org/libsdl/app/SDLControllerManager.java" regexp=".*InputDevice#isExternal.*" />
+    </issue>
+    <!-- The legacy overload is in the SDK<33 branch; >=33 passes RECEIVER_EXPORTED. -->
+    <issue id="UnspecifiedRegisterReceiverFlag">
+        <ignore path="../../external/rexglue-android/thirdparty/sdl3/android-project/app/src/main/java/org/libsdl/app/HIDDeviceManager.java" />
+    </issue>
+</lint>

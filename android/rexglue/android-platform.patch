@@ -1,0 +1,366 @@
+diff --git a/include/rex/audio/audio_system.h b/include/rex/audio/audio_system.h
+index 33fd32c..ad02d4b 100644
+--- a/include/rex/audio/audio_system.h
++++ b/include/rex/audio/audio_system.h
+@@ -84,6 +84,7 @@ class AudioSystem : public system::IAudioSystem {
+     uint32_t callback_arg;
+     uint32_t wrapped_callback_arg;
+     bool in_use;
++    bool callback_active = false;
+   } clients_[kMaximumClientCount];
+ 
+   int FindFreeClient();
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..b73d7af 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,7 +116,7 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__ANDROID__)
+ // Apple libc++ does not expose clock_time_conversion or clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+diff --git a/include/rex/system/gpu_plugin.h b/include/rex/system/gpu_plugin.h
+index 453c210..16efbfb 100644
+--- a/include/rex/system/gpu_plugin.h
++++ b/include/rex/system/gpu_plugin.h
+@@ -29,7 +29,7 @@
+ namespace rex::system {
+ 
+ // Bump on any change to GpuCreateInfo or to the IGraphicsSystem interface.
+-inline constexpr uint32_t kGpuPluginAbiVersion = 1;
++inline constexpr uint32_t kGpuPluginAbiVersion = 2; // reNut: PresentFrontBuffer extends IGraphicsSystem.
+ 
+ inline constexpr const char* kGpuCreateSymbol = "rex_gpu_create";
+ inline constexpr const char* kGpuAbiVersionSymbol = "rex_gpu_abi_version";
+diff --git a/include/rex/system/interfaces/graphics.h b/include/rex/system/interfaces/graphics.h
+index d54df86..4306549 100644
+--- a/include/rex/system/interfaces/graphics.h
++++ b/include/rex/system/interfaces/graphics.h
+@@ -50,6 +50,12 @@ class IGraphicsSystem {
+ 
+   virtual bool has_presentation() const = 0;
+ 
++  // Optional native presentation path. Fetch words use host endianness and a
++  // physical base address, as prepared by VdSwap. False keeps the PM4 path.
++  virtual bool PresentFrontBuffer(const uint32_t* fetch_words, uint32_t width, uint32_t height) {
++    return false;
++  }
++
+   // --- Optional capabilities, default no-op -------------------------------
+ 
+   // Host presentation objects for ReXApp's overlay wiring; custom systems may
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 7a711a8..cd768de 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -137,6 +137,7 @@ void AudioSystem::WorkerThreadMain() {
+       auto global_lock = global_critical_region_.Acquire();
+       uint32_t client_callback = clients_[index].callback;
+       uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
++      clients_[index].callback_active = client_callback != 0;
+       global_lock.unlock();
+ 
+       if (client_callback) {
+@@ -148,6 +149,17 @@ void AudioSystem::WorkerThreadMain() {
+         uint64_t args[] = {client_callback_arg};
+         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
+                                       rex::countof(args));
++        // Unregister may run while guest code is executing without the global
++        // lock. Keep its driver and wrapped argument alive until this point.
++        {
++          auto completion_lock = global_critical_region_.Acquire();
++          clients_[index].callback_active = false;
++          if (!clients_[index].in_use) {
++            DestroyDriver(clients_[index].driver);
++            memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
++            clients_[index] = {nullptr, 0, 0, 0, false};
++          }
++        }
+         if (diag_pump_count < 10) {
+           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
+         }
+@@ -176,7 +188,7 @@ void AudioSystem::WorkerThreadMain() {
+ int AudioSystem::FindFreeClient() {
+   for (size_t i = 0; i < kMaximumClientCount; i++) {
+     auto& client = clients_[i];
+-    if (!client.in_use) {
++    if (!client.in_use && !client.driver) {
+       return i;
+     }
+   }
+@@ -217,7 +229,7 @@ void AudioSystem::Shutdown() {
+   // Destroy all active client drivers (closes SDL audio devices, stopping
+   // callback threads) before the semaphores they reference are destroyed.
+   for (size_t i = 0; i < kMaximumClientCount; i++) {
+-    if (clients_[i].in_use) {
++    if (clients_[i].driver) {
+       DestroyDriver(clients_[i].driver);
+       if (clients_[i].wrapped_callback_arg) {
+         memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
+@@ -233,7 +245,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
+   auto global_lock = global_critical_region_.Acquire();
+ 
+   auto index = FindFreeClient();
+-  assert_true(index >= 0);
++  if (index < 0) return X_STATUS_INSUFFICIENT_RESOURCES;
+   REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
+                queued_frames_);
+ 
+@@ -272,6 +284,10 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+ 
+   auto global_lock = global_critical_region_.Acquire();
+   assert_true(index < kMaximumClientCount);
++  if (index >= kMaximumClientCount || !clients_[index].driver) {
++    REXAPU_WARN("Ignoring audio frame for unregistered client {}", index);
++    return;
++  }
+   assert_true(clients_[index].driver != NULL);
+   (clients_[index].driver)->SubmitFrame(samples_ptr);
+ }
+@@ -281,9 +297,14 @@ void AudioSystem::UnregisterClient(size_t index) {
+ 
+   auto global_lock = global_critical_region_.Acquire();
+   assert_true(index < kMaximumClientCount);
+-  DestroyDriver(clients_[index].driver);
+-  memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
+-  clients_[index] = {nullptr, 0, 0, 0, false};
++  if (index >= kMaximumClientCount || !clients_[index].in_use) return;
++  clients_[index].in_use = false;
++  clients_[index].callback = 0;
++  if (!clients_[index].callback_active) {
++    DestroyDriver(clients_[index].driver);
++    memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
++    clients_[index] = {nullptr, 0, 0, 0, false};
++  }
+ 
+   // Drain the semaphore of its count.
+   auto client_semaphore = client_semaphores_[index].get();
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 4fe1ca6..40a44d4 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -23,6 +23,13 @@
+ 
+ #include <cassert>
+ 
++#if REX_PLATFORM_ANDROID
++#include <libucontext/libucontext.h>
++#define getcontext libucontext_getcontext
++#define makecontext libucontext_makecontext
++#define swapcontext libucontext_swapcontext
++#endif
++
+ namespace rex::thread {
+ 
+ thread_local Fiber* Fiber::tls_current_ = nullptr;
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..0b1d219 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -46,6 +46,7 @@
+ #endif
+ 
+ #if REX_PLATFORM_ANDROID
++#include <rex/main_android.h>
+ #include <string.h>
+ 
+ #include <dlfcn.h>
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..69b9917 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -49,7 +49,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <rex/string.h>
+ #endif
+ 
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+ // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
+ #define REX_HAS_SIGEV_THREAD_ID 1
+ #ifdef __GLIBC__
+@@ -270,7 +270,7 @@ static sem_t* RexCreateAnonymousSemaphore() {
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+     // Use robust mutexes so waits can recover if owner thread terminates.
+     pthread_mutexattr_t attr;
+     if (pthread_mutexattr_init(&attr) == 0) {
+@@ -290,7 +290,7 @@ class PosixConditionBase {
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+     auto predicate = [this] { return this->signaled(); };
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     int lock_result = pthread_mutex_lock(native_mutex);
+     if (lock_result == EOWNERDEAD) {
+@@ -344,7 +344,7 @@ class PosixConditionBase {
+       locks.reserve(handles.size());
+ 
+       for (size_t i = 0; i < handles.size(); ++i) {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+         int result = pthread_mutex_trylock(native_mutex);
+         if (result == 0 || result == EOWNERDEAD) {
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..8f0f91b 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -312,6 +312,9 @@ bool CommandProcessor::SetupContext() {
+ void CommandProcessor::ShutdownContext() {}
+ 
+ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
++#if REX_PLATFORM_ANDROID
++  REXGPU_INFO("Renut: Xenos ring buffer {:08X}, size_log2={}",ptr,size_log2);
++#endif
+   read_ptr_index_ = 0;
+   primary_buffer_ptr_ = ptr;
+   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..f64072f 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2271,6 +2271,11 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++#if REX_PLATFORM_ANDROID
++  static uint64_t renut_swap_count=0;
++  if(++renut_swap_count==1 || renut_swap_count%300==0)
++    REXGPU_INFO("Renut: Xenos swap #{} {}x{}",renut_swap_count,frontbuffer_width,frontbuffer_height);
++#endif
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 91ac08f..38b5364 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -1246,8 +1246,9 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
+     return false;
+   }
+ 
+-  // TODO(Triang3l): Log that the shader has been successfully translated in
+-  // common code.
++#if REX_PLATFORM_ANDROID
++  REXGPU_INFO("Renut: shader {:016X} translated to SPIR-V and Vulkan module created", shader.ucode_data_hash());
++#endif
+ 
+   // Set up the texture binding layout.
+   if (shader.EnterBindingLayoutUserUIDSetup()) {
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..c4563b6 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -873,8 +873,14 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+   }
+   sampler_create_info.minLod = float(parameters.mip_min_level);
+   if (parameters.mip_base_map) {
+-    assert_false(parameters.mip_linear);
+-    sampler_create_info.maxLod = sampler_create_info.minLod + 0.25f;
++    // Anisotropy forces linear mip filtering even for kBaseMap. Clamp to the
++    // base level in that case, matching the D3D12 backend. The 0.25 allowance
++    // only preserves min/mag selection with nearest mip filtering.
++    sampler_create_info.maxLod = sampler_create_info.minLod;
++    if (parameters.aniso_filter == xenos::AnisoFilter::kDisabled) {
++      assert_false(parameters.mip_linear);
++      sampler_create_info.maxLod += 0.25f;
++    }
+   } else {
+     sampler_create_info.maxLod = VK_LOD_CLAMP_NONE;
+   }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 1254710..6fa91bf 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -487,6 +487,15 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+   assert_true(*width == 1 + gpu_fetch.size_2d.width);
+   assert_true(*height == 1 + gpu_fetch.size_2d.height);
+ 
++  auto* graphics = REX_KERNEL_STATE()->emulator()->graphics_system();
++  if (graphics && graphics->PresentFrontBuffer(&gpu_fetch.dword_0, *width, *height)) {
++    // Native presentation consumed the frame; keep the caller's command space
++    // valid without submitting a second (emulated) swap.
++    auto words = buffer_ptr.as_array<uint32_t>();
++    for (uint32_t i = 0; i < 64; ++i) words[i] = xenos::MakePacketType2();
++    return;
++  }
++
+   // The caller seems to reserve 64 words (256b) in the primary ringbuffer
+   // for this method to do what it needs. We just zero them out and send a
+   // token value. It'd be nice to figure out what this is really doing so
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..1e6bcb5 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -20,6 +20,9 @@
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/instance.h>
+ #include <rex/ui/vulkan/presenter.h>
++#if REX_PLATFORM_ANDROID
++extern void* renutXenosVulkanSymbol(const char* name);
++#endif
+ 
+ #if REX_PLATFORM_MAC
+ #include "vulkan_moltenvk.h"
+@@ -45,7 +48,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+ 
+   bool functions_loaded = true;
+   bool loader_loaded = false;
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_ANDROID
++  loader_loaded = renutXenosVulkanSymbol("vkGetInstanceProcAddr") != nullptr;
++  if (!loader_loaded) {
++    REXLOG_ERROR("Android Vulkan loader was not configured");
++    return nullptr;
++  }
++#elif REX_PLATFORM_MAC
+   const MacOSVulkanRuntimePaths macos_runtime_paths = DetectMacOSVulkanRuntimePaths();
+   ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
+ 
+@@ -82,8 +91,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   }
+ #endif
+ 
++#if REX_PLATFORM_ANDROID
++#define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
++  functions_loaded &= (ifn.name = reinterpret_cast<PFN_##name>(renutXenosVulkanSymbol(#name))) != nullptr;
++#else
+ #define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
+   functions_loaded &= (ifn.name = vulkan_instance->loader_.GetSymbol<PFN_##name>(#name)) != nullptr;
++#endif
+   XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
+   XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
+ #undef XE_VULKAN_LOAD_LOADER_FUNCTION
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..697d21e 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -35,6 +35,8 @@
+ #include <SDL3/SDL_metal.h>
+ 
+ #include <rex/ui/surface_mac.h>
++#elif REX_PLATFORM_ANDROID
++#include <rex/ui/surface_android.h>
+ #else
+ #include <X11/Xlib-xcb.h>
+ #include <rex/ui/surface_gnulinux.h>
+@@ -398,6 +400,11 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+       SDL_Metal_DestroyView(metal_view);
+     }
+   }
++#elif REX_PLATFORM_ANDROID
++  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
++    auto* native = static_cast<ANativeWindow*>(SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
++    if (native) return std::make_unique<AndroidNativeWindowSurface>(native);
++  }
+ #else
+   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {

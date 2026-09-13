@@ -1,0 +1,26 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'org.renut.android'
+    compileSdk 35
+    ndkVersion '29.0.14206865'
+    defaultConfig {
+        applicationId 'org.renut.android'
+        minSdk 28
+        targetSdk 35
+        versionCode 4
+        versionName '0.4.0-xenos-experimental'
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_shared', '-DCMAKE_JOB_POOLS=compile_pool=4', '-DCMAKE_JOB_POOL_COMPILE=compile_pool' } }
+    }
+    externalNativeBuild {
+        cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    sourceSets.main.java.srcDir '../../external/rexglue-android/thirdparty/sdl3/android-project/app/src/main/java'
+    packaging { jniLibs { useLegacyPackaging true } }
+    buildTypes { release { minifyEnabled false } }
+}

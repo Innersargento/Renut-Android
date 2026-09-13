@@ -7,6 +7,8 @@
 
 Originally created with <a href="https://github.com/rexglue/rexglue-sdk">Rexglue-SDK</a>
 
+Android development: see [the Android prototype](android/README.md) for the ARM64 importer, RexGlue runtime, locally recompiled game code, Xenos/Vulkan backend and Plume diagnostics. The European executable now starts and renders opening images; the menu and gameplay are **not yet validated**. Resume from [the development handoff](docs/RETOMADA-2026-09-13.md). Existing desktop instructions below remain separate.
+
 
 
 DISCORD

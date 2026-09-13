@@ -1,0 +1,8 @@
+[project]
+sdk_version = "0.10.0"
+name = "renut_android"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated/android"
+includes = ["config/renut_funcs.toml"]

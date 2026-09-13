@@ -1,0 +1,17 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00402000" android:required="false" />
+    <application android:label="reNut" android:theme="@android:style/Theme.Material.NoActionBar"
+        android:icon="@drawable/ic_renut" android:dataExtractionRules="@xml/data_extraction_rules"
+        android:allowBackup="false" android:supportsRtl="true">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".ProbeActivity" android:process=":gpu" android:exported="false" />
+        <activity android:name=".RuntimeActivity" android:process=":runtime" android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+    </application>
+</manifest>
