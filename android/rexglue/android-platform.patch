@@ -23,6 +23,57 @@ index d876846..b73d7af 100644
  // Apple libc++ does not expose clock_time_conversion or clock_cast.
  template <class, class>
  struct clock_time_conversion {};
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d26cd4f..5f4f662 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -55,6 +55,9 @@ namespace rex::graphics {
+ // because textures are streamed this way anyway.
+ class TextureCache {
+  public:
++  // reNut diagnostics: texture count and host memory for periodic reports.
++  size_t renut_texture_count() const { return textures_.size(); }
++  uint64_t renut_texture_memory() const { return textures_total_host_memory_usage_; }
+   // Hard limit, originating from the half-pixel offset filling hack in the
+   // resolve shaders only filling up to 3 pixels, due to the bit counts used for
+   // passing the scale to shaders, and because the full 490 MB EDRAM buffer is
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..f9d441d 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -11,6 +11,9 @@
+  */
+ 
+ #include <array>
++#include <atomic>
++
++#include <rex/platform.h>
+ #include <climits>
+ #include <cstdint>
+ #include <deque>
+@@ -45,6 +48,22 @@
+ 
+ namespace rex::graphics::vulkan {
+ 
++#if REX_PLATFORM_ANDROID
++// reNut diagnostics: GPU work counters reset every 300 swaps by IssueSwap.
++enum RenutGpuWork : size_t {
++  kRenutDraws,
++  kRenutResolves,
++  kRenutSubmissions,
++  kRenutTextureLoads,
++  kRenutTextureLoadBytes,
++  kRenutRtTransferBatches,
++  kRenutRtTransfers,
++  kRenutResolveClears,
++  kRenutGpuWorkCount,
++};
++extern std::atomic<uint64_t> renut_gpu_work[kRenutGpuWorkCount];
++#endif
++
+ class VulkanCommandProcessor : public CommandProcessor {
+  public:
+   // Single-descriptor layouts for use within a single frame.
 diff --git a/include/rex/system/gpu_plugin.h b/include/rex/system/gpu_plugin.h
 index 453c210..16efbfb 100644
 --- a/include/rex/system/gpu_plugin.h
@@ -54,10 +105,20 @@ index d54df86..4306549 100644
  
    // Host presentation objects for ReXApp's overlay wiring; custom systems may
 diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
-index 9b9cf9e..03ece2a 100644
+index 9b9cf9e..377167a 100644
 --- a/include/rex/system/kernel_state.h
 +++ b/include/rex/system/kernel_state.h
-@@ -391,6 +391,9 @@ class KernelState {
+@@ -244,6 +244,9 @@ class KernelState {
+   object_ref<XThread> PrepareModuleLaunch(object_ref<UserModule> module);
+   object_ref<UserModule> GetExecutableModule();
+   void SetExecutableModule(object_ref<UserModule> module);
++  // reNut diagnostics: logs each guest thread's pending wait and guest call
++  // chain. Caller must hold the global critical region.
++  void DumpGuestThreadsForDiagnostics(uint64_t host_now_ms);
+   object_ref<UserModule> LoadUserModule(const std::string_view name, bool call_entry = true);
+   void UnloadUserModule(const object_ref<UserModule>& module, bool call_entry = true);
+ 
+@@ -391,6 +394,9 @@ class KernelState {
    std::atomic<bool> dispatch_thread_running_;
    std::atomic<bool> terminating_title_{false};
    object_ref<XHostThread> dispatch_thread_;
@@ -67,8 +128,20 @@ index 9b9cf9e..03ece2a 100644
    // Must be guarded by the global critical region.
    util::NativeList dpc_list_;
    std::condition_variable_any dispatch_cond_;
+diff --git a/include/rex/system/xevent.h b/include/rex/system/xevent.h
+index e81df52..ec9a0d0 100644
+--- a/include/rex/system/xevent.h
++++ b/include/rex/system/xevent.h
+@@ -33,6 +33,7 @@ class XEvent : public XObject {
+   void InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header);
+ 
+   void Query(uint32_t* out_type, uint32_t* out_state);
++  bool manual_reset() const { return manual_reset_; }
+ 
+   int32_t Set(uint32_t priority_increment, bool wait);
+   int32_t Pulse(uint32_t priority_increment, bool wait);
 diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
-index a72911e..1e76368 100644
+index a72911e..88948dd 100644
 --- a/include/rex/system/xthread.h
 +++ b/include/rex/system/xthread.h
 @@ -219,7 +219,11 @@ struct X_KTHREAD {
@@ -84,11 +157,97 @@ index a72911e..1e76368 100644
    rex::be<uint32_t> stack_base;      // 0x5C
    rex::be<uint32_t> stack_limit;     // 0x60
    rex::be<uint32_t> stack_kernel;    // 0x64
+@@ -387,6 +391,21 @@ class XThread : public XObject {
+   virtual bool Save(stream::ByteStream* stream) override;
+   static object_ref<XThread> Restore(KernelState* kernel_state, stream::ByteStream* stream);
+ 
++  // reNut diagnostics: the kernel wait this thread is blocked in, if any.
++  // Written by the thread itself around XObject waits, read racily by the
++  // periodic thread dump in KernelState. start_ms == 0 means not waiting.
++  struct WaitDiag {
++    static constexpr uint32_t kMaxObjects = 4;
++    std::atomic<uint64_t> start_ms{0};
++    std::atomic<uint32_t> guest_lr{0};
++    std::atomic<uint32_t> timeout_ms{0};
++    std::atomic<uint32_t> count{0};
++    std::atomic<uint32_t> alertable{0};
++    std::atomic<uint32_t> objects[kMaxObjects] = {};
++    std::atomic<uint32_t> types[kMaxObjects] = {};
++  };
++  WaitDiag& wait_diag() { return wait_diag_; }
++
+   // Internal - do not use.
+   void AcquireMutantOnStartup(object_ref<XMutant> mutant) {
+     pending_mutant_acquires_.push_back(mutant);
+@@ -439,6 +458,7 @@ class XThread : public XObject {
+ 
+   std::unique_ptr<rex::thread::Thread> thread_ = nullptr;
+   rex::thread::Fiber* main_fiber_ = nullptr;
++  WaitDiag wait_diag_;
+ };
+ 
+ class XHostThread : public XThread {
+diff --git a/include/rex/ui/vulkan/upload_buffer_pool.h b/include/rex/ui/vulkan/upload_buffer_pool.h
+index 4b9fb3d..8d49c05 100644
+--- a/include/rex/ui/vulkan/upload_buffer_pool.h
++++ b/include/rex/ui/vulkan/upload_buffer_pool.h
+@@ -36,13 +36,18 @@ class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
+   struct VulkanPage : public Page {
+     // Takes ownership of the buffer and its memory and mapping.
+     VulkanPage(const VulkanDevice* vulkan_device, VkBuffer buffer, VkDeviceMemory memory,
+-               void* mapping)
+-        : vulkan_device_(vulkan_device), buffer_(buffer), memory_(memory), mapping_(mapping) {}
++               void* mapping, VkDeviceSize size = 0)
++        : vulkan_device_(vulkan_device),
++          buffer_(buffer),
++          memory_(memory),
++          mapping_(mapping),
++          size_(size) {}
+     ~VulkanPage() override;
+     const VulkanDevice* vulkan_device_;
+     VkBuffer buffer_;
+     VkDeviceMemory memory_;
+     void* mapping_;
++    VkDeviceSize size_;
+   };
+ 
+   const VulkanDevice* vulkan_device_;
+diff --git a/include/rex/ui/vulkan/util.h b/include/rex/ui/vulkan/util.h
+index 27a5136..4dc7d14 100644
+--- a/include/rex/ui/vulkan/util.h
++++ b/include/rex/ui/vulkan/util.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <algorithm>
+ #include <cstdint>
+ 
+@@ -19,6 +20,10 @@
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
++// reNut diagnostics: live bytes allocated through the upload buffer pools and
++// the dedicated-allocation helpers.
++extern std::atomic<int64_t> renut_upload_pool_bytes;
++extern std::atomic<int64_t> renut_dedicated_bytes;
+ namespace util {
+ 
+ template <typename DestroyFunction, typename Object>
 diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
-index 7a711a8..cd768de 100644
+index 7a711a8..bd487c3 100644
 --- a/src/audio/audio_system.cpp
 +++ b/src/audio/audio_system.cpp
-@@ -137,6 +137,7 @@ void AudioSystem::WorkerThreadMain() {
+@@ -21,6 +21,7 @@
+ #include <rex/stream.h>
+ #include <rex/string/buffer.h>
+ #include <rex/system/thread_state.h>
++#include <rex/system/xthread.h>
+ #include <rex/thread.h>
+ #include <rex/cvar.h>
+ 
+@@ -137,6 +138,7 @@ void AudioSystem::WorkerThreadMain() {
        auto global_lock = global_critical_region_.Acquire();
        uint32_t client_callback = clients_[index].callback;
        uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
@@ -96,7 +255,7 @@ index 7a711a8..cd768de 100644
        global_lock.unlock();
  
        if (client_callback) {
-@@ -148,6 +149,17 @@ void AudioSystem::WorkerThreadMain() {
+@@ -148,6 +150,17 @@ void AudioSystem::WorkerThreadMain() {
          uint64_t args[] = {client_callback_arg};
          function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                        rex::countof(args));
@@ -114,7 +273,7 @@ index 7a711a8..cd768de 100644
          if (diag_pump_count < 10) {
            REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
          }
-@@ -176,7 +188,7 @@ void AudioSystem::WorkerThreadMain() {
+@@ -176,7 +189,7 @@ void AudioSystem::WorkerThreadMain() {
  int AudioSystem::FindFreeClient() {
    for (size_t i = 0; i < kMaximumClientCount; i++) {
      auto& client = clients_[i];
@@ -123,7 +282,7 @@ index 7a711a8..cd768de 100644
        return i;
      }
    }
-@@ -217,7 +229,7 @@ void AudioSystem::Shutdown() {
+@@ -217,7 +230,7 @@ void AudioSystem::Shutdown() {
    // Destroy all active client drivers (closes SDL audio devices, stopping
    // callback threads) before the semaphores they reference are destroyed.
    for (size_t i = 0; i < kMaximumClientCount; i++) {
@@ -132,7 +291,7 @@ index 7a711a8..cd768de 100644
        DestroyDriver(clients_[i].driver);
        if (clients_[i].wrapped_callback_arg) {
          memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
-@@ -233,7 +245,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
+@@ -233,7 +246,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
    auto global_lock = global_critical_region_.Acquire();
  
    auto index = FindFreeClient();
@@ -141,7 +300,7 @@ index 7a711a8..cd768de 100644
    REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
                 queued_frames_);
  
-@@ -272,6 +284,10 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+@@ -272,6 +285,10 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
  
    auto global_lock = global_critical_region_.Acquire();
    assert_true(index < kMaximumClientCount);
@@ -152,7 +311,7 @@ index 7a711a8..cd768de 100644
    assert_true(clients_[index].driver != NULL);
    (clients_[index].driver)->SubmitFrame(samples_ptr);
  }
-@@ -281,9 +297,14 @@ void AudioSystem::UnregisterClient(size_t index) {
+@@ -281,9 +298,32 @@ void AudioSystem::UnregisterClient(size_t index) {
  
    auto global_lock = global_critical_region_.Acquire();
    assert_true(index < kMaximumClientCount);
@@ -162,7 +321,25 @@ index 7a711a8..cd768de 100644
 +  if (index >= kMaximumClientCount || !clients_[index].in_use) return;
 +  clients_[index].in_use = false;
 +  clients_[index].callback = 0;
-+  if (!clients_[index].callback_active) {
++  // The console does not return from unregistration while the client's
++  // callback is still running. Titles rely on that: Banjo's audio shutdown
++  // wakes its render thread once, and that thread only exits if the callback
++  // has already cleared its "in callback" flag. Returning early lets both
++  // wakeups merge on the auto-reset event and the render thread waits forever.
++  // Wait with the lock released (the callback's guest code needs it), bounded
++  // in case the caller holds something the callback is blocked on.
++  if (clients_[index].callback_active && system::XThread::GetCurrentThread() != worker_thread_.get()) {
++    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
++    while (clients_[index].callback_active && std::chrono::steady_clock::now() < deadline) {
++      global_lock.unlock();
++      rex::thread::Sleep(std::chrono::milliseconds(1));
++      global_lock.lock();
++    }
++    if (clients_[index].callback_active) {
++      REXAPU_WARN("UnregisterClient: callback for client {} still running after 1 s", index);
++    }
++  }
++  if (!clients_[index].callback_active && clients_[index].driver) {
 +    DestroyDriver(clients_[index].driver);
 +    memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
 +    clients_[index] = {nullptr, 0, 0, 0, false};
@@ -170,6 +347,55 @@ index 7a711a8..cd768de 100644
  
    // Drain the semaphore of its count.
    auto client_semaphore = client_semaphores_[index].get();
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index a0a178d..f1396c5 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <rex/audio/xma/context.h>
+ #include <rex/audio/xma/decoder.h>
+ #include <rex/cvar.h>
+@@ -213,6 +214,7 @@ uint32_t XmaDecoder::AllocateContext() {
+   XmaContext& context = contexts_[index];
+   assert_false(context.is_allocated());
+   context.set_is_allocated(true);
++  REXAPU_DEBUG("Renut: XMA context {} allocated at {:08X}", index, context.guest_ptr());
+   return context.guest_ptr();
+ }
+ 
+@@ -224,6 +226,7 @@ void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
+   assert_true(context.is_allocated());
+   context.Release();
+   context_bitmap_.Release(context_id);
++  REXAPU_DEBUG("Renut: XMA context {} released", context_id);
+ }
+ 
+ bool XmaDecoder::BlockOnContext(uint32_t guest_ptr, bool poll) {
+@@ -295,12 +298,20 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+     }
+     // Decode inline. waiting on the worker sweep stalls the realtime
+     // audio thread 50-100ms during kick bursts.
++    // reNut diagnostics: kicks and successful decodes, logged periodically.
++    static std::atomic<uint32_t> renut_kicks{0}, renut_worked{0};
+     for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+       if (kicked_value & 1) {
+         uint32_t context_id = base_context_id + i;
+         auto& context = contexts_[context_id];
++        uint32_t kicks = ++renut_kicks;
+         if (context.Work()) {
+           context.SignalWorkDone();
++          ++renut_worked;
++        }
++        if (kicks <= 5 || (kicks % 4096) == 0) {
++          REXAPU_INFO("Renut: XMA kick #{} context {} ({} decoded so far)", kicks, context_id,
++                      renut_worked.load());
+         }
+       }
+     }
 diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
 index 4fe1ca6..40a44d4 100644
 --- a/src/core/fiber_posix.cpp
@@ -262,10 +488,69 @@ index 9ac8d15..c56800d 100644
      int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
  #endif
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..8f0f91b 100644
+index a744375..0c21642 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -312,6 +312,9 @@ bool CommandProcessor::SetupContext() {
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <chrono>
+ #include <cmath>
+ #include <cstring>
+ #include <string_view>
+@@ -37,6 +38,30 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
++#if REX_PLATFORM_ANDROID
++namespace {
++// reNut diagnostics: where the command processor spends time between swaps.
++// Only touched by the command processor worker thread.
++struct RenutCpStats {
++  uint64_t idle_us = 0;
++  uint64_t wait_us = 0;
++  uint64_t wait_count = 0;
++  uint64_t wait_max_us = 0;
++  uint64_t swap_us = 0;
++  uint64_t window_start_us = 0;
++  uint32_t swaps = 0;
++  uint32_t last_wait_info = 0, last_wait_addr = 0, last_wait_ref = 0, last_wait_mask = 0,
++           last_wait_wait = 0, last_wait_value = 0;
++} renut_cp_stats;
++
++uint64_t RenutNowUs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++}  // namespace
++#endif
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -216,6 +241,9 @@ void CommandProcessor::WorkerThreadMain() {
+       // We've run out of commands to execute.
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
++#if REX_PLATFORM_ANDROID
++      uint64_t renut_idle_start = RenutNowUs();
++#endif
+       PrepareForWait();
+       uint32_t loop_count = 0;
+       do {
+@@ -232,6 +260,9 @@ void CommandProcessor::WorkerThreadMain() {
+       } while (worker_running_ && pending_fns_.empty() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
++#if REX_PLATFORM_ANDROID
++      renut_cp_stats.idle_us += RenutNowUs() - renut_idle_start;
++#endif
+       if (!worker_running_ || !pending_fns_.empty()) {
+         continue;
+       }
+@@ -312,6 +343,9 @@ bool CommandProcessor::SetupContext() {
  void CommandProcessor::ShutdownContext() {}
  
  void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
@@ -275,6 +560,84 @@ index a744375..8f0f91b 100644
    read_ptr_index_ = 0;
    primary_buffer_ptr_ = ptr;
    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+@@ -958,7 +992,33 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
++#if REX_PLATFORM_ANDROID
++  uint64_t renut_swap_start = RenutNowUs();
++#endif
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++#if REX_PLATFORM_ANDROID
++  {
++    auto& st = renut_cp_stats;
++    uint64_t now_us = RenutNowUs();
++    st.swap_us += now_us - renut_swap_start;
++    if (!st.window_start_us) {
++      st.window_start_us = now_us;
++    }
++    if (++st.swaps == 300) {
++      uint64_t window_us = std::max<uint64_t>(1, now_us - st.window_start_us);
++      REXGPU_INFO(
++          "Renut: CP stats over {} swaps / {} ms: {:.1f} swaps/s, idle {} ms, "
++          "WAIT_REG_MEM {} ms in {} waits (max {} ms; last info={:X} addr={:08X} ref={:X} "
++          "mask={:X} wait={:X} value={:X}), IssueSwap {} ms",
++          st.swaps, window_us / 1000, st.swaps * 1e6 / double(window_us), st.idle_us / 1000,
++          st.wait_us / 1000, st.wait_count, st.wait_max_us / 1000, st.last_wait_info,
++          st.last_wait_addr, st.last_wait_ref, st.last_wait_mask, st.last_wait_wait,
++          st.last_wait_value, st.swap_us / 1000);
++      st = RenutCpStats{};
++      st.window_start_us = now_us;
++    }
++  }
++#endif
+ 
+   ++counter_;
+   return true;
+@@ -990,6 +1050,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
+   bool matched = false;
++#if REX_PLATFORM_ANDROID
++  uint64_t renut_wait_start = RenutNowUs();
++  uint32_t renut_last_value = 0;
++  bool renut_waited = false;
++#endif
+   do {
+     uint32_t value = 0;
+     if (is_memory) {
+@@ -1029,6 +1094,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         matched = true;
+         break;
+     }
++#if REX_PLATFORM_ANDROID
++    renut_last_value = value;
++    renut_waited |= !matched;
++#endif
+     if (!matched) {
+       // Wait.
+       if (wait >= 0x100) {
+@@ -1052,6 +1121,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   } while (!matched);
+ 
++#if REX_PLATFORM_ANDROID
++  if (renut_waited) {
++    uint64_t waited_us = RenutNowUs() - renut_wait_start;
++    renut_cp_stats.wait_us += waited_us;
++    renut_cp_stats.wait_count++;
++    renut_cp_stats.wait_max_us = std::max(renut_cp_stats.wait_max_us, waited_us);
++    renut_cp_stats.last_wait_info = wait_info;
++    renut_cp_stats.last_wait_addr = poll_reg_addr;
++    renut_cp_stats.last_wait_ref = ref;
++    renut_cp_stats.last_wait_mask = mask;
++    renut_cp_stats.last_wait_wait = wait;
++    renut_cp_stats.last_wait_value = renut_last_value;
++  }
++#endif
+   return true;
+ }
+ 
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
 index 76f5600..cc3961a 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
@@ -369,10 +732,51 @@ index 76f5600..cc3961a 100644
    }
  
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..f64072f 100644
+index 001f36b..98eb3fe 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
-@@ -2271,6 +2271,11 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <chrono>
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
+@@ -71,8 +72,32 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+ 
+ namespace rex::graphics::vulkan {
+ 
++#if REX_PLATFORM_ANDROID
++// reNut diagnostics: per-swap-window GPU work counters, see RenutGpuWork.
++std::atomic<uint64_t> renut_gpu_work[kRenutGpuWorkCount];
++#endif
++
+ namespace {
+ 
++#if REX_PLATFORM_ANDROID
++// reNut diagnostics: where Vulkan swap time goes. Command processor thread only.
++struct RenutSwapTiming {
++  uint64_t fence_wait_us = 0;
++  uint64_t fence_waits = 0;
++  uint64_t begin_us = 0;
++  uint64_t swap_texture_us = 0;
++  uint64_t refresh_us = 0;
++  uint64_t end_us = 0;
++  uint32_t swaps = 0;
++} renut_swap_timing;
++
++uint64_t RenutSwapNowUs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++#endif
++
+ // glslang default built-in resource limits.
+ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+     /* .maxLights = */ 32,
+@@ -2271,6 +2296,11 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
  
  void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                         uint32_t frontbuffer_height) {
@@ -384,24 +788,237 @@ index 001f36b..f64072f 100644
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
+@@ -2283,11 +2313,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+     return;
+   }
+ 
++#if REX_PLATFORM_ANDROID
++  uint64_t renut_t0 = RenutSwapNowUs();
++#endif
+   // In case the swap command is the only one in the frame.
+   if (!BeginSubmission(true)) {
+     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
+     return;
+   }
++#if REX_PLATFORM_ANDROID
++  uint64_t renut_t1 = RenutSwapNowUs();
++  renut_swap_timing.begin_us += renut_t1 - renut_t0;
++#endif
+ 
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+@@ -2315,6 +2352,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
+       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
++#if REX_PLATFORM_ANDROID
++  uint64_t renut_t2 = RenutSwapNowUs();
++  renut_swap_timing.swap_texture_us += renut_t2 - renut_t1;
++#endif
+   if (swap_texture_view == VK_NULL_HANDLE) {
+     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
+     return;
+@@ -2408,6 +2449,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
+   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+ 
++#if REX_PLATFORM_ANDROID
++  uint64_t renut_t3 = RenutSwapNowUs();
++#endif
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
+@@ -2924,9 +2968,37 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+         return true;
+       });
+ 
++#if REX_PLATFORM_ANDROID
++  uint64_t renut_t4 = RenutSwapNowUs();
++  renut_swap_timing.refresh_us += renut_t4 - renut_t3;
++#endif
+   // End the frame even if did not present for any reason (the image refresher
+   // was not called), to prevent leaking per-frame resources.
+   EndSubmission(true);
++#if REX_PLATFORM_ANDROID
++  {
++    auto& st = renut_swap_timing;
++    st.end_us += RenutSwapNowUs() - renut_t4;
++    if (++st.swaps == 300) {
++      REXGPU_INFO(
++          "Renut: swap timing over {} swaps: fence waits {} ms in {}, begin {} ms, "
++          "swap texture {} ms, refresh {} ms, end {} ms",
++          st.swaps, st.fence_wait_us / 1000, st.fence_waits, st.begin_us / 1000,
++          st.swap_texture_us / 1000, st.refresh_us / 1000, st.end_us / 1000);
++      uint64_t w[kRenutGpuWorkCount];
++      for (size_t i = 0; i < kRenutGpuWorkCount; ++i) {
++        w[i] = renut_gpu_work[i].exchange(0, std::memory_order_relaxed);
++      }
++      REXGPU_INFO(
++          "Renut: GPU work over {} swaps: draws {}, resolves {}, submissions {}, texture loads {} "
++          "({} KiB guest), RT transfer batches {} ({} transfers), resolve clears {}",
++          st.swaps, w[kRenutDraws], w[kRenutResolves], w[kRenutSubmissions],
++          w[kRenutTextureLoads], w[kRenutTextureLoadBytes] / 1024, w[kRenutRtTransferBatches],
++          w[kRenutRtTransfers], w[kRenutResolveClears]);
++      st = RenutSwapTiming{};
++    }
++  }
++#endif
+ }
+ 
+ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
+@@ -3590,6 +3662,30 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
++#if REX_PLATFORM_ANDROID
++  renut_gpu_work[kRenutDraws].fetch_add(1, std::memory_order_relaxed);
++  {
++    // reNut diagnostics: time-based report, since swaps can stop entirely.
++    static uint64_t next_report_ms = 0;
++    static uint64_t draws_since = 0;
++    ++draws_since;
++    uint64_t now_ms = RenutSwapNowUs() / 1000;
++    if (now_ms >= next_report_ms) {
++      if (next_report_ms) {
++        REXGPU_INFO(
++            "Renut: 2s report: draws {}, submission current {} completed {}, textures {} "
++            "({} MiB), upload pools {} MiB, dedicated {} MiB",
++            draws_since, GetCurrentSubmission(), GetCompletedSubmission(),
++            texture_cache_ ? texture_cache_->renut_texture_count() : 0,
++            texture_cache_ ? texture_cache_->renut_texture_memory() >> 20 : 0,
++            ui::vulkan::renut_upload_pool_bytes.load() >> 20,
++            ui::vulkan::renut_dedicated_bytes.load() >> 20);
++      }
++      draws_since = 0;
++      next_report_ms = now_ms + 2000;
++    }
++  }
++#endif
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -4382,6 +4478,9 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+ }
+ 
+ bool VulkanCommandProcessor::IssueCopy() {
++#if REX_PLATFORM_ANDROID
++  renut_gpu_work[kRenutResolves].fetch_add(1, std::memory_order_relaxed);
++#endif
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -4970,9 +5069,16 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     // defined by vkQueueSubmit additionally include in the first
+     // synchronization scope all commands that occur earlier in submission
+     // order."
++#if REX_PLATFORM_ANDROID
++    uint64_t renut_fence_start = RenutSwapNowUs();
++#endif
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++#if REX_PLATFORM_ANDROID
++    renut_swap_timing.fence_wait_us += RenutSwapNowUs() - renut_fence_start;
++    renut_swap_timing.fence_waits++;
++#endif
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -5230,6 +5336,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+ }
+ 
+ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
++#if REX_PLATFORM_ANDROID
++  if (submission_open_) {
++    renut_gpu_work[kRenutSubmissions].fetch_add(1, std::memory_order_relaxed);
++  }
++#endif
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index 91ac08f..38b5364 100644
+index 91ac08f..ac712fb 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
-@@ -1246,8 +1246,9 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <array>
+ #include <atomic>
+ #include <cstdint>
+@@ -1246,8 +1247,11 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
      return false;
    }
  
 -  // TODO(Triang3l): Log that the shader has been successfully translated in
 -  // common code.
 +#if REX_PLATFORM_ANDROID
-+  REXGPU_INFO("Renut: shader {:016X} translated to SPIR-V and Vulkan module created", shader.ucode_data_hash());
++  REXGPU_INFO("Renut: shader {:016X} translated to SPIR-V ({} bytes, {} ucode dwords, dynamic regs {}) and Vulkan module created",
++              shader.ucode_data_hash(), translation.translated_binary().size(),
++              shader.ucode_dword_count(), shader.uses_register_dynamic_addressing());
 +#endif
  
    // Set up the texture binding layout.
    if (shader.EnterBindingLayoutUserUIDSetup()) {
+@@ -3480,8 +3484,26 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
++#if REX_PLATFORM_ANDROID
++  auto renut_create_start = std::chrono::steady_clock::now();
++#endif
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++#if REX_PLATFORM_ANDROID
++  {
++    static std::atomic<uint32_t> renut_pipelines{0};
++    static std::atomic<uint64_t> renut_pipeline_us{0};
++    uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                               std::chrono::steady_clock::now() - renut_create_start)
++                               .count());
++    uint32_t n = ++renut_pipelines;
++    uint64_t total = renut_pipeline_us += us;
++    if (n <= 5 || (n % 25) == 0) {
++      REXGPU_INFO("Renut: pipeline #{} created in {} ms (placeholder {}, total {} ms)", n,
++                  us / 1000, fragment_shader_override != VK_NULL_HANDLE, total / 1000);
++    }
++  }
++#endif
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..797808c 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -4558,6 +4558,23 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+ 
+   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
++#if REX_PLATFORM_ANDROID
++  {
++    uint64_t transfers = 0;
++    if (render_target_transfers) {
++      for (uint32_t i = 0; i < render_target_count; ++i) {
++        transfers += render_target_transfers[i].size();
++      }
++    }
++    if (transfers) {
++      renut_gpu_work[kRenutRtTransferBatches].fetch_add(1, std::memory_order_relaxed);
++      renut_gpu_work[kRenutRtTransfers].fetch_add(transfers, std::memory_order_relaxed);
++    }
++    if (resolve_clear_needed) {
++      renut_gpu_work[kRenutResolveClears].fetch_add(1, std::memory_order_relaxed);
++    }
++  }
++#endif
+   VkClearRect resolve_clear_rect;
+   if (resolve_clear_needed) {
+     // Assuming the rectangle is already clamped by the setup function from the
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940..c4563b6 100644
+index ecbd940..a635d5b 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -873,8 +873,14 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
@@ -421,6 +1038,243 @@ index ecbd940..c4563b6 100644
    } else {
      sampler_create_info.maxLod = VK_LOD_CLAMP_NONE;
    }
+@@ -1217,6 +1223,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                                                                bool load_mips) {
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
++#if REX_PLATFORM_ANDROID
++  renut_gpu_work[kRenutTextureLoads].fetch_add(1, std::memory_order_relaxed);
++  renut_gpu_work[kRenutTextureLoadBytes].fetch_add(
++      (load_base ? texture.GetGuestBaseSize() : 0) + (load_mips ? texture.GetGuestMipsSize() : 0),
++      std::memory_order_relaxed);
++#endif
+ 
+   // Get the pipeline.
+   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_audio.cpp b/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+index 86e7888..a9ca7d2 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+@@ -12,6 +12,8 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <atomic>
++
+ #include <rex/audio/audio_system.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -24,13 +26,34 @@
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
++namespace {
++// Driver handles are 0x4155xxxx. Banjo occasionally passes something else while
++// it re-registers its render client; upstream only asserts (compiled out in
++// release builds), so treat those calls as no-ops instead of aborting.
++bool IsAudioDriverHandle(uint32_t driver, const char* caller) {
++  if ((driver & 0xFFFF0000) == 0x41550000) {
++    return true;
++  }
++  static std::atomic<uint32_t> invalid_count{0};
++  uint32_t count = ++invalid_count;
++  if (count <= 8 || (count & (count - 1)) == 0) {
++    REXKRNL_WARN("{}: ignoring invalid audio driver handle {:08X} (seen {} times)", caller, driver,
++                 count);
++  }
++  return false;
++}
++}  // namespace
++
+ u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
+   *config_ptr = 0x00010001;
+   return X_ERROR_SUCCESS;
+ }
+ 
+ u32 XAudioGetVoiceCategoryVolumeChangeMask_entry(mapped_void driver_ptr, mapped_u32 out_ptr) {
+-  assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
++  if (!IsAudioDriverHandle(driver_ptr.guest_address(), "XAudioGetVoiceCategoryVolumeChangeMask")) {
++    *out_ptr = 0;
++    return X_ERROR_SUCCESS;
++  }
+ 
+   rex::thread::Sleep(std::chrono::microseconds(1));
+ 
+@@ -80,7 +103,9 @@ u32 XAudioRegisterRenderDriverClient_entry(mapped_u32 callback_ptr, mapped_u32 d
+ }
+ 
+ u32 XAudioUnregisterRenderDriverClient_entry(mapped_void driver_ptr) {
+-  assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
++  if (!IsAudioDriverHandle(driver_ptr.guest_address(), "XAudioUnregisterRenderDriverClient")) {
++    return X_ERROR_SUCCESS;
++  }
+ 
+   auto* audio_system =
+       static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system());
+@@ -89,7 +114,9 @@ u32 XAudioUnregisterRenderDriverClient_entry(mapped_void driver_ptr) {
+ }
+ 
+ u32 XAudioSubmitRenderDriverFrame_entry(mapped_void driver_ptr, mapped_void samples_ptr) {
+-  assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
++  if (!IsAudioDriverHandle(driver_ptr.guest_address(), "XAudioSubmitRenderDriverFrame")) {
++    return X_ERROR_SUCCESS;
++  }
+ 
+   static uint32_t submit_krnl_count = 0;
+   if (submit_krnl_count < 10) {
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_module.cpp b/src/kernel/xboxkrnl/xboxkrnl_module.cpp
+index dcb3af6..06075d5 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_module.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_module.cpp
+@@ -187,15 +187,26 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
+   uint32_t pKeTimeStampBundle = memory_->SystemHeapAlloc(24);
+   auto lpKeTimeStampBundle = memory_->TranslateVirtual(pKeTimeStampBundle);
+   export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x00AD, pKeTimeStampBundle);
+-  memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 0, 0);
+-  memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 8, 0);
+-  memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
+-                                   chrono::Clock::QueryGuestUptimeMillis());
++  // Layout: interrupt_time (100 ns units since boot), system_time (FILETIME),
++  // tick_count (ms), padding. All three advance on the console; titles may
++  // time transitions with any of them.
++  auto update_time_stamp_bundle = [lpKeTimeStampBundle]() {
++    uint32_t uptime_ms = chrono::Clock::QueryGuestUptimeMillis();
++    memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 0, uint64_t(uptime_ms) * 10000);
++    memory::store_and_swap<uint64_t>(lpKeTimeStampBundle + 8,
++                                     chrono::Clock::QueryGuestSystemTime());
++    memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16, uptime_ms);
++  };
+   memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 20, 0);
++  update_time_stamp_bundle();
+   timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
+-      std::chrono::milliseconds(1), [lpKeTimeStampBundle]() {
+-        memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
+-                                         chrono::Clock::QueryGuestUptimeMillis());
++      std::chrono::milliseconds(1), [update_time_stamp_bundle]() {
++        update_time_stamp_bundle();
++        // reNut diagnostics: confirm the timer really fires on this platform.
++        static uint32_t renut_fires = 0;
++        if (++renut_fires == 5000) {
++          REXKRNL_INFO("Renut: KeTimeStampBundle timer fired 5000 times");
++        }
+       });
+ 
+   // Wire kernel object type variables to KernelGuestGlobals.
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..8565046 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -15,7 +15,12 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <map>
+ #include <memory>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <tuple>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
+@@ -451,7 +456,70 @@ u32 KeTlsSetValue_entry(u32 tls_index, u32 tls_value) {
+   return 0;
+ }
+ 
++
++// reNut diagnostics (temporary): trace operations on Banjo's static XAudio
++// KEVENTs to find the lost wakeup between its render thread and shutdown.
++static void RenutTraceAudioEvent(const char* op, uint32_t address, const void* native,
++                                 int64_t extra = 0) {
++  if (address < 0x82FA7C00 || address >= 0x82FA7C80) {
++    return;
++  }
++  static std::mutex trace_mutex;
++  static std::map<std::tuple<uint32_t, std::string, uint32_t>, uint32_t> counts;
++  static uint64_t verbose_until_ms = 0;
++  uint64_t now_ms = chrono::Clock::QueryHostUptimeMillis();
++  uint32_t tid = XThread::IsInThread() ? XThread::GetCurrentThreadId() : 0;
++  std::lock_guard<std::mutex> lock(trace_mutex);
++  if (std::string_view(op) == "init") {
++    verbose_until_ms = now_ms + 3000;
++  }
++  uint32_t count = ++counts[{tid, op, address}];
++  if (std::string_view(op) == "set" && count <= 3) {
++    // A new setter (e.g. the shutdown path): capture everything around it.
++    verbose_until_ms = now_ms + 2000;
++  }
++  if (now_ms > verbose_until_ms && count > 3 && (count & (count - 1))) {
++    return;
++  }
++  auto header = reinterpret_cast<const X_DISPATCH_HEADER*>(native);
++  uint32_t lr = 0;
++  if (XThread::IsInThread()) {
++    auto* state = XThread::GetCurrentThread()->thread_state();
++    lr = state && state->context() ? uint32_t(state->context()->lr) : 0;
++  }
++  REXKRNL_INFO("Renut: kevent {} {:08X} tid={:X} lr={:08X} handle={:08X} sig={} extra={} (#{})", op,
++               address, tid, lr,
++               header->wait_list_flink == kXObjSignature ? uint32_t(header->wait_list_blink) : 0,
++               int32_t(header->signal_state), extra, count);
++}
++
+ void KeInitializeEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 event_type, u32 initial_state) {
++  RenutTraceAudioEvent("init", event_ptr.guest_address(), event_ptr.host_address(),
++                       event_type * 10 + initial_state);
++  // Re-initializing a KEVENT that already backs a native event must keep that
++  // object: zeroing the header drops the stashed handle, the next use creates a
++  // new event, and a thread still blocked on the old one never wakes. Banjo
++  // re-initializes its static XAudio events while the render thread waits on
++  // them, then deadlocks joining that thread. The guest identifies an event by
++  // its address, so reuse the object and only reset its state.
++  if (event_ptr->header.wait_list_flink == kXObjSignature) {
++    auto existing = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr, event_type);
++    if (existing && existing->type() == XObject::Type::Event &&
++        existing->manual_reset() == (event_type == 0)) {
++      uint32_t handle = event_ptr->header.wait_list_blink;
++      event_ptr.Zero();
++      event_ptr->header.type = event_type;
++      event_ptr->header.signal_state = (uint32_t)initial_state;
++      event_ptr->header.wait_list_flink = kXObjSignature;
++      event_ptr->header.wait_list_blink = handle;
++      if (initial_state) {
++        existing->Set(0, false);
++      } else {
++        existing->Reset();
++      }
++      return;
++    }
++  }
+   event_ptr.Zero();
+   event_ptr->header.type = event_type;
+   event_ptr->header.signal_state = (uint32_t)initial_state;
+@@ -473,6 +541,7 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+ }
+ 
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
++  RenutTraceAudioEvent("set", event_ptr.guest_address(), event_ptr.host_address());
+   return xeKeSetEvent(event_ptr, increment, wait);
+ }
+ 
+@@ -487,6 +556,7 @@ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+ }
+ 
+ u32 KeResetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr) {
++  RenutTraceAudioEvent("reset", event_ptr.guest_address(), event_ptr.host_address());
+   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
+   if (!ev) {
+     assert_always();
+@@ -844,8 +914,10 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
+   // object_ptr.guest_address(), (uint32_t)wait_reason,
+   //(uint32_t)processor_mode, (uint32_t)alertable,
+   // timeout_ptr ? (int64_t)timeout : -1);
++  RenutTraceAudioEvent("wait", object_ptr.guest_address(), object_ptr.host_address());
+   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
+                                         timeout_ptr ? &timeout : nullptr);
++  RenutTraceAudioEvent("woke", object_ptr.guest_address(), object_ptr.host_address(), result);
+   // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
+   return result;
+ }
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 index 1254710..6fa91bf 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
@@ -442,10 +1296,19 @@ index 1254710..6fa91bf 100644
    // for this method to do what it needs. We just zero them out and send a
    // token value. It'd be nice to figure out what this is really doing so
 diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
-index 697399c..8ecda53 100644
+index 697399c..d50e6fa 100644
 --- a/src/system/kernel_state.cpp
 +++ b/src/system/kernel_state.cpp
-@@ -16,6 +16,7 @@
+@@ -9,13 +9,16 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
+ #include <chrono>
++#include <iterator>
+ #include <cstring>
+ #include <filesystem>
+ #include <string>
  
  #include <fmt/format.h>
  #include <rex/assert.h>
@@ -453,7 +1316,7 @@ index 697399c..8ecda53 100644
  #include <rex/image_info.h>
  #include <rex/logging.h>
  #include <rex/math.h>
-@@ -163,6 +164,11 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
+@@ -163,6 +166,11 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
  KernelState::~KernelState() {
    app_manager_.reset();
  
@@ -465,7 +1328,82 @@ index 697399c..8ecda53 100644
    // Stop the dispatch thread before touching the object table
    if (dispatch_thread_running_) {
      dispatch_thread_running_ = false;
-@@ -686,6 +692,38 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
+@@ -585,6 +593,74 @@ object_ref<UserModule> KernelState::GetExecutableModule() {
+   return executable_module_;
+ }
+ 
++void KernelState::DumpGuestThreadsForDiagnostics(uint64_t host_now_ms) {
++  static const char* kTypeNames[] = {"undef",  "enum",   "event",  "file",   "iocomp",
++                                     "module", "mutant", "notify", "sema",   "session",
++                                     "socket", "symlink", "thread", "timer"};
++  auto load_u32 = [this](uint32_t address) {
++    return memory::load_and_swap<uint32_t>(memory()->TranslateVirtual(address));
++  };
++  REXSYS_INFO("Renut: thread dump ({} threads)", threads_by_id_.size());
++  for (auto& [id, thread] : threads_by_id_) {
++    if (!thread) {
++      continue;
++    }
++    auto& diag = thread->wait_diag();
++    std::string line = fmt::format("  [{:08X}] '{}' obj={:08X}{}", id,
++                                   thread->thread() ? thread->thread()->name() : std::string(),
++                                   thread->guest_object(), thread->is_running() ? "" : " EXITED");
++    uint64_t start_ms = diag.start_ms.load();
++    if (start_ms) {
++      line += fmt::format(" WAIT {}ms lr={:08X} timeout={} alertable={} objs=",
++                          host_now_ms - std::min(host_now_ms, start_ms), diag.guest_lr.load(),
++                          int64_t(diag.timeout_ms.load() == UINT32_MAX ? -1
++                                                                       : diag.timeout_ms.load()),
++                          diag.alertable.load());
++      uint32_t count = std::min(diag.count.load(), XThread::WaitDiag::kMaxObjects);
++      for (uint32_t i = 0; i < count; ++i) {
++        uint32_t type = diag.types[i].load();
++        line += fmt::format("{}{}:{:08X}", i ? "," : "",
++                            type < std::size(kTypeNames) ? kTypeNames[type] : "?",
++                            diag.objects[i].load());
++      }
++      if (diag.count.load() > count) {
++        line += fmt::format(" (+{})", diag.count.load() - count);
++      }
++    } else {
++      line += " run/delay";
++    }
++    // Guest back chain: frame[0] is the caller's SP, and a non-leaf callee saves
++    // its LR at -8 from that caller SP.
++    // Exited threads have freed their stacks (XThread::Exit -> FreeStack).
++    auto* state = thread->thread_state();
++    if (thread->is_running() && state && state->context()) {
++      auto* ctx = state->context();
++      line += fmt::format(" | lr={:08X} sp={:08X} stack:", uint32_t(ctx->lr), ctx->r1.u32);
++      // Only walk inside this thread's committed stack: r1 is read racily and a
++      // stray value would fault on the guard or an unmapped page.
++      uint32_t stack_low = 0, stack_high = 0;
++      if (thread->guest_object()) {
++        auto* kthread = thread->guest_object<X_KTHREAD>();
++        stack_low = kthread->stack_limit;
++        stack_high = kthread->stack_base;
++      }
++      uint32_t sp = ctx->r1.u32;
++      for (int depth = 0; depth < 14; ++depth) {
++        if (sp < stack_low || sp + 4 > stack_high || (sp & 3)) {
++          break;
++        }
++        uint32_t back = load_u32(sp);
++        if (back <= sp || back + 4 > stack_high || back - 8 < stack_low) {
++          break;
++        }
++        line += fmt::format(" {:08X}", load_u32(back - 8));
++        sp = back;
++      }
++    }
++    REXSYS_INFO("{}", line);
++  }
++}
++
+ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
+   if (module.get() == executable_module_.get()) {
+     return;
+@@ -686,6 +762,44 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
      }
    }
  
@@ -477,6 +1415,7 @@ index 697399c..8ecda53 100644
 +  if (!kernel_time_thread_running_) {
 +    kernel_time_thread_running_ = true;
 +    kernel_time_thread_ = object_ref<XHostThread>(new XHostThread(this, 64 * 1024, 0, [this]() {
++      uint64_t next_dump_ms = chrono::Clock::QueryHostUptimeMillis() + 20000;
 +      while (kernel_time_thread_running_) {
 +        {
 +          auto global_lock = global_critical_region_.Acquire();
@@ -486,6 +1425,11 @@ index 697399c..8ecda53 100644
 +              continue;
 +            }
 +            thread->guest_object<X_KTHREAD>()->kernel_time = now;
++          }
++          uint64_t host_now = chrono::Clock::QueryHostUptimeMillis();
++          if (host_now >= next_dump_ms) {
++            next_dump_ms = host_now + 20000;
++            DumpGuestThreadsForDiagnostics(host_now);
 +          }
 +        }
 +        std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -504,6 +1448,112 @@ index 697399c..8ecda53 100644
    LoadAchievementsData();
  }
  
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index d358f39..dc86180 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <unordered_map>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
+@@ -200,6 +202,47 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+   }
+ }
+ 
++namespace {
++// Records the wait in the calling XThread so a periodic dump can show what each
++// blocked guest thread is waiting on and from where (reNut diagnostics).
++class WaitDiagScope {
++ public:
++  WaitDiagScope(XObject* const* objects, uint32_t count, uint32_t alertable,
++                std::chrono::milliseconds timeout) {
++    // Host threads (e.g. the Android view thread) also wait on kernel objects;
++    // GetCurrentThread() asserts on those, so only record kernel threads.
++    if (!XThread::IsInThread()) {
++      return;
++    }
++    thread_ = XThread::GetCurrentThread();
++    auto& diag = thread_->wait_diag();
++    auto* state = thread_->thread_state();
++    diag.guest_lr = state && state->context() ? uint32_t(state->context()->lr) : 0;
++    diag.timeout_ms = timeout == std::chrono::milliseconds::max()
++                          ? UINT32_MAX
++                          : uint32_t(std::min<int64_t>(timeout.count(), UINT32_MAX - 1));
++    diag.count = count;
++    diag.alertable = alertable;
++    for (uint32_t i = 0; i < XThread::WaitDiag::kMaxObjects; ++i) {
++      XObject* object = i < count ? objects[i] : nullptr;
++      diag.objects[i] = object ? (object->guest_object() ? object->guest_object()
++                                                         : object->handle())
++                               : 0;
++      diag.types[i] = object ? uint32_t(object->type()) : 0;
++    }
++    diag.start_ms = std::max<uint64_t>(1, chrono::Clock::QueryHostUptimeMillis());
++  }
++  ~WaitDiagScope() {
++    if (thread_) {
++      thread_->wait_diag().start_ms = 0;
++    }
++  }
++
++ private:
++  XThread* thread_ = nullptr;
++};
++}  // namespace
++
+ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                        uint64_t* opt_timeout) {
+   auto wait_handle = GetWaitHandle();
+@@ -213,6 +256,8 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  XObject* self = this;
++  WaitDiagScope diag_scope(&self, 1, alertable, timeout_ms);
+   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+   XThread::CheckTitleTermination();
+   switch (result) {
+@@ -239,6 +284,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+ 
++  WaitDiagScope diag_scope(&wait_object, 1, alertable, timeout_ms);
+   auto result =
+       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+                                  alertable ? true : false, timeout_ms);
+@@ -273,6 +319,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  WaitDiagScope diag_scope(objects, count, alertable, timeout_ms);
+   if (wait_type) {
+     auto result =
+         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+@@ -444,6 +491,19 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
+     // FIXME: This assumes the object contains a dispatch header (some don't!)
+     StashHandle(header, object->handle());
+ 
++    // reNut diagnostics: a second native object for the same guest address
++    // orphans the first one, and any thread still waiting on it never wakes.
++    {
++      static std::unordered_map<uintptr_t, uint32_t> native_creations;
++      uint32_t creations = ++native_creations[reinterpret_cast<uintptr_t>(native_ptr)];
++      if (creations > 1) {
++        uint32_t guest_address =
++            kernel_state->memory()->HostToGuestVirtual(native_ptr);
++        REXSYS_WARN("Renut: native object at {:08X} (type {}) recreated ({} times), new handle {:08X}",
++                    guest_address, as_type, creations, object->handle());
++      }
++    }
++
+     return object_ref<XObject>(object);
+   }
+ }
 diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
 index 914b311..1e6bcb5 100644
 --- a/src/ui/vulkan/vulkan_instance.cpp
@@ -547,6 +1597,84 @@ index 914b311..1e6bcb5 100644
    XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
    XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
  #undef XE_VULKAN_LOAD_LOADER_FUNCTION
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..0c371fe 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1840,6 +1840,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+                 swapchain_effect, paint_context_.swapchain_render_pass);
+             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+               guest_output_flow.effect_count = 0;
++            } else {
++              // Without this the format check above never matches, so every
++              // frame waited for the previous paint and rebuilt the pipeline.
++              swapchain_effect_pipeline.swapchain_format =
++                  paint_context_.swapchain_render_pass_format;
+             }
+           }
+         }
+diff --git a/src/ui/vulkan/vulkan_upload_buffer_pool.cpp b/src/ui/vulkan/vulkan_upload_buffer_pool.cpp
+index 771019a..601f7b9 100644
+--- a/src/ui/vulkan/vulkan_upload_buffer_pool.cpp
++++ b/src/ui/vulkan/vulkan_upload_buffer_pool.cpp
+@@ -147,6 +147,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
+     dfn.vkDestroyBuffer(device, buffer, nullptr);
+     return nullptr;
+   }
++  renut_upload_pool_bytes += int64_t(allocation_size_);
+ 
+   if (dfn.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+     REXLOG_ERROR("Failed to bind memory to a Vulkan upload buffer with {} bytes", page_size_);
+@@ -163,7 +164,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
+     return nullptr;
+   }
+ 
+-  return new VulkanPage(vulkan_device_, buffer, memory, mapping);
++  return new VulkanPage(vulkan_device_, buffer, memory, mapping, allocation_size_);
+ }
+ 
+ void VulkanUploadBufferPool::FlushPageWrites(Page* page, size_t offset, size_t size) {
+@@ -178,6 +179,7 @@ VulkanUploadBufferPool::VulkanPage::~VulkanPage() {
+   dfn.vkDestroyBuffer(device, buffer_, nullptr);
+   // Unmapping is done implicitly when the memory is freed.
+   dfn.vkFreeMemory(device, memory_, nullptr);
++  renut_upload_pool_bytes -= int64_t(size_);
+ }
+ 
+ }  // namespace vulkan
+diff --git a/src/ui/vulkan/vulkan_util.cpp b/src/ui/vulkan/vulkan_util.cpp
+index 2106800..f7e8c47 100644
+--- a/src/ui/vulkan/vulkan_util.cpp
++++ b/src/ui/vulkan/vulkan_util.cpp
+@@ -19,6 +19,8 @@
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
++std::atomic<int64_t> renut_upload_pool_bytes{0};
++std::atomic<int64_t> renut_dedicated_bytes{0};
+ namespace util {
+ 
+ void FlushMappedMemoryRange(const VulkanDevice* const vulkan_device, const VkDeviceMemory memory,
+@@ -95,6 +97,9 @@ bool CreateDedicatedAllocationBuffer(const VulkanDevice* const vulkan_device,
+     dfn.vkDestroyBuffer(device, buffer, nullptr);
+     return false;
+   }
++  renut_dedicated_bytes += int64_t(memory_allocate_info.allocationSize);
++  if (false) {
++  }
+ 
+   if (dfn.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+     dfn.vkDestroyBuffer(device, buffer, nullptr);
+@@ -154,6 +159,9 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+     dfn.vkDestroyImage(device, image, nullptr);
+     return false;
+   }
++  renut_dedicated_bytes += int64_t(memory_allocate_info.allocationSize);
++  if (false) {
++  }
+ 
+   if (dfn.vkBindImageMemory(device, image, memory, 0) != VK_SUCCESS) {
+     dfn.vkDestroyImage(device, image, nullptr);
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
 index 2251429..697d21e 100644
 --- a/src/ui/window_sdl.cpp

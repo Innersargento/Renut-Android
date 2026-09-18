@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <rex/runtime.h>
+#include <rex/cvar.h>
 #include <rex/kernel/init.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/memory/utils.h>
@@ -137,7 +138,15 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     // /data/user/0 and /data/data may name the same directory on Android.
     root = std::filesystem::canonical(root);
     auto log_path = (root / "rexglue-runtime.log").string();
-    rex::InitLogging(log_path.c_str(), spdlog::level::info);
+    // Optional cvar overrides for on-device experiments, pushed with
+    // `adb shell run-as org.renut.android` into files/renut.toml. Loaded before
+    // logging so that log_level applies from the first line.
+    bool has_config = std::filesystem::is_regular_file(root / "renut.toml");
+    if (has_config) rex::cvar::LoadConfig(root / "renut.toml");
+    auto log_level = spdlog::level::from_str(rex::cvar::GetFlagByName("log_level"));
+    if (log_level == spdlog::level::off) log_level = spdlog::level::info;
+    rex::InitLogging(log_path.c_str(), log_level);
+    if (has_config) note("Configuração: renut.toml aplicado.");
     note("RexGlue 0.10.0 / ARM64: biblioteca carregada.");
     size_t mappings = 0;
     while (PPCFuncMappings[mappings].host) ++mappings;
