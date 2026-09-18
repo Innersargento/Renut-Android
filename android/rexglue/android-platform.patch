@@ -53,6 +53,37 @@ index d54df86..4306549 100644
    // --- Optional capabilities, default no-op -------------------------------
  
    // Host presentation objects for ReXApp's overlay wiring; custom systems may
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 9b9cf9e..03ece2a 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -391,6 +391,9 @@ class KernelState {
+   std::atomic<bool> dispatch_thread_running_;
+   std::atomic<bool> terminating_title_{false};
+   object_ref<XHostThread> dispatch_thread_;
++  // Advances X_KTHREAD::kernel_time so guest watchdogs that poll it can expire.
++  std::atomic<bool> kernel_time_thread_running_{false};
++  object_ref<XHostThread> kernel_time_thread_;
+   // Must be guarded by the global critical region.
+   util::NativeList dpc_list_;
+   std::condition_variable_any dispatch_cond_;
+diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
+index a72911e..1e76368 100644
+--- a/include/rex/system/xthread.h
++++ b/include/rex/system/xthread.h
+@@ -219,7 +219,11 @@ struct X_KTHREAD {
+   rex::be<uint32_t> unk_14;          // 0x14
+   X_KTIMER wait_timeout_timer;       // 0x18
+   X_KWAIT_BLOCK wait_timeout_block;  // 0x40
+-  uint8_t unk_58[0x4];               // 0x58
++  // 0x58 is the thread's kernel time, documented in xboxkrnl_threading.cpp and
++  // read directly by guest code. Titles use it as a monotonic millisecond
++  // counter: Banjo-Kazooie: Nuts & Bolts drives its allocator reclaim watchdog
++  // off it and spins forever while it stays zero. KernelState advances it.
++  rex::be<uint32_t> kernel_time;     // 0x58
+   rex::be<uint32_t> stack_base;      // 0x5C
+   rex::be<uint32_t> stack_limit;     // 0x60
+   rex::be<uint32_t> stack_kernel;    // 0x64
 diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
 index 7a711a8..cd768de 100644
 --- a/src/audio/audio_system.cpp
@@ -170,7 +201,7 @@ index b52bf39..0b1d219 100644
  
  #include <dlfcn.h>
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..69b9917 100644
+index 9ac8d15..c56800d 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -49,7 +49,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -209,6 +240,27 @@ index 9ac8d15..69b9917 100644
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
          int result = pthread_mutex_trylock(native_mutex);
          if (result == 0 || result == EOWNERDEAD) {
+@@ -876,8 +876,18 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     sigval value{};
+     value.sival_ptr = this;
+ #if REX_PLATFORM_ANDROID
+-    int result = sigqueue(pthread_gettid_np(thread_),
+-                          GetSystemSignal(SignalType::kThreadUserCallback), value);
++    // sigqueue() addresses a process, not a thread: passing a tid targets some
++    // unrelated pid and fails with ESRCH, so the wakeup never arrived (the
++    // alertable poll slice hid it). pthread_sigqueue() needs API 29 and this
++    // build targets 28, so use the syscall bionic itself calls.
++    siginfo_t info{};
++    info.si_signo = GetSystemSignal(SignalType::kThreadUserCallback);
++    info.si_code = SI_QUEUE;
++    info.si_pid = getpid();
++    info.si_uid = getuid();
++    info.si_value = value;
++    int result = syscall(SYS_rt_tgsigqueueinfo, getpid(), pthread_gettid_np(thread_),
++                         info.si_signo, &info);
+ #else
+     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
+ #endif
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
 index a744375..8f0f91b 100644
 --- a/src/graphics/command_processor.cpp
@@ -223,6 +275,99 @@ index a744375..8f0f91b 100644
    read_ptr_index_ = 0;
    primary_buffer_ptr_ = ptr;
    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..cc3961a 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -10,7 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <array>
+ #include <cstdint>
++#include <mutex>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -899,6 +901,43 @@ bool TextureCache::LoadTextureData(Texture& texture) {
+   return CommitPreparedTextureLoad(pending_load);
+ }
+ 
++namespace {
++
++// Invalid fetch constants repeat on every draw that samples an unbound slot.
++// Logging each one buries the rest of the session: a stuck frame produced
++// ~2400 identical lines in eleven seconds and rotated everything else away.
++// Report every distinct descriptor once, then count the repeats and emit a
++// single periodic summary so the flood stays visible without hiding it.
++bool ShouldReportInvalidFetch(const uint32_t* dwords, size_t dword_count) {
++  static std::mutex mutex;
++  static std::array<uint64_t, 64> seen{};
++  static size_t seen_count = 0;
++  static uint64_t repeats = 0;
++  uint64_t key = 0xcbf29ce484222325ull;
++  for (size_t i = 0; i < dword_count; ++i) {
++    key = (key ^ dwords[i]) * 0x100000001b3ull;
++  }
++  std::lock_guard<std::mutex> lock(mutex);
++  for (size_t i = 0; i < seen_count; ++i) {
++    if (seen[i] == key) {
++      if (++repeats % 20000 == 0) {
++        REXGPU_WARN("Suppressed {} repeated invalid fetch constant warnings.", repeats);
++      }
++      return false;
++    }
++  }
++  if (seen_count < seen.size()) {
++    seen[seen_count++] = key;
++    return true;
++  }
++  // More distinct descriptors than the table holds: keep counting instead of
++  // reporting, so an unbounded pattern cannot flood the log either.
++  ++repeats;
++  return false;
++}
++
++}  // namespace
++
+ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                                 TextureKey& key_out, uint8_t* swizzled_signs_out) {
+   // Reset the key and the signedness.
+@@ -914,18 +953,24 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
+       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+         break;
+       }
+-      REXGPU_WARN(
+-          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+-          "has \"invalid\" type! This is incorrect behavior, but you can try "
+-          "bypassing this by launching Xenia with "
+-          "--gpu_allow_invalid_fetch_constants=true.",
+-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
++      if (ShouldReportInvalidFetch(&fetch.dword_0, 6)) {
++        REXGPU_WARN(
++            "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
++            "has \"invalid\" type! This is incorrect behavior, but you can try "
++            "bypassing this by launching Xenia with "
++            "--gpu_allow_invalid_fetch_constants=true.",
++            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
++            fetch.dword_5);
++      }
+       return;
+     default:
+-      REXGPU_WARN(
+-          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+-          "is completely invalid!",
+-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
++      if (ShouldReportInvalidFetch(&fetch.dword_0, 6)) {
++        REXGPU_WARN(
++            "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
++            "is completely invalid!",
++            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
++            fetch.dword_5);
++      }
+       return;
+   }
+ 
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index 001f36b..f64072f 100644
 --- a/src/graphics/vulkan/command_processor.cpp
@@ -296,6 +441,69 @@ index 1254710..6fa91bf 100644
    // The caller seems to reserve 64 words (256b) in the primary ringbuffer
    // for this method to do what it needs. We just zero them out and send a
    // token value. It'd be nice to figure out what this is really doing so
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399c..8ecda53 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <fmt/format.h>
+ #include <rex/assert.h>
++#include <rex/chrono/clock.h>
+ #include <rex/image_info.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -163,6 +164,11 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
+ KernelState::~KernelState() {
+   app_manager_.reset();
+ 
++  if (kernel_time_thread_running_) {
++    kernel_time_thread_running_ = false;
++    kernel_time_thread_->Wait(0, 0, 0, nullptr);
++  }
++
+   // Stop the dispatch thread before touching the object table
+   if (dispatch_thread_running_) {
+     dispatch_thread_running_ = false;
+@@ -686,6 +692,38 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
+     }
+   }
+ 
++  // Guest code reads X_KTHREAD::kernel_time (0x58) straight out of memory and
++  // expects it to keep moving; nothing else in the kernel ever wrote it. Banjo's
++  // allocator reclaim loop gives up only once it advances 5000, so with a zero
++  // field the guest spun at 100% CPU forever. Advance it as a millisecond
++  // counter, which makes that threshold the five second timeout it reads like.
++  if (!kernel_time_thread_running_) {
++    kernel_time_thread_running_ = true;
++    kernel_time_thread_ = object_ref<XHostThread>(new XHostThread(this, 64 * 1024, 0, [this]() {
++      while (kernel_time_thread_running_) {
++        {
++          auto global_lock = global_critical_region_.Acquire();
++          uint32_t now = chrono::Clock::QueryGuestUptimeMillis();
++          for (auto& [id, thread] : threads_by_id_) {
++            if (!thread || !thread->guest_object()) {
++              continue;
++            }
++            thread->guest_object<X_KTHREAD>()->kernel_time = now;
++          }
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++      }
++      return 0;
++    }));
++    kernel_time_thread_->set_name("Kernel Time");
++    X_STATUS kernel_time_status = kernel_time_thread_->Create();
++    if (XFAILED(kernel_time_status)) {
++      kernel_time_thread_running_ = false;
++      kernel_time_thread_.reset();
++      REX_FATAL("Failed to create kernel time thread (status {:#x})", kernel_time_status);
++    }
++  }
++
+   LoadAchievementsData();
+ }
+ 
 diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
 index 914b311..1e6bcb5 100644
 --- a/src/ui/vulkan/vulkan_instance.cpp
