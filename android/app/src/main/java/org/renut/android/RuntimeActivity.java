@@ -13,12 +13,15 @@ import java.nio.charset.StandardCharsets;
 public final class RuntimeActivity extends Activity implements SurfaceHolder.Callback {
     private TextView status;
     private SurfaceView surface;
+    private GamepadOverlay overlay;
     private ScrollView results;
     private boolean started, graphics, launch;
     private volatile boolean loaded, cancelled;
     private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,String renderer,boolean launch);
     private static native void nativeStop();
     private static native void nativeButton(int button,boolean down);
+    private static native void nativeStick(int stick,float x,float y);
+    private static native void nativeTrigger(int trigger,float value);
     public int openContentFd(String uri, String mode) throws java.io.IOException {
         android.os.ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(android.net.Uri.parse(uri),mode);
         if(descriptor==null)throw new java.io.IOException("Arquivo indisponível.");
@@ -30,30 +33,37 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
         if(launch)setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         graphics=launch||getIntent().getBooleanExtra("graphics",false);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        status=new TextView(this);status.setTextColor(Color.rgb(226,237,235));status.setTextSize(16);
+        results=new ScrollView(this);results.addView(status);
+        if(launch){
+            // Full screen: the game surface with the Xbox 360 controller drawn over it.
+            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+                |View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                |View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN|View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+            if(android.os.Build.VERSION.SDK_INT>=28)getWindow().getAttributes().layoutInDisplayCutoutMode=
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            FrameLayout root=new FrameLayout(this);root.setBackgroundColor(Color.BLACK);
+            surface=new SurfaceView(this);surface.getHolder().addCallback(this);
+            root.addView(surface,new FrameLayout.LayoutParams(-1,-1));
+            overlay=new GamepadOverlay(this,new GamepadOverlay.Sink(){
+                @Override public void button(int mask,boolean down){if(loaded)nativeButton(mask,down);}
+                @Override public void stick(int stick,float x,float y){if(loaded)nativeStick(stick,x,y);}
+                @Override public void trigger(int trigger,float value){if(loaded)nativeTrigger(trigger,value);}
+                @Override public void exit(){finish();}
+            });
+            root.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
+            results.setVisibility(View.GONE);results.setBackgroundColor(Color.rgb(12,23,28));
+            root.addView(results,new FrameLayout.LayoutParams(-1,-1));
+            setContentView(root);
+            return;
+        }
         LinearLayout body=new LinearLayout(this);body.setOrientation(LinearLayout.VERTICAL);
         int pad=(int)(20*getResources().getDisplayMetrics().density);
         body.setPadding(pad,pad*2,pad,pad);body.setBackgroundColor(Color.rgb(12,23,28));
         body.setOnApplyWindowInsetsListener((v,i)->{v.setPadding(pad,pad+i.getSystemWindowInsetTop(),pad,pad+i.getSystemWindowInsetBottom());return i;});
-        status=new TextView(this);status.setTextColor(Color.rgb(226,237,235));status.setTextSize(16);
-        status.setText(launch?"Banjo-Kazooie: Nuts & Bolts · Experimental":graphics?"RexGlue + Plume\nImagem de teste na memória do runtime. Ainda não representa cenas do jogo.":"Validando o runtime ARM64…\nEste teste ainda não inicia o jogo.");
-        results=new ScrollView(this);results.addView(status);
+        status.setText(graphics?"RexGlue + Plume\nImagem de teste na memória do runtime. Ainda não representa cenas do jogo.":"Validando o runtime ARM64…\nEste teste ainda não inicia o jogo.");
         body.addView(results,new LinearLayout.LayoutParams(-1,graphics?-2:0,graphics?0:1));
         if(graphics){surface=new SurfaceView(this);surface.getHolder().addCallback(this);body.addView(surface,new LinearLayout.LayoutParams(-1,0,1));}
-        if(launch){
-            LinearLayout controls=new LinearLayout(this);
-            String[] labels={"↑","↓","←","→","Start","A","B"};int[] masks={1,2,4,8,16,4096,8192};
-            for(int index=0;index<labels.length;index++){
-                Button key=new Button(this);key.setText(labels[index]);final int mask=masks[index];
-                key.setOnTouchListener((v,event)->{
-                    int action=event.getActionMasked();
-                    if(action==MotionEvent.ACTION_DOWN){if(loaded)nativeButton(mask,true);return true;}
-                    if(action==MotionEvent.ACTION_UP||action==MotionEvent.ACTION_CANCEL){if(loaded)nativeButton(mask,false);if(action==MotionEvent.ACTION_UP)v.performClick();return true;}
-                    return true;
-                });
-                controls.addView(key,new LinearLayout.LayoutParams(0,-2,1));
-            }
-            body.addView(controls);
-        }
         Button close=new Button(this);close.setText("Voltar");close.setOnClickListener(v->finish());body.addView(close);
         setContentView(body);
         if(!graphics)startValidation(null);
@@ -74,7 +84,9 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
                 try{Files.write(new File(getFilesDir(),"runtime-report.txt").toPath(),report.getBytes(StandardCharsets.UTF_8));}catch(Exception ignored){}
             }
             final String message=report;
-            runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
+            runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
+                if(overlay!=null){overlay.setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
+                else results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
         },"renut-runtime-validation").start();
     }
     private void stop(){cancelled=true;if(loaded)nativeStop();}

@@ -34,7 +34,13 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) { return JNI_VERSIO
 static std::atomic<bool> render_stopped{false};
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeStop(JNIEnv*,jclass) {render_stopped=true;}
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeButton(JNIEnv*,jclass,jint button,jboolean down) {
-  renut::SetTouchButton(uint16_t(button)&0x301F,down);
+  renut::SetTouchButton(uint16_t(button),down);
+}
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeStick(JNIEnv*,jclass,jint stick,jfloat x,jfloat y) {
+  renut::SetTouchStick(stick,x,y);
+}
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeTrigger(JNIEnv*,jclass,jint trigger,jfloat value) {
+  renut::SetTouchTrigger(trigger,value);
 }
 static std::string javaString(JNIEnv* env,jstring value){
   if(!value)return {};const char* chars=env->GetStringUTFChars(value,nullptr);
