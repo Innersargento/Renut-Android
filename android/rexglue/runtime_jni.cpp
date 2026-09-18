@@ -16,6 +16,8 @@
 #include "plume_graphics.h"
 #include "android_game_window.h"
 #include "touch_input.h"
+#include "d3d_layer.h"
+#include "plume_renderer.h"
 #include <rex/system/gpu_plugin.h>
 #include <rex/ui/presenter.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
@@ -126,7 +128,7 @@ static void validateFibers() {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activity, jstring directory,
-    jobject surface,jstring hooks,jstring driverDirectory,jstring driverLibrary,jboolean launch) {
+    jobject surface,jstring hooks,jstring driverDirectory,jstring driverLibrary,jstring renderer,jboolean launch) {
   const char* chars = env->GetStringUTFChars(directory, nullptr);
   if (!chars) return nullptr;
   std::filesystem::path root(chars);
@@ -147,6 +149,11 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     if (log_level == spdlog::level::off) log_level = spdlog::level::info;
     rex::InitLogging(log_path.c_str(), log_level);
     if (has_config) note("Configuração: renut.toml aplicado.");
+    // The launcher's renderer choice overrides renut.toml.
+    if (auto choice = javaString(env, renderer); !choice.empty()) {
+      rex::cvar::SetFlagByName("renut_renderer", choice);
+    }
+    note("Renderizador: " + rex::cvar::GetFlagByName("renut_renderer"));
     note("RexGlue 0.10.0 / ARM64: biblioteca carregada.");
     size_t mappings = 0;
     while (PPCFuncMappings[mappings].host) ++mappings;
@@ -179,7 +186,19 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       game_context=std::make_unique<renut::GameContext>();
       game_window=std::make_unique<renut::GameWindow>(*game_context,window);
       if(!game_window->Open())throw std::runtime_error("Falha ao abrir a superfície do jogo.");
-      runtime.set_app_context(game_context.get());runtime.set_display_window(game_window.get());
+      renut::d3d::SetShaderDumpDirectory((root / "shader-dump").string());
+      if(renut::d3d::PlumeActive()){
+        // The emulated Xenos keeps fences, vertical blank and swaps but does not
+        // present: without an app context it creates no presenter, so the
+        // native renderer owns the window.
+        std::string plume_error;
+        if(!renut::PlumeRenderer::Start(window,&plume_error))throw std::runtime_error(plume_error);
+        renut::d3d::RegisterPlumeHandlers();
+        note("Plume nativo: janela assumida; o Xenos segue sem apresentação.");
+      }else{
+        runtime.set_app_context(game_context.get());
+      }
+      runtime.set_display_window(game_window.get());
       rex::system::GpuCreateInfo info{sizeof(rex::system::GpuCreateInfo),"vulkan"};
       config.graphics.reset(rex_gpu_create(rex::system::kGpuPluginAbiVersion,&info));
       if(!config.graphics)throw std::runtime_error("Backend Xenos indisponível.");
@@ -224,7 +243,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       throw std::runtime_error("Resultado ARM64 divergente.");
     note("Função original 0x82296D30 executada em ARM64: resultado correto.");
     if(launch){
-      game_window->SetPresenter(runtime.graphics_system()->presenter());
+      if(auto* presenter=runtime.graphics_system()->presenter())game_window->SetPresenter(presenter);
       runtime.graphics_system()->InitializeShaderStorage(root / "runtime-cache",runtime.kernel_state()->title_id(),false);
       note("Iniciando o ponto de entrada do Banjo; acompanhe rexglue-runtime.log.");
       auto thread=runtime.LaunchModule();
@@ -242,6 +261,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     }
     if(graphics){validateSwap(runtime,*graphics);note(graphics->report());}
     runtime.Shutdown();
+    if(auto* plume=renut::PlumeRenderer::Get()){note(plume->report());renut::PlumeRenderer::Stop();}
     note(launch?"Sessão experimental encerrada; consulte o log para verificar a renderização.":surface?"Ponte VdSwap → Plume validada com framebuffer de teste. As cenas e os shaders do jogo ainda não são renderizados.":
         "Validação concluída. O jogo ainda não foi iniciado; gráficos e áudio não são exercitados neste teste.");
   } catch (const std::exception& e) {

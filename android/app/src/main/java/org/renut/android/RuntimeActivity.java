@@ -16,7 +16,7 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
     private ScrollView results;
     private boolean started, graphics, launch;
     private volatile boolean loaded, cancelled;
-    private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,boolean launch);
+    private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,String renderer,boolean launch);
     private static native void nativeStop();
     private static native void nativeButton(int button,boolean down);
     public int openContentFd(String uri, String mode) throws java.io.IOException {
@@ -67,7 +67,8 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
                 System.loadLibrary("renut_runtime");loaded=true;
                 if(cancelled){nativeStop();return;}
                 report=nativeValidate(getFilesDir().getAbsolutePath(),target,getApplicationInfo().nativeLibraryDir,
-                    getIntent().getStringExtra("driverDir"),getIntent().getStringExtra("driverLib"),launch);
+                    getIntent().getStringExtra("driverDir"),getIntent().getStringExtra("driverLib"),
+                    getIntent().getStringExtra("renderer"),launch);
             }catch(Throwable e){
                 report="Falha ao iniciar o runtime: "+e;
                 try{Files.write(new File(getFilesDir(),"runtime-report.txt").toPath(),report.getBytes(StandardCharsets.UTF_8));}catch(Exception ignored){}

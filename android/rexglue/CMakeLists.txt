@@ -120,6 +120,7 @@ target_link_libraries(renut_guest PRIVATE rexruntime)
 # CPU inside two guest functions, so this target's level matters most.
 target_compile_options(renut_guest PRIVATE -O2 -g0 -Wno-unused-variable -Wno-unused-label)
 target_precompile_headers(renut_guest PRIVATE "${RENUT_ROOT}/generated/android/renut_android_pch.h")
-add_library(renut_runtime SHARED runtime_jni.cpp plume_graphics.cpp game_fixes.cpp $<TARGET_OBJECTS:renut_guest>)
+add_library(renut_runtime SHARED runtime_jni.cpp plume_graphics.cpp game_fixes.cpp
+    d3d_layer.cpp plume_d3d.cpp plume_renderer.cpp $<TARGET_OBJECTS:renut_guest>)
 target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android")
 target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume adrenotools android log dl)

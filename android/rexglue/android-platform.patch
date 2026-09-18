@@ -732,7 +732,7 @@ index 76f5600..cc3961a 100644
    }
  
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..98eb3fe 100644
+index 001f36b..5230772 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,6 +9,7 @@
@@ -788,7 +788,17 @@ index 001f36b..98eb3fe 100644
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
-@@ -2283,11 +2313,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2279,15 +2309,27 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
+   if (!presenter) {
+-    REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
++    // Expected when another renderer owns the window (reNut's plume mode).
++    static bool logged = false;
++    if (!logged) {
++      logged = true;
++      REXGPU_INFO("XELOG_GPU PRESENT: no presenter; swaps are not displayed");
++    }
      return;
    }
  
@@ -807,7 +817,7 @@ index 001f36b..98eb3fe 100644
  
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
-@@ -2315,6 +2352,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2315,6 +2357,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
        frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
        &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
@@ -818,7 +828,7 @@ index 001f36b..98eb3fe 100644
    if (swap_texture_view == VK_NULL_HANDLE) {
      REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
      return;
-@@ -2408,6 +2449,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2408,6 +2454,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
    uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
  
@@ -828,7 +838,7 @@ index 001f36b..98eb3fe 100644
    presenter->RefreshGuestOutput(
        guest_output_width, guest_output_height, display_width, display_height,
        [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
-@@ -2924,9 +2968,37 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2924,9 +2973,37 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
          return true;
        });
  
@@ -866,7 +876,7 @@ index 001f36b..98eb3fe 100644
  }
  
  bool VulkanCommandProcessor::PushBufferMemoryBarrier(
-@@ -3590,6 +3662,30 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+@@ -3590,6 +3667,30 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
  bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                         IndexBufferInfo* index_buffer_info,
                                         bool major_mode_explicit) {
@@ -897,7 +907,7 @@ index 001f36b..98eb3fe 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4382,6 +4478,9 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+@@ -4382,6 +4483,9 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
  }
  
  bool VulkanCommandProcessor::IssueCopy() {
@@ -907,7 +917,7 @@ index 001f36b..98eb3fe 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-@@ -4970,9 +5069,16 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+@@ -4970,9 +5074,16 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
      // defined by vkQueueSubmit additionally include in the first
      // synchronization scope all commands that occur earlier in submission
      // order."
@@ -924,7 +934,7 @@ index 001f36b..98eb3fe 100644
      if (wait_result == VK_SUCCESS) {
        fences_awaited += await_submission - submission_completed_;
      } else {
-@@ -5230,6 +5336,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5230,6 +5341,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
  }
  
  bool VulkanCommandProcessor::EndSubmission(bool is_swap) {

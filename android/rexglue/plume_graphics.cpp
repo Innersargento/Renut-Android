@@ -28,6 +28,10 @@ static_assert(tiledOffset(32,0,64)==4096 && tiledOffset(0,32,64)==8192);
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 }
 
+// The native D3D renderer shares the loader opened for the session (Turnip or
+// the system driver) instead of opening a second one.
+void renutSetPlumeVulkanEntry(PFN_vkGetInstanceProcAddr loader_entry) { entry = loader_entry; }
+
 VkResult renutInitializeVulkanLoader() {
   if (!entry) return VK_ERROR_INITIALIZATION_FAILED;
   volkInitializeCustom(entry);
