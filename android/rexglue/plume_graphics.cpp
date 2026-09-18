@@ -71,9 +71,12 @@ X_STATUS PlumeGraphics::SetupPresentation(rex::ui::WindowedAppContext*) {
   if(s.swap)return X_STATUS_SUCCESS;
   require(!s.stopped,"Apresentação cancelada.");
   require(!driver_handle,"O driver já foi inicializado; abra uma nova sessão.");
+  // adrenotools concatenates directory + library name, so it needs the slash.
+  std::string driver_dir=s.directory;
+  if(!driver_dir.empty()&&driver_dir.back()!='/')driver_dir+='/';
   driver_handle=s.library.empty()?dlopen("libvulkan.so",RTLD_NOW|RTLD_LOCAL):
       adrenotools_open_libvulkan(RTLD_NOW|RTLD_LOCAL,ADRENOTOOLS_DRIVER_CUSTOM,nullptr,
-          s.hooks.c_str(),s.directory.c_str(),s.library.c_str(),nullptr,nullptr);
+          s.hooks.c_str(),driver_dir.c_str(),s.library.c_str(),nullptr,nullptr);
   require(driver_handle,"Falha ao carregar o driver Vulkan selecionado.");
   entry=reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(driver_handle,"vkGetInstanceProcAddr"));
   require(entry,"Driver sem vkGetInstanceProcAddr.");

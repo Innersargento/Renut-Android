@@ -65,7 +65,9 @@ Java_org_renut_android_ProbeActivity_nativeRun(JNIEnv* env, jclass, jobject surf
     try {
         captureErrors();
         const auto hookPath = stringValue(env, hooks);
-        const auto dir = stringValue(env, driverDir);
+        // adrenotools concatenates directory + library name, so it needs the slash.
+        auto dir = stringValue(env, driverDir);
+        if (!dir.empty() && dir.back() != '/') dir += '/';
         const auto lib = stringValue(env, libraryName);
         if (!lib.empty()) {
             driverLibrary = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL,
