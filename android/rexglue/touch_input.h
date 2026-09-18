@@ -1,7 +1,13 @@
 #pragma once
 #include <rex/input/input_driver.h>
+#include <rex/input/input.h>
+#include <rex/ui/virtual_key.h>
+
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
+#include <deque>
 #include <mutex>
 
 namespace renut {
@@ -18,6 +24,77 @@ inline std::mutex touch_mutex;
 inline TouchPad touch_pad;
 inline uint32_t touch_packet = 0;
 
+// Keystroke events (XamInputGetKeystroke*), which menus such as the Single
+// Player house read instead of the pad state. Each touch change is queued, so
+// a quick tap still yields both its down and up events.
+using VK = rex::ui::VirtualKey;
+constexpr std::array<VK, 34> kTouchKeys = {
+    // 0-15: the XInput button bits
+    VK::kXInputPadDpadUp, VK::kXInputPadDpadDown, VK::kXInputPadDpadLeft,
+    VK::kXInputPadDpadRight, VK::kXInputPadStart, VK::kXInputPadBack,
+    VK::kXInputPadLThumbPress, VK::kXInputPadRThumbPress, VK::kXInputPadLShoulder,
+    VK::kXInputPadRShoulder, VK::kNone, VK::kNone, VK::kXInputPadA, VK::kXInputPadB,
+    VK::kXInputPadX, VK::kXInputPadY,
+    // 16-17: triggers
+    VK::kXInputPadLTrigger, VK::kXInputPadRTrigger,
+    // 18-25: left stick directions, 26-33: right stick directions
+    VK::kXInputPadLThumbUp, VK::kXInputPadLThumbDown, VK::kXInputPadLThumbRight,
+    VK::kXInputPadLThumbLeft, VK::kXInputPadLThumbUpLeft, VK::kXInputPadLThumbUpRight,
+    VK::kXInputPadLThumbDownRight, VK::kXInputPadLThumbDownLeft,
+    VK::kXInputPadRThumbUp, VK::kXInputPadRThumbDown, VK::kXInputPadRThumbRight,
+    VK::kXInputPadRThumbLeft, VK::kXInputPadRThumbUpLeft, VK::kXInputPadRThumbUpRight,
+    VK::kXInputPadRThumbDownRight, VK::kXInputPadRThumbDownLeft,
+};
+struct TouchKeyEvent {
+  uint16_t key;
+  uint16_t flags;
+};
+inline std::deque<TouchKeyEvent> touch_keys;
+inline uint64_t touch_key_state = 0;
+inline int touch_repeat_index = -1;
+inline std::chrono::steady_clock::time_point touch_repeat_time;
+
+// Bit (0-7, in kTouchKeys order) of the direction a stick points to, or -1.
+inline int StickDirection(int16_t x, int16_t y) {
+  float fx = x / 32767.f, fy = y / 32767.f;
+  if (fx * fx + fy * fy < 0.5f * 0.5f) return -1;
+  // Eight 45-degree sectors starting at right, counter-clockwise.
+  int sector = int(std::lround(std::atan2(fy, fx) / (3.14159265f / 4))) & 7;
+  static constexpr int kBits[8] = {2, 5, 0, 4, 3, 7, 1, 6};  // R UR U UL L DL D DR
+  return kBits[sector];
+}
+
+// Queues the key transitions since the last call. Caller holds touch_mutex.
+inline void UpdateTouchKeys() {
+  uint64_t next = touch_pad.buttons;
+  if (touch_pad.left_trigger > 64) next |= 1ull << 16;
+  if (touch_pad.right_trigger > 64) next |= 1ull << 17;
+  if (int d = StickDirection(touch_pad.lx, touch_pad.ly); d >= 0) next |= 1ull << (18 + d);
+  if (int d = StickDirection(touch_pad.rx, touch_pad.ry); d >= 0) next |= 1ull << (26 + d);
+  uint64_t changed = next ^ touch_key_state;
+  // Releases first, so a stick moving between directions is never in two.
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int i = 0; i < int(kTouchKeys.size()); ++i) {
+      uint64_t bit = 1ull << i;
+      if (!(changed & bit) || kTouchKeys[i] == VK::kNone) continue;
+      bool down = next & bit;
+      if (down != (pass == 1)) continue;
+      if (touch_keys.size() < 64) {
+        touch_keys.push_back({uint16_t(kTouchKeys[i]),
+                              uint16_t(down ? rex::input::X_INPUT_KEYSTROKE_KEYDOWN
+                                            : rex::input::X_INPUT_KEYSTROKE_KEYUP)});
+      }
+      if (down) {
+        touch_repeat_index = i;
+        touch_repeat_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+      } else if (touch_repeat_index == i) {
+        touch_repeat_index = -1;
+      }
+    }
+  }
+  touch_key_state = next;
+}
+
 // XInput buttons the overlay may set: D-pad, Start, Back, L3, R3, LB, RB, A,
 // B, X, Y. The Guide button is reserved by the system.
 constexpr uint16_t kTouchButtonMask = 0xF3FF;
@@ -29,6 +106,7 @@ inline void SetTouchButton(uint16_t button, bool down) {
   if (next != touch_pad.buttons) {
     touch_pad.buttons = next;
     ++touch_packet;
+    UpdateTouchKeys();
   }
 }
 
@@ -46,6 +124,7 @@ inline void SetTouchStick(int stick, float x, float y) {
     ax = nx;
     ay = ny;
     ++touch_packet;
+    UpdateTouchKeys();
   }
 }
 
@@ -57,6 +136,7 @@ inline void SetTouchTrigger(int trigger, float value) {
   if (next != t) {
     t = next;
     ++touch_packet;
+    UpdateTouchKeys();
   }
 }
 
@@ -107,8 +187,28 @@ class TouchInput final : public rex::input::InputDriver {
     return id == id_ ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
   }
   rex::X_RESULT GetDeviceKeystroke(rex::input::DeviceId id, uint32_t,
-                                   rex::input::X_INPUT_KEYSTROKE*) override {
-    return id == id_ ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+                                   rex::input::X_INPUT_KEYSTROKE* out) override {
+    if (id != id_) return X_ERROR_DEVICE_NOT_CONNECTED;
+    if (!out) return X_ERROR_BAD_ARGUMENTS;
+    std::lock_guard lock(touch_mutex);
+    TouchKeyEvent event;
+    if (!touch_keys.empty()) {
+      event = touch_keys.front();
+      touch_keys.pop_front();
+    } else if (touch_repeat_index >= 0 &&
+               std::chrono::steady_clock::now() >= touch_repeat_time) {
+      // A held key repeats after 400 ms, every 100 ms, like a real pad.
+      touch_repeat_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+      event = {uint16_t(kTouchKeys[touch_repeat_index]),
+               uint16_t(rex::input::X_INPUT_KEYSTROKE_KEYDOWN |
+                        rex::input::X_INPUT_KEYSTROKE_REPEAT)};
+    } else {
+      return X_ERROR_EMPTY;
+    }
+    *out = {};
+    out->virtual_key = event.key;
+    out->flags = event.flags;
+    return X_ERROR_SUCCESS;
   }
 };
 }  // namespace renut

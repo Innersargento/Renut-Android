@@ -488,18 +488,20 @@ index 9ac8d15..c56800d 100644
      int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
  #endif
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..0c21642 100644
+index a744375..fd4f065 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -11,6 +11,7 @@
+@@ -10,7 +10,9 @@
+  */
  
  #include <algorithm>
++#include <atomic>
  #include <cinttypes>
 +#include <chrono>
  #include <cmath>
  #include <cstring>
  #include <string_view>
-@@ -37,6 +38,30 @@
+@@ -37,6 +39,30 @@
  
  REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
  
@@ -530,7 +532,22 @@ index a744375..0c21642 100644
  REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                      "Refresh page-valid state from GPU-written memory at frame end. "
                      "Disable for minor CPU overhead reduction, but may break memory coherency.")
-@@ -216,6 +241,9 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -80,6 +106,14 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++#if REX_PLATFORM_ANDROID
++// Swaps the guest submitted (frames it presented), read by the reNut FPS counter.
++static std::atomic<uint64_t> renut_swap_count{0};
++extern "C" __attribute__((visibility("default"))) uint64_t renut_guest_swap_count() {
++  return renut_swap_count.load(std::memory_order_relaxed);
++}
++#endif
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+@@ -216,6 +250,9 @@ void CommandProcessor::WorkerThreadMain() {
        // We've run out of commands to execute.
        // We spin here waiting for new ones, as the overhead of waiting on our
        // event is too high.
@@ -540,7 +557,7 @@ index a744375..0c21642 100644
        PrepareForWait();
        uint32_t loop_count = 0;
        do {
-@@ -232,6 +260,9 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -232,6 +269,9 @@ void CommandProcessor::WorkerThreadMain() {
        } while (worker_running_ && pending_fns_.empty() &&
                 (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
        ReturnFromWait();
@@ -550,7 +567,7 @@ index a744375..0c21642 100644
        if (!worker_running_ || !pending_fns_.empty()) {
          continue;
        }
-@@ -312,6 +343,9 @@ bool CommandProcessor::SetupContext() {
+@@ -312,6 +352,9 @@ bool CommandProcessor::SetupContext() {
  void CommandProcessor::ShutdownContext() {}
  
  void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
@@ -560,12 +577,13 @@ index a744375..0c21642 100644
    read_ptr_index_ = 0;
    primary_buffer_ptr_ = ptr;
    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
-@@ -958,7 +992,33 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -958,7 +1001,34 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
    uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
    reader->AdvanceRead((count - 4) * sizeof(uint32_t));
  
 +#if REX_PLATFORM_ANDROID
 +  uint64_t renut_swap_start = RenutNowUs();
++  renut_swap_count.fetch_add(1, std::memory_order_relaxed);
 +#endif
    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 +#if REX_PLATFORM_ANDROID
@@ -594,7 +612,7 @@ index a744375..0c21642 100644
  
    ++counter_;
    return true;
-@@ -990,6 +1050,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -990,6 +1060,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
    bool is_memory = (wait_info & 0x10) != 0;
  
    bool matched = false;
@@ -606,7 +624,7 @@ index a744375..0c21642 100644
    do {
      uint32_t value = 0;
      if (is_memory) {
-@@ -1029,6 +1094,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1029,6 +1104,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
          matched = true;
          break;
      }
@@ -617,7 +635,7 @@ index a744375..0c21642 100644
      if (!matched) {
        // Wait.
        if (wait >= 0x100) {
-@@ -1052,6 +1121,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1052,6 +1131,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
      }
    } while (!matched);
  

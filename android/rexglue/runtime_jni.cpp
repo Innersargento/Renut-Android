@@ -42,6 +42,10 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeS
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeTrigger(JNIEnv*,jclass,jint trigger,jfloat value) {
   renut::SetTouchTrigger(trigger,value);
 }
+extern "C" uint64_t renut_guest_swap_count();
+extern "C" JNIEXPORT jlong JNICALL Java_org_renut_android_RuntimeActivity_nativeFrameCount(JNIEnv*,jclass) {
+  return jlong(renut_guest_swap_count());
+}
 static std::string javaString(JNIEnv* env,jstring value){
   if(!value)return {};const char* chars=env->GetStringUTFChars(value,nullptr);
   if(!chars)throw std::runtime_error("String JNI indisponível.");

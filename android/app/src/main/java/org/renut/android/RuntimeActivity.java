@@ -22,6 +22,8 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
     private static native void nativeButton(int button,boolean down);
     private static native void nativeStick(int stick,float x,float y);
     private static native void nativeTrigger(int trigger,float value);
+    private static native long nativeFrameCount();
+    private TextView fps;
     public int openContentFd(String uri, String mode) throws java.io.IOException {
         android.os.ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(android.net.Uri.parse(uri),mode);
         if(descriptor==null)throw new java.io.IOException("Arquivo indisponível.");
@@ -52,6 +54,25 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
                 @Override public void exit(){finish();}
             });
             root.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
+            if(getIntent().getBooleanExtra("fps",false)){
+                // Frames the game presented (D3DDevice_Swap) per second, sampled every 0.5 s.
+                fps=new TextView(this);fps.setTextColor(Color.rgb(120,255,120));fps.setTextSize(14);
+                fps.setTypeface(android.graphics.Typeface.MONOSPACE,android.graphics.Typeface.BOLD);
+                fps.setShadowLayer(3,1,1,Color.BLACK);fps.setText("FPS --");
+                FrameLayout.LayoutParams at=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
+                at.bottomMargin=(int)(8*getResources().getDisplayMetrics().density);
+                root.addView(fps,at);
+                final long[] last={-1,0};
+                fps.postDelayed(new Runnable(){@Override public void run(){
+                    if(isFinishing())return;
+                    if(loaded){
+                        long frames=nativeFrameCount(),now=android.os.SystemClock.elapsedRealtime();
+                        if(last[0]>=0&&now>last[1])fps.setText(String.format(java.util.Locale.ROOT,"FPS %.1f",(frames-last[0])*1000.0/(now-last[1])));
+                        last[0]=frames;last[1]=now;
+                    }
+                    fps.postDelayed(this,500);
+                }},500);
+            }
             results.setVisibility(View.GONE);results.setBackgroundColor(Color.rgb(12,23,28));
             root.addView(results,new FrameLayout.LayoutParams(-1,-1));
             setContentView(root);
@@ -85,7 +106,7 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
             }
             final String message=report;
             runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
-                if(overlay!=null){overlay.setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
+                if(overlay!=null){overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
                 else results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
         },"renut-runtime-validation").start();
     }

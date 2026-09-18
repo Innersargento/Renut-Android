@@ -18,7 +18,7 @@ import java.util.zip.*;
 public final class MainActivity extends Activity {
     private static final int ISO=10, XEX=11, DRIVER=12, EXPORT=13;
     private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
-    private TextView status, library, driver, renderer;
+    private TextView status, library, driver, renderer, fpsCounter;
     private ProgressBar progress;
     private Button cancel;
     private volatile Thread worker;
@@ -48,7 +48,8 @@ public final class MainActivity extends Activity {
             Intent i=new Intent(this,RuntimeActivity.class).putExtra("launch",true);
             i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
             i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
-            i.putExtra("renderer",getPreferences(0).getString("renderer","xenos"));startActivity(i);
+            i.putExtra("renderer",getPreferences(0).getString("renderer","xenos"));
+            i.putExtra("fps",getPreferences(0).getBoolean("fps",false));startActivity(i);
         });
         button(game,"Validar runtime ARM64",()->startActivity(new Intent(this,RuntimeActivity.class)));
         button(game,"Testar runtime com Plume",()->{
@@ -64,6 +65,10 @@ public final class MainActivity extends Activity {
         button(graphics,"Alternar renderizador",()->{
             String next="plume".equals(getPreferences(0).getString("renderer","xenos"))?"xenos":"plume";
             getPreferences(0).edit().putString("renderer",next).apply(); refresh();
+        });
+        fpsCounter=text("",16,ink); graphics.addView(fpsCounter);
+        button(graphics,"Ativar/desativar contador de FPS",()->{
+            getPreferences(0).edit().putBoolean("fps",!getPreferences(0).getBoolean("fps",false)).apply(); refresh();
         });
         button(graphics,"Testar Plume no aparelho",()->{
             Intent intent=new Intent(this,ProbeActivity.class);
@@ -109,6 +114,7 @@ public final class MainActivity extends Activity {
         driver.setText(getPreferences(0).getString("driverLib","Driver do sistema"));
         renderer.setText("plume".equals(getPreferences(0).getString("renderer","xenos"))
             ?"Renderizador: Plume nativo (em desenvolvimento)":"Renderizador: RexGlue (emulação Xenos)");
+        fpsCounter.setText(getPreferences(0).getBoolean("fps",false)?"Contador de FPS: ativado":"Contador de FPS: desativado");
         File diagnostic=new File(getFilesDir(),"probe-report.txt");
         try{if(diagnostic.lastModified()>reportReadAt){report=new String(Files.readAllBytes(diagnostic.toPath()),java.nio.charset.StandardCharsets.UTF_8);reportReadAt=diagnostic.lastModified();if(worker==null)status.setText(report);}}catch(IOException ignored){}
         File runtimeReport=new File(getFilesDir(),"runtime-report.txt");
