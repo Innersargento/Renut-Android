@@ -13,6 +13,11 @@ set(REXGLUE_ENABLE_PERF_COUNTERS OFF)
 set(CMAKE_INSTALL_INCLUDEDIR include)
 add_compile_definitions(REX_PLATFORM_LINUX=1 REXGLUE_BUILD_CONFIG="Release")
 add_compile_options(-fno-strict-aliasing -ffp-model=strict -fno-char8_t)
+# assembleDebug leaves CMAKE_BUILD_TYPE=Debug, so clang defaulted to -O0 for
+# every target except rexgpu-xenos: the kernel, runtime and shader compiler all
+# ran unoptimized even though REXGLUE_BUILD_CONFIG says "Release". Optimize the
+# whole tree; asserts stay enabled (no NDEBUG) so behaviour is unchanged.
+add_compile_options(-O2)
 include("${REXGLUE_ROOT}/cmake/rex_pch.cmake")
 set(REXGLUE_DERIVED_MAJOR 0)
 set(REXGLUE_DERIVED_MINOR 10)
@@ -111,7 +116,9 @@ include("${RENUT_ROOT}/generated/android/sources.cmake")
 add_library(renut_guest OBJECT ${GENERATED_SOURCES})
 target_include_directories(renut_guest PRIVATE "${RENUT_ROOT}/generated/android")
 target_link_libraries(renut_guest PRIVATE rexruntime)
-target_compile_options(renut_guest PRIVATE -O1 -g0 -Wno-unused-variable -Wno-unused-label)
+# The recompiled game is the hot path: a profile of the boot stall put ~90% of
+# CPU inside two guest functions, so this target's level matters most.
+target_compile_options(renut_guest PRIVATE -O2 -g0 -Wno-unused-variable -Wno-unused-label)
 target_precompile_headers(renut_guest PRIVATE "${RENUT_ROOT}/generated/android/renut_android_pch.h")
 add_library(renut_runtime SHARED runtime_jni.cpp plume_graphics.cpp $<TARGET_OBJECTS:renut_guest>)
 target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android")
