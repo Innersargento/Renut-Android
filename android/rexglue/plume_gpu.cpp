@@ -560,7 +560,32 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint64_t, Target> targets_;
   std::unordered_map<uint64_t, std::unique_ptr<RenderFramebuffer>> framebuffers_;
   std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> pipelines_;
-  std::unordered_map<uint32_t, Resolved> resolved_;
+  // Keyed by guest address and host format: N&B reuses an address within a
+  // frame for different things (a 768x768 shadow map, then the bloom chain),
+  // and draws recorded earlier must keep the texture they sampled.
+  std::unordered_map<uint64_t, Resolved> resolved_;
+  // Textures replaced while the frame's commands may still use them; freed
+  // once the frame has run (IssueSwap waits for it).
+  std::vector<std::unique_ptr<RenderTexture>> retired_;
+  std::vector<std::unique_ptr<RenderFramebuffer>> retired_framebuffers_;
+  static uint64_t ResolvedKey(uint32_t address, RenderFormat format) {
+    return uint64_t(address) | (uint64_t(format) << 32);
+  }
+  Resolved* FindResolved(uint32_t address, bool depth) {
+    auto found = resolved_.find(ResolvedKey(address, depth ? RenderFormat::R32_FLOAT : RenderFormat::R8G8B8A8_UNORM));
+    if (found != resolved_.end()) return &found->second;
+    // Anything else at the address: colour resolves of other formats (16_16
+    // float targets), or a depth resolve read as colour (the depth-of-field
+    // pass fetches the scene depth as 8_8_8_8 too) - better than decoding
+    // whatever the guest memory holds, which the resolve never wrote.
+    Resolved* other = nullptr;
+    for (auto& [key, r] : resolved_) {
+      if (uint32_t(key) != address) continue;
+      if ((r.format == RenderFormat::R32_FLOAT) == depth) return &r;
+      other = &r;
+    }
+    return other;
+  }
   std::unordered_map<uint64_t, GuestTexture> guest_textures_;
   std::unordered_set<uint32_t> unsupported_formats_;
   uint32_t next_descriptor_ = 1;
@@ -740,6 +765,8 @@ bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::
 }
 
 void PlumeCommandProcessor::BeginFrame() {
+  retired_framebuffers_.clear();
+  retired_.clear();
   // Keep the permanent allocations (white texel, zeros) at the start.
   upload_used_ = zero_offset_ + 64;
   uploaded_streams_.clear();
@@ -774,7 +801,8 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
 
 Resolved* PlumeCommandProcessor::FindResolvedContaining(uint32_t address, RenderFormat format,
                                                         uint32_t bytes_per_pixel, uint32_t& row) {
-  for (auto& [base, resolved] : resolved_) {
+  for (auto& [key, resolved] : resolved_) {
+    const uint32_t base = uint32_t(key);
     if (!resolved.texture || resolved.format != format || address <= base) continue;
     const uint32_t row_bytes = resolved.width * bytes_per_pixel;
     const uint32_t offset = address - base;
@@ -788,6 +816,7 @@ Resolved* PlumeCommandProcessor::FindResolvedContaining(uint32_t address, Render
 
 uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint32_t height) {
   if (!r.fitted || r.fitted_width != width || r.fitted_height != height) {
+    if (r.fitted) retired_.push_back(std::move(r.fitted));
     r.fitted = device_->createTexture(RenderTextureDesc::Texture2D(width, height, 1, r.format));
     r.fitted_width = width;
     r.fitted_height = height;
@@ -832,6 +861,7 @@ Target* PlumeCommandProcessor::GetTarget(uint32_t base, uint32_t format, bool de
                           : ColorFormat(xenos::ColorRenderTargetFormat(format));
   RenderTextureDesc desc = depth ? RenderTextureDesc::DepthTarget(pitch, new_height, rf)
                                  : RenderTextureDesc::ColorTarget(pitch, new_height, rf);
+  if (target.texture) retired_.push_back(std::move(target.texture));
   target.texture = device_->createTexture(desc);
   if (!target.texture) {
     targets_.erase(key);
@@ -843,6 +873,7 @@ Target* PlumeCommandProcessor::GetTarget(uint32_t base, uint32_t format, bool de
   target.depth = depth;
   target.layout = RenderTextureLayout::UNKNOWN;
   // Framebuffers referencing the old texture are stale.
+  for (auto& [key, framebuffer] : framebuffers_) retired_framebuffers_.push_back(std::move(framebuffer));
   framebuffers_.clear();
   bound_framebuffer_ = nullptr;
   return &target;
@@ -881,13 +912,14 @@ void PlumeCommandProcessor::SetFramebuffer(RenderFramebuffer* framebuffer) {
 
 Resolved& PlumeCommandProcessor::GetResolved(uint32_t address, RenderFormat format, uint32_t width,
                                              uint32_t height) {
-  Resolved& resolved = resolved_[address];
+  Resolved& resolved = resolved_[ResolvedKey(address, format)];
   if (resolved.texture && resolved.format == format && resolved.width >= width &&
       resolved.height >= height) {
     return resolved;
   }
   uint32_t w = std::max(width, resolved.format == format ? resolved.width : 0u);
   uint32_t h = std::max(height, resolved.format == format ? resolved.height : 0u);
+  if (resolved.texture) retired_.push_back(std::move(resolved.texture));
   resolved.texture = device_->createTexture(RenderTextureDesc::Texture2D(w, h, 1, format));
   resolved.format = format;
   resolved.width = w;
@@ -1012,6 +1044,7 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   // New contents reuse the image when its shape is unchanged: earlier draws of
   // this frame may still reference it, and the upload is ordered after them.
   if (!texture.texture || texture.levels != levels || texture.width != width || texture.height != height) {
+    if (texture.texture) retired_.push_back(std::move(texture.texture));
     texture.texture = device_->createTexture(
         RenderTextureDesc::Texture2D(width, height, levels, RenderFormat::R8G8B8A8_UNORM));
     texture.levels = levels;
@@ -1315,9 +1348,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                     : fetch.clamp_x == xenos::ClampMode::kMirroredRepeat ? 2
                                                                          : 1;
     sampler_descriptor[slot] = (point ? kSamplerPointWrap : kSamplerLinearWrap) + mode;
-    auto found = resolved_.find(fetch.base_address << 12);
-    if (found != resolved_.end() && found->second.descriptor) {
-      Resolved& r = found->second;
+    const bool depth_fetch = fetch.format == xenos::TextureFormat::k_24_8 ||
+                             fetch.format == xenos::TextureFormat::k_24_8_FLOAT;
+    Resolved* found = FindResolved(fetch.base_address << 12, depth_fetch);
+    if (found && found->descriptor) {
+      Resolved& r = *found;
       const uint32_t fw = fetch.size_2d.width + 1, fh = fetch.size_2d.height + 1;
       if (fw < r.width || fh < r.height) {
         texture_descriptor[slot] = FittedResolved(r, std::min(fw, r.width), std::min(fh, r.height));
@@ -1354,7 +1389,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       line += fmt::format(" t{}={:08X}/f{}/{}x{}/d{}{}", slot, fetch.base_address << 12,
                           uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
                           uint32_t(fetch.dimension),
-                          resolved_.count(fetch.base_address << 12) ? "/R" : "");
+                          FindResolved(fetch.base_address << 12,
+                                       fetch.format == xenos::TextureFormat::k_24_8 ||
+                                           fetch.format == xenos::TextureFormat::k_24_8_FLOAT)
+                              ? "/R"
+                              : "");
     }
     Trace("{}", line);
   }
@@ -2034,9 +2073,9 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
   RenderTexture* source = nullptr;
-  auto found = resolved_.find(frontbuffer_ptr);
-  if (found != resolved_.end() && found->second.texture) {
-    Resolved& r = found->second;
+  Resolved* found = FindResolved(frontbuffer_ptr, false);
+  if (found && found->texture) {
+    Resolved& r = *found;
     Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
     source = r.texture.get();
     frontbuffer_width = std::min(frontbuffer_width, r.width);
