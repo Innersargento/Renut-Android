@@ -438,6 +438,7 @@ struct Resolved {
 struct GuestTexture {
   std::unique_ptr<RenderTexture> texture;
   uint32_t descriptor = 0;
+  uint32_t levels = 1;
   uint64_t content = 0;
   bool failed = false;
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
@@ -466,6 +467,10 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool IssueCopy() override;
   // Direct3D's own Clear (see IssueDraw).
   void IssueD3DClear(xenos::EdramMode edram_mode);
+  // Copies a rectangle of a depth target's depth into an R32_FLOAT texture.
+  bool CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
+                 uint32_t dest_x, uint32_t dest_y);
+  std::unique_ptr<RenderBuffer> depth_staging_;
 
  private:
   // Upload ring (one frame; reset after every swap).
@@ -478,7 +483,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void Flush();
   void Transition(RenderTexture* texture, RenderTextureLayout& current, RenderTextureLayout layout);
   Target* GetTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, uint32_t height);
-  Target* FindTarget(uint32_t base, uint32_t format, bool depth);
+  Target* FindTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch = 0);
   RenderFramebuffer* GetFramebuffer(const std::array<Target*, 4>& colors, uint32_t color_count,
                                     Target* depth);
   void SetFramebuffer(RenderFramebuffer* framebuffer);
@@ -790,10 +795,11 @@ uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint
   return r.fitted_descriptor;
 }
 
-Target* PlumeCommandProcessor::FindTarget(uint32_t base, uint32_t format, bool depth) {
+Target* PlumeCommandProcessor::FindTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch) {
   Target* best = nullptr;
   for (auto& [key, target] : targets_) {
     if ((key & 0xFFF) == base && ((key >> 12) & 0xF) == format && bool((key >> 16) & 1) == depth) {
+      if (pitch && target.width == pitch) return &target;
       if (!best || target.width * target.height > best->width * best->height) best = &target;
     }
   }
@@ -912,9 +918,18 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     if (next_descriptor_ >= kMaxTextures2D) return 0;
     texture.descriptor = next_descriptor_++;
   }
-  if (!texture.texture || texture.content != content) {
+  // Mip levels: as many as the fetch declares, rebuilt from the base level
+  // with a box filter (the guest's own mips sit in a packed tail the decoder
+  // does not read yet). Without them distant terrain and foliage alias badly.
+  uint32_t levels = 1;
+  if (fetch.mip_filter != xenos::TextureFilter::kBaseMap && !(skip_mask_ & 8192)) {
+    const uint32_t full = 32 - __builtin_clz(std::max(width, height));
+    levels = std::clamp<uint32_t>(uint32_t(fetch.mip_max_level) + 1, 1, full);
+  }
+  if (!texture.texture || texture.content != content || texture.levels != levels) {
     texture.texture = device_->createTexture(
-        RenderTextureDesc::Texture2D(width, height, 1, RenderFormat::R8G8B8A8_UNORM));
+        RenderTextureDesc::Texture2D(width, height, levels, RenderFormat::R8G8B8A8_UNORM));
+    texture.levels = levels;
     texture.layout = RenderTextureLayout::UNKNOWN;
     if (!texture.texture) {
       texture.failed = true;
@@ -922,14 +937,39 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     }
   }
   texture.content = content;
-  const uint64_t staging = Allocate(uint64_t(width) * height * 4, 512);
-  if (staging == UINT64_MAX) return 0;
-  std::memcpy(Pointer(staging), rgba.data(), size_t(width) * height * 4);
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
-  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get()),
-                           RenderTextureCopyLocation::PlacedFootprint(
-                               upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, 1,
-                               width, staging));
+  uint32_t w = width, h = height;
+  for (uint32_t level = 0; level < levels; ++level) {
+    if (level) {
+      // 2x2 box filter per channel, clamping at odd edges.
+      const uint32_t nw = std::max(1u, w / 2), nh = std::max(1u, h / 2);
+      std::vector<uint32_t> next(size_t(nw) * nh);
+      for (uint32_t y = 0; y < nh; ++y) {
+        const uint32_t y0 = std::min(2 * y, h - 1), y1 = std::min(2 * y + 1, h - 1);
+        for (uint32_t x = 0; x < nw; ++x) {
+          const uint32_t x0 = std::min(2 * x, w - 1), x1 = std::min(2 * x + 1, w - 1);
+          const uint32_t p[4] = {rgba[size_t(y0) * w + x0], rgba[size_t(y0) * w + x1],
+                                 rgba[size_t(y1) * w + x0], rgba[size_t(y1) * w + x1]};
+          uint32_t out = 0;
+          for (uint32_t c = 0; c < 32; c += 8) {
+            const uint32_t sum = ((p[0] >> c) & 0xFF) + ((p[1] >> c) & 0xFF) + ((p[2] >> c) & 0xFF) +
+                                 ((p[3] >> c) & 0xFF);
+            out |= ((sum + 2) / 4) << c;
+          }
+          next[size_t(y) * nw + x] = out;
+        }
+      }
+      rgba = std::move(next);
+      w = nw;
+      h = nh;
+    }
+    const uint64_t staging = Allocate(uint64_t(w) * h * 4, 512);
+    if (staging == UINT64_MAX) return 0;
+    std::memcpy(Pointer(staging), rgba.data(), size_t(w) * h * 4);
+    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
+                             RenderTextureCopyLocation::PlacedFootprint(
+                                 upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, w, staging));
+  }
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
   set_2d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
   ++stats_.textures_decoded;
@@ -1109,9 +1149,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
 
   if (trace_) {
-    std::string line = fmt::format("draw vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={}",
+    std::string line = fmt::format("draw vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X}",
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
-                                   index_count, uint32_t(edram_mode), pitch, height);
+                                   index_count, uint32_t(edram_mode), pitch, height,
+                                   regs[XE_GPU_REG_RB_COLORCONTROL]);
     for (uint32_t i = 0; i < color_count; ++i) {
       reg::RB_COLOR_INFO info;
       info.value = regs[kColorInfo[i]];
@@ -1154,9 +1195,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     std::memcpy(sh + RENUT_SHARED_LOOP_OFFSET + i * 16, loop, 16);
   }
   const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
-  const bool alpha_test = ps && color_control.alpha_test_enable &&
-                          color_control.alpha_func != xenos::CompareFunction::kAlways;
-  float alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
+  const bool alpha_test_enabled = color_control.alpha_test_enable &&
+                                  color_control.alpha_func != xenos::CompareFunction::kAlways;
+  // Alpha to coverage (N&B's grass and foliage) has no samples to cover
+  // without MSAA; like a single-sample A2C, keep the fragments at or above
+  // half coverage.
+  const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(skip_mask_ & 4096);
+  const bool alpha_test = ps && (alpha_test_enabled || alpha_to_mask);
+  float alpha_ref = alpha_test_enabled ? regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF) : 0.5f;
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 12, &alpha_ref, 4);
 
   // Vertex inputs: the layout the bound vertex shader's vfetches describe
@@ -1575,11 +1621,13 @@ bool PlumeCommandProcessor::IssueCopy() {
   const bool copying_depth = info.IsCopyingDepth();
   const draw_util::ResolveEdramInfo& edram = copying_depth ? info.depth_edram_info : info.color_edram_info;
   const uint32_t original = copying_depth ? info.depth_original_base : info.color_original_base;
-  Target* source = FindTarget(original, edram.format, copying_depth);
-
   // Source rectangle in pixels: whole tiles from the render target's base,
   // plus the offset within the first tile.
   const uint32_t tile_width = edram.format_is_64bpp ? 40 : 80;
+  // EDRAM bases are shared between targets of different pitches (both shadow
+  // maps use depth base 0), so prefer the one the resolve's pitch names.
+  Target* source = FindTarget(original, edram.format, copying_depth,
+                              std::max(1u, uint32_t(edram.pitch_tiles)) * tile_width);
   const uint32_t tiles = edram.base_tiles - original;
   const uint32_t pitch_tiles = std::max(1u, uint32_t(edram.pitch_tiles));
   const uint32_t x = (tiles % pitch_tiles) * tile_width + info.coordinate_info.edram_offset_x_div_8 * 8;
@@ -1592,7 +1640,7 @@ bool PlumeCommandProcessor::IssueCopy() {
         info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32,
         info.copy_dest_coordinate_info.height_aligned_div_32 * 32, info.IsClearingColor() ? "c" : "",
         info.IsClearingDepth() ? "d" : "");
-  if (source && !copying_depth && x < source->width && y < source->height &&
+  if (source && x < source->width && y < source->height &&
       info.rb_copy_control.copy_command != xenos::CopyCommand::kNull) {
     const uint32_t w = std::min(width, source->width - x), h = std::min(height, source->height - y);
     const uint32_t dest_w = std::max(uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32u, w);
@@ -1607,19 +1655,28 @@ bool PlumeCommandProcessor::IssueCopy() {
     const auto* dest_info = rex::graphics::FormatInfo::Get(
         xenos::TextureFormat(uint32_t(info.copy_dest_info.copy_dest_format)));
     const uint32_t dest_bpp = dest_info ? std::max(1u, dest_info->bits_per_pixel / 8) : 4;
-    Resolved* inside = FindResolvedContaining(info.copy_dest_base, source->format, dest_bpp, row);
+    // Depth resolves become R32_FLOAT textures holding the depth, which is what
+    // a k_24_8 / k_24_8_FLOAT fetch returns in x (shadow maps, and the scene
+    // depth the depth-of-field and fog passes read).
+    const RenderFormat dest_format = copying_depth ? RenderFormat::R32_FLOAT : source->format;
+    Resolved* inside = FindResolvedContaining(info.copy_dest_base, dest_format, dest_bpp, row);
     Resolved& dest = inside && inside->height >= row + dy + h
                          ? *inside
-                         : GetResolved(info.copy_dest_base, source->format, dest_w + dx, dest_h + dy);
+                         : GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
     const uint32_t dest_y = &dest == inside ? dy + row : dy;
     ++dest.generation;
-    if (dest.texture) {
+    if (dest.texture && copying_depth) {
+      Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
+      CopyDepth(*source, x, y, w, h, dest.texture.get(), dx, dest_y);
+    } else if (dest.texture) {
       Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
       RenderBox box(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h), 0, 1);
       list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
                                RenderTextureCopyLocation::Subresource(source->texture.get()), dx,
                                dest_y, 0, &box);
+    }
+    if (dest.texture) {
       if (snap_address_ && info.copy_dest_base == snap_address_ && ++snap_seen_ == snap_ordinal_) {
         if (!snap_ || snap_width_ != dest.width || snap_height_ != dest.height || snap_format_ != dest.format) {
           snap_ = device_->createTexture(
@@ -1667,7 +1724,8 @@ bool PlumeCommandProcessor::IssueCopy() {
     ++stats_.clears;
   }
   if (info.IsClearingDepth()) {
-    Target* depth = FindTarget(info.depth_original_base, info.depth_edram_info.format, true);
+    Target* depth = FindTarget(info.depth_original_base, info.depth_edram_info.format, true,
+                               std::max(1u, uint32_t(info.depth_edram_info.pitch_tiles)) * 80);
     if (depth) {
       Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
       std::array<Target*, 4> none{};
@@ -1677,6 +1735,46 @@ bool PlumeCommandProcessor::IssueCopy() {
       ++stats_.clears;
     }
   }
+  return true;
+}
+
+bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                      RenderTexture* dest, uint32_t dest_x, uint32_t dest_y) {
+  // Vulkan copies a depth aspect only to a buffer, so go through one: depth
+  // to buffer (4 bytes per texel for D32_SFLOAT), buffer to the colour image.
+  constexpr uint64_t kStagingSize = 4096ull * 2048 * 4;
+  if (uint64_t(w) * h * 4 > kStagingSize) return false;
+  if (!depth_staging_) {
+    depth_staging_ = device_->createBuffer(RenderBufferDesc::DefaultBuffer(kStagingSize));
+    if (!depth_staging_) return false;
+  }
+  // Always a barrier call, which also ends any open render pass before the
+  // raw Vulkan commands below.
+  list_->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source.texture.get(), RenderTextureLayout::COPY_SOURCE));
+  source.layout = RenderTextureLayout::COPY_SOURCE;
+  bound_framebuffer_ = nullptr;
+  VkCommandBuffer cb = static_cast<VulkanCommandList*>(list_.get())->vk;
+  VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
+                       nullptr, 0, nullptr);
+  VkBufferImageCopy region = {};
+  region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  region.imageSubresource.layerCount = 1;
+  region.imageOffset = {int32_t(x), int32_t(y), 0};
+  region.imageExtent = {w, h, 1};
+  vkCmdCopyImageToBuffer(cb, static_cast<VulkanTexture*>(source.texture.get())->vk,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         static_cast<VulkanBuffer*>(depth_staging_.get())->vk, 1, &region);
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
+                       nullptr, 0, nullptr);
+  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest),
+                           RenderTextureCopyLocation::PlacedFootprint(depth_staging_.get(),
+                                                                      RenderFormat::R32_FLOAT, w, h, 1, w),
+                           dest_x, dest_y);
   return true;
 }
 
