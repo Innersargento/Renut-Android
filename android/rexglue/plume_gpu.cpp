@@ -1187,10 +1187,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       slot_used[element->slot] = true;
       input_slots.emplace_back(element->slot, element->stride);
     }
-    xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - element->slot);
-    if (IsSixteenBitFormat(element->format) && fetch.endian == xenos::Endian::k8in32 &&
-        !(skip_mask_ & 512)) {
-      // A 32-bit swap leaves 16-bit pairs reversed; swapFloats() undoes it.
+    // 16-bit elements need no swapFloats(): after the k8in32 swap the input
+    // assembler reads the hardware's component order (X in the low half), and
+    // Direct3D already patched the vfetch swizzle (.yxwz) to put the halves
+    // back in memory order. Swapping here as well mangled every mesh with
+    // half-float positions; only the manually fetched grass survived.
+    if (IsSixteenBitFormat(element->format) && (skip_mask_ & 512)) {
+      // Debug: the old behaviour, reversing the 16-bit pairs a second time.
       int which = -1;
       switch (element->usage) {
         case 5: which = 0; break;   // TEXCOORD
