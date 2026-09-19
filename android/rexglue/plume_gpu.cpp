@@ -63,7 +63,7 @@ const UcodeMapEntry kUcodeMap[] = {
 };
 
 constexpr uint32_t kMaxTextures2D = 4096;
-constexpr uint32_t kMaxTextures3D = 16;
+constexpr uint32_t kMaxTextures3D = 128;
 constexpr uint32_t kMaxTexturesCube = 16;
 constexpr uint32_t kMaxSamplers = 16;
 constexpr uint64_t kUploadSize = 128ull << 20;
@@ -428,6 +428,8 @@ struct Resolved {
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
   // Bumped by every resolve into this texture.
   uint64_t generation = 0;
+  // Serial of the last resolve into it (see FindResolved).
+  uint64_t written = 0;
   // The texture is sized to the copy's aligned extent (720 rows become 736),
   // but a fetch normalizes coordinates to its own size, so a fetch smaller
   // than the texture samples this copy of its top-left corner instead.
@@ -498,6 +500,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height);
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
+  uint32_t GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   void Report();
 
   RenderDevice* device_ = nullptr;
@@ -571,26 +574,26 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   static uint64_t ResolvedKey(uint32_t address, RenderFormat format) {
     return uint64_t(address) | (uint64_t(format) << 32);
   }
-  Resolved* FindResolved(uint32_t address, bool depth) {
-    auto found = resolved_.find(ResolvedKey(address, depth ? RenderFormat::R32_FLOAT : RenderFormat::R8G8B8A8_UNORM));
-    if (found != resolved_.end()) return &found->second;
-    // Anything else at the address: colour resolves of other formats (16_16
-    // float targets), or a depth resolve read as colour (the depth-of-field
-    // pass fetches the scene depth as 8_8_8_8 too) - better than decoding
-    // whatever the guest memory holds, which the resolve never wrote.
-    Resolved* other = nullptr;
+  // The texture a fetch at `address` sees: whichever resolve wrote there
+  // last, as the memory would hold. The same address is a depth resolve in one
+  // phase and a colour resolve in another (the depth-of-field pass also reads
+  // the scene depth as 8_8_8_8), and a stale entry of the other kind must not
+  // shadow the current one.
+  Resolved* FindResolved(uint32_t address) {
+    Resolved* latest = nullptr;
     for (auto& [key, r] : resolved_) {
-      if (uint32_t(key) != address) continue;
-      if ((r.format == RenderFormat::R32_FLOAT) == depth) return &r;
-      other = &r;
+      if (uint32_t(key) == address && r.texture && (!latest || r.written > latest->written)) latest = &r;
     }
-    return other;
+    return latest;
   }
+  uint64_t resolve_serial_ = 0;
   std::unordered_map<uint64_t, GuestTexture> guest_textures_;
   std::unordered_set<uint32_t> unsupported_formats_;
   uint32_t next_descriptor_ = 1;
   std::unordered_map<uint64_t, GuestTexture> guest_cubes_;
   uint32_t next_cube_descriptor_ = 1;
+  std::unordered_map<uint64_t, GuestTexture> guest_stacks_;
+  uint32_t next_3d_descriptor_ = 1;
 
   Stats stats_;
   uint64_t swaps_ = 0;
@@ -1113,6 +1116,91 @@ void PlumeCommandProcessor::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fet
   }
 }
 
+// Stacked textures (arrays of 2D slices: the terrain's material and normal map
+// sets), which the shaders sample with tfetch3D, z picking the slice. Slices
+// follow each other at a 4 KB aligned stride; bound as a 3D texture of that
+// depth, one level (mips would halve the slice count too).
+uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  const uint32_t address = fetch.base_address << 12;
+  if (!address || (skip_mask_ & 65536)) return 0;
+  const uint32_t depth = uint32_t(fetch.size_2d.stack_depth) + 1;
+  uint64_t key = 0;
+  HashCombine(key, fetch.dword_0 & ~0x3FFu);
+  HashCombine(key, fetch.dword_1);
+  HashCombine(key, fetch.dword_2);
+  HashCombine(key, fetch.swizzle);
+  HashCombine(key, uint32_t(fetch.mip_min_level));
+  HashCombine(key, uint32_t(fetch.mip_address));
+  xenos::xe_gpu_texture_fetch_t top = fetch;
+  const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(address);
+  // Streamed in like the 2D ones: level 1 of every slice first at mip_address.
+  if (fetch.mip_min_level == 1 && fetch.mip_address && !(skip_mask_ & 32768)) {
+    uint32_t offset = 0;
+    if (MipLevelFetch(fetch, 1, top, offset)) {
+      data = memory_->TranslatePhysical<const uint8_t*>(fetch.mip_address << 12);
+    } else {
+      top = fetch;
+    }
+  }
+  const uint32_t slice_stride = (TextureBaseSpan(top) + 4095) & ~4095u;
+  if (!slice_stride) return 0;
+  GuestTexture& texture = guest_stacks_[key];
+  if (texture.failed) return 0;
+  if (texture.texture && texture.checked_frame == swaps_) {
+    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    return texture.descriptor;
+  }
+  texture.checked_frame = swaps_;
+  const uint64_t content = ContentHash(data, slice_stride * depth);
+  if (texture.texture && texture.content == content) {
+    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    return texture.descriptor;
+  }
+  std::vector<uint32_t> all, slice;
+  uint32_t width = 0, height = 0;
+  for (uint32_t z = 0; z < depth; ++z) {
+    uint32_t w = 0, h = 0;
+    if (!DecodeTexture2D(top, data + size_t(z) * slice_stride, slice, w, h) || (z && (w != width || h != height))) {
+      texture.failed = true;
+      ++stats_.texture_failures;
+      return 0;
+    }
+    width = w;
+    height = h;
+    all.insert(all.end(), slice.begin(), slice.end());
+  }
+  if (!texture.descriptor) {
+    if (next_3d_descriptor_ >= kMaxTextures3D) return 0;
+    texture.descriptor = next_3d_descriptor_++;
+  }
+  if (!texture.texture || texture.width != width || texture.height != height || texture.levels != depth) {
+    if (texture.texture) retired_.push_back(std::move(texture.texture));
+    texture.texture = device_->createTexture(
+        RenderTextureDesc::Texture3D(width, height, depth, 1, RenderFormat::R8G8B8A8_UNORM));
+    texture.width = width;
+    texture.height = height;
+    texture.levels = depth;
+    texture.layout = RenderTextureLayout::UNKNOWN;
+    if (!texture.texture) {
+      texture.failed = true;
+      return 0;
+    }
+  }
+  texture.content = content;
+  const uint64_t staging = Allocate(uint64_t(width) * height * depth * 4, 512);
+  if (staging == UINT64_MAX) return 0;
+  std::memcpy(Pointer(staging), all.data(), all.size() * 4);
+  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
+  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get()),
+                           RenderTextureCopyLocation::PlacedFootprint(
+                               upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, depth, width,
+                               staging));
+  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
+  ++stats_.textures_decoded;
+  return texture.descriptor;
+}
+
 // Cube maps (the sky dome): six 2D faces, +X -X +Y -Y +Z -Z, one after the
 // other at a 4 KB aligned stride, each decoded like a 2D texture.
 uint32_t PlumeCommandProcessor::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
@@ -1339,6 +1427,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // Textures used by the draw: resolved render targets, by guest address.
   uint32_t texture_descriptor[32] = {};
   uint32_t cube_descriptor[32] = {};
+  uint32_t stack_descriptor[32] = {};
   uint32_t sampler_descriptor[32] = {};
   for (uint32_t slot = 0; slot < 32; ++slot) {
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
@@ -1348,9 +1437,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                     : fetch.clamp_x == xenos::ClampMode::kMirroredRepeat ? 2
                                                                          : 1;
     sampler_descriptor[slot] = (point ? kSamplerPointWrap : kSamplerLinearWrap) + mode;
-    const bool depth_fetch = fetch.format == xenos::TextureFormat::k_24_8 ||
-                             fetch.format == xenos::TextureFormat::k_24_8_FLOAT;
-    Resolved* found = FindResolved(fetch.base_address << 12, depth_fetch);
+    Resolved* found = FindResolved(fetch.base_address << 12);
     if (found && found->descriptor) {
       Resolved& r = *found;
       const uint32_t fw = fetch.size_2d.width + 1, fh = fetch.size_2d.height + 1;
@@ -1362,6 +1449,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       }
     } else if (fetch.dimension == xenos::DataDimension::k2DOrStacked) {
       texture_descriptor[slot] = GetGuestTexture(fetch);
+      if (fetch.stacked) stack_descriptor[slot] = GetGuestStackedTexture(fetch);
     } else if (fetch.dimension == xenos::DataDimension::kCube) {
       cube_descriptor[slot] = GetGuestCubeTexture(fetch);
     }
@@ -1389,11 +1477,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       line += fmt::format(" t{}={:08X}/f{}/{}x{}/d{}{}", slot, fetch.base_address << 12,
                           uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
                           uint32_t(fetch.dimension),
-                          FindResolved(fetch.base_address << 12,
-                                       fetch.format == xenos::TextureFormat::k_24_8 ||
-                                           fetch.format == xenos::TextureFormat::k_24_8_FLOAT)
-                              ? "/R"
-                              : "");
+                          FindResolved(fetch.base_address << 12) ? "/R" : "");
     }
     Trace("{}", line);
   }
@@ -1410,6 +1494,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   std::memset(sh, 0, RENUT_SHARED_SIZE);
   std::memcpy(sh + RENUT_SHARED_TEXTURE2D_OFFSET, texture_descriptor, sizeof(texture_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
+  std::memcpy(sh + RENUT_SHARED_TEXTURE3D_OFFSET, stack_descriptor, sizeof(stack_descriptor));
   std::memcpy(sh + RENUT_SHARED_SAMPLER_OFFSET, sampler_descriptor, sizeof(sampler_descriptor));
   std::memcpy(sh + RENUT_SHARED_BOOLEANS_OFFSET, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
               RENUT_BOOL_REGISTER_COUNT / 8);
@@ -1889,6 +1974,7 @@ bool PlumeCommandProcessor::IssueCopy() {
                          : GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
     const uint32_t dest_y = &dest == inside ? dy + row : dy;
     ++dest.generation;
+    dest.written = ++resolve_serial_;
     if (dest.texture && copying_depth) {
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
       CopyDepth(*source, x, y, w, h, dest.texture.get(), dx, dest_y);
@@ -2045,6 +2131,8 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
       Target* target = find(info.color_base, uint32_t(info.color_format), false);
       if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
       cleared[i] = target;
+      Trace("  clear colour rt{} base={:X} -> target {}x{}", i, uint32_t(info.color_base), target->width,
+            target->height);
       Transition(target->texture.get(), target->layout, RenderTextureLayout::COLOR_WRITE);
       std::array<Target*, 4> colors{target};
       SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
@@ -2058,6 +2146,8 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
   if (clear_depth || clear_stencil) {
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     Target* depth = find(depth_info.depth_base, uint32_t(depth_info.depth_format), true);
+    Trace("  clear depth base={:X} -> {}", uint32_t(depth_info.depth_base),
+          depth ? fmt::format("target {}x{}", depth->width, depth->height) : std::string("none"));
     if (depth) {
       Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
       std::array<Target*, 4> none{};
@@ -2073,7 +2163,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
   RenderTexture* source = nullptr;
-  Resolved* found = FindResolved(frontbuffer_ptr, false);
+  Resolved* found = FindResolved(frontbuffer_ptr);
   if (found && found->texture) {
     Resolved& r = *found;
     Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
@@ -2097,6 +2187,10 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (trace_) {
     Trace("swap front={:08X} {}x{} found={}", frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
           source != nullptr);
+    for (auto& [key, target] : targets_) {
+      Trace("  target base={:X} fmt={} depth={} {}x{}", key & 0xFFF, (key >> 12) & 0xF, (key >> 16) & 1,
+            target.width, target.height);
+    }
     std::fclose(trace_);
     trace_ = nullptr;
     REXLOG_INFO("Renut: Plume frame trace written");
