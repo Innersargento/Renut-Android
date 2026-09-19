@@ -450,6 +450,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unique_ptr<ShaderStore> store_;
   std::unordered_map<uint64_t, std::unique_ptr<HostShader>> shaders_;
   std::unordered_set<uint64_t> missed_;
+  std::unordered_map<uint64_t, uint64_t> missed_draws_;
+  std::unordered_set<uint64_t> missed_pairs_;
   std::string miss_dump_directory_;
 
   std::unique_ptr<RenderPipelineLayout> layout_;
@@ -865,6 +867,15 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   auto* vs = static_cast<HostShader*>(active_vertex_shader());
   if (!vs || !vs->entry) {
     ++stats_.no_vs;
+    if (vs) {
+      auto* ps_miss = static_cast<HostShader*>(active_pixel_shader());
+      const uint64_t ps_hash = ps_miss && ps_miss->entry ? ps_miss->entry->hash : 0;
+      ++missed_draws_[vs->ucode_data_hash()];
+      if (missed_pairs_.insert(vs->ucode_data_hash() ^ ps_hash).second && missed_pairs_.size() <= 48) {
+        REXLOG_INFO("Renut: Plume missing VS {:016X} with PS {:016X}, mode {}, prim {}, {} indices",
+                    vs->ucode_data_hash(), ps_hash, uint32_t(edram_mode), uint32_t(prim_type), index_count);
+      }
+    }
     return true;
   }
   auto* ps = static_cast<HostShader*>(active_pixel_shader());
@@ -1077,6 +1088,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // Viewport. With the guest's viewport transform enabled the shader emits
   // clip space and the host viewport reproduces PA_CL_VPORT_*; with it off the
   // shader emits window coordinates and g_ViewportScaleOffset maps them.
+  // XenosRecomp compiles with -fvk-invert-y, so the shaders already negate Y:
+  // window y = yo + ys * ndc becomes a viewport of height -2 * ys at yo + ys.
   const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
   const Target* extent = colors[0] ? colors[0] : depth;
   RenderViewport viewport;
@@ -1088,14 +1101,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     float yo = vte.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.f;
     float zs = vte.vport_z_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE) : 1.f;
     float zo = vte.vport_z_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET) : 0.f;
-    viewport = RenderViewport(xo - xs, yo - ys, 2.f * xs, 2.f * ys,
+    viewport = RenderViewport(xo - xs, yo + ys, 2.f * xs, -2.f * ys,
                               std::clamp(zo, 0.f, 1.f), std::clamp(zo + zs, 0.f, 1.f));
   } else {
     viewport = RenderViewport(0.f, 0.f, float(extent->width), float(extent->height));
     scale_offset[0] = 2.f / float(extent->width);
-    scale_offset[1] = 2.f / float(extent->height);
+    scale_offset[1] = -2.f / float(extent->height);
     scale_offset[2] = -1.f;
-    scale_offset[3] = -1.f;
+    scale_offset[3] = 1.f;
   }
   if (viewport.width <= 0.f) {
     viewport = RenderViewport(0.f, 0.f, float(extent->width), float(extent->height));
@@ -1392,6 +1405,10 @@ void PlumeCommandProcessor::Report() {
       targets_.size(), resolved_.size(), shaders_.size(), missed_.size(), stats_.overflow,
       upload_used_ >> 10, guest_textures_.size(), stats_.textures_decoded,
       stats_.texture_failures);
+  for (const auto& [hash, count] : missed_draws_) {
+    REXLOG_INFO("Renut: Plume   missing VS {:016X}: {} draws", hash, count);
+  }
+  missed_draws_.clear();
   stats_ = {};
 }
 

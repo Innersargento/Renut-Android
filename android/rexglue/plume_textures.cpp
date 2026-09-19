@@ -1,6 +1,7 @@
 #include "plume_textures.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include <rex/graphics/pipeline/texture/info.h>
@@ -19,6 +20,24 @@ struct Texel {
 
 uint16_t Load16(const uint8_t* p) { return uint16_t(p[0] | (p[1] << 8)); }
 uint32_t Load32(const uint8_t* p) { return uint32_t(p[0] | (p[1] << 8) | (p[2] << 16) | (uint32_t(p[3]) << 24)); }
+
+// Float in [0, 1] (clamped) to 0..255.
+uint8_t Unorm(float v) { return uint8_t(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); }
+
+float Half(uint16_t h) {
+  const uint32_t sign = h >> 15, exp = (h >> 10) & 31, mant = h & 1023;
+  float v = exp == 0 ? std::ldexp(float(mant), -24)
+            : exp == 31 ? (mant ? 0.f : 65504.f)
+                        : std::ldexp(float(mant | 1024), int(exp) - 25);
+  return sign ? -v : v;
+}
+
+float Float32(const uint8_t* p) {
+  const uint32_t bits = Load32(p);
+  float v;
+  std::memcpy(&v, &bits, 4);
+  return v;
+}
 
 uint8_t Expand(uint32_t value, uint32_t bits) {
   return uint8_t(bits >= 8 ? value : (value * 255 + ((1u << bits) - 1) / 2) / ((1u << bits) - 1));
@@ -132,6 +151,57 @@ bool DecodeBlock(TextureFormat format, const uint8_t* b, Texel* out) {
     case TextureFormat::k_8_8:
       out[0] = {{b[0], b[1], 0, 255}};
       return true;
+    // 16-bit and float formats are narrowed to 8 bits: the host texture is
+    // RGBA8 for now, so HDR range and precision are lost.
+    case TextureFormat::k_16:
+    case TextureFormat::k_16_EXPAND:
+      out[0] = {{b[1], 0, 0, 255}};
+      return true;
+    case TextureFormat::k_16_16:
+    case TextureFormat::k_16_16_EXPAND:
+      out[0] = {{b[1], b[3], 0, 255}};
+      return true;
+    case TextureFormat::k_16_16_16_16:
+    case TextureFormat::k_16_16_16_16_EXPAND:
+      out[0] = {{b[1], b[3], b[5], b[7]}};
+      return true;
+    case TextureFormat::k_16_FLOAT:
+      out[0] = {{Unorm(Half(Load16(b))), 0, 0, 255}};
+      return true;
+    case TextureFormat::k_16_16_FLOAT:
+      out[0] = {{Unorm(Half(Load16(b))), Unorm(Half(Load16(b + 2))), 0, 255}};
+      return true;
+    case TextureFormat::k_16_16_16_16_FLOAT:
+      out[0] = {{Unorm(Half(Load16(b))), Unorm(Half(Load16(b + 2))), Unorm(Half(Load16(b + 4))),
+                 Unorm(Half(Load16(b + 6)))}};
+      return true;
+    case TextureFormat::k_32_FLOAT:
+      out[0] = {{Unorm(Float32(b)), 0, 0, 255}};
+      return true;
+    case TextureFormat::k_2_10_10_10: {
+      const uint32_t v = Load32(b);
+      out[0] = {{uint8_t((v & 1023) >> 2), uint8_t(((v >> 10) & 1023) >> 2),
+                 uint8_t(((v >> 20) & 1023) >> 2), Expand(v >> 30, 2)}};
+      return true;
+    }
+    // Depth: sampled as shadow maps. Depth resolves are not copied yet, so
+    // report the far plane (nothing shadowed) instead of garbage.
+    case TextureFormat::k_24_8:
+    case TextureFormat::k_24_8_FLOAT:
+      out[0] = {{255, 255, 255, 255}};
+      return true;
+    case TextureFormat::k_CTX1: {
+      // Two 8:8 endpoints (R in the high byte) and 2-bit indices.
+      const uint8_t g0 = b[0], r0 = b[1], g1 = b[2], r1 = b[3];
+      const uint32_t indices = Load32(b + 4);
+      const uint8_t r[4] = {r0, r1, uint8_t((2 * r0 + r1) / 3), uint8_t((r0 + 2 * r1) / 3)};
+      const uint8_t g[4] = {g0, g1, uint8_t((2 * g0 + g1) / 3), uint8_t((g0 + 2 * g1) / 3)};
+      for (int t = 0; t < 16; ++t) {
+        const uint32_t i = (indices >> (2 * t)) & 3;
+        out[t] = {{r[i], g[i], 0, 255}};
+      }
+      return true;
+    }
     case TextureFormat::k_DXT1:
     case TextureFormat::k_DXT1_AS_16_16_16_16:
       DecodeColorBlock(b, false, out);
