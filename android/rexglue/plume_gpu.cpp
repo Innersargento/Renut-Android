@@ -68,6 +68,10 @@ constexpr uint64_t kUploadSize = 128ull << 20;
 // Bindings 0..15 are the guest's vertex streams; this one feeds zeros to any
 // input the draw has no data for.
 constexpr uint32_t kZeroBinding = 16;
+// Container hash of Direct3D's Clear vertex shader (microcode 1E6883FCCDE1F688,
+// wrapped by tools/shaders/wrap_raw_ucode.py): position and colour of a
+// rectangle from vertex fetch constant 0.
+constexpr uint64_t kD3DClearVertexShader = 0xBA454DD8A2FCFCBAull;
 
 enum Sampler : uint32_t {
   kSamplerLinearWrap,
@@ -460,6 +464,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  // Direct3D's own Clear (see IssueDraw).
+  void IssueD3DClear(xenos::EdramMode edram_mode);
 
  private:
   // Upload ring (one frame; reset after every swap).
@@ -496,6 +502,15 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   FILE* trace_ = nullptr;
   // Debug: <files>/plume-skip holds a bit mask of draw kinds to drop (see IssueDraw).
   uint32_t skip_mask_ = 0;
+  // Debug: <files>/plume-snap holds "<hex address> <n>": the n-th resolve of
+  // the frame into that address is copied aside and presented instead of the
+  // front buffer, to see an intermediate pass on screen.
+  uint32_t snap_address_ = 0, snap_ordinal_ = 0, snap_seen_ = 0;
+  std::unique_ptr<RenderTexture> snap_;
+  uint32_t snap_width_ = 0, snap_height_ = 0;
+  RenderFormat snap_format_ = RenderFormat::UNKNOWN;
+  RenderTextureLayout snap_layout_ = RenderTextureLayout::UNKNOWN;
+  bool snap_taken_ = false;
   template <typename... Args>
   void Trace(fmt::format_string<Args...> format, Args&&... args) {
     if (trace_) {
@@ -952,6 +967,15 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   ++stats_.draws;
 
   auto* vs = static_cast<HostShader*>(active_vertex_shader());
+  if (trace_ && (!vs || !vs->entry)) {
+    const auto dc = draw_util::GetNormalizedDepthControl(regs);
+    Trace("dropped vs={:016X} prim={} n={} mode={} rt0={:X} ds={:X} z={}{}{} f{} colormask={:X}",
+          vs ? vs->ucode_data_hash() : 0, uint32_t(prim_type), index_count, uint32_t(edram_mode),
+          uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_base),
+          uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base), dc.z_enable ? "t" : "",
+          dc.z_write_enable ? "w" : "", dc.stencil_enable ? "s" : "", uint32_t(dc.zfunc),
+          regs[XE_GPU_REG_RB_COLOR_MASK]);
+  }
   if (!vs || !vs->entry) {
     ++stats_.no_vs;
     if (vs) {
@@ -963,6 +987,15 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                     vs->ucode_data_hash(), ps_hash, uint32_t(edram_mode), uint32_t(prim_type), index_count);
       }
     }
+    return true;
+  }
+  // Direct3D's Clear draws a rectangle with its own shader, in an EDRAM view
+  // of the targets (half the pitch at 64 bpp, all four colour targets, a
+  // 4096-row surface) that only aliases the real ones on the hardware. Drawn
+  // literally it would clear render targets of its own; clear the real ones.
+  if (vs->entry->hash == kD3DClearVertexShader && prim_type == xenos::PrimitiveType::kRectangleList &&
+      !(skip_mask_ & 2048)) {
+    IssueD3DClear(edram_mode);
     return true;
   }
   auto* ps = static_cast<HostShader*>(active_pixel_shader());
@@ -999,6 +1032,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       break;
     default:
       ++stats_.skipped_prim;
+      Trace("dropped prim={} n={}", uint32_t(prim_type), index_count);
       return true;
   }
   if (rect_list && !rect_list_gs_) {
@@ -1083,7 +1117,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       info.value = regs[kColorInfo[i]];
       line += fmt::format(" rt{}={:X}/f{}", i, uint32_t(info.color_base), uint32_t(info.color_format));
     }
-    if (depth) line += fmt::format(" ds={:X}", uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base));
+    if (depth) {
+      line += fmt::format(" ds={:X}/f{} z={}{}{} f{}", uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base),
+                          uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format),
+                          depth_control.z_enable ? "t" : "", depth_control.z_write_enable ? "w" : "",
+                          depth_control.stencil_enable ? "s" : "", uint32_t(depth_control.zfunc));
+    }
     for (uint32_t slot = 0; slot < 32; ++slot) {
       xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
       if (fetch.type != xenos::FetchConstantType::kTexture || !fetch.base_address) continue;
@@ -1133,7 +1172,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   bool r11g11b10_normals = false;
   uint64_t streams[RENUT_VERTEX_STREAM_COUNT] = {};
   for (uint32_t stream = 0; stream < RENUT_VERTEX_STREAM_COUNT; ++stream) {
-    xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - stream);
+    // The last entry is fetch constant 0, which Direct3D's own Clear uses.
+    xenos::xe_gpu_vertex_fetch_t fetch =
+        regs.GetVertexFetch(stream == RENUT_DIRECT_FETCH_STREAM ? 0 : 95 - stream);
     if (fetch.type != xenos::FetchConstantType::kVertex) continue;
     uint64_t offset;
     if (UploadGuest(fetch.address << 2, fetch.size << 2, fetch.endian, offset)) {
@@ -1299,10 +1340,15 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   RenderRect scissor_rect(int32_t(scissor.offset[0]), int32_t(scissor.offset[1]),
                           int32_t(scissor.offset[0] + scissor.extent[0]),
                           int32_t(scissor.offset[1] + scissor.extent[1]));
+  if (trace_) {
+    Trace("  viewport ({}, {}) {}x{} window ({}, {}) scissor ({}, {})-({}, {}) vte={:X}", viewport.x,
+          viewport.y, viewport.width, viewport.height, window_x, window_y, scissor_rect.left,
+          scissor_rect.top, scissor_rect.right, scissor_rect.bottom, vte.value);
+  }
   if (scissor_rect.right <= scissor_rect.left || scissor_rect.bottom <= scissor_rect.top) return true;
 
   // Pipeline.
-  const bool depth_enabled = depth && depth_control.z_enable;
+  const bool depth_enabled = depth && depth_control.z_enable && !(skip_mask_ & 1024);
   const bool depth_write = depth_enabled && depth_control.z_write_enable;
   RenderBlendDesc blends[4];
   for (uint32_t i = 0; i < color_count; ++i) {
@@ -1574,6 +1620,22 @@ bool PlumeCommandProcessor::IssueCopy() {
       list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
                                RenderTextureCopyLocation::Subresource(source->texture.get()), dx,
                                dest_y, 0, &box);
+      if (snap_address_ && info.copy_dest_base == snap_address_ && ++snap_seen_ == snap_ordinal_) {
+        if (!snap_ || snap_width_ != dest.width || snap_height_ != dest.height || snap_format_ != dest.format) {
+          snap_ = device_->createTexture(
+              RenderTextureDesc::Texture2D(dest.width, dest.height, 1, dest.format));
+          snap_width_ = dest.width;
+          snap_height_ = dest.height;
+          snap_format_ = dest.format;
+          snap_layout_ = RenderTextureLayout::UNKNOWN;
+        }
+        if (snap_) {
+          Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_SOURCE);
+          Transition(snap_.get(), snap_layout_, RenderTextureLayout::COPY_DEST);
+          list_->copyTexture(snap_.get(), dest.texture.get());
+          snap_taken_ = true;
+        }
+      }
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
       if (dest.descriptor) {
         set_2d_->setTexture(dest.descriptor, dest.texture.get(), RenderTextureLayout::SHADER_READ);
@@ -1618,6 +1680,73 @@ bool PlumeCommandProcessor::IssueCopy() {
   return true;
 }
 
+void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
+  const gfx::RegisterFile& regs = *register_file_;
+  // The rectangle's first vertex: float3 position (z is the clear depth) and
+  // float4 colour, 28 bytes, through vertex fetch constant 0.
+  const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
+  if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.address || (fetch.size << 2) < 28) return;
+  uint8_t vertex[28];
+  CopySwapped(vertex, memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), sizeof(vertex),
+              fetch.endian);
+  float v[7];
+  std::memcpy(v, vertex, sizeof(v));
+  ++stats_.clears;
+  Trace("clear mode={} pitch={} depth={} color=({}, {}, {}, {}) colormask={:X}", uint32_t(edram_mode),
+        uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch), v[2], v[3], v[4], v[5], v[6],
+        regs[XE_GPU_REG_RB_COLOR_MASK]);
+
+  // The whole target: Direct3D clears the current viewport, which for
+  // N&B's predicated-tiling bands is the band - the target itself.
+  static constexpr gfx::Register kColorInfo[4] = {XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_COLOR1_INFO,
+                                                  XE_GPU_REG_RB_COLOR2_INFO, XE_GPU_REG_RB_COLOR3_INFO};
+  // The clear's pitch is the target's, or half of it when Direct3D clears a
+  // 32 bpp target as a 64 bpp one; EDRAM bases are shared between targets of
+  // other pitches (the shadow maps), so match the pitch, not just the base.
+  const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+  auto find = [&](uint32_t base, uint32_t format, bool depth) -> Target* {
+    Target* half = nullptr;
+    for (auto& [key, target] : targets_) {
+      if ((key & 0xFFF) != base || ((key >> 12) & 0xF) != format || bool((key >> 16) & 1) != depth) continue;
+      if (target.width == pitch) return &target;
+      if (target.width == 2 * pitch) half = &target;
+    }
+    return half;
+  };
+  const uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+  if (edram_mode == xenos::EdramMode::kColorDepth) {
+    std::array<Target*, 4> cleared{};
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (!((color_mask >> (4 * i)) & 0xF)) continue;
+      reg::RB_COLOR_INFO info;
+      info.value = regs[kColorInfo[i]];
+      Target* target = find(info.color_base, uint32_t(info.color_format), false);
+      if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
+      cleared[i] = target;
+      Transition(target->texture.get(), target->layout, RenderTextureLayout::COLOR_WRITE);
+      std::array<Target*, 4> colors{target};
+      SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
+      const RenderRect rect(0, 0, int32_t(target->width), int32_t(target->height));
+      list_->clearColor(0, RenderColor(v[3], v[4], v[5], v[6]), &rect, 1);
+    }
+  }
+  const auto depth_control = draw_util::GetNormalizedDepthControl(regs);
+  const bool clear_depth = depth_control.z_enable && depth_control.z_write_enable;
+  const bool clear_stencil = depth_control.stencil_enable;
+  if (clear_depth || clear_stencil) {
+    const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+    Target* depth = find(depth_info.depth_base, uint32_t(depth_info.depth_format), true);
+    if (depth) {
+      Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+      std::array<Target*, 4> none{};
+      SetFramebuffer(GetFramebuffer(none, 0, depth));
+      const RenderRect rect(0, 0, int32_t(depth->width), int32_t(depth->height));
+      list_->clearDepthStencil(clear_depth, clear_stencil, std::clamp(v[2], 0.f, 1.f),
+                               regs.Get<reg::RB_STENCILREFMASK>().stencilref, &rect, 1);
+    }
+  }
+}
+
 void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
@@ -1630,6 +1759,14 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     frontbuffer_width = std::min(frontbuffer_width, r.width);
     frontbuffer_height = std::min(frontbuffer_height, r.height);
   }
+  if (snap_taken_ && snap_) {
+    Transition(snap_.get(), snap_layout_, RenderTextureLayout::COPY_SOURCE);
+    source = snap_.get();
+    frontbuffer_width = std::min(frontbuffer_width, snap_width_);
+    frontbuffer_height = std::min(frontbuffer_height, snap_height_);
+  }
+  snap_taken_ = false;
+  snap_seen_ = 0;
   list_->end();
   list_open_ = false;
   if (renderer) {
@@ -1656,6 +1793,16 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     if (mask != skip_mask_) REXLOG_INFO("Renut: Plume skip mask {:X}", mask);
     skip_mask_ = mask;
+    uint32_t address = 0, ordinal = 0;
+    if (FILE* file = std::fopen((root + "/plume-snap").c_str(), "r")) {
+      if (std::fscanf(file, "%x %u", &address, &ordinal) != 2) address = ordinal = 0;
+      std::fclose(file);
+    }
+    if (address != snap_address_ || ordinal != snap_ordinal_) {
+      REXLOG_INFO("Renut: Plume snapshot of resolve {} into {:08X}", ordinal, address);
+    }
+    snap_address_ = address;
+    snap_ordinal_ = ordinal;
   }
   if (swaps_ % 300 == 1) Report();
   BeginFrame();

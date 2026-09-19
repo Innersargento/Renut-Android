@@ -68,3 +68,22 @@ isso só 238 capturas até o menu. `D3DDevice_SetVertexShader` (`sub_8222A0A8`) 
 3. Rodar `recompile_shaders.sh` sobre `xex.bin` + dumps.
 4. Opcional: com o layout do objeto conhecido, seguir o fixup correspondente no CAFF e
    extrair tudo offline.
+
+## Shaders internos do Direct3D (19/09/2026)
+
+O `Clear` do D3D e os draws de pontos em torno de fences usam shaders próprios do D3D
+que estão no XEX como microcódigo cru, sem contêiner, e por isso nunca entravam no
+cache (VS `1E6883FCCDE1F688`, `B6C9863F710683EC`, `DDED7E538422AE73`,
+`BF9066893FA79ADD`, `AB1E86137A0240E8`, microcódigo). O renderizador grava o microcódigo
+de cada VS ausente em `files/plume-miss`; `tools/shaders/wrap_raw_ucode.py` embrulha
+cada um num contêiner sem elementos de vértice (todo `vfetch` vira busca manual) e com um
+interpolador por registrador exportado (COLOR0 primeiro). Os `.bin` gerados vão no
+diretório de entrada do `recompile_shaders.sh`, junto de `xex.bin` e dos dumps.
+
+O Clear busca pela constante de fetch 0, que ganhou a entrada 16 da tabela de streams
+(`RENUT_DIRECT_FETCH_STREAM`). O host não desenha o Clear: ele usa uma visão da EDRAM
+(meio pitch a 64 bpp, os quatro alvos de cor, 4096 linhas) que só coincide com os alvos
+reais no hardware. `IssueD3DClear` lê a cor e a profundidade do primeiro vértice e limpa
+os alvos reais de mesma base, formato e pitch (ou o dobro do pitch). Sem ele, o depth que
+o passe de DOF restaura no fim do quadro continuava lá quando a primeira faixa do
+predicated tiling do quadro seguinte desenhava, e a metade de cima da tela saía preta.

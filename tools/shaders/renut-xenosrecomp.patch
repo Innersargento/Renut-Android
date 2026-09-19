@@ -45,26 +45,34 @@ index c1b854e..e3a571b 100644
  
          f.println("}};");
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..5485e15 100644
+index ee3830d..9c31dda 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -75,7 +75,14 @@
+@@ -73,9 +73,20 @@
+ // Sixteen because that is how many streams SetStreamSource can bind: it writes
+ // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
- #define RENUT_VERTEX_STREAM_COUNT 16
- #define RENUT_SHARED_STREAMS_OFFSET      (RENUT_SHARED_MISC_OFFSET + 64)                     // 1120 .. 1247
+-#define RENUT_VERTEX_STREAM_COUNT 16
+-#define RENUT_SHARED_STREAMS_OFFSET      (RENUT_SHARED_MISC_OFFSET + 64)                     // 1120 .. 1247
 -#define RENUT_SHARED_SIZE                (RENUT_SHARED_STREAMS_OFFSET + RENUT_VERTEX_STREAM_COUNT * 8)   // 1248
++//
++// Entry 16 is vertex fetch constant 0, which Direct3D's own shaders (the
++// rectangle-list Clear) fetch through; entry 17 pads the table to 16 bytes.
++#define RENUT_VERTEX_STREAM_COUNT 17
++#define RENUT_DIRECT_FETCH_STREAM 16
++#define RENUT_SHARED_STREAMS_OFFSET      (RENUT_SHARED_MISC_OFFSET + 64)                     // 1120 .. 1263
 +// Per-draw vertex input flags that did not fit in the misc block.
-+#define RENUT_SHARED_INPUTS_OFFSET       (RENUT_SHARED_STREAMS_OFFSET + RENUT_VERTEX_STREAM_COUNT * 8)   // 1248 .. 1263
++#define RENUT_SHARED_INPUTS_OFFSET       (RENUT_SHARED_STREAMS_OFFSET + 18 * 8)              // 1264 .. 1279
 +// Live vertex fetches (see vfetchLive): uint4 per fetch - stream | format << 8
 +// | flags << 16, stride bytes, offset bytes, exp scale as float bits.
 +#define RENUT_LIVE_FETCH_COUNT           32
 +#define RENUT_LIVE_FETCH_LOCATION        0xFE
-+#define RENUT_SHARED_FETCH_OFFSET        (RENUT_SHARED_INPUTS_OFFSET + 16)                   // 1264 .. 1775
-+#define RENUT_SHARED_SIZE                (RENUT_SHARED_FETCH_OFFSET + RENUT_LIVE_FETCH_COUNT * 16)   // 1776
++#define RENUT_SHARED_FETCH_OFFSET        (RENUT_SHARED_INPUTS_OFFSET + 16)                   // 1280 .. 1791
++#define RENUT_SHARED_SIZE                (RENUT_SHARED_FETCH_OFFSET + RENUT_LIVE_FETCH_COUNT * 16)   // 1792
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -136,7 +143,7 @@
+@@ -136,7 +147,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -73,7 +81,7 @@ index ee3830d..5485e15 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +159,13 @@ struct ShaderInputElement
+@@ -152,6 +163,13 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -87,7 +95,7 @@ index ee3830d..5485e15 100644
  };
  #endif
  
-@@ -224,6 +238,9 @@ struct PushConstants
+@@ -224,6 +242,9 @@ struct PushConstants
  #define g_SwappedBlendWeights vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 28)
  #define g_SwappedPositions    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 32)
  #define g_SintTexcoords       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 36)
@@ -97,7 +105,7 @@ index ee3830d..5485e15 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -253,6 +270,157 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,6 +274,157 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -255,7 +263,7 @@ index ee3830d..5485e15 100644
  // Per-stage float4 constant file. The recompiler picks the stage by defining
  // RENUT_STAGE_CONSTANTS to the matching push-constant address.
  #define cReg(INDEX) \
-@@ -289,7 +457,10 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -289,7 +461,10 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint   g_SwappedBlendWeights             : packoffset(c67.w); \
      uint   g_SwappedPositions                : packoffset(c68.x); \
      uint   g_SintTexcoords                   : packoffset(c68.y); \
@@ -267,7 +275,7 @@ index ee3830d..5485e15 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -483,6 +654,25 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +658,25 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -294,7 +302,7 @@ index ee3830d..5485e15 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..7287c22 100644
+index c71e7c9..965158f 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -341,7 +349,7 @@ index c71e7c9..7287c22 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -222,10 +244,62 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -222,37 +244,115 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      // vertex fetch constant 95 - StreamNumber, and the instruction names fetch
      // constant constIndex * 3 + constIndexSelect. So the host binds the stream
      // and this reads it as a raw buffer.
@@ -352,6 +360,8 @@ index c71e7c9..7287c22 100644
 +        findResult != vertexElements.end() && isWritten(uint32_t(instr.srcRegister));
 +    if (indexedByComputedRegister)
      {
+-        const uint32_t fetchConstant =
+-            uint32_t(instr.constIndex) * 3 + uint32_t(instr.constIndexSelect);
 +        if (!instr.isMiniFetch)
 +        {
 +            lastFullFetch = instr;
@@ -388,7 +398,11 @@ index c71e7c9..7287c22 100644
 +        }
 +        return;
 +    }
-+
+ 
+-        // The fetch constants above 95 are not stream sources at all, and a
+-        // negative stream is not one either. Either way there is nothing to
+-        // read, and guessing would bind the wrong buffer.
+-        if (fetchConstant > 95 || (95 - fetchConstant) >= RENUT_VERTEX_STREAM_COUNT)
 +    if (findResult == vertexElements.end() || indexedByComputedRegister)
 +    {
 +        if (!instr.isMiniFetch)
@@ -400,13 +414,18 @@ index c71e7c9..7287c22 100644
 +        const VertexFetchInstruction& fetchSource =
 +            (instr.isMiniFetch && haveLastFullFetch) ? lastFullFetch : instr;
 +
-         const uint32_t fetchConstant =
--            uint32_t(instr.constIndex) * 3 + uint32_t(instr.constIndexSelect);
++        const uint32_t fetchConstant =
 +            uint32_t(fetchSource.constIndex) * 3 + uint32_t(fetchSource.constIndexSelect);
- 
-         // The fetch constants above 95 are not stream sources at all, and a
-         // negative stream is not one either. Either way there is nothing to
-@@ -236,15 +310,34 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
++
++        // Streams 0..15 are what SetStreamSource binds, vertex fetch constants
++        // 95 - StreamNumber. Direct3D's own shaders (the rectangle-list Clear)
++        // fetch through constant 0, which gets the extra entry. Anything else
++        // is not a stream source, and guessing would bind the wrong buffer.
++        const int32_t stream = fetchConstant == 0 ? RENUT_DIRECT_FETCH_STREAM
++            : (fetchConstant <= 95 && (95 - fetchConstant) < 16) ? int32_t(95 - fetchConstant) : -1;
++        if (stream < 0)
+         {
+             error("vfetch from address {} names fetch constant {}, which is not a stream source",
                  address, fetchConstant);
              out += "0.0;\n";
          }
@@ -419,11 +438,16 @@ index c71e7c9..7287c22 100644
 +            // Reading an unknown format as anything would be silently wrong
 +            // rather than missing.
              error("vfetch from address {} on stream {} has unsupported format {}",
-                 address, 95 - fetchConstant, uint32_t(instr.format));
+-                address, 95 - fetchConstant, uint32_t(instr.format));
++                address, stream, uint32_t(instr.format));
              out += "0.0;\n";
          }
-+        else if (instr.format != 38 || instr.expAdjust != 0)
++        else if (instr.format != 38 || instr.expAdjust != 0 ||
++            (uint32_t(fetchSource.stride) % 4) != 0 || (uint32_t(instr.offset) % 4) != 0)
 +        {
++            // (The float4 fast path below loads with 16-byte alignment, so a
++            // stride or offset that is not a multiple of four dwords - the
++            // Clear's 28-byte position + colour vertices - takes this one.)
 +            // Skinning's bone rows (k_32_32_32_32_FLOAT) keep the aligned fast
 +            // path below; everything else - N&B's particle and sprite shaders
 +            // pull k_8_8_8_8 colours and k_16_16 corners the same way - goes
@@ -431,7 +455,7 @@ index c71e7c9..7287c22 100644
 +            const uint32_t flags = uint32_t(instr.formatCompAll) |
 +                (uint32_t(instr.numFormatAll) << 1) | (uint32_t(instr.signedRfModeAll) << 2);
 +
-+            print("vfetchStreamFormat({}, r{}.{}, {}, {}, {}, {}, {})", 95 - fetchConstant,
++            print("vfetchStreamFormat({}, r{}.{}, {}, {}, {}, {}, {})", stream,
 +                uint32_t(instr.srcRegister), SWIZZLES[uint32_t(instr.srcSwizzle) & 3],
 +                uint32_t(fetchSource.stride) * 4, uint32_t(instr.offset) * 4,
 +                uint32_t(instr.format), flags, std::ldexp(1.0f, int32_t(instr.expAdjust)));
@@ -445,16 +469,17 @@ index c71e7c9..7287c22 100644
          else
          {
              // stride and offset are in dwords, which is what makes a 16-stride
-@@ -252,7 +345,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+             // fetch at offsets 0, 4 and 8 three whole float4s rather than three
              // overlapping ones.
-             print("vfetchStream({}, r{}.{}, {}, {})", 95 - fetchConstant,
+-            print("vfetchStream({}, r{}.{}, {}, {})", 95 - fetchConstant,
++            print("vfetchStream({}, r{}.{}, {}, {})", stream,
                  uint32_t(instr.srcRegister), SWIZZLES[uint32_t(instr.srcSwizzle) & 3],
 -                uint32_t(instr.stride) * 4, uint32_t(instr.offset) * 4);
 +                uint32_t(fetchSource.stride) * 4, uint32_t(instr.offset) * 4);
  
              out += '.';
              printDstSwizzle(instr.dstSwizzle, true);
-@@ -292,6 +385,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -292,6 +392,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      case DeclUsage::BlendWeight:
          print("swapFloats(g_SwappedBlendWeights, ");
          break;
@@ -464,7 +489,7 @@ index c71e7c9..7287c22 100644
      case DeclUsage::TexCoord:
          print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
          break;
-@@ -372,13 +468,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -372,13 +475,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
              // is the whole point of one, reading a different field of the same
              // vertex.
              element.offsetBytes = uint16_t(uint32_t(instr.offset) * 4);
@@ -483,7 +508,7 @@ index c71e7c9..7287c22 100644
  
              for (auto& usageLocation : USAGE_LOCATIONS)
              {
-@@ -406,7 +505,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -406,7 +512,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      }
  #endif
  
@@ -510,7 +535,7 @@ index c71e7c9..7287c22 100644
  
  #ifdef RENUT_RECOMP
      switch (findResult->second.usage)
-@@ -423,6 +541,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -423,6 +548,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
          break;
  
      case DeclUsage::BlendWeight:
@@ -518,7 +543,7 @@ index c71e7c9..7287c22 100644
      case DeclUsage::Position:
          print(", {})", uint32_t(findResult->second.usageIndex));
          break;
-@@ -517,6 +636,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
+@@ -517,6 +643,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
      }
  
      indent();
@@ -528,7 +553,7 @@ index c71e7c9..7287c22 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -1034,6 +1156,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1034,6 +1163,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -538,7 +563,7 @@ index c71e7c9..7287c22 100644
              print("r{}.", instr.vectorDest);
          }
  
-@@ -1421,6 +1546,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1421,6 +1553,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -548,7 +573,7 @@ index c71e7c9..7287c22 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1689,6 +1817,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1689,6 +1824,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
@@ -559,7 +584,7 @@ index c71e7c9..7287c22 100644
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1828,6 +1960,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1828,6 +1967,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
              }
