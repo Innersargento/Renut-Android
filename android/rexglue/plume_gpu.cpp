@@ -418,6 +418,8 @@ struct Target {
   uint32_t width = 0, height = 0;
   bool depth = false;
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
+  // Serial of the last draw that rendered to it (see IssueD3DClear).
+  uint64_t last_used = 0;
 };
 
 struct Resolved {
@@ -430,6 +432,13 @@ struct Resolved {
   uint64_t generation = 0;
   // Serial of the last resolve into it (see FindResolved).
   uint64_t written = 0;
+  // The guest memory under it when last resolved. Resolves are not written
+  // back to guest memory, so if these bytes change the CPU has put something
+  // else there (a texture streamed into freed render memory) and this image
+  // is stale.
+  uint64_t guest_hash = 0;
+  uint32_t guest_bytes = 0;
+  uint64_t checked_frame = ~0ull;
   // The texture is sized to the copy's aligned extent (720 rows become 736),
   // but a fetch normalizes coordinates to its own size, so a fetch smaller
   // than the texture samples this copy of its top-left corner instead.
@@ -450,6 +459,8 @@ struct GuestTexture {
   bool failed = false;
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
 };
+
+uint64_t ContentHash(const uint8_t* data, uint32_t span);
 
 struct Stats {
   uint64_t textures_decoded = 0, texture_failures = 0;
@@ -516,6 +527,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   FILE* trace_ = nullptr;
   // Debug: <files>/plume-skip holds a bit mask of draw kinds to drop (see IssueDraw).
   uint32_t skip_mask_ = 0;
+  // Debug: <files>/plume-drawskip holds "<first> <end>": draws of each frame
+  // with an index in that range are dropped (to bisect a rendering bug).
+  uint32_t drawskip_first_ = 0, drawskip_end_ = 0, frame_draw_ = 0;
   // Debug: <files>/plume-snap holds "<hex address> <n>": the n-th resolve of
   // the frame into that address is copied aside and presented instead of the
   // front buffer, to see an intermediate pass on screen.
@@ -584,9 +598,27 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     for (auto& [key, r] : resolved_) {
       if (uint32_t(key) == address && r.texture && (!latest || r.written > latest->written)) latest = &r;
     }
+    if (latest && latest->guest_bytes && latest->checked_frame != swaps_) {
+      latest->checked_frame = swaps_;
+      const uint8_t* memory = memory_->TranslatePhysical<const uint8_t*>(address);
+      if (ContentHash(memory, latest->guest_bytes) != latest->guest_hash) {
+        // Something else lives here now; forget every resolve at the address.
+        for (auto it = resolved_.begin(); it != resolved_.end();) {
+          if (uint32_t(it->first) == address) {
+            if (it->second.texture) retired_.push_back(std::move(it->second.texture));
+            if (it->second.fitted) retired_.push_back(std::move(it->second.fitted));
+            it = resolved_.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        return nullptr;
+      }
+    }
     return latest;
   }
   uint64_t resolve_serial_ = 0;
+  uint64_t target_serial_ = 0;
   std::unordered_map<uint64_t, GuestTexture> guest_textures_;
   std::unordered_set<uint32_t> unsupported_formats_;
   uint32_t next_descriptor_ = 1;
@@ -857,6 +889,7 @@ Target* PlumeCommandProcessor::GetTarget(uint32_t base, uint32_t format, bool de
   uint64_t key = uint64_t(base & 0xFFF) | (uint64_t(format & 0xF) << 12) | (uint64_t(depth) << 16) |
                  (uint64_t(pitch) << 32);
   Target& target = targets_[key];
+  target.last_used = ++target_serial_;
   if (target.texture && target.height >= height) return &target;
   // New, or taller than before: (re)create. Contents are lost on growth.
   uint32_t new_height = std::max({height, target.height, 64u});
@@ -1307,6 +1340,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) return IssueCopy();
   ++stats_.draws;
+  const uint32_t draw_index = frame_draw_++;
+  if (draw_index >= drawskip_first_ && draw_index < drawskip_end_) return true;
 
   auto* vs = static_cast<HostShader*>(active_vertex_shader());
   if (trace_ && (!vs || !vs->entry)) {
@@ -1456,7 +1491,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
 
   if (trace_) {
-    std::string line = fmt::format("draw vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X}",
+    std::string line = fmt::format("draw #{} vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X}",
+                                   draw_index,
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
                                    index_count, uint32_t(edram_mode), pitch, height,
                                    regs[XE_GPU_REG_RB_COLORCONTROL]);
@@ -1975,6 +2011,14 @@ bool PlumeCommandProcessor::IssueCopy() {
     const uint32_t dest_y = &dest == inside ? dy + row : dy;
     ++dest.generation;
     dest.written = ++resolve_serial_;
+    // Snapshot of the guest memory under the whole resolved texture.
+    {
+      uint32_t base_address = info.copy_dest_base;
+      if (&dest == inside) base_address -= row * dest.width * dest_bpp;
+      dest.guest_bytes = dest.width * dest.height * dest_bpp;
+      dest.guest_hash = ContentHash(memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
+      dest.checked_frame = swaps_;
+    }
     if (dest.texture && copying_depth) {
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
       CopyDepth(*source, x, y, w, h, dest.texture.get(), dx, dest_y);
@@ -2112,14 +2156,17 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
   // 32 bpp target as a 64 bpp one; EDRAM bases are shared between targets of
   // other pitches (the shadow maps), so match the pitch, not just the base.
   const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+  // Several targets can match (a pitch-640 target from another phase next to
+  // the 1280-wide scene target that a 64 bpp clear also names): the one last
+  // rendered to is the one the game is about to use.
   auto find = [&](uint32_t base, uint32_t format, bool depth) -> Target* {
-    Target* half = nullptr;
+    Target* best = nullptr;
     for (auto& [key, target] : targets_) {
       if ((key & 0xFFF) != base || ((key >> 12) & 0xF) != format || bool((key >> 16) & 1) != depth) continue;
-      if (target.width == pitch) return &target;
-      if (target.width == 2 * pitch) half = &target;
+      if (target.width != pitch && target.width != 2 * pitch) continue;
+      if (!best || target.last_used > best->last_used) best = &target;
     }
-    return half;
+    return best;
   };
   const uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
   if (edram_mode == xenos::EdramMode::kColorDepth) {
@@ -2179,6 +2226,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   snap_taken_ = false;
   snap_seen_ = 0;
+  frame_draw_ = 0;
   list_->end();
   list_open_ = false;
   if (renderer) {
@@ -2226,6 +2274,16 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     snap_address_ = address;
     snap_ordinal_ = ordinal;
+    uint32_t first = 0, end = 0;
+    if (FILE* file = std::fopen((root + "/plume-drawskip").c_str(), "r")) {
+      if (std::fscanf(file, "%u %u", &first, &end) != 2) first = end = 0;
+      std::fclose(file);
+    }
+    if (first != drawskip_first_ || end != drawskip_end_) {
+      REXLOG_INFO("Renut: Plume dropping draws {}..{} of every frame", first, end);
+    }
+    drawskip_first_ = first;
+    drawskip_end_ = end;
   }
   if (swaps_ % 300 == 1) Report();
   BeginFrame();
