@@ -21,6 +21,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/shader.h>
+#include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -394,6 +395,15 @@ struct Resolved {
   uint32_t width = 0, height = 0;
   uint32_t descriptor = 0;
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
+  // Bumped by every resolve into this texture.
+  uint64_t generation = 0;
+  // The texture is sized to the copy's aligned extent (720 rows become 736),
+  // but a fetch normalizes coordinates to its own size, so a fetch smaller
+  // than the texture samples this copy of its top-left corner instead.
+  std::unique_ptr<RenderTexture> fitted;
+  uint32_t fitted_width = 0, fitted_height = 0, fitted_descriptor = 0;
+  uint64_t fitted_generation = UINT64_MAX;
+  RenderTextureLayout fitted_layout = RenderTextureLayout::UNKNOWN;
 };
 
 struct GuestTexture {
@@ -441,6 +451,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   RenderFramebuffer* GetFramebuffer(const std::array<Target*, 4>& colors, uint32_t color_count,
                                     Target* depth);
   void SetFramebuffer(RenderFramebuffer* framebuffer);
+  Resolved* FindResolvedContaining(uint32_t address, RenderFormat format, uint32_t bytes_per_pixel,
+                                  uint32_t& row);
+  uint32_t FittedResolved(Resolved& resolved, uint32_t width, uint32_t height);
   Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height);
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   void Report();
@@ -453,6 +466,16 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint64_t, uint64_t> missed_draws_;
   std::unordered_set<uint64_t> missed_pairs_;
   std::string miss_dump_directory_;
+  // One-frame trace: touching <files>/plume-trace-request records the next
+  // frame's draws and resolves into <files>/plume-trace.txt.
+  FILE* trace_ = nullptr;
+  template <typename... Args>
+  void Trace(fmt::format_string<Args...> format, Args&&... args) {
+    if (trace_) {
+      fmt::print(trace_, format, std::forward<Args>(args)...);
+      std::fputc(10, trace_);
+    }
+  }
 
   std::unique_ptr<RenderPipelineLayout> layout_;
   std::unique_ptr<RenderDescriptorSet> set_2d_, set_3d_, set_cube_, set_samplers_;
@@ -686,6 +709,43 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
   list_->barriers(stages, RenderTextureBarrier(texture, layout));
   current = layout;
   bound_framebuffer_ = nullptr;  // barriers end the render pass
+}
+
+Resolved* PlumeCommandProcessor::FindResolvedContaining(uint32_t address, RenderFormat format,
+                                                        uint32_t bytes_per_pixel, uint32_t& row) {
+  for (auto& [base, resolved] : resolved_) {
+    if (!resolved.texture || resolved.format != format || address <= base) continue;
+    const uint32_t row_bytes = resolved.width * bytes_per_pixel;
+    const uint32_t offset = address - base;
+    if (offset < row_bytes * resolved.height && offset % row_bytes == 0) {
+      row = offset / row_bytes;
+      return &resolved;
+    }
+  }
+  return nullptr;
+}
+
+uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint32_t height) {
+  if (!r.fitted || r.fitted_width != width || r.fitted_height != height) {
+    r.fitted = device_->createTexture(RenderTextureDesc::Texture2D(width, height, 1, r.format));
+    r.fitted_width = width;
+    r.fitted_height = height;
+    r.fitted_layout = RenderTextureLayout::UNKNOWN;
+    r.fitted_generation = UINT64_MAX;
+    if (!r.fitted_descriptor && next_descriptor_ < kMaxTextures2D) r.fitted_descriptor = next_descriptor_++;
+    if (!r.fitted || !r.fitted_descriptor) return 0;
+    set_2d_->setTexture(r.fitted_descriptor, r.fitted.get(), RenderTextureLayout::SHADER_READ);
+  }
+  if (r.fitted_generation != r.generation) {
+    Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
+    Transition(r.fitted.get(), r.fitted_layout, RenderTextureLayout::COPY_DEST);
+    RenderBox box(0, 0, int32_t(width), int32_t(height), 0, 1);
+    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(r.fitted.get()),
+                             RenderTextureCopyLocation::Subresource(r.texture.get()), 0, 0, 0, &box);
+    r.fitted_generation = r.generation;
+  }
+  Transition(r.fitted.get(), r.fitted_layout, RenderTextureLayout::SHADER_READ);
+  return r.fitted_descriptor;
 }
 
 Target* PlumeCommandProcessor::FindTarget(uint32_t base, uint32_t format, bool depth) {
@@ -975,11 +1035,37 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     auto found = resolved_.find(fetch.base_address << 12);
     if (found != resolved_.end() && found->second.descriptor) {
       Resolved& r = found->second;
-      Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
-      texture_descriptor[slot] = r.descriptor;
+      const uint32_t fw = fetch.size_2d.width + 1, fh = fetch.size_2d.height + 1;
+      if (fw < r.width || fh < r.height) {
+        texture_descriptor[slot] = FittedResolved(r, std::min(fw, r.width), std::min(fh, r.height));
+      } else {
+        Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
+        texture_descriptor[slot] = r.descriptor;
+      }
     } else if (fetch.dimension == xenos::DataDimension::k2DOrStacked) {
       texture_descriptor[slot] = GetGuestTexture(fetch);
     }
+  }
+
+  if (trace_) {
+    std::string line = fmt::format("draw vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={}",
+                                   vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
+                                   index_count, uint32_t(edram_mode), pitch, height);
+    for (uint32_t i = 0; i < color_count; ++i) {
+      reg::RB_COLOR_INFO info;
+      info.value = regs[kColorInfo[i]];
+      line += fmt::format(" rt{}={:X}/f{}", i, uint32_t(info.color_base), uint32_t(info.color_format));
+    }
+    if (depth) line += fmt::format(" ds={:X}", uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base));
+    for (uint32_t slot = 0; slot < 32; ++slot) {
+      xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
+      if (fetch.type != xenos::FetchConstantType::kTexture || !fetch.base_address) continue;
+      line += fmt::format(" t{}={:08X}/f{}/{}x{}/d{}{}", slot, fetch.base_address << 12,
+                          uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
+                          uint32_t(fetch.dimension),
+                          resolved_.count(fetch.base_address << 12) ? "/R" : "");
+    }
+    Trace("{}", line);
   }
 
   // Constants: the guest register file, exactly as the recompiled shaders
@@ -1092,6 +1178,18 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // window y = yo + ys * ndc becomes a viewport of height -2 * ys at yo + ys.
   const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
   const Target* extent = colors[0] ? colors[0] : depth;
+  // Window offset (predicated tiling moves each band to the target's origin)
+  // and the D3D9 pixel centre at integer coordinates.
+  float window_x = 0.f, window_y = 0.f;
+  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+    const auto offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    window_x = float(offset.window_x_offset);
+    window_y = float(offset.window_y_offset);
+  }
+  if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
+    window_x += 0.5f;
+    window_y += 0.5f;
+  }
   RenderViewport viewport;
   float scale_offset[4] = {1.f, 1.f, 0.f, 0.f};
   if (vte.vport_x_scale_ena) {
@@ -1101,10 +1199,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     float yo = vte.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.f;
     float zs = vte.vport_z_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE) : 1.f;
     float zo = vte.vport_z_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET) : 0.f;
-    viewport = RenderViewport(xo - xs, yo + ys, 2.f * xs, -2.f * ys,
+    viewport = RenderViewport(xo - xs + window_x, yo + ys + window_y, 2.f * xs, -2.f * ys,
                               std::clamp(zo, 0.f, 1.f), std::clamp(zo + zs, 0.f, 1.f));
   } else {
-    viewport = RenderViewport(0.f, 0.f, float(extent->width), float(extent->height));
+    viewport = RenderViewport(window_x, window_y, float(extent->width), float(extent->height));
     scale_offset[0] = 2.f / float(extent->width);
     scale_offset[1] = -2.f / float(extent->height);
     scale_offset[2] = -1.f;
@@ -1314,6 +1412,13 @@ bool PlumeCommandProcessor::IssueCopy() {
   const uint32_t x = (tiles % pitch_tiles) * tile_width + info.coordinate_info.edram_offset_x_div_8 * 8;
   const uint32_t y = (tiles / pitch_tiles) * 16 + info.coordinate_info.edram_offset_y_div_8 * 8;
 
+  Trace("resolve {} base={:X} fmt={} src=({},{}) {}x{} found={} -> {:08X} dfmt={} ({},{}) pitch={} h={} clear={}{}",
+        copying_depth ? "depth" : "color", original, uint32_t(edram.format), x, y, width, height,
+        source != nullptr, uint32_t(info.copy_dest_base), uint32_t(info.copy_dest_info.copy_dest_format),
+        info.copy_dest_coordinate_info.offset_x_div_8 * 8, info.copy_dest_coordinate_info.offset_y_div_8 * 8,
+        info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32,
+        info.copy_dest_coordinate_info.height_aligned_div_32 * 32, info.IsClearingColor() ? "c" : "",
+        info.IsClearingDepth() ? "d" : "");
   if (source && !copying_depth && x < source->width && y < source->height &&
       info.rb_copy_control.copy_command != xenos::CopyCommand::kNull) {
     const uint32_t w = std::min(width, source->width - x), h = std::min(height, source->height - y);
@@ -1321,14 +1426,27 @@ bool PlumeCommandProcessor::IssueCopy() {
     const uint32_t dest_h = std::max(uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) * 32u, h);
     const uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8;
     const uint32_t dy = info.copy_dest_coordinate_info.offset_y_div_8 * 8;
-    Resolved& dest = GetResolved(info.copy_dest_base, source->format, dest_w + dx, dest_h + dy);
+    // Predicated tiling resolves each screen band to its own address inside
+    // one texture (the second band of a 1280x720 frame lands 384 rows in), so
+    // an address inside an existing resolved texture of the same format
+    // continues that texture.
+    uint32_t row = 0;
+    const auto* dest_info = rex::graphics::FormatInfo::Get(
+        xenos::TextureFormat(uint32_t(info.copy_dest_info.copy_dest_format)));
+    const uint32_t dest_bpp = dest_info ? std::max(1u, dest_info->bits_per_pixel / 8) : 4;
+    Resolved* inside = FindResolvedContaining(info.copy_dest_base, source->format, dest_bpp, row);
+    Resolved& dest = inside && inside->height >= row + dy + h
+                         ? *inside
+                         : GetResolved(info.copy_dest_base, source->format, dest_w + dx, dest_h + dy);
+    const uint32_t dest_y = &dest == inside ? dy + row : dy;
+    ++dest.generation;
     if (dest.texture) {
       Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
       RenderBox box(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h), 0, 1);
       list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
-                               RenderTextureCopyLocation::Subresource(source->texture.get()), dx, dy,
-                               0, &box);
+                               RenderTextureCopyLocation::Subresource(source->texture.get()), dx,
+                               dest_y, 0, &box);
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
       if (dest.descriptor) {
         set_2d_->setTexture(dest.descriptor, dest.texture.get(), RenderTextureLayout::SHADER_READ);
@@ -1390,7 +1508,19 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (renderer) {
     renderer->SubmitAndPresent(list_.get(), source, frontbuffer_width, frontbuffer_height);
   }
-  if (++swaps_ % 300 == 1) Report();
+  if (trace_) {
+    Trace("swap front={:08X} {}x{} found={}", frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+          source != nullptr);
+    std::fclose(trace_);
+    trace_ = nullptr;
+    REXLOG_INFO("Renut: Plume frame trace written");
+  }
+  if (++swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
+    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    const std::string request = root + "/plume-trace-request";
+    if (std::remove(request.c_str()) == 0) trace_ = std::fopen((root + "/plume-trace.txt").c_str(), "w");
+  }
+  if (swaps_ % 300 == 1) Report();
   BeginFrame();
 }
 
