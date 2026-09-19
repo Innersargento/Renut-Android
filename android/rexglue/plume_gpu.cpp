@@ -177,6 +177,10 @@ class HostShader : public gfx::Shader {
   CompiledShader* compiled = nullptr;
   // Vertex shaders: the input layout decoded from this variant's vfetches.
   std::vector<LiveElement> elements;
+  // Fetches the shader indexes with a computed register (vfetchLive): slot k
+  // of the shared fetch table, as uint4 {stream | format << 8 | flags << 16,
+  // stride, offset, exp scale bits}.
+  std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> live_fetches;
   bool elements_decoded = false;
 };
 
@@ -239,6 +243,7 @@ void DecodeLiveElements(HostShader& shader) {
   for (uint32_t i = 0; i < shader.entry->inputElementCount; ++i) {
     const ShaderInputElement& e = elements[i];
     if (e.location == 0xFF || e.fetchAddress >= slots) continue;
+    const bool live_fetch = e.location == RENUT_LIVE_FETCH_LOCATION;
     const uint32_t* f = u + size_t(e.fetchAddress) * 3;
     if ((f[0] & 0x1F) != 0) continue;
     const uint32_t* full = f;
@@ -253,6 +258,18 @@ void DecodeLiveElements(HostShader& shader) {
     }
     const uint32_t fetch_constant = ((full[0] >> 20) & 0x1F) * 3 + ((full[0] >> 25) & 0x3);
     if (fetch_constant > 95 || 95 - fetch_constant >= 16) continue;
+    if (live_fetch) {
+      if (e.slot >= RENUT_LIVE_FETCH_COUNT) continue;
+      const uint32_t flags = ((f[1] >> 12) & 1) | (((f[1] >> 13) & 1) << 1) | (((f[1] >> 14) & 1) << 2);
+      const int32_t exp_adjust = int32_t(f[1] << 2) >> 26;  // bits 24..29, signed
+      const float scale = std::ldexp(1.f, exp_adjust);
+      uint32_t scale_bits;
+      std::memcpy(&scale_bits, &scale, 4);
+      shader.live_fetches.push_back(
+          {e.slot, {(95 - fetch_constant) | (((f[1] >> 16) & 0x3F) << 8) | (flags << 16),
+                    (full[2] & 0xFF) * 4, ((f[2] >> 8) & 0x7FFFFF) * 4, scale_bits}});
+      continue;
+    }
     LiveElement live;
     live.location = e.location;
     live.slot = 95 - fetch_constant;
@@ -293,38 +310,46 @@ bool IsBlendable(RenderFormat format) {
   return format != RenderFormat::R32_FLOAT && format != RenderFormat::R32G32_FLOAT;
 }
 
-RenderFormat VertexFormat(uint32_t format, bool is_signed, bool normalized, bool integer_input) {
-  if (integer_input) {
-    switch (format) {
-      case 6: return RenderFormat::R8G8B8A8_UINT;
-      case 25: return RenderFormat::R16G16_UINT;
-      case 26: return RenderFormat::R16G16B16A16_UINT;
-      default: return RenderFormat::R32G32B32A32_UINT;
-    }
-  }
+// How a vertex element reaches the recompiled shader, whose inputs are all
+// float4 like the hardware's vfetch results.
+enum class InputDecode { kNone, kInteger, kPacked1010102, kPacked111110 };
+
+// The host format for a guest vertex format, and what unpackInput() (or
+// tfetchR11G11B10) must still do in the shader: integers read as numbers
+// arrive as raw bits, and the packed formats have no host equivalent.
+RenderFormat VertexFormat(uint32_t format, bool is_signed, bool normalized, InputDecode& decode) {
+  decode = InputDecode::kNone;
+  auto integer = [&](RenderFormat unsigned_format, RenderFormat signed_format) {
+    decode = InputDecode::kInteger;
+    return is_signed ? signed_format : unsigned_format;
+  };
   switch (format) {
     case 6:
       return normalized ? (is_signed ? RenderFormat::R8G8B8A8_SNORM : RenderFormat::R8G8B8A8_UNORM)
-                        : (is_signed ? RenderFormat::R8G8B8A8_SINT : RenderFormat::R8G8B8A8_UINT);
+                        : integer(RenderFormat::R8G8B8A8_UINT, RenderFormat::R8G8B8A8_SINT);
     case 25:
       return normalized ? (is_signed ? RenderFormat::R16G16_SNORM : RenderFormat::R16G16_UNORM)
-                        : (is_signed ? RenderFormat::R16G16_SINT : RenderFormat::R16G16_UINT);
+                        : integer(RenderFormat::R16G16_UINT, RenderFormat::R16G16_SINT);
     case 26:
       return normalized
                  ? (is_signed ? RenderFormat::R16G16B16A16_SNORM : RenderFormat::R16G16B16A16_UNORM)
-                 : (is_signed ? RenderFormat::R16G16B16A16_SINT : RenderFormat::R16G16B16A16_UINT);
+                 : integer(RenderFormat::R16G16B16A16_UINT, RenderFormat::R16G16B16A16_SINT);
     case 31: return RenderFormat::R16G16_FLOAT;
     case 32: return RenderFormat::R16G16B16A16_FLOAT;
-    case 33: return is_signed ? RenderFormat::R32_SINT : RenderFormat::R32_UINT;
-    case 34: return is_signed ? RenderFormat::R32G32_SINT : RenderFormat::R32G32_UINT;
-    case 35: return is_signed ? RenderFormat::R32G32B32A32_SINT : RenderFormat::R32G32B32A32_UINT;
+    case 33: return integer(RenderFormat::R32_UINT, RenderFormat::R32_SINT);
+    case 34: return integer(RenderFormat::R32G32_UINT, RenderFormat::R32G32_SINT);
+    case 35: return integer(RenderFormat::R32G32B32A32_UINT, RenderFormat::R32G32B32A32_SINT);
     case 36: return RenderFormat::R32_FLOAT;
     case 37: return RenderFormat::R32G32_FLOAT;
     case 38: return RenderFormat::R32G32B32A32_FLOAT;
     case 57: return RenderFormat::R32G32B32_FLOAT;
     case 7:
+      decode = InputDecode::kPacked1010102;
+      return RenderFormat::R32_FLOAT;
     case 16:
-    case 17: return RenderFormat::R32_UINT;
+    case 17:
+      decode = InputDecode::kPacked111110;
+      return RenderFormat::R32_FLOAT;
     default: return RenderFormat::UNKNOWN;
   }
 }
@@ -469,6 +494,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // One-frame trace: touching <files>/plume-trace-request records the next
   // frame's draws and resolves into <files>/plume-trace.txt.
   FILE* trace_ = nullptr;
+  // Debug: <files>/plume-skip holds a bit mask of draw kinds to drop (see IssueDraw).
+  uint32_t skip_mask_ = 0;
   template <typename... Args>
   void Trace(fmt::format_string<Args...> format, Args&&... args) {
     if (trace_) {
@@ -667,7 +694,7 @@ bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::
   if (!address || !size || size > (32u << 20)) return false;
   uint64_t key = (uint64_t(address) << 32) ^ (uint64_t(size) << 2) ^ uint64_t(endian);
   auto found = uploaded_streams_.find(key);
-  if (found != uploaded_streams_.end()) {
+  if (found != uploaded_streams_.end() && !(skip_mask_ & 256)) {
     offset = found->second;
     return true;
   }
@@ -1101,7 +1128,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   std::array<uint64_t, 17> slot_offsets{};
   std::array<uint32_t, 17> slot_sizes{};
   std::array<bool, 17> slot_used{};
-  uint32_t swapped[6] = {};  // texcoord, normal, binormal, tangent, blendweight, position
+  uint32_t swapped[7] = {};  // texcoord, normal, binormal, tangent, blendweight, position, blendindices
+  uint32_t packed_inputs = 0, int_inputs = 0;
+  bool r11g11b10_normals = false;
   uint64_t streams[RENUT_VERTEX_STREAM_COUNT] = {};
   for (uint32_t stream = 0; stream < RENUT_VERTEX_STREAM_COUNT; ++stream) {
     xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - stream);
@@ -1114,6 +1143,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   std::memcpy(sh + RENUT_SHARED_STREAMS_OFFSET, streams, sizeof(streams));
+  for (const auto& [k, entry] : vs->live_fetches) {
+    std::memcpy(sh + RENUT_SHARED_FETCH_OFFSET + k * 16, entry.data(), 16);
+  }
   bool zero_used = false;
   for (auto [location, integer] : vs->compiled->inputs) {
     const LiveElement* element = nullptr;
@@ -1123,9 +1155,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         break;
       }
     }
-    RenderFormat format = element ? VertexFormat(element->format, element->is_signed,
-                                                 element->normalized, integer)
-                                  : RenderFormat::UNKNOWN;
+    InputDecode decode = InputDecode::kNone;
+    RenderFormat format = element && !integer ? VertexFormat(element->format, element->is_signed,
+                                                             element->normalized, decode)
+                                              : RenderFormat::UNKNOWN;
     if (!element || format == RenderFormat::UNKNOWN || !element->stride ||
         !slot_sizes[element->slot] ||
         (slot_used[element->slot] &&
@@ -1141,12 +1174,22 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     input_elements.emplace_back("TEXCOORD", location, location, format, element->slot,
                                 element->offset);
+    switch (decode) {
+      case InputDecode::kInteger: int_inputs |= 1u << location; break;
+      case InputDecode::kPacked1010102: packed_inputs |= 1u << location; break;
+      case InputDecode::kPacked111110:
+        // tfetchR11G11B10 decodes these, for normals, tangents and binormals only.
+        r11g11b10_normals |= element->usage == 3 || element->usage == 6 || element->usage == 7;
+        break;
+      default: break;
+    }
     if (!slot_used[element->slot]) {
       slot_used[element->slot] = true;
       input_slots.emplace_back(element->slot, element->stride);
     }
     xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - element->slot);
-    if (IsSixteenBitFormat(element->format) && fetch.endian == xenos::Endian::k8in32) {
+    if (IsSixteenBitFormat(element->format) && fetch.endian == xenos::Endian::k8in32 &&
+        !(skip_mask_ & 512)) {
       // A 32-bit swap leaves 16-bit pairs reversed; swapFloats() undoes it.
       int which = -1;
       switch (element->usage) {
@@ -1156,9 +1199,42 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         case 6: which = 3; break;   // TANGENT
         case 1: which = 4; break;   // BLENDWEIGHT
         case 0: which = 5; break;   // POSITION
+        case 2: which = 6; break;   // BLENDINDICES
         default: break;
       }
       if (which >= 0) swapped[which] |= 1u << element->usage_index;
+    }
+  }
+  if (trace_) {
+    std::string line = "  inputs";
+    for (auto [location, integer] : vs->compiled->inputs) {
+      const LiveElement* e = nullptr;
+      for (const LiveElement& l : vs->elements) {
+        if (l.location == location) e = &l;
+      }
+      if (!e) {
+        line += fmt::format(" L{}{}=none", location, integer ? "u" : "f");
+        continue;
+      }
+      const auto fetch = regs.GetVertexFetch(95 - e->slot);
+      line += fmt::format(" L{}{}=u{}.{}/f{}{}{}/s{}+{}/e{}", location, integer ? "u" : "f", e->usage,
+                          e->usage_index, e->format, e->is_signed ? "s" : "", e->normalized ? "n" : "",
+                          e->stride, e->offset, uint32_t(fetch.endian));
+    }
+    Trace("{}", line);
+  }
+  if (skip_mask_) {
+    bool skinned = false, half_position = false;
+    for (const LiveElement& e : vs->elements) {
+      skinned |= e.usage == 2;
+      half_position |= e.usage == 0 && e.format == 32;
+    }
+    const int32_t base = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+    if (((skip_mask_ & 1) && int_inputs) || ((skip_mask_ & 2) && packed_inputs) ||
+        ((skip_mask_ & 4) && skinned) || ((skip_mask_ & 8) && half_position) ||
+        ((skip_mask_ & 16) && quad_list) || ((skip_mask_ & 32) && base != 0) ||
+        ((skip_mask_ & 64) && !skinned) || ((skip_mask_ & 128) && zero_used)) {
+      return true;
     }
   }
   if (zero_used) input_slots.emplace_back(kZeroBinding, 0);
@@ -1170,6 +1246,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 24, &swapped[3], 4);
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 28, &swapped[4], 4);
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 32, &swapped[5], 4);
+  std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 40, &swapped[6], 4);
+  std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 44, &packed_inputs, 4);
+  std::memcpy(sh + RENUT_SHARED_INPUTS_OFFSET, &int_inputs, 4);
 
   // Viewport. With the guest's viewport transform enabled the shader emits
   // clip space and the host viewport reproduces PA_CL_VPORT_*; with it off the
@@ -1240,7 +1319,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                        b.blendOpAlpha == RenderBlendOperation::ADD);
     b.renderTargetWriteMask = uint8_t((color_mask >> (4 * i)) & 0xF);
   }
-  const uint32_t spec = alpha_test ? SPEC_CONSTANT_ALPHA_TEST : 0;
+  const uint32_t spec = (alpha_test ? SPEC_CONSTANT_ALPHA_TEST : 0) |
+                        (r11g11b10_normals ? SPEC_CONSTANT_R11G11B10_NORMAL : 0);
   uint64_t key = 0;
   HashCombine(key, vs->compiled);
   HashCombine(key, ps ? ps->compiled : nullptr);
@@ -1378,6 +1458,50 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     list_->setVertexBuffers(slot.index, &view, 1, &slot);
   }
   const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+  if (trace_) {
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (uint32_t i = 0; i < vertex_count; ++i) {
+      uint32_t v = !indexed ? i
+                   : index_format == RenderFormat::R32_UINT
+                       ? reinterpret_cast<const uint32_t*>(Pointer(index_offset))[i]
+                       : reinterpret_cast<const uint16_t*>(Pointer(index_offset))[i];
+      if (indexed && v == (index_format == RenderFormat::R32_UINT ? 0xFFFFFFFFu : 0xFFFFu)) continue;
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+    std::string line = fmt::format("  indices {}..{} base={} count={}", lo, hi, base_vertex, vertex_count);
+    for (const LiveElement& e : vs->elements) {
+      if (e.usage != 0 || !e.stride || !slot_sizes[e.slot]) continue;
+      const uint32_t capacity = slot_sizes[e.slot] / e.stride;
+      line += fmt::format(" pos(slot {} fmt {} cap {})", e.slot, e.format, capacity);
+      // Decode the referenced positions as the host will read them.
+      float mn = 1e30f, mx = -1e30f;
+      uint32_t bad = 0;
+      for (uint32_t v = lo; v <= hi && v - lo < 4096; ++v) {
+        const uint64_t vi = uint64_t(int64_t(v) + base_vertex);
+        const uint64_t at = vi * e.stride + e.offset;
+        if (at + 16 > slot_sizes[e.slot]) { ++bad; continue; }
+        const uint8_t* p = Pointer(slot_offsets[e.slot]) + at;
+        for (int c = 0; c < 3; ++c) {
+          float f;
+          if (e.format == 32) {
+            uint16_t h;
+            std::memcpy(&h, p + 2 * (c ^ 1), 2);  // pairs reversed by the 32-bit swap
+            const uint32_t sign = h >> 15, exp = (h >> 10) & 31, mant = h & 1023;
+            f = exp == 31 ? INFINITY : exp ? std::ldexp(float(mant | 1024), int(exp) - 25)
+                                           : std::ldexp(float(mant), -24);
+            if (sign) f = -f;
+          } else {
+            std::memcpy(&f, p + 4 * c, 4);
+          }
+          if (!std::isfinite(f)) ++bad;
+          else { mn = std::min(mn, f); mx = std::max(mx, f); }
+        }
+      }
+      line += fmt::format(" range [{}, {}] bad={}", mn, mx, bad);
+    }
+    Trace("{}", line);
+  }
   if (indexed) {
     RenderIndexBufferView view(RenderBufferReference(upload_.get(), index_offset), index_bytes,
                                index_format);
@@ -1519,6 +1643,16 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
     const std::string request = root + "/plume-trace-request";
     if (std::remove(request.c_str()) == 0) trace_ = std::fopen((root + "/plume-trace.txt").c_str(), "w");
+  }
+  if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
+    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    uint32_t mask = 0;
+    if (FILE* file = std::fopen((root + "/plume-skip").c_str(), "r")) {
+      if (std::fscanf(file, "%u", &mask) != 1) mask = 0;
+      std::fclose(file);
+    }
+    if (mask != skip_mask_) REXLOG_INFO("Renut: Plume skip mask {:X}", mask);
+    skip_mask_ = mask;
   }
   if (swaps_ % 300 == 1) Report();
   BeginFrame();

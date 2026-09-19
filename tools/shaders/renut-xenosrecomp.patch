@@ -45,10 +45,26 @@ index c1b854e..e3a571b 100644
  
          f.println("}};");
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..d3a3627 100644
+index ee3830d..5485e15 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -136,7 +136,7 @@
+@@ -75,7 +75,14 @@
+ // constIndex * 3 + constIndexSelect, so the two meet in this table.
+ #define RENUT_VERTEX_STREAM_COUNT 16
+ #define RENUT_SHARED_STREAMS_OFFSET      (RENUT_SHARED_MISC_OFFSET + 64)                     // 1120 .. 1247
+-#define RENUT_SHARED_SIZE                (RENUT_SHARED_STREAMS_OFFSET + RENUT_VERTEX_STREAM_COUNT * 8)   // 1248
++// Per-draw vertex input flags that did not fit in the misc block.
++#define RENUT_SHARED_INPUTS_OFFSET       (RENUT_SHARED_STREAMS_OFFSET + RENUT_VERTEX_STREAM_COUNT * 8)   // 1248 .. 1263
++// Live vertex fetches (see vfetchLive): uint4 per fetch - stream | format << 8
++// | flags << 16, stride bytes, offset bytes, exp scale as float bits.
++#define RENUT_LIVE_FETCH_COUNT           32
++#define RENUT_LIVE_FETCH_LOCATION        0xFE
++#define RENUT_SHARED_FETCH_OFFSET        (RENUT_SHARED_INPUTS_OFFSET + 16)                   // 1264 .. 1775
++#define RENUT_SHARED_SIZE                (RENUT_SHARED_FETCH_OFFSET + RENUT_LIVE_FETCH_COUNT * 16)   // 1776
+ 
+ // SPIR-V vertex input locations, shared with the host input-layout builder. A
+ // semantic missing here gets no location from the emitter, and the recompiler
+@@ -136,7 +143,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -57,7 +73,7 @@ index ee3830d..d3a3627 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +152,13 @@ struct ShaderInputElement
+@@ -152,6 +159,13 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -71,7 +87,17 @@ index ee3830d..d3a3627 100644
  };
  #endif
  
-@@ -253,6 +260,149 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -224,6 +238,9 @@ struct PushConstants
+ #define g_SwappedBlendWeights vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 28)
+ #define g_SwappedPositions    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 32)
+ #define g_SintTexcoords       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 36)
++#define g_SwappedBlendIndices vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 40)
++#define g_PackedInputs        vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 44)
++#define g_IntInputs           vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_INPUTS_OFFSET + 0)
+ 
+ // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
+ //
+@@ -253,6 +270,157 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -218,14 +244,75 @@ index ee3830d..d3a3627 100644
 +    return result;
 +}
 +
++// A vertex input indexed by a register the shader computed, with the stream,
++// format, stride and offset of the live (bind-time patched) instruction.
++float4 vfetchLive(uint k, float index)
++{
++    uint4 d = vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + RENUT_SHARED_FETCH_OFFSET + k * 16, 0x10);
++    return vfetchStreamFormat(d.x & 0xFF, index, d.y, d.z, (d.x >> 8) & 0xFF, (d.x >> 16) & 0xFF, asfloat(d.w));
++}
++
  // Per-stage float4 constant file. The recompiler picks the stage by defining
  // RENUT_STAGE_CONSTANTS to the matching push-constant address.
  #define cReg(INDEX) \
+@@ -289,7 +457,10 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+     uint   g_SwappedBlendWeights             : packoffset(c67.w); \
+     uint   g_SwappedPositions                : packoffset(c68.x); \
+     uint   g_SintTexcoords                   : packoffset(c68.y); \
+-    float4 g_ViewportScaleOffset             : packoffset(c69);
++    uint   g_SwappedBlendIndices             : packoffset(c68.z); \
++    uint   g_PackedInputs                    : packoffset(c68.w); \
++    float4 g_ViewportScaleOffset             : packoffset(c69); \
++    uint   g_IntInputs                       : packoffset(c78.x);
+ 
+ #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
+ #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
+@@ -483,6 +654,25 @@ float4 tfetchR11G11B10(float4 value)
+     return value;
+ }
+ 
++// 2_10_10_10 signed normalized (N&B's normals, tangents and some texcoords):
++// no host vertex format matches, so the host binds the 32 bits as R32_FLOAT
++// and flags the input's location in g_PackedInputs.
++float4 unpackInput(float4 value, uint location)
++{
++    if ((g_PackedInputs & (1u << location)) != 0)
++    {
++        uint v = asuint(value.x);
++        int4 s = int4(int(v << 22) >> 22, int(v << 12) >> 22, int(v << 2) >> 22, int(v) >> 30);
++        return max(float4(s) / float4(511.0, 511.0, 511.0, 1.0), -1.0);
++    }
++    // Integer formats read as numbers (UBYTE4, SHORT2/4): the host binds them
++    // as UINT/SINT, which reaches a float input as raw bits, and the hardware
++    // would have handed the shader the value as a float.
++    if ((g_IntInputs & (1u << location)) != 0)
++        return float4(asint(value));
++    return value;
++}
++
+ // Undo the engine bswap32 16-bit-pair swap (.yxwz) for any 16-bit-packed semantic flagged in the mask.
+ float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
+ {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..262751f 100644
+index c71e7c9..7287c22 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
-@@ -77,6 +77,18 @@ static constexpr const char* USAGE_SEMANTICS[] =
+@@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
+ {
+     "float4", // POSITION
+     "float4", // BLENDWEIGHT
++#ifdef RENUT_RECOMP
++    // The hardware hands every vfetch to the shader as floats, and N&B stores
++    // bone indices as UBYTE4N (scaled by 255 in the shader) and FLOAT16_2 as
++    // well as UBYTE4, so the input is the float the guest shader expected.
++    "float4", // BLENDINDICES
++#else
+     "uint4", // BLENDINDICES
++#endif
+ #ifdef RENUT_RECOMP
+     // BD IA-decodes SNORM normals to float; swapFloats() undoes the engine int16-pair swap, DEC3N goes through tfetchR11G11B10().
+     "float4", // NORMAL
+@@ -77,6 +84,18 @@ static constexpr const char* USAGE_SEMANTICS[] =
      "SAMPLE"
  };
  
@@ -244,10 +331,66 @@ index c71e7c9..262751f 100644
  struct DeclUsageLocation
  {
      DeclUsage usage;
-@@ -224,8 +236,17 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -196,6 +215,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     }
+ 
+     indent();
++#ifdef RENUT_RECOMP
++    markWritten(uint32_t(instr.dstRegister));
++#endif
+     print("r{}.", instr.dstRegister);
+     printDstSwizzle(instr.dstSwizzle, false);
+ 
+@@ -222,10 +244,62 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     // vertex fetch constant 95 - StreamNumber, and the instruction names fetch
+     // constant constIndex * 3 + constIndexSelect. So the host binds the stream
      // and this reads it as a raw buffer.
-     if (findResult == vertexElements.end())
+-    if (findResult == vertexElements.end())
++    // A declared input indexed by a register the shader computed is not
++    // indexed by the vertex id, so the host input assembler cannot fetch it.
++    const bool indexedByComputedRegister =
++        findResult != vertexElements.end() && isWritten(uint32_t(instr.srcRegister));
++    if (indexedByComputedRegister)
      {
++        if (!instr.isMiniFetch)
++        {
++            lastFullFetch = instr;
++            haveLastFullFetch = true;
++        }
++
++        // D3D rewrites the vfetch at bind time for the vertex buffer actually
++        // bound, so the stream, format, stride and offset in the microcode as
++        // registered are not the ones in use. The host decodes the live
++        // instruction at fetchAddress and fills slot k of the fetch table.
++        const uint32_t k = liveFetchCount++;
++        ShaderInputElement element{};
++        element.usage = uint8_t(findResult->second.usage);
++        element.usageIndex = uint8_t(findResult->second.usageIndex);
++        element.location = RENUT_LIVE_FETCH_LOCATION;
++        element.slot = uint8_t(k);
++        element.fetchAddress = uint16_t(address);
++        inputLayout.push_back(element);
++
++        indent();
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
++        print(" = vfetchLive({}, r{}.{}).", k, uint32_t(instr.srcRegister),
++            SWIZZLES[uint32_t(instr.srcSwizzle) & 3]);
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
++    if (findResult == vertexElements.end() || indexedByComputedRegister)
++    {
 +        if (!instr.isMiniFetch)
 +        {
 +            lastFullFetch = instr;
@@ -263,7 +406,7 @@ index c71e7c9..262751f 100644
  
          // The fetch constants above 95 are not stream sources at all, and a
          // negative stream is not one either. Either way there is nothing to
-@@ -236,15 +257,34 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -236,15 +310,34 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
                  address, fetchConstant);
              out += "0.0;\n";
          }
@@ -302,7 +445,7 @@ index c71e7c9..262751f 100644
          else
          {
              // stride and offset are in dwords, which is what makes a 16-stride
-@@ -252,7 +292,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -252,7 +345,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
              // overlapping ones.
              print("vfetchStream({}, r{}.{}, {}, {})", 95 - fetchConstant,
                  uint32_t(instr.srcRegister), SWIZZLES[uint32_t(instr.srcSwizzle) & 3],
@@ -311,7 +454,17 @@ index c71e7c9..262751f 100644
  
              out += '.';
              printDstSwizzle(instr.dstSwizzle, true);
-@@ -372,13 +412,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -292,6 +385,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     case DeclUsage::BlendWeight:
+         print("swapFloats(g_SwappedBlendWeights, ");
+         break;
++    case DeclUsage::BlendIndices:
++        print("swapFloats(g_SwappedBlendIndices, ");
++        break;
+     case DeclUsage::TexCoord:
+         print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
+         break;
+@@ -372,13 +468,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
              // is the whole point of one, reading a different field of the same
              // vertex.
              element.offsetBytes = uint16_t(uint32_t(instr.offset) * 4);
@@ -330,3 +483,114 @@ index c71e7c9..262751f 100644
  
              for (auto& usageLocation : USAGE_LOCATIONS)
              {
+@@ -406,7 +505,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     }
+ #endif
+ 
++#ifdef RENUT_RECOMP
++    // Formats with no host vertex format (2_10_10_10) arrive as raw bits;
++    // unpackInput() decodes them for the locations the host flags.
++    {
++        uint32_t inputLocation = 0xFF;
++        for (auto& usageLocation : USAGE_LOCATIONS)
++        {
++            if (usageLocation.usage == findResult->second.usage &&
++                usageLocation.usageIndex == uint32_t(findResult->second.usageIndex))
++            {
++                inputLocation = usageLocation.location;
++                break;
++            }
++        }
++        print("unpackInput(i{}{}, {})", USAGE_VARIABLES[uint32_t(findResult->second.usage)],
++              uint32_t(findResult->second.usageIndex), inputLocation);
++    }
++#else
+     print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
++#endif
+ 
+ #ifdef RENUT_RECOMP
+     switch (findResult->second.usage)
+@@ -423,6 +541,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+         break;
+ 
+     case DeclUsage::BlendWeight:
++    case DeclUsage::BlendIndices:
+     case DeclUsage::Position:
+         print(", {})", uint32_t(findResult->second.usageIndex));
+         break;
+@@ -517,6 +636,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
+     }
+ 
+     indent();
++#ifdef RENUT_RECOMP
++    markWritten(uint32_t(instr.dstRegister));
++#endif
+     print("r{}.", instr.dstRegister);
+     printDstSwizzle(instr.dstSwizzle, false);
+ 
+@@ -1034,6 +1156,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         }
+         else
+         {
++#ifdef RENUT_RECOMP
++            markWritten(uint32_t(instr.vectorDest));
++#endif
+             print("r{}.", instr.vectorDest);
+         }
+ 
+@@ -1421,6 +1546,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         }
+         else
+         {
++#ifdef RENUT_RECOMP
++            markWritten(uint32_t(instr.scalarDest));
++#endif
+             print("r{}.", instr.scalarDest);
+         }
+ 
+@@ -1689,6 +1817,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
+         }
+ 
++    #ifdef RENUT_RECOMP
++        // The hardware loads the vertex index into r0.x before the shader runs.
++        out += "\tin uint iVertexId : SV_VertexID,\n";
++    #endif
+     #ifdef UNLEASHED_RECOMP
+         if (hasIndexCount)
+         {
+@@ -1828,6 +1960,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+             }
++        #ifdef RENUT_RECOMP
++            else if (!isPixelShader && i == 0)
++            {
++                out += "float4(float(iVertexId), 0.0, 0.0, 0.0);\n";
++            }
++        #endif
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
+             {
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index 9c94800..91f7747 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -50,6 +50,17 @@ struct ShaderRecompiler : StringBuffer
+     // emitted (then-branch close is part of the event, not ifEndLabels).
+     std::unordered_set<uint32_t> elseLabels;
+     uint32_t specConstantsMask = 0;
++#ifdef RENUT_RECOMP
++    // General purpose registers some instruction has written so far, in
++    // emission order. A vfetch indexed by one of them is not indexed by the
++    // vertex id (N&B divides the index to instance meshes: vertex =
++    // floor(index / 32), instance = the remainder), so it cannot be a vertex
++    // input and reads its stream directly.
++    uint64_t writtenRegisters[2] = {};
++    uint32_t liveFetchCount = 0;
++    void markWritten(uint32_t reg) { if (reg < 128) writtenRegisters[reg / 64] |= 1ull << (reg % 64); }
++    bool isWritten(uint32_t reg) const { return reg < 128 && (writtenRegisters[reg / 64] >> (reg % 64)) & 1; }
++#endif
+ 
+ #ifdef RENUT_RECOMP
+     // Constant registers the shader's own float4 definition table initialises.
