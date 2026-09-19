@@ -1,0 +1,332 @@
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index c1b854e..e3a571b 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -96,7 +96,8 @@ int main(int argc, char** argv)
+         std::vector<std::unique_ptr<uint8_t[]>> files;
+         std::map<XXH64_hash_t, RecompiledShader> shaders;
+ 
+-        for (auto& file : std::filesystem::recursive_directory_iterator(input))
++        for (auto& file : std::filesystem::recursive_directory_iterator(input,
++            std::filesystem::directory_options::follow_directory_symlink))
+         {
+             if (std::filesystem::is_directory(file))
+             {
+@@ -243,7 +244,17 @@ int main(int argc, char** argv)
+             fmt::println(stderr, "Recompile failures ({}):", g_failures.size());
+             for (const auto& failure : g_failures)
+                 fmt::println(stderr, "  hash=0x{:016X} reason={}", failure.hash, failure.reason);
+-            return 2;
++
++            // Opt-in: write the cache without the shaders that failed, for
++            // callers that have already accounted for every failure.
++            const char* allow = std::getenv("XENOS_RECOMP_ALLOW_FAILURES");
++            if (allow == nullptr || allow[0] != '1')
++                return 2;
++
++            for (const auto& failure : g_failures)
++                shaders.erase(failure.hash);
++
++            fmt::println(stderr, "Leaving {} failed shaders out of the cache.", g_failures.size());
+         }
+ 
+         fmt::println("Creating shader cache...");
+@@ -288,10 +299,10 @@ int main(int argc, char** argv)
+ 
+         for (const ShaderInputElement& element : inputElements)
+         {
+-            f.println("\t{{ {}, {}, {}, {}, {}, {}, {}, {}, {}, 0 }},",
++            f.println("\t{{ {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, {} }},",
+                 element.usage, element.usageIndex, element.location, element.slot,
+                 element.offsetBytes, element.strideBytes, element.format, element.isSigned,
+-                element.isNormalized);
++                element.isNormalized, element.fetchAddress);
+         }
+ 
+         f.println("}};");
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index ee3830d..d3a3627 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -136,7 +136,7 @@
+ // declaration in hand builds its input layout out of this instead.
+ //
+ // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
+-// `isNormalized` come from the instruction's signedRfModeAll and numFormatAll
++// `isNormalized` come from the instruction's formatCompAll and numFormatAll
+ // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
+ struct ShaderInputElement
+ {
+@@ -152,6 +152,13 @@ struct ShaderInputElement
+     uint8_t isSigned;
+     uint8_t isNormalized;
+     uint8_t padding;
++
++    // Instruction slot of the vfetch that reads this element. Direct3D
++    // rewrites a vertex shader's vfetch instructions (stream, format, stride,
++    // offset) when it binds the shader to a vertex declaration, so the fields
++    // above only describe the shader as registered; a host that sees the
++    // bound microcode decodes the live values from this instruction.
++    uint16_t fetchAddress;
+ };
+ #endif
+ 
+@@ -253,6 +260,149 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+     return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
+ }
+ 
++// The same fetch for every other Xenos vertex format.
++//
++// The host uploads streams swapped per 32-bit word (k_8in32), so each dword
++// reads back as the guest's own value and the component layout is the one the
++// hardware documents: X in the low bits. `flags` packs the instruction's
++// format_comp_all (bit 0, signed), num_format_all (bit 1, integer rather than
++// fraction) and signed_rf_mode_all (bit 2, full range); `expScale` is
++// 2^exp_adjust. Components the format lacks read as (0, 0, 0, 1), and the
++// destination swizzle picks what it needs from that.
++float vfetchNormalize(uint raw, uint bits, uint flags)
++{
++    bool isSigned = (flags & 1) != 0;
++    bool isInteger = (flags & 2) != 0;
++    bool isFullRange = (flags & 4) != 0;
++
++    if (isSigned)
++    {
++        int value = int(raw << (32 - bits)) >> (32 - bits);
++        if (isInteger)
++            return float(value);
++        float maxValue = float((1u << (bits - 1)) - 1);
++        if (isFullRange)
++            return (float(value) * 2.0 + 1.0) / (maxValue * 2.0 + 1.0);
++        return max(float(value) / maxValue, -1.0);
++    }
++
++    if (isInteger)
++        return float(raw);
++    return float(raw) / float((1u << bits) - 1);
++}
++
++float4 vfetchStreamFormat(uint stream, float index, uint strideBytes, uint offsetBytes,
++    uint format, uint flags, float expScale)
++{
++    uint64_t address = vk::RawBufferLoad<uint64_t>(
++        g_PushConstants.SharedConstants + RENUT_SHARED_STREAMS_OFFSET + stream * 8, 0x8);
++
++    if (address == 0)
++        return 0.0;
++
++    address += uint(index) * strideBytes + offsetBytes;
++
++    float4 result = float4(0.0, 0.0, 0.0, 1.0);
++    bool isFloat = false;
++
++    switch (format)
++    {
++    case 6: // k_8_8_8_8
++    {
++        uint w = vk::RawBufferLoad<uint>(address, 4);
++        result = float4(vfetchNormalize(w & 0xFF, 8, flags), vfetchNormalize((w >> 8) & 0xFF, 8, flags),
++            vfetchNormalize((w >> 16) & 0xFF, 8, flags), vfetchNormalize(w >> 24, 8, flags));
++        break;
++    }
++    case 7: // k_2_10_10_10
++    {
++        uint w = vk::RawBufferLoad<uint>(address, 4);
++        result = float4(vfetchNormalize(w & 0x3FF, 10, flags), vfetchNormalize((w >> 10) & 0x3FF, 10, flags),
++            vfetchNormalize((w >> 20) & 0x3FF, 10, flags), vfetchNormalize(w >> 30, 2, flags));
++        break;
++    }
++    case 16: // k_10_11_11
++    {
++        uint w = vk::RawBufferLoad<uint>(address, 4);
++        result.xyz = float3(vfetchNormalize(w & 0x7FF, 11, flags), vfetchNormalize((w >> 11) & 0x7FF, 11, flags),
++            vfetchNormalize(w >> 22, 10, flags));
++        break;
++    }
++    case 17: // k_11_11_10
++    {
++        uint w = vk::RawBufferLoad<uint>(address, 4);
++        result.xyz = float3(vfetchNormalize(w & 0x3FF, 10, flags), vfetchNormalize((w >> 10) & 0x7FF, 11, flags),
++            vfetchNormalize(w >> 21, 11, flags));
++        break;
++    }
++    case 25: // k_16_16
++    {
++        uint w = vk::RawBufferLoad<uint>(address, 4);
++        result.xy = float2(vfetchNormalize(w & 0xFFFF, 16, flags), vfetchNormalize(w >> 16, 16, flags));
++        break;
++    }
++    case 26: // k_16_16_16_16
++    {
++        uint2 w = vk::RawBufferLoad<uint2>(address, 4);
++        result = float4(vfetchNormalize(w.x & 0xFFFF, 16, flags), vfetchNormalize(w.x >> 16, 16, flags),
++            vfetchNormalize(w.y & 0xFFFF, 16, flags), vfetchNormalize(w.y >> 16, 16, flags));
++        break;
++    }
++    case 31: // k_16_16_FLOAT
++    {
++        uint w = vk::RawBufferLoad<uint>(address, 4);
++        result.xy = f16tof32(uint2(w & 0xFFFF, w >> 16));
++        isFloat = true;
++        break;
++    }
++    case 32: // k_16_16_16_16_FLOAT
++    {
++        uint2 w = vk::RawBufferLoad<uint2>(address, 4);
++        result = f16tof32(uint4(w.x & 0xFFFF, w.x >> 16, w.y & 0xFFFF, w.y >> 16));
++        isFloat = true;
++        break;
++    }
++    case 33: // k_32
++        result.x = vfetchNormalize(vk::RawBufferLoad<uint>(address, 4), 32, flags | 2);
++        break;
++    case 34: // k_32_32
++    {
++        uint2 w = vk::RawBufferLoad<uint2>(address, 4);
++        result.xy = float2(vfetchNormalize(w.x, 32, flags | 2), vfetchNormalize(w.y, 32, flags | 2));
++        break;
++    }
++    case 35: // k_32_32_32_32
++    {
++        uint4 w = vk::RawBufferLoad<uint4>(address, 4);
++        result = float4(vfetchNormalize(w.x, 32, flags | 2), vfetchNormalize(w.y, 32, flags | 2),
++            vfetchNormalize(w.z, 32, flags | 2), vfetchNormalize(w.w, 32, flags | 2));
++        break;
++    }
++    case 36: // k_32_FLOAT
++        result.x = vk::RawBufferLoad<float>(address, 4);
++        isFloat = true;
++        break;
++    case 37: // k_32_32_FLOAT
++        result.xy = vk::RawBufferLoad<float2>(address, 4);
++        isFloat = true;
++        break;
++    case 38: // k_32_32_32_32_FLOAT
++        result = vk::RawBufferLoad<float4>(address, 4);
++        isFloat = true;
++        break;
++    case 57: // k_32_32_32_FLOAT
++        result.xyz = vk::RawBufferLoad<float3>(address, 4);
++        isFloat = true;
++        break;
++    }
++
++    // exp_adjust scales fixed-point results only; floats pass through.
++    if (!isFloat)
++        result *= expScale;
++
++    return result;
++}
++
+ // Per-stage float4 constant file. The recompiler picks the stage by defining
+ // RENUT_STAGE_CONSTANTS to the matching push-constant address.
+ #define cReg(INDEX) \
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index c71e7c9..262751f 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -77,6 +77,18 @@ static constexpr const char* USAGE_SEMANTICS[] =
+     "SAMPLE"
+ };
+ 
++static bool isStreamFetchFormatSupported(uint32_t format)
++{
++    switch (format)
++    {
++    case 6: case 7: case 16: case 17: case 25: case 26: case 31: case 32:
++    case 33: case 34: case 35: case 36: case 37: case 38: case 57:
++        return true;
++    default:
++        return false;
++    }
++}
++
+ struct DeclUsageLocation
+ {
+     DeclUsage usage;
+@@ -224,8 +236,17 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     // and this reads it as a raw buffer.
+     if (findResult == vertexElements.end())
+     {
++        if (!instr.isMiniFetch)
++        {
++            lastFullFetch = instr;
++            haveLastFullFetch = true;
++        }
++
++        const VertexFetchInstruction& fetchSource =
++            (instr.isMiniFetch && haveLastFullFetch) ? lastFullFetch : instr;
++
+         const uint32_t fetchConstant =
+-            uint32_t(instr.constIndex) * 3 + uint32_t(instr.constIndexSelect);
++            uint32_t(fetchSource.constIndex) * 3 + uint32_t(fetchSource.constIndexSelect);
+ 
+         // The fetch constants above 95 are not stream sources at all, and a
+         // negative stream is not one either. Either way there is nothing to
+@@ -236,15 +257,34 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+                 address, fetchConstant);
+             out += "0.0;\n";
+         }
+-        else if (instr.format != 38)
++        else if (!isStreamFetchFormatSupported(uint32_t(instr.format)))
+         {
+-            // 38 is k_32_32_32_32_FLOAT, the only format every one of these
+-            // fetches uses. Anything else needs its own unpack, and reading it
+-            // as four floats would be silently wrong rather than missing.
++            // Reading an unknown format as anything would be silently wrong
++            // rather than missing.
+             error("vfetch from address {} on stream {} has unsupported format {}",
+                 address, 95 - fetchConstant, uint32_t(instr.format));
+             out += "0.0;\n";
+         }
++        else if (instr.format != 38 || instr.expAdjust != 0)
++        {
++            // Skinning's bone rows (k_32_32_32_32_FLOAT) keep the aligned fast
++            // path below; everything else - N&B's particle and sprite shaders
++            // pull k_8_8_8_8 colours and k_16_16 corners the same way - goes
++            // through the generic unpack.
++            const uint32_t flags = uint32_t(instr.formatCompAll) |
++                (uint32_t(instr.numFormatAll) << 1) | (uint32_t(instr.signedRfModeAll) << 2);
++
++            print("vfetchStreamFormat({}, r{}.{}, {}, {}, {}, {}, {})", 95 - fetchConstant,
++                uint32_t(instr.srcRegister), SWIZZLES[uint32_t(instr.srcSwizzle) & 3],
++                uint32_t(fetchSource.stride) * 4, uint32_t(instr.offset) * 4,
++                uint32_t(instr.format), flags, std::ldexp(1.0f, int32_t(instr.expAdjust)));
++
++            out += '.';
++            printDstSwizzle(instr.dstSwizzle, true);
++            out += ";\n";
++
++            printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++        }
+         else
+         {
+             // stride and offset are in dwords, which is what makes a 16-stride
+@@ -252,7 +292,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+             // overlapping ones.
+             print("vfetchStream({}, r{}.{}, {}, {})", 95 - fetchConstant,
+                 uint32_t(instr.srcRegister), SWIZZLES[uint32_t(instr.srcSwizzle) & 3],
+-                uint32_t(instr.stride) * 4, uint32_t(instr.offset) * 4);
++                uint32_t(fetchSource.stride) * 4, uint32_t(instr.offset) * 4);
+ 
+             out += '.';
+             printDstSwizzle(instr.dstSwizzle, true);
+@@ -372,13 +412,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+             // is the whole point of one, reading a different field of the same
+             // vertex.
+             element.offsetBytes = uint16_t(uint32_t(instr.offset) * 4);
++            element.fetchAddress = uint16_t(address);
+             element.strideBytes = uint16_t(uint32_t(source.stride) * 4);
+             element.format = uint8_t(source.format);
+ 
+             // numFormatAll clear means the components are fractions - the
+-            // normalised reading - and set means raw integers.
++            // normalised reading - and set means raw integers. Signedness is
++            // formatCompAll; signedRfModeAll only picks how a signed fraction
++            // maps to [-1, 1] (xenia's is_signed() / signed_rf_mode()).
+             element.isNormalized = source.numFormatAll ? 0 : 1;
+-            element.isSigned = source.signedRfModeAll ? 1 : 0;
++            element.isSigned = source.formatCompAll ? 1 : 0;
+ 
+             for (auto& usageLocation : USAGE_LOCATIONS)
+             {

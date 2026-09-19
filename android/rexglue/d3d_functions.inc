@@ -221,3 +221,8 @@ X(Direct3DDevice_Release, D3DDevice_Release)
 X(Direct3DDevice_CreateTexture, D3DDevice_CreateTexture)
 X(D3DDevice_BlockUntilIdle, D3DDevice_BlockUntilIdle)
 X(D3D__UninitializeDevice, D3D_UninitializeDevice)
+// Shader registration for in-place shader objects (model shaders loaded from
+// the CAFF bundles never go through Create*Shader). Addresses from the same
+// symbol map: nut_XGRegisterVertexShader / nut_XGRegisterPixelShader.
+X(sub_8264E7B8, XGRegisterVertexShader)
+X(sub_8264E670, XGRegisterPixelShader)

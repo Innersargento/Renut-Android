@@ -2,6 +2,7 @@
 
 #include "plume_vulkan.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -161,6 +162,69 @@ void PlumeRenderer::Present() {
   auto* wait = s.acquire.get();
   auto* signal = s.release[index].get();
   s.queue->executeCommandLists(&list, 1, &wait, 1, &signal, 1, s.fence.get());
+  s.swap->present(index, &signal, 1);
+  s.queue->waitForCommandFence(s.fence.get());
+  if (s.frames.fetch_add(1) == 0) {
+    REXLOG_INFO("Renut: Plume presented its first frame");
+  }
+}
+
+RenderDevice* PlumeRenderer::device() const { return state_->device.get(); }
+RenderCommandQueue* PlumeRenderer::queue() const { return state_->queue.get(); }
+
+void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* source,
+                                     uint32_t width, uint32_t height) {
+  auto& s = *state_;
+  uint32_t index = 0;
+  bool acquired = s.swap->acquireTexture(s.acquire.get(), &index);
+  if (!acquired) {
+    // Still run the frame: the guest's fences and resolved textures depend on it.
+    if (frame) {
+      const RenderCommandList* list = frame;
+      s.queue->executeCommandLists(&list, 1, nullptr, 0, nullptr, 0, s.fence.get());
+      s.queue->waitForCommandFence(s.fence.get());
+    }
+    s.swap->resize();
+    return;
+  }
+  auto* target = s.swap->getTexture(index);
+  s.commands->begin();
+  s.commands->barriers(RenderBarrierStage::COPY,
+                       RenderTextureBarrier(target, RenderTextureLayout::COPY_DEST));
+  VkCommandBuffer cb = static_cast<VulkanCommandList*>(s.commands.get())->vk;
+  VkImage dst = static_cast<VulkanTexture*>(target)->vk;
+  VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  // Black around a letterboxed frame; the game's last clear colour otherwise.
+  VkClearColorValue background{};
+  if (!source) {
+    std::lock_guard lock(s.color_mutex);
+    for (int i = 0; i < 4; ++i) background.float32[i] = s.clear_color[i];
+  }
+  vkCmdClearColorImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &background, 1, &range);
+  if (source && width && height) {
+    // Letterbox: keep the guest's aspect ratio inside the swapchain.
+    const float sw = float(s.swap->getWidth()), sh = float(s.swap->getHeight());
+    const float scale = std::min(sw / float(width), sh / float(height));
+    const int32_t w = int32_t(float(width) * scale), h = int32_t(float(height) * scale);
+    const int32_t x = (int32_t(sw) - w) / 2, y = (int32_t(sh) - h) / 2;
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[0] = {x, y, 0};
+    blit.dstOffsets[1] = {x + w, y + h, 1};
+    vkCmdBlitImage(cb, static_cast<VulkanTexture*>(source)->vk,
+                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &blit, VK_FILTER_LINEAR);
+  }
+  s.commands->barriers(RenderBarrierStage::NONE,
+                       RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
+  s.commands->end();
+  const RenderCommandList* lists[] = {frame, s.commands.get()};
+  auto* wait = s.acquire.get();
+  auto* signal = s.release[index].get();
+  s.queue->executeCommandLists(frame ? lists : lists + 1, frame ? 2 : 1, &wait, 1, &signal, 1,
+                               s.fence.get());
   s.swap->present(index, &signal, 1);
   s.queue->waitForCommandFence(s.fence.get());
   if (s.frames.fetch_add(1) == 0) {

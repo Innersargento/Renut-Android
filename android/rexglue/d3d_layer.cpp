@@ -21,8 +21,8 @@ REXCVAR_DEFINE_STRING(renut_renderer, "xenos", "reNut",
                       "Renderer: xenos (RexGlue's emulated Xenos GPU) or plume (native "
                       "renderer driven by the game's Direct3D calls; in development)");
 REXCVAR_DEFINE_BOOL(renut_d3d_dump_shaders, true, "reNut",
-                    "Save every shader container passed to CreateVertexShader and "
-                    "CreatePixelShader, for offline recompilation");
+                    "Save every shader the game creates or registers (Create*Shader, "
+                    "XGRegister*Shader) as a complete container, for offline recompilation");
 REXCVAR_DEFINE_INT32(renut_d3d_report_swaps, 600, "reNut",
                      "Log the most called Direct3D functions every N swaps (0 = off)");
 
@@ -47,30 +47,59 @@ uint32_t LoadBE32(const uint8_t* p) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
 }
 
-// Shader containers begin with flags 0x102A11xx, then virtual and physical
-// sizes; the physical part (microcode) follows the virtual part.
-void DumpShader(uint8_t* base, uint32_t guest_address, const char* kind) {
-  if (!REXCVAR_GET(renut_d3d_dump_shaders) || !guest_address) {
+bool IsContainer(const uint8_t* data) {
+  return (LoadBE32(data) & 0xFFFFFF00) == 0x102A1100 && LoadBE32(data + 28) == 0 &&
+         LoadBE32(data + 32) == 0;
+}
+
+// Saves a complete shader container - the virtual part the object was built
+// from, followed by the physical part (literals and microcode) the GPU reads -
+// once the object is registered, so the microcode is byte for byte what the
+// command processor is handed (XGRegisterVertexShader patches it).
+//
+// Object layout, from the recompiled XGRegisterVertexShader/PixelShader and
+// XGGetMicrocodeShaderParts: a vertex shader object is 872 bytes, a pixel
+// shader object 40, and the container's virtual part follows the object. The
+// physical part's guest address is stored at +32 (vertex) or +24 (pixel).
+void DumpShaderObject(uint8_t* base, uint32_t object, bool vertex) {
+  if (!REXCVAR_GET(renut_d3d_dump_shaders) || !object) {
     return;
   }
-  const uint8_t* data = base + guest_address;
-  uint32_t flags = LoadBE32(data);
-  uint64_t size = uint64_t(LoadBE32(data + 4)) + LoadBE32(data + 8);
-  if ((flags & 0xFFFFFF00) != 0x102A1100 || size < 36 || size > (16u << 20)) {
+  uint32_t container = 0;
+  for (uint32_t offset : {vertex ? 872u : 40u, vertex ? 40u : 872u}) {
+    if (IsContainer(base + object + offset)) {
+      container = object + offset;
+      break;
+    }
+  }
+  if (!container) {
+    static std::atomic<int> warned{0};
+    if (warned.fetch_add(1) < 8) {
+      REXLOG_WARN("Renut: shader object {:08X} has no container after it", object);
+    }
     return;
   }
+  const uint8_t* header = base + container;
+  uint32_t virtual_size = LoadBE32(header + 4);
+  uint32_t physical_size = LoadBE32(header + 8);
+  uint32_t physical = LoadBE32(base + object + (vertex ? 32 : 24));
+  if (!physical || virtual_size < 36 || virtual_size > (1u << 20) || physical_size > (1u << 20)) {
+    return;
+  }
+  std::vector<uint8_t> blob(header, header + virtual_size);
+  blob.insert(blob.end(), base + physical, base + physical + physical_size);
   // FNV-1a: stable across runs, good enough to deduplicate files.
   uint64_t hash = 0xCBF29CE484222325ull;
-  for (uint64_t i = 0; i < size; ++i) {
-    hash = (hash ^ data[i]) * 0x100000001B3ull;
+  for (uint8_t byte : blob) {
+    hash = (hash ^ byte) * 0x100000001B3ull;
   }
   std::lock_guard lock(dump_mutex);
   if (dump_directory.empty() || !dumped.insert(hash).second) {
     return;
   }
-  auto path = fmt::format("{}/{}_{:016X}.bin", dump_directory, kind, hash);
+  auto path = fmt::format("{}/{}_{:016X}.bin", dump_directory, vertex ? "vs" : "ps", hash);
   if (FILE* file = std::fopen(path.c_str(), "wb")) {
-    std::fwrite(data, 1, size_t(size), file);
+    std::fwrite(blob.data(), 1, blob.size(), file);
     std::fclose(file);
   }
 }
@@ -96,11 +125,7 @@ void Report() {
 // Called for every intercepted function. Returns true if a handler took it.
 inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
   counts[function].fetch_add(1, std::memory_order_relaxed);
-  if (function == kD3DDevice_CreateVertexShader) {
-    DumpShader(base, ctx.r3.u32, "vs");
-  } else if (function == kD3DDevice_CreatePixelShader) {
-    DumpShader(base, ctx.r3.u32, "ps");
-  } else if (function == kD3DDevice_Swap) {
+  if (function == kD3DDevice_Swap) {
     static std::atomic<uint32_t> swaps{0};
     int32_t every = REXCVAR_GET(renut_d3d_report_swaps);
     if (every > 0 && (++swaps % uint32_t(every)) == 0) {
@@ -115,6 +140,27 @@ inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
 }
 
 }  // namespace
+
+// Called after the original (or a handler) ran; `r3`/`r4` are the arguments
+// it was called with.
+inline void Leave(Function function, uint32_t r3, uint32_t r4, PPCContext& ctx, uint8_t* base) {
+  switch (function) {
+    case kXGRegisterVertexShader:
+      DumpShaderObject(base, r3, true);
+      break;
+    case kXGRegisterPixelShader:
+      DumpShaderObject(base, r3, false);
+      break;
+    case kD3DDevice_CreateVertexShader:
+      DumpShaderObject(base, ctx.r3.u32, true);
+      break;
+    case kD3DDevice_CreatePixelShader:
+      DumpShaderObject(base, ctx.r3.u32, false);
+      break;
+    default:
+      break;
+  }
+}
 
 bool PlumeActive() {
   int mode = plume_mode.load(std::memory_order_relaxed);
@@ -149,9 +195,11 @@ void SetShaderDumpDirectory(std::string directory) {
 #define X(symbol, name)                                                          \
   extern "C" void __imp__##symbol(PPCContext& __restrict, uint8_t*);             \
   REX_EXTERN(symbol) {                                                           \
+    const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;                             \
     if (!renut::d3d::Enter(renut::d3d::k##name, ctx, base)) {                    \
       __imp__##symbol(ctx, base);                                                \
     }                                                                            \
+    renut::d3d::Leave(renut::d3d::k##name, r3, r4, ctx, base);                   \
   }
 #include "d3d_functions.inc"
 #undef X

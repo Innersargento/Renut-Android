@@ -31,7 +31,8 @@ contêineres embutidos no executável do Banjo:
 | Falha | 51 | `vfetch` em endereço fora da declaração de vértices (busca manual) |
 | Falha | 13 | export para `eA` (32): memexport, partículas |
 
-Ambos exigem estender o XenosRecomp. Os 238 shaders capturados em jogo ainda não foram
+Ambos exigem estender o XenosRecomp — feito em 19/09 com o fork do reNut; ver
+`docs/SHADERS-PLUME.md` (105/105 do XEX). Os 238 shaders capturados em jogo ainda não foram
 passados pela ferramenta.
 
 ## Achado que muda o plano

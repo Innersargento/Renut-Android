@@ -110,6 +110,11 @@ add_subdirectory("${REXGLUE_ROOT}/src/kernel" kernel)
 add_subdirectory("${REXGLUE_ROOT}/src/graphics" graphics)
 target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
 target_compile_options(rexgpu-xenos PRIVATE -O2)
+# The native Plume backend (plume_gpu.cpp) derives from the plugin's
+# GraphicsSystem/CommandProcessor and uses its register decoding helpers, so
+# the plugin exports its symbols instead of only rex_gpu_create.
+set_target_properties(rexgpu-xenos PROPERTIES CXX_VISIBILITY_PRESET default
+    VISIBILITY_INLINES_HIDDEN OFF)
 target_compile_definitions(rexui PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
 
 include("${RENUT_ROOT}/generated/android/sources.cmake")
@@ -120,7 +125,17 @@ target_link_libraries(renut_guest PRIVATE rexruntime)
 # CPU inside two guest functions, so this target's level matters most.
 target_compile_options(renut_guest PRIVATE -O2 -g0 -Wno-unused-variable -Wno-unused-label)
 target_precompile_headers(renut_guest PRIVATE "${RENUT_ROOT}/generated/android/renut_android_pch.h")
+# Native Plume renderer: the offline-recompiled shaders (generated/shaders, from
+# tools/shaders/recompile_shaders.sh) are compiled in; their smol-v blob is
+# embedded with .incbin.
+set(RENUT_SHADERS "${RENUT_ROOT}/generated/shaders")
+set_source_files_properties(shader_cache_blob.S PROPERTIES
+    COMPILE_OPTIONS "-DRENUT_SHADER_BLOB=\"${RENUT_SHADERS}/shader_spirv.smolv\""
+    OBJECT_DEPENDS "${RENUT_SHADERS}/shader_spirv.smolv")
 add_library(renut_runtime SHARED runtime_jni.cpp plume_graphics.cpp game_fixes.cpp
-    d3d_layer.cpp plume_d3d.cpp plume_renderer.cpp $<TARGET_OBJECTS:renut_guest>)
-target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android")
-target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume adrenotools android log dl)
+    d3d_layer.cpp plume_d3d.cpp plume_renderer.cpp plume_gpu.cpp plume_textures.cpp shader_cache_blob.S
+    "${RENUT_SHADERS}/shader_cache.cpp" thirdparty/smolv/smolv.cpp $<TARGET_OBJECTS:renut_guest>)
+target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/smolv")
+target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume adrenotools
+    xxHash::xxhash android log dl)

@@ -7,3 +7,4 @@
 /android/local.properties
 /android/**/build/
 /android/**/.cxx/
+__pycache__/

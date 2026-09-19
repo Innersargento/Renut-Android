@@ -18,6 +18,7 @@
 #include "touch_input.h"
 #include "d3d_layer.h"
 #include "plume_renderer.h"
+#include "plume_gpu.h"
 #include <rex/system/gpu_plugin.h>
 #include <rex/ui/presenter.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
@@ -204,14 +205,21 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
         std::string plume_error;
         if(!renut::PlumeRenderer::Start(window,&plume_error))throw std::runtime_error(plume_error);
         renut::d3d::RegisterPlumeHandlers();
-        note("Plume nativo: janela assumida; o Xenos segue sem apresentação.");
+        note("Plume nativo: janela assumida; desenhos, resolves e swaps executados pelo Plume com os shaders recompilados.");
       }else{
         runtime.set_app_context(game_context.get());
       }
       runtime.set_display_window(game_window.get());
-      rex::system::GpuCreateInfo info{sizeof(rex::system::GpuCreateInfo),"vulkan"};
-      config.graphics.reset(rex_gpu_create(rex::system::kGpuPluginAbiVersion,&info));
-      if(!config.graphics)throw std::runtime_error("Backend Xenos indisponível.");
+      if(renut::d3d::PlumeActive()){
+        // Native renderer: the command stream is parsed as before, but draws,
+        // resolves and swaps run on Plume with the recompiled shaders.
+        renut::SetPlumeMissDumpDirectory((root / "plume-miss").string());
+        config.graphics.reset(renut::CreatePlumeGraphicsSystem());
+      }else{
+        rex::system::GpuCreateInfo info{sizeof(rex::system::GpuCreateInfo),"vulkan"};
+        config.graphics.reset(rex_gpu_create(rex::system::kGpuPluginAbiVersion,&info));
+      }
+      if(!config.graphics)throw std::runtime_error("Backend gráfico indisponível.");
       config.audio_factory=REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
       config.input_factory=[](bool tool_mode){
         auto input=rex::input::CreateDefaultInputSystem(tool_mode);
