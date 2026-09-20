@@ -543,6 +543,8 @@ struct Stats {
   // Wall clock, in microseconds: whole frames, the pipelines built inside them
   // and the submit that ends them. What is left is the rest of the draw path.
   uint64_t frame_us = 0, pipeline_us = 0, submit_us = 0;
+  // Constant blocks a draw found already in the ring, out of three per draw.
+  uint64_t constants_reused = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -573,6 +575,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint8_t* Pointer(uint64_t offset) { return upload_data_ + offset; }
   uint64_t Address(uint64_t offset) const { return upload_address_ + offset; }
   bool UploadGuest(uint32_t address, uint32_t size, xenos::Endian endian, uint64_t& offset);
+  bool CommitConstants(uint8_t* shadow, const void* source, size_t size, uint64_t& offset);
 
   void BeginFrame();
   void Flush();
@@ -664,6 +667,33 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint64_t upload_used_ = 0;
   uint64_t zero_offset_ = 0;
   std::unordered_map<uint64_t, uint64_t> uploaded_streams_;
+  // Counted up every time the ring restarts, so a draw can tell that the
+  // blocks it placed there were dropped underneath it.
+  uint64_t upload_generation_ = 0;
+  // The three constant blocks a draw hands the shaders, kept between draws.
+  //
+  // The guest rewrites a few registers between draws and leaves the rest
+  // alone, so nearly every draw was copying the same 10 KB into a fresh
+  // stretch of the ring. Pointing it at the block the last draw left there
+  // saves the copy, and - what this is really for - lets the GPU read lines it
+  // already has: every constant a recompiled shader reads is a load from this
+  // buffer (cReg in shader_common.h), so a block per draw turns every one of
+  // those loads into a miss.
+  //
+  // The shadow copies are what the comparison reads. The ring itself is
+  // write-combined memory, which is slow to read back.
+  static constexpr size_t kStageConstantSize = 4096;
+  alignas(16) uint8_t vs_shadow_[kStageConstantSize] = {};
+  alignas(16) uint8_t ps_shadow_[kStageConstantSize] = {};
+  alignas(16) uint8_t shared_shadow_[RENUT_SHARED_SIZE] = {};
+  // Where a draw assembles its shared block before it is compared.
+  alignas(16) uint8_t shared_built_[RENUT_SHARED_SIZE] = {};
+  uint64_t vs_constants_offset_ = UINT64_MAX;
+  uint64_t ps_constants_offset_ = UINT64_MAX;
+  uint64_t shared_offset_ = UINT64_MAX;
+  // The addresses last pushed, to leave the push constants alone when the
+  // three blocks are the ones already bound.
+  uint64_t pushed_constants_[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 
   std::unique_ptr<RenderCommandList> list_;
   std::unique_ptr<RenderCommandFence> fence_;
@@ -911,6 +941,23 @@ bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::
   return true;
 }
 
+// Puts `source` in the upload ring unless an earlier draw already left the
+// same bytes there - see the shadow buffers.
+bool PlumeCommandProcessor::CommitConstants(uint8_t* shadow, const void* source, size_t size,
+                                            uint64_t& offset) {
+  if (offset != UINT64_MAX && !(skip_mask_ & 4194304) && std::memcmp(shadow, source, size) == 0) {
+    ++stats_.constants_reused;
+    return true;
+  }
+  // Allocate can flush the ring, which drops every offset including this one.
+  const uint64_t at = Allocate(size, 256);
+  if (at == UINT64_MAX) return false;
+  std::memcpy(shadow, source, size);
+  std::memcpy(Pointer(at), source, size);
+  offset = at;
+  return true;
+}
+
 void PlumeCommandProcessor::BeginFrame() {
   // Both callers wait for the GPU before starting a new command list.
   for (uint32_t index : retired_descriptors_) {
@@ -923,6 +970,10 @@ void PlumeCommandProcessor::BeginFrame() {
   // Keep the permanent allocations (white texel, zeros) at the start.
   upload_used_ = zero_offset_ + 64;
   uploaded_streams_.clear();
+  ++upload_generation_;
+  vs_constants_offset_ = ps_constants_offset_ = shared_offset_ = UINT64_MAX;
+  // A new command list starts with no push constants of its own.
+  pushed_constants_[0] = pushed_constants_[1] = pushed_constants_[2] = UINT64_MAX;
   list_->begin();
   list_open_ = true;
   bound_framebuffer_ = nullptr;
@@ -1839,13 +1890,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
 
   // Constants: the guest register file, exactly as the recompiled shaders
   // address it (vertex c0..c255, pixel c256..c511 as their c0..c255).
-  uint64_t vs_constants = Allocate(4096, 256);
-  uint64_t ps_constants = Allocate(4096, 256);
-  uint64_t shared = Allocate(RENUT_SHARED_SIZE, 256);
-  if (vs_constants == UINT64_MAX || ps_constants == UINT64_MAX || shared == UINT64_MAX) return true;
-  std::memcpy(Pointer(vs_constants), &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4096);
-  std::memcpy(Pointer(ps_constants), &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], 4096);
-  uint8_t* sh = Pointer(shared);
+  // The block is assembled here and only goes into the ring once it is whole,
+  // so that a draw whose constants did not change can keep the last one.
+  uint8_t* sh = shared_built_;
   std::memset(sh, 0, RENUT_SHARED_SIZE);
   std::memcpy(sh + RENUT_SHARED_TEXTURE2D_OFFSET, texture_descriptor, sizeof(texture_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
@@ -2055,6 +2102,22 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     viewport = RenderViewport(0.f, 0.f, float(extent->width), float(extent->height));
   }
   std::memcpy(sh + RENUT_SHARED_VIEWPORT_OFFSET, scale_offset, sizeof(scale_offset));
+
+  // The shared block is complete; place all three where the shaders will read
+  // them. A block that overflows the ring flushes it, which drops the two
+  // placed before it, so the generation says whether to lay them down again.
+  uint64_t generation;
+  do {
+    generation = upload_generation_;
+    if (!CommitConstants(vs_shadow_, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X],
+                         kStageConstantSize, vs_constants_offset_) ||
+        !CommitConstants(ps_shadow_, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X],
+                         kStageConstantSize, ps_constants_offset_) ||
+        !CommitConstants(shared_shadow_, shared_built_, RENUT_SHARED_SIZE, shared_offset_)) {
+      return true;
+    }
+  } while (generation != upload_generation_);
+
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
   RenderRect scissor_rect(int32_t(scissor.offset[0]), int32_t(scissor.offset[1]),
@@ -2280,8 +2343,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     list_->setPipeline(pipeline.get());
     bound_pipeline_ = pipeline.get();
   }
-  const uint64_t push[3] = {Address(vs_constants), Address(ps_constants), Address(shared)};
-  list_->setGraphicsPushConstants(0, push, 0, sizeof(push));
+  const uint64_t push[3] = {Address(vs_constants_offset_), Address(ps_constants_offset_),
+                            Address(shared_offset_)};
+  if (std::memcmp(push, pushed_constants_, sizeof(push)) != 0) {
+    list_->setGraphicsPushConstants(0, push, 0, sizeof(push));
+    std::memcpy(pushed_constants_, push, sizeof(push));
+  }
   list_->setViewports(&viewport, 1);
   list_->setScissors(&scissor_rect, 1);
   for (const auto& slot : input_slots) {
@@ -2747,14 +2814,16 @@ void PlumeCommandProcessor::Report() {
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
       "no_target={} resolves={} clears={} passes={} pipelines={} targets={} resolved={} shaders={} "
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
-      "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={}",
+      "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={} "
+      "const_reused={}",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes,
       stats_.pipelines,
       targets_.size(), resolved_.size(), shaders_.size(), missed_.size(), stats_.overflow,
       upload_used_ >> 10, guest_textures_.size(), stats_.textures_decoded,
       stats_.texture_failures, stats_.frame_us / 1000, stats_.pipeline_us / 1000,
-      stats_.submit_us / 1000, renut_guest_swap_count() - reported_guest_swaps_);
+      stats_.submit_us / 1000, renut_guest_swap_count() - reported_guest_swaps_,
+      stats_.constants_reused);
   // Keep what the driver compiled this interval, so the next run of this scene
   // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
   // shuts the process down cleanly, so waiting for the device's own save would

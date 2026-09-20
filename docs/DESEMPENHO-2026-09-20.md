@@ -77,12 +77,47 @@ As duas faixas da cena são `scissor (0,0)-(1280,384)` com `window (0.5, 0.5)` e
 767 desenhos —, então unificá-las economiza a geometria que cruza a divisa mais
 um ciclo de limpar/resolver, não metade do trabalho.
 
-## Próximo passo
+## A candidata do uniform buffer, testada e descartada
 
-Candidata número um, ainda não testada: os shaders leem constantes e índices de
-descritor por `vk::RawBufferLoad` sobre endereços vindos de push constants, e
-não por uniform buffer. Num Adreno, um UBO é promovido para memória de
-constantes rápida; uma carga crua por ponteiro não é.
+A suspeita era que os shaders leem constantes e índices de descritor por
+`vk::RawBufferLoad` sobre endereços vindos de push constants, e não por uniform
+buffer - num Adreno um UBO é promovido para memória de constantes rápida, uma
+carga crua por ponteiro não é.
+
+A conversão em si é cara: `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC`, que a
+interface do Plume não expõe (`setBuffer` não aceita deslocamento e
+`setGraphicsDescriptorSet` não aceita deslocamentos dinâmicos), mais o
+`shader_common.h` do fork do XenosRecomp e um rebuild dos 3.243 shaders. Antes
+de pagar isso, testamos a metade barata da mesma ideia.
+
+O que tornava a leitura cara não era o descritor e sim o dado estar frio: cada
+desenho copiava 10 KB de constantes para um trecho novo do anel de upload -
+5.800 desenhos, 58 MB por quadro que a GPU nunca tinha tocado. O jogo reescreve
+uns poucos registradores entre desenhos, então agora cada bloco é comparado com
+o que o desenho anterior deixou no anel e reaproveitado quando os bytes batem.
+**43% dos blocos passaram a ser reaproveitados.**
+
+A/B no aparelho com a câmera parada, alternando o bit `4194304` em seis janelas
+de dois minutos (desenhos por janela dentro de 1%, mesma cena, mesma bateria):
+
+| rodada | sem reuso | com reuso | |
+| --- | --- | --- | --- |
+| 1 | 29,88 µs/desenho | 29,25 | -2,1% |
+| 2 | 32,44 | 31,87 | -1,8% |
+| 3 | 33,14 | 33,16 | +0,1% |
+
+O aparelho esquenta ao longo do teste - 29,9 para 33,1 µs nas janelas sem reuso
+-, e essa deriva de 11% é maior que o efeito medido. **Tornar 43% das
+constantes quentes vale de 0 a 2% do quadro.** A conversão completa para uniform
+buffer, que custaria o refactor do descritor mais o rebuild dos shaders, está
+descartada por esse número.
+
+O que a mudança rende de fato, e isso é limpo e repetível nas três rodadas, é
+**105 MB para 80 MB de anel por quadro (-24%)**, menos `vkCmdPushConstants`, e
+com isso menos risco de `upload_overflow` - um estouro do anel força um flush
+com espera da GPU no meio do quadro.
+
+## Próximo passo
 
 **Medir antes de mexer.** Quatro previsões erradas nesta sessão — 19% que deu
 47%, "grande" que deu 4%, 4x que deu ruído, e um ganho de FPS que deu zero — e
@@ -97,4 +132,5 @@ perde.
 - Trace de um quadro: `touch files/plume-trace-request`, saída em `files/plume-trace.txt`
 - Reverter por bit, sem recompilar: `echo <máscara> > files/plume-skip`, lido a cada 30 swaps.
   `1048576` volta a vincular os 32 slots de textura; `2097152` devolve ao Clear o
-  poder de dimensionar os alvos.
+  poder de dimensionar os alvos; `4194304` volta a dar a cada desenho um bloco
+  de constantes novo.
