@@ -83,8 +83,13 @@ enum Sampler : uint32_t {
   kSamplerPointWrap,
   kSamplerPointClamp,
   kSamplerPointMirror,
-  kSamplerCount
+  // The same six with the Z axis clamped, for the stacked textures: their Z
+  // picks a slice of an array, which the guest never wraps around.
+  kSamplerStackedBase,
+  kSamplerCount = kSamplerStackedBase * 2
 };
+
+static_assert(kSamplerCount <= kMaxSamplers, "the sampler heap has to hold every combination");
 
 uint32_t BSwap32(uint32_t v) { return __builtin_bswap32(v); }
 
@@ -457,7 +462,7 @@ struct GuestTexture {
   uint32_t width = 0, height = 0;
   std::unique_ptr<RenderTextureView> view;  // cube maps
   uint32_t descriptor = 0;
-  uint32_t levels = 1;
+  uint32_t levels = 1, depth = 1;
   uint64_t content = 0;
   bool failed = false;
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
@@ -691,13 +696,14 @@ bool PlumeCommandProcessor::SetupContext() {
 
   for (uint32_t i = 0; i < kSamplerCount; ++i) {
     RenderSamplerDesc desc;
-    const bool point = i >= kSamplerPointWrap;
+    const bool point = (i % kSamplerStackedBase) >= kSamplerPointWrap;
     desc.minFilter = desc.magFilter = point ? RenderFilter::NEAREST : RenderFilter::LINEAR;
     desc.mipmapMode = point ? RenderMipmapMode::NEAREST : RenderMipmapMode::LINEAR;
     RenderTextureAddressMode mode = (i % 3) == 0   ? RenderTextureAddressMode::WRAP
                                     : (i % 3) == 1 ? RenderTextureAddressMode::CLAMP
                                                    : RenderTextureAddressMode::MIRROR;
-    desc.addressU = desc.addressV = desc.addressW = mode;
+    desc.addressU = desc.addressV = mode;
+    desc.addressW = i >= kSamplerStackedBase ? RenderTextureAddressMode::CLAMP : mode;
     samplers_[i] = device_->createSampler(desc);
     set_samplers_->setSampler(i, samplers_[i].get());
   }
@@ -1163,9 +1169,15 @@ void PlumeCommandProcessor::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fet
 }
 
 // Stacked textures (arrays of 2D slices: the terrain's material and normal map
-// sets), which the shaders sample with tfetch3D, z picking the slice. Slices
-// follow each other at a 4 KB aligned stride; bound as a 3D texture of that
-// depth, one level (mips would halve the slice count too).
+// sets, and the fur bump map on Banjo, whose 16 slices are one relief at
+// growing amplitude), which the shaders sample with tfetch3D, z picking the
+// slice. Slices follow each other at a 4 KB aligned stride, bound as a 3D
+// texture of that depth.
+//
+// A host 3D image halves its depth at every mip level, which would blend one
+// slice into the next, so only a stack one slice deep can carry the guest's mip
+// chain; a deeper stack keeps the single level it had before, as every stack in
+// the menu does.
 uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address || (skip_mask_ & 65536)) return 0;
@@ -1180,12 +1192,20 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
   uint32_t base_page, mip_page, top_level, last_level;
   gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
       &base_page, &mip_page, &top_level, &last_level);
-  if (skip_mask_ & 32768) { base_page = fetch.base_address; top_level = 0; }
-  TextureLevel level;
-  if (!LocateTextureLevel(fetch, top_level, level)) return 0;
-  const uint64_t start = (uint64_t(level.from_mips ? mip_page : base_page) << 12) + level.offset;
-  if (!start || start + level.extent > 0x20000000ull) return 0;
-  const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(uint32_t(start));
+  if (skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
+  if (depth > 1 || (skip_mask_ & (8192 | 262144))) last_level = top_level;
+  const uint32_t levels = last_level - top_level + 1;
+  HashCombine(key, last_level);
+  HashCombine(key, uint32_t(fetch.packed_mips));
+  std::array<TextureLevel, 14> layouts;
+  std::array<const uint8_t*, 14> data{};
+  for (uint32_t i = 0; i < levels; ++i) {
+    TextureLevel& level = layouts[i];
+    if (!LocateTextureLevel(fetch, top_level + i, level)) return 0;
+    const uint64_t start = (uint64_t(level.from_mips ? mip_page : base_page) << 12) + level.offset;
+    if (!start || start + level.extent > 0x20000000ull) return 0;
+    data[i] = memory_->TranslatePhysical<const uint8_t*>(uint32_t(start));
+  }
   GuestTexture& texture = guest_stacks_[key];
   if (texture.failed) return 0;
   if (texture.texture && texture.checked_frame == swaps_ && texdump_directory_.empty()) {
@@ -1193,37 +1213,44 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
     return texture.descriptor;
   }
   texture.checked_frame = swaps_;
-  const uint64_t content = ContentHash(data, level.extent);
+  uint64_t content = 0;
+  for (uint32_t i = 0; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
   if (!texdump_directory_.empty() && dumped_.insert(key ^ 2).second) texture.content = ~content;
   if (texture.texture && texture.content == content) {
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
-  std::vector<uint32_t> all, slice;
-  uint32_t width = 0, height = 0;
-  for (uint32_t z = 0; z < depth; ++z) {
-    const uint32_t w = level.width, h = level.height;
-    if (!DecodeTextureLevel(fetch, level, data, z, slice)) {
-      texture.failed = true;
-      ++stats_.texture_failures;
-      return 0;
+  // Every level is decoded before the image is touched: a level that fails
+  // partway has to leave the contents an earlier frame uploaded alone.
+  std::array<std::vector<uint32_t>, 14> all;
+  std::vector<uint32_t> slice;
+  for (uint32_t i = 0; i < levels; ++i) {
+    for (uint32_t z = 0; z < depth; ++z) {
+      if (!DecodeTextureLevel(fetch, layouts[i], data[i], z, slice)) {
+        texture.failed = true;
+        ++stats_.texture_failures;
+        return 0;
+      }
+      if (!texdump_directory_.empty()) {
+        DumpTexture(fetch, slice, layouts[i].width, layouts[i].height, "stack");
+      }
+      all[i].insert(all[i].end(), slice.begin(), slice.end());
     }
-    width = w;
-    height = h;
-    if (!texdump_directory_.empty()) DumpTexture(fetch, slice, w, h, "stack");
-    all.insert(all.end(), slice.begin(), slice.end());
   }
+  const uint32_t width = layouts[0].width, height = layouts[0].height;
   if (!texture.descriptor) {
     if (next_3d_descriptor_ >= kMaxTextures3D) return 0;
     texture.descriptor = next_3d_descriptor_++;
   }
-  if (!texture.texture || texture.width != width || texture.height != height || texture.levels != depth) {
+  if (!texture.texture || texture.width != width || texture.height != height ||
+      texture.depth != depth || texture.levels != levels) {
     if (texture.texture) retired_.push_back(std::move(texture.texture));
     texture.texture = device_->createTexture(
-        RenderTextureDesc::Texture3D(width, height, depth, 1, RenderFormat::R8G8B8A8_UNORM));
+        RenderTextureDesc::Texture3D(width, height, depth, levels, RenderFormat::R8G8B8A8_UNORM));
     texture.width = width;
     texture.height = height;
-    texture.levels = depth;
+    texture.depth = depth;
+    texture.levels = levels;
     texture.layout = RenderTextureLayout::UNKNOWN;
     if (!texture.texture) {
       texture.failed = true;
@@ -1231,14 +1258,17 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
     }
   }
   texture.content = content;
-  const uint64_t staging = Allocate(uint64_t(width) * height * depth * 4, 512);
-  if (staging == UINT64_MAX) return 0;
-  std::memcpy(Pointer(staging), all.data(), all.size() * 4);
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
-  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get()),
-                           RenderTextureCopyLocation::PlacedFootprint(
-                               upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, depth, width,
-                               staging));
+  for (uint32_t i = 0; i < levels; ++i) {
+    const uint32_t w = layouts[i].width, h = layouts[i].height;
+    const uint64_t staging = Allocate(uint64_t(w) * h * depth * 4, 512);
+    if (staging == UINT64_MAX) return 0;
+    std::memcpy(Pointer(staging), all[i].data(), all[i].size() * 4);
+    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), i),
+                             RenderTextureCopyLocation::PlacedFootprint(
+                                 upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, depth, w,
+                                 staging));
+  }
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
   set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
   ++stats_.textures_decoded;
@@ -1482,7 +1512,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     uint32_t mode = fetch.clamp_x == xenos::ClampMode::kRepeat           ? 0
                     : fetch.clamp_x == xenos::ClampMode::kMirroredRepeat ? 2
                                                                          : 1;
-    sampler_descriptor[slot] = (point ? kSamplerPointWrap : kSamplerLinearWrap) + mode;
+    // A stack is an array of slices on the guest, and its Z addresses a layer,
+    // which is clamped to the array however the wrap mode reads - the fur bump
+    // map asks for z = -0.5/16, one half slice below the first, and means the
+    // flat slice 0, not slice 15 at the other end of the stack.
+    sampler_descriptor[slot] = (point ? kSamplerPointWrap : kSamplerLinearWrap) + mode +
+                               (fetch.stacked ? kSamplerStackedBase : 0);
     Resolved* found = FindResolved(fetch.base_address << 12);
     if (found && found->descriptor) {
       Resolved& r = *found;
@@ -1521,10 +1556,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     for (uint32_t slot = 0; slot < 32; ++slot) {
       xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
       if (fetch.type != xenos::FetchConstantType::kTexture || !fetch.base_address) continue;
-      line += fmt::format(" t{}={:08X}/f{}/{}x{}/d{}{}", slot, fetch.base_address << 12,
-                          uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
-                          uint32_t(fetch.dimension),
-                          FindResolved(fetch.base_address << 12) ? "/R" : "");
+      uint32_t t_base, t_mip, t_top, t_last;
+      gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &t_base,
+                                                          &t_mip, &t_top, &t_last);
+      line += fmt::format(
+          " t{}={:08X}/f{}/{}x{}/d{}/L{}-{}/c{}{}{}{}{}", slot, fetch.base_address << 12,
+          uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
+          uint32_t(fetch.dimension), t_top, t_last, uint32_t(fetch.clamp_x),
+          uint32_t(fetch.clamp_y), uint32_t(fetch.clamp_z),
+          fetch.stacked ? fmt::format("/s{}", uint32_t(fetch.size_2d.stack_depth) + 1) : "",
+          FindResolved(fetch.base_address << 12) ? "/R" : "");
     }
     Trace("{}", line);
     Trace("  raster mode={:08X} offset=({},{},{},{}) blend={:08X} constants=({},{},{},{}) alpha={}",
@@ -1536,6 +1577,27 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
           regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
           regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF));
+    // What a stacked fetch is actually handed: the pixel shader constants,
+    // among them the one whose Z picks the slice.
+    if (ps) {
+      bool stacked = false;
+      for (uint32_t slot = 0; slot < 32; ++slot) {
+        xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
+        stacked = stacked || (fetch.type == xenos::FetchConstantType::kTexture && fetch.stacked &&
+                              fetch.base_address);
+      }
+      if (stacked) {
+        std::string constants;
+        for (uint32_t i = 0; i < 4; ++i) {
+          constants += fmt::format(" c{}=({},{},{},{})", i,
+                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + 0),
+                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + 1),
+                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + 2),
+                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + 3));
+        }
+        Trace("  ps{:016X}{}", ps->entry->hash, constants);
+      }
+    }
     const auto* declared = g_shaderInputElements + vs->entry->inputElementOffset;
     for (uint32_t i = 0; i < vs->entry->inputElementCount; ++i) {
       const auto& e = declared[i];

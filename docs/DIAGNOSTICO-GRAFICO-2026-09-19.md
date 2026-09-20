@@ -4,7 +4,7 @@
 
 Projeto: reNut, branch `codex/android-xenos-runtime`. Testes no Samsung SM-S918B, GPU Adreno 740, driver Turnip. O renderizador selecionado ao encerrar os testes é Plume. A comparação com Xenos foi feita no mesmo aparelho.
 
-As correções anteriores da aura dourada, das rosetas verdes no terreno e da montagem das sombras distantes foram aprovadas pelo usuário. Ao encerrar esta etapa, o usuário confirmou também que os problemas de sombra foram resolvidos, incluindo os relatos de projeção em texturas e no chão com pedras. Permanecem pendentes os pelos do Banjo, a água e o veículo.
+As correções anteriores da aura dourada, das rosetas verdes no terreno e da montagem das sombras distantes foram aprovadas pelo usuário. Ao encerrar esta etapa, o usuário confirmou também que os problemas de sombra foram resolvidos, incluindo os relatos de projeção em texturas e no chão com pedras. Os pelos do Banjo foram corrigidos nesta etapa. Permanecem pendentes a água e o veículo.
 
 ## Mudanças registradas nesta etapa
 
@@ -14,26 +14,60 @@ Arquivo: `android/rexglue/plume_gpu.cpp`.
 - Incluir esses estados na chave do cache de pipelines, evitando reutilizar um pipeline com orientação ou descarte diferentes.
 - Acrescentar ao diagnóstico de desenhos os estados de rasterização, deslocamento de profundidade, mistura de cores e referência de alfa. A saída adicional depende da captura de diagnóstico estar ativa.
 - Manter a opção de diagnóstico `plume-skip=131072` para desativar temporariamente o novo descarte de faces.
+- Limitar o eixo Z das texturas empilhadas à extremidade da pilha, em vez de repeti-lo com o modo do eixo X, e carregar a cadeia de mipmaps do guest nas pilhas de uma única fatia. Ver a seção 1.
+- Acrescentar ao diagnóstico de desenhos os modos de limite por eixo, a faixa de níveis e a profundidade de cada textura, e as constantes do pixel shader nos desenhos com textura empilhada.
+- Manter a opção de diagnóstico `plume-skip=262144` para desativar temporariamente os mipmaps das pilhas de uma fatia.
 
 Validação: compilação Android concluída com `BUILD SUCCESSFUL in 21s` em `out/graphics-next/build-culling.log`; APK instalado e observado no aparelho. O menu apresentou melhora visível na TV e no aquário. A passagem inicial da câmera não apresentou inversão geral da geometria. Isso não constitui validação de todos os cenários do jogo. Os pelos do Banjo continuaram incorretos.
 
-## 1. Pelos do Banjo no menu — pendente, investigação avançada
+## 1. Pelos do Banjo no menu — resolvido
 
-Sintoma: braços, pernas e cabeça apresentam granulação muito forte. Na referência Xenos, os pelos têm aparência mais uniforme. A aura permanece dourada; o defeito atual não é a antiga ocorrência de faixas coloridas na aura.
+Sintoma anterior: braços, pernas e cabeça apresentavam granulação muito forte,
+enquanto na referência Xenos os pelos têm aparência uniforme.
 
-Teste mais recente: capturado o menu ao vivo em `banjo-menu-now.png`. Desativar temporariamente as texturas empilhadas com `plume-skip=65536` eliminou a granulação visível (`banjo-no-stack.png`). A configuração foi restaurada para `0` imediatamente após a captura. Esse teste aponta para o caminho da textura de relevo usada pelos pelos, mas não prova ainda qual etapa está errada. Desativar a textura não é uma correção aceitável: também altera a iluminação do material.
+Causa: o eixo Z das texturas empilhadas era endereçado com o modo de repetição do
+eixo X. A pilha é um arranjo de fatias; o Z escolhe uma camada e o guest a limita
+à extremidade, nunca a repete. O registro de desenho confirma o que o jogo pede
+na constante de busca da textura de relevo `1C21C000`: `clamp_x=0` e `clamp_y=0`
+(repetir), `clamp_z=2` (limitar à extremidade).
 
-Testes anteriores: desativar a aproximação de alpha-to-coverage (`4096`) e limitar os mipmaps das texturas 2D (`8192`) não resolveu o defeito. O teste de mipmaps 2D não elimina a hipótese de problema nos mipmaps das texturas empilhadas.
+O shader entrega Z = `-0.03125`, ou seja meia fatia abaixo da primeira de uma
+pilha de 16. Limitando o eixo, isso é a fatia 0; repetindo, vira a fatia 15, no
+outro extremo. As 16 fatias despejadas do aparelho mostram por que a diferença é
+tão visível: são o mesmo relevo em amplitude crescente, da fatia 0 plana (canais
+G e B constantes em 125 e 123) até a fatia 15 com amplitude total (G de 0 a 255).
+O Plume aplicava o relevo mais forte da pilha onde o jogo pede o mais fraco.
 
-Identificação pelos dumps de texturas e pelos desenhos do menu:
+Correção em `android/rexglue/plume_gpu.cpp`: a tabela de amostradores passa a ter
+uma segunda metade com o eixo W limitado, e as buscas empilhadas usam essa
+metade. Os eixos U e V continuam com o modo do guest.
 
-- Pixel shaders envolvidos: `EA4C367F67309DCC`, `14A0D4C740686E7D` e `54A01C80D41DA2BA`.
+Também nesta etapa, as texturas empilhadas de uma única fatia passam a carregar a
+cadeia de mipmaps do guest, como já faziam as 2D. Uma imagem 3D do host divide a
+profundidade a cada nível, o que misturaria fatias vizinhas, então pilhas com
+mais de uma fatia continuam com um nível só. O menu não exercita esse caminho:
+todas as pilhas vistas nele têm 16 fatias.
+
+Validação: `BUILD SUCCESSFUL` em `out/graphics-next/build-fur.log`; APK instalado
+no SM-S918B com Plume/Turnip e menu capturado em
+`out/graphics-next/banjo-fur-fixed.png`, com os pelos uniformes e a textura de
+relevo ainda ligada — diferente do teste `plume-skip=65536`, que a desligava e
+alterava a iluminação do material. Evidências: `fur-stack-slices.png` (as 16
+fatias), `fur-ucode-trace.txt` (a constante Z por desenho) e
+`fur-clamped-trace.txt` (os modos de limite por textura).
+
+Identificação, mantida para referência:
+
+- Pixel shaders envolvidos: `EA4C367F67309DCC`, `14A0D4C740686E7D`,
+  `54A01C80D41DA2BA`, `785DDFE8F61DF106` e `5C13267B0C24C259`.
 - Vertex shader frequente: `B814D7237E615990`.
-- Textura de relevo empilhada em t1: `1C21C000`, formato f18/DXT1, tamanho declarado 128×128; nível superior observado 64×64, mip mínimo 1. Outra textura usada no rosto: `1B908000`, f19/DXT3.
-- Texturas de cor identificadas: braços `1C87D000`, rosto `1BFB1000`, corpo `1C17E000`. Os endereços pertencem à execução capturada e podem mudar ao reiniciar.
-- O shader lê `tfetch3D(...).yzw` e reconstrói a normal. `GetGuestStackedTexture` representa a pilha como uma textura 3D com apenas um nível de mipmap.
+- Textura de relevo empilhada em t1: `1C21C000`, f18/DXT1, 128×128 declarados,
+  nível superior 64×64, mip mínimo 1, 16 fatias.
+- Texturas de cor identificadas: braços `1C87D000`, rosto `1BFB1000`, corpo
+  `1C17E000`. Os endereços pertencem à execução capturada.
 
-Próxima investigação: comparar a seleção/interpolação de camadas, o endereçamento por eixo, os filtros de volume e os mipmaps com o caminho do Xenos. Confirmar também a decodificação das fatias. Não há ainda causa raiz comprovada nem correção dos pelos.
+Testes anteriores que não resolviam: desativar a aproximação de alpha-to-coverage
+(`4096`) e limitar os mipmaps das texturas 2D (`8192`).
 
 ## 2. Sombras sobre texturas e chão com pedras — resolvido, validado pelo usuário
 
