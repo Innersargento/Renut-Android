@@ -1527,6 +1527,15 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                           FindResolved(fetch.base_address << 12) ? "/R" : "");
     }
     Trace("{}", line);
+    Trace("  raster mode={:08X} offset=({},{},{},{}) blend={:08X} constants=({},{},{},{}) alpha={}",
+          regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
+          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
+          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
+          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
+          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), regs[XE_GPU_REG_RB_BLENDCONTROL0],
+          regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
+          regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
+          regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF));
     const auto* declared = g_shaderInputElements + vs->entry->inputElementOffset;
     for (uint32_t i = 0; i < vs->entry->inputElementCount; ++i) {
       const auto& e = declared[i];
@@ -1760,6 +1769,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (scissor_rect.right <= scissor_rect.left || scissor_rect.bottom <= scissor_rect.top) return true;
 
   // Pipeline.
+  const auto raster = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  const bool polygonal = draw_util::IsPrimitivePolygonal(false, prim_type);
+  RenderCullMode cull = RenderCullMode::NONE;
+  if (polygonal && !(skip_mask_ & 131072)) {
+    if (raster.cull_front && raster.cull_back) return true;
+    if (raster.cull_front) cull = RenderCullMode::FRONT;
+    else if (raster.cull_back) cull = RenderCullMode::BACK;
+  }
+  const RenderFrontFace front_face = raster.face ? RenderFrontFace::CLOCKWISE
+                                                : RenderFrontFace::COUNTER_CLOCKWISE;
   const bool depth_enabled = depth && depth_control.z_enable && !(skip_mask_ & 1024);
   const bool depth_write = depth_enabled && depth_control.z_write_enable;
   RenderBlendDesc blends[4];
@@ -1787,6 +1806,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   HashCombine(key, ps ? ps->compiled : nullptr);
   HashCombine(key, topology);
   HashCombine(key, rect_list);
+  HashCombine(key, cull);
+  HashCombine(key, front_face);
   HashCombine(key, color_count);
   for (uint32_t i = 0; i < color_count; ++i) {
     HashCombine(key, colors[i]->format);
@@ -1822,7 +1843,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.geometryShader = rect_list ? rect_list_gs_.get() : nullptr;
     desc.pixelShader = ps ? ps->compiled->module.get() : nullptr;
     desc.primitiveTopology = topology;
-    desc.cullMode = RenderCullMode::NONE;
+    desc.cullMode = cull;
+    desc.frontFace = front_face;
     desc.depthClipEnabled = true;
     desc.depthEnabled = depth_enabled;
     desc.depthWriteEnabled = depth_write;
