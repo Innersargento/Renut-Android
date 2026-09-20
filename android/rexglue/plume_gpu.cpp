@@ -190,6 +190,9 @@ class HostShader : public gfx::Shader {
   // What the cache is keyed by, which is not this shader's own hash.
   uint64_t ucode_key = 0;
   uint64_t loose_key = 0;
+  // Texture fetch constants this shader reads; ~0 until TextureMask ran.
+  uint32_t texture_mask = 0;
+  bool texture_mask_decoded = false;
   CompiledShader* compiled = nullptr;
   // Vertex shaders: the input layout decoded from this variant's vfetches.
   std::vector<LiveElement> elements;
@@ -275,6 +278,26 @@ class ShaderStore {
 };
 
 // Decodes the vertex layout a bound vertex shader really fetches. Direct3D
+// Which texture fetch constants a shader reads, as a bit per slot. The draw
+// path used to ask every one of the 32 slots for its texture, sampler and
+// resolved target, on every draw; a shader samples two or three. The constant a
+// tfetch names sits in the same bits as a vfetch's, and Direct3D does not
+// rewrite it.
+uint32_t TextureMask(const gfx::Shader& shader) {
+  const uint32_t* u = shader.ucode_dwords();
+  const size_t count = shader.ucode_dword_count();
+  std::vector<uint8_t> be(count * 4);
+  for (size_t i = 0; i < count; ++i) ucode::StoreBE(be.data() + i * 4, u[i]);
+  uint32_t mask = 0;
+  for (uint32_t slot : ucode::FetchSlots(be.data(), be.size())) {
+    if (size_t(slot) * 3 + 2 >= count) continue;
+    const uint32_t w0 = u[size_t(slot) * 3];
+    if ((w0 & 0x1F) == 0) continue;  // a vfetch, not a texture fetch
+    mask |= 1u << ((w0 >> 20) & 0x1F);
+  }
+  return mask;
+}
+
 // patched the vfetch instructions for the current vertex declaration; the
 // recompiler recorded which instruction reads each element (fetchAddress).
 void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
@@ -603,6 +626,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // the frame into that address is copied aside and presented instead of the
   // front buffer, to see an intermediate pass on screen.
   uint32_t snap_address_ = 0, snap_ordinal_ = 0, snap_seen_ = 0;
+  // The tallest a draw has rendered, which bounds what a clear may grow.
+  uint32_t max_draw_height_ = 0;
   std::chrono::steady_clock::time_point frame_start_{};
   uint64_t reported_guest_swaps_ = 0;
   std::unique_ptr<RenderTexture> snap_;
@@ -1657,6 +1682,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (!pitch) return true;
   const auto window_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   const uint32_t height = std::clamp<uint32_t>(window_br.br_y, 16, 4096);
+  max_draw_height_ = std::max(max_draw_height_, height);
   const uint32_t color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
   static constexpr gfx::Register kColorInfo[4] = {
       XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_COLOR1_INFO, XE_GPU_REG_RB_COLOR2_INFO,
@@ -1698,7 +1724,23 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   uint32_t cube_descriptor[32] = {};
   uint32_t stack_descriptor[32] = {};
   uint32_t sampler_descriptor[32] = {};
-  for (uint32_t slot = 0; slot < 32; ++slot) {
+  // Only the slots the bound shaders actually sample. The game leaves the other
+  // fetch constants set from earlier draws, and asking all 32 for a texture, a
+  // sampler and a resolved target was most of what this path did.
+  auto slots_of = [&](HostShader* shader) {
+    if (!shader) return 0u;
+    if (!shader->texture_mask_decoded) {
+      shader->texture_mask = TextureMask(*shader);
+      shader->texture_mask_decoded = true;
+    }
+    return shader->texture_mask;
+  };
+  uint32_t used_slots = slots_of(vs) | slots_of(ps);
+  // Debug: go back to binding every slot, to compare against a capture.
+  if (skip_mask_ & 1048576) used_slots = ~0u;
+  for (uint32_t remaining = used_slots; remaining;) {
+    const uint32_t slot = uint32_t(__builtin_ctz(remaining));
+    remaining &= remaining - 1;
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
     if (fetch.type != xenos::FetchConstantType::kTexture) continue;
     sampler_descriptor[slot] = GetSampler(fetch);
@@ -2522,8 +2564,19 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
   // 32 bpp target as a 64 bpp one; EDRAM bases are shared between targets of
   // other pitches (the shadow maps), so match the pitch, not just the base.
   const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
-  const uint32_t clear_height = std::clamp<uint32_t>(
+  // Direct3D's Clear scissors the EDRAM view, which is 4096 rows tall, while
+  // the game renders into a few hundred. GetTarget never shrinks a target, so
+  // letting that height through grew every real target to 4096 rows and made a
+  // tiler reload and resolve 21 MB of attachment at each of the hundred render
+  // passes in a frame. Cap it by the tallest height a draw has actually asked
+  // for; a draw that needs more still grows the target itself.
+  uint32_t clear_height = std::clamp<uint32_t>(
       regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y, 16, 4096);
+  if (!(skip_mask_ & 2097152)) {
+    // The floor covers the clears that land before the first draw of a target,
+    // among them the static shadow map's 512-row tiles.
+    clear_height = std::min(clear_height, std::max(max_draw_height_, 1024u));
+  }
   // Several targets can match (a pitch-640 target from another phase next to
   // the 1280-wide scene target that a 64 bpp clear also names): the one last
   // rendered to is the one the game is about to use.
