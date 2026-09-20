@@ -1450,7 +1450,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       break;
     default:
       ++stats_.skipped_prim;
-      Trace("dropped prim={} n={}", uint32_t(prim_type), index_count);
+      // Point lists and the tessellated patches of the water go through here:
+      // the shader and the tessellation mode say which is which.
+      Trace("dropped prim={} n={} vs={:016X} ps={:016X} tess={} indexed={}", uint32_t(prim_type),
+            index_count, vs->entry->hash, ps ? ps->entry->hash : 0,
+            uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
+            uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().source_select));
       return true;
   }
   if (rect_list && !rect_list_gs_) {

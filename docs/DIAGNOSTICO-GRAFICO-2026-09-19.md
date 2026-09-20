@@ -4,7 +4,7 @@
 
 Projeto: reNut, branch `codex/android-xenos-runtime`. Testes no Samsung SM-S918B, GPU Adreno 740, driver Turnip. O renderizador selecionado ao encerrar os testes é Plume. A comparação com Xenos foi feita no mesmo aparelho.
 
-As correções anteriores da aura dourada, das rosetas verdes no terreno e da montagem das sombras distantes foram aprovadas pelo usuário. Ao encerrar esta etapa, o usuário confirmou também que os problemas de sombra foram resolvidos, incluindo os relatos de projeção em texturas e no chão com pedras. Os pelos do Banjo foram corrigidos nesta etapa. Permanecem pendentes a água e o veículo.
+As correções anteriores da aura dourada, das rosetas verdes no terreno e da montagem das sombras distantes foram aprovadas pelo usuário. Ao encerrar esta etapa, o usuário confirmou também que os problemas de sombra foram resolvidos, incluindo os relatos de projeção em texturas e no chão com pedras. Os pelos do Banjo foram corrigidos nesta etapa. A causa da água ausente foi identificada, sem correção ainda. Permanece pendente o veículo.
 
 ## Mudanças registradas nesta etapa
 
@@ -77,11 +77,60 @@ Preservar o comportamento atual. A validação visual final é do usuário; não
 
 Como histórico técnico, o registro de deslocamento de profundidade mostrou valores não nulos em poucos desenhos de partículas. Não foi aplicada uma correção de depth bias nesta etapa. As hipóteses anteriores sobre filtragem ou stencil não devem ser tratadas como defeitos confirmados nem como trabalho pendente de sombras.
 
-## 3. Água ausente — pendente
+## 3. Água ausente — causa identificada, correção pendente
 
-Referências: `215953.jpg` e `215957.jpg`, no vale com ponte durante a passagem inicial. A superfície da água não aparece corretamente.
+Não é falta de patch do jogo nem de dados: o jogo emite os desenhos da água, e o
+Plume é que os descarta. O registro da passagem inicial mostra a sequência, logo
+após o resolve da cena e antes do resolve final do quadro:
 
-Ainda é necessário identificar o desenho da superfície e comparar com Xenos no mesmo ponto. Foi observado um possível problema de interpretação de profundidade em shaders de partículas: alguns leem o canal Z de uma textura de profundidade resolvida que o Plume fornece como R32. Isso pode produzir valores incorretos, mas não foi demonstrada relação causal com a água ausente. Não aplicar uma correção específica à água com base apenas nessa hipótese.
+```
+dropped prim=1  n=1   vs=9CD3AF1135A8FEE3 ps=60E8DEF931549772 tess=2 indexed=2
+dropped prim=1  n=99  vs=1DF3417E061967C2 ps=88680E4C8A6BCFFE tess=2 indexed=2
+dropped prim=1  n=512 vs=3D0794ADDBF5A4F3 ps=60E8DEF931549772 tess=2 indexed=2
+dropped prim=17 n=99  vs=F09B139EE9188255 ps=3277104CE11D8635 tess=2 indexed=0
+```
+
+`prim=17` é `kTrianglePatch` e `tess=2` é o modo adaptativo. As três listas de
+pontos antes dele são passagens de *memory export*: escrevem na memória os
+fatores de tesselação que o desenho adaptativo lê. O próprio rexglue registra
+esse uso para o título 4D5307E6 em `primitive_processor.cpp`: «4D5307E6 — water —
+adaptive».
+
+O Plume não tem caminho de tesselação nem de memory export. No `switch` de
+topologia, `kTrianglePatch` cai no `default` e o desenho é omitido; as listas de
+pontos caem no mesmo lugar. O vertex shader da água confirma que é um domain
+shader: ele mistura três pontos de controle com pesos baricêntricos que o
+hardware entrega em `r0.xyz`.
+
+```
+r2 = P0 * r0.z + P1 * r0.y + P2 * r0.x
+```
+
+O XenosRecomp não conhece domain shaders: ele inicializa `r0` com o índice do
+vértice (`float4 r0 = float4(float(iVertexId), 0, 0, 0)`), então o shader
+recompilado hoje não reproduz a superfície nem se o desenho fosse aceito. O
+recompilador também não emula memory export — as escritas vão para um registrador
+descartado.
+
+Isso explica também por que o Xenos não desenha a água no mesmo aparelho: o
+defeito não está nos dados do jogo, está no suporte a tesselação e a memory
+export do renderizador.
+
+Para resolver são necessários, no mínimo:
+
+1. `r0.xyz` vindo dos pesos do domínio nos shaders recompilados, com um spec
+   constant para não alterar os desenhos comuns — o que exige regerar
+   `generated/shaders/`.
+2. No Plume, expandir cada patch em um triângulo (fator de tesselação 1),
+   repetindo o elemento de cada patch três vezes e emitindo os pesos por canto.
+3. Opcionalmente, memory export, para usar os fatores adaptativos reais em vez
+   de um fator fixo.
+
+Evidências: `water-trace.txt` (a sequência acima) e `flyby-states.txt`.
+
+A hipótese anterior sobre a leitura do canal Z de uma textura de profundidade
+resolvida entregue como R32 não tem relação com a água ausente e permanece sem
+demonstração.
 
 ## 4. Veículo incompleto na cena da água — pendente
 
