@@ -3,12 +3,23 @@
 // vfetch fields Direct3D rewrites at bind time cleared.
 //
 // When Direct3D binds a vertex shader to a vertex declaration it patches the
-// shader's vfetch instructions in place - fetch constant, format, stride,
-// offset, destination swizzle - so the microcode the GPU is handed differs from
-// the microcode the game registered (and that was recompiled) in exactly those
-// instructions. Clearing everything in a vfetch but its opcode, registers and
-// source swizzle gives both the same key. Shared by the runtime
-// (plume_gpu.cpp) and tools/shaders/ucode_map.cpp so the two cannot drift.
+// shader's vfetch instructions in place - fetch constant, format, stride and
+// offset - so the microcode the GPU is handed differs from the microcode the
+// game registered (and that was recompiled) in exactly those fields. Clearing
+// them gives both the same key. Shared by the runtime (plume_gpu.cpp) and
+// tools/shaders/ucode_map.cpp so the two cannot drift.
+//
+// The destination swizzle stays in `Key`. It decides which components of the
+// fetched vector land in which register lanes, the recompiled shader bakes it
+// in, and two bindings of the same shader can differ in nothing else: the menu
+// has one container fetching the position as .yxw and another as .xyz. Clearing
+// it made both hash alike, so the cache answered with whichever container came
+// first and the geometry that needed the other one came out inside out.
+//
+// `LooseKey` clears the swizzle as well, and is only the fallback: a binding
+// whose swizzle was never captured still finds a shader compiled from the same
+// instructions, which is what the cache did for every draw before. The store
+// tries `Key` first and `LooseKey` after.
 //
 // The microcode is big-endian dwords, as stored in guest memory.
 #include <cstddef>
@@ -68,17 +79,24 @@ inline std::vector<uint32_t> FetchSlots(const uint8_t* code, size_t size) {
   return slots;
 }
 
-inline uint64_t Key(const void* data, size_t size) {
+// `swizzle_mask` keeps the destination swizzle (0xFFF) or drops it (0).
+inline uint64_t KeyMasked(const void* data, size_t size, uint32_t swizzle_mask) {
   std::vector<uint8_t> code(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
   for (uint32_t slot : FetchSlots(code.data(), code.size())) {
     uint8_t* instruction = code.data() + size_t(slot) * 12;
     uint32_t w0 = LoadBE(instruction);
     if ((w0 & 0x1F) != 0) continue;  // not a vfetch
+    // Keep opcode, registers and source swizzle in the first dword, and the
+    // destination swizzle - the low 12 bits - in the second.
     StoreBE(instruction, w0 & 0xC00FFFFF);
-    StoreBE(instruction + 4, 0);
+    StoreBE(instruction + 4, LoadBE(instruction + 4) & swizzle_mask);
     StoreBE(instruction + 8, 0);
   }
   return XXH3_64bits(code.data(), code.size());
 }
+
+inline uint64_t Key(const void* data, size_t size) { return KeyMasked(data, size, 0xFFF); }
+
+inline uint64_t LooseKey(const void* data, size_t size) { return KeyMasked(data, size, 0); }
 
 }  // namespace renut::ucode

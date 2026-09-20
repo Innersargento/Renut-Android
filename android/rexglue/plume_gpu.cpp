@@ -57,6 +57,7 @@ std::string g_miss_dump_directory;
 
 struct UcodeMapEntry {
   uint64_t ucode;
+  uint64_t loose;
   uint64_t container;
 };
 const UcodeMapEntry kUcodeMap[] = {
@@ -182,6 +183,7 @@ class HostShader : public gfx::Shader {
   const ShaderCacheEntry* entry = nullptr;
   // What the cache is keyed by, which is not this shader's own hash.
   uint64_t ucode_key = 0;
+  uint64_t loose_key = 0;
   CompiledShader* compiled = nullptr;
   // Vertex shaders: the input layout decoded from this variant's vfetches.
   std::vector<LiveElement> elements;
@@ -205,19 +207,26 @@ class ShaderStore {
     for (size_t i = 0; i < g_shaderCacheEntryCount; ++i) {
       by_container_.emplace(g_shaderCacheEntries[i].hash, &g_shaderCacheEntries[i]);
     }
-    for (const auto& m : kUcodeMap) by_ucode_.emplace(m.ucode, m.container);
+    for (const auto& m : kUcodeMap) {
+      by_ucode_.emplace(m.ucode, m.container);
+      // The fallback keeps the first container of each loose key, which is the
+      // container the store answered with before the swizzle joined the key.
+      by_loose_.emplace(m.loose, m.container);
+    }
     REXLOG_INFO("Renut: Plume shader cache: {} shaders, {} microcode keys, {} MB smol-v",
                 g_shaderCacheEntryCount, by_ucode_.size(),
                 size_t(g_spirvCacheEnd - g_spirvCache) >> 20);
   }
 
-  const ShaderCacheEntry* Find(uint64_t ucode_hash) const { return Find(ucode_hash, 0); }
+  const ShaderCacheEntry* Find(uint64_t ucode_hash, uint64_t loose_hash) const {
+    return Find(ucode_hash, loose_hash, 0);
+  }
 
   // The domain stage form of a vertex shader, recompiled a second time under
   // the container's hash xored with the tag. Absent unless the shader is in
   // tools/shaders/domain-shaders.txt.
-  const ShaderCacheEntry* FindDomain(uint64_t ucode_hash) const {
-    return Find(ucode_hash, RENUT_DOMAIN_SHADER_HASH_TAG);
+  const ShaderCacheEntry* FindDomain(uint64_t ucode_hash, uint64_t loose_hash) const {
+    return Find(ucode_hash, loose_hash, RENUT_DOMAIN_SHADER_HASH_TAG);
   }
 
   CompiledShader* Build(RenderDevice* device, const ShaderCacheEntry* entry, bool vertex) {
@@ -240,15 +249,22 @@ class ShaderStore {
   }
 
  private:
-  const ShaderCacheEntry* Find(uint64_t ucode_hash, uint64_t tag) const {
-    auto container = by_ucode_.find(ucode_hash);
-    if (container == by_ucode_.end()) return nullptr;
+  const ShaderCacheEntry* Find(uint64_t ucode_hash, uint64_t loose_hash, uint64_t tag) const {
+    if (const ShaderCacheEntry* entry = Lookup(by_ucode_, ucode_hash, tag)) return entry;
+    return Lookup(by_loose_, loose_hash, tag);
+  }
+
+  const ShaderCacheEntry* Lookup(const std::unordered_map<uint64_t, uint64_t>& by_key, uint64_t key,
+                                 uint64_t tag) const {
+    auto container = by_key.find(key);
+    if (container == by_key.end()) return nullptr;
     auto entry = by_container_.find(container->second ^ tag);
     return entry == by_container_.end() ? nullptr : entry->second;
   }
 
   std::unordered_map<uint64_t, const ShaderCacheEntry*> by_container_;
   std::unordered_map<uint64_t, uint64_t> by_ucode_;
+  std::unordered_map<uint64_t, uint64_t> by_loose_;
   std::unordered_map<const ShaderCacheEntry*, CompiledShader> compiled_;
 };
 
@@ -1448,8 +1464,10 @@ gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, ui
   auto& shader = shaders_[hash];
   if (!shader) {
     shader = std::make_unique<HostShader>(shader_type, hash, host_address, dword_count);
-    shader->ucode_key = ucode::Key(host_address, size_t(dword_count) * sizeof(uint32_t));
-    shader->entry = store_->Find(shader->ucode_key);
+    const size_t ucode_bytes = size_t(dword_count) * sizeof(uint32_t);
+    shader->ucode_key = ucode::Key(host_address, ucode_bytes);
+    shader->loose_key = ucode::LooseKey(host_address, ucode_bytes);
+    shader->entry = store_->Find(shader->ucode_key, shader->loose_key);
     if (!shader->entry && missed_.insert(hash).second && missed_.size() <= 32) {
       REXLOG_WARN("Renut: Plume has no recompiled {} shader for microcode {:016X} ({} dwords)",
                   shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash, dword_count);
@@ -1546,7 +1564,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       // have made.
       if (!vs->domain_decoded) {
         vs->domain_decoded = true;
-        vs->domain_entry = store_->FindDomain(vs->ucode_key);
+        vs->domain_entry = store_->FindDomain(vs->ucode_key, vs->loose_key);
         if (vs->domain_entry) {
           vs->domain_compiled = store_->Build(device_, vs->domain_entry, false);
           std::vector<LiveElement> unused;
