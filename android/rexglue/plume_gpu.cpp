@@ -24,6 +24,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -438,6 +439,8 @@ struct Resolved {
   // is stale.
   uint64_t guest_hash = 0;
   uint32_t guest_bytes = 0;
+  uint32_t guest_pitch = 0, guest_height = 0, guest_bpp = 0;
+  uint64_t written_frame = ~0ull;
   uint64_t checked_frame = ~0ull;
   // The texture is sized to the copy's aligned extent (720 rows become 736),
   // but a fetch normalizes coordinates to its own size, so a fetch smaller
@@ -506,6 +509,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
                                     Target* depth);
   void SetFramebuffer(RenderFramebuffer* framebuffer);
   Resolved* FindResolvedContaining(uint32_t address, RenderFormat format, uint32_t bytes_per_pixel,
+                                  uint32_t pitch, uint32_t height,
                                   uint32_t& row);
   uint32_t FittedResolved(Resolved& resolved, uint32_t width, uint32_t height);
   Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height);
@@ -584,6 +588,22 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Textures replaced while the frame's commands may still use them; freed
   // once the frame has run (IssueSwap waits for it).
   std::vector<std::unique_ptr<RenderTexture>> retired_;
+  // A recorded draw stores a bindless index, not a snapshot of that binding.
+  // Keep old image bindings alive until the submission has finished as well.
+  std::vector<uint32_t> retired_descriptors_, free_descriptors_;
+  uint32_t AllocateTextureDescriptor() {
+    if (!free_descriptors_.empty()) {
+      uint32_t index = free_descriptors_.back();
+      free_descriptors_.pop_back();
+      return index;
+    }
+    return next_descriptor_ < kMaxTextures2D ? next_descriptor_++ : 0;
+  }
+  void RetireTexture(std::unique_ptr<RenderTexture>& texture, uint32_t& descriptor) {
+    if (texture) retired_.push_back(std::move(texture));
+    if (descriptor) retired_descriptors_.push_back(descriptor);
+    descriptor = 0;
+  }
   std::vector<std::unique_ptr<RenderFramebuffer>> retired_framebuffers_;
   static uint64_t ResolvedKey(uint32_t address, RenderFormat format) {
     return uint64_t(address) | (uint64_t(format) << 32);
@@ -605,8 +625,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
         // Something else lives here now; forget every resolve at the address.
         for (auto it = resolved_.begin(); it != resolved_.end();) {
           if (uint32_t(it->first) == address) {
-            if (it->second.texture) retired_.push_back(std::move(it->second.texture));
-            if (it->second.fitted) retired_.push_back(std::move(it->second.fitted));
+            RetireTexture(it->second.texture, it->second.descriptor);
+            RetireTexture(it->second.fitted, it->second.fitted_descriptor);
             it = resolved_.erase(it);
           } else {
             ++it;
@@ -800,6 +820,12 @@ bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::
 }
 
 void PlumeCommandProcessor::BeginFrame() {
+  // Both callers wait for the GPU before starting a new command list.
+  for (uint32_t index : retired_descriptors_) {
+    set_2d_->setTexture(index, white_2d_.get(), RenderTextureLayout::SHADER_READ);
+    free_descriptors_.push_back(index);
+  }
+  retired_descriptors_.clear();
   retired_framebuffers_.clear();
   retired_.clear();
   // Keep the permanent allocations (white texel, zeros) at the start.
@@ -835,13 +861,21 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
 }
 
 Resolved* PlumeCommandProcessor::FindResolvedContaining(uint32_t address, RenderFormat format,
-                                                        uint32_t bytes_per_pixel, uint32_t& row) {
+                                                        uint32_t bytes_per_pixel, uint32_t pitch,
+                                                        uint32_t height, uint32_t& row) {
   for (auto& [key, resolved] : resolved_) {
     const uint32_t base = uint32_t(key);
     if (!resolved.texture || resolved.format != format || address <= base) continue;
-    const uint32_t row_bytes = resolved.width * bytes_per_pixel;
+    // Only join bands of the same guest surface. Different guest formats can
+    // share a host format (for example an 8-bit mask stored in RGBA8). Testing
+    // the incoming bpp against an old image's host extent aliases unrelated
+    // allocations, notably Banjo's mask and the adjacent golden aura.
+    if (resolved.guest_bpp != bytes_per_pixel || resolved.guest_pitch != pitch ||
+        resolved.guest_height != height || resolved.written_frame != swaps_) continue;
+    const uint32_t row_bytes = resolved.guest_pitch * bytes_per_pixel;
     const uint32_t offset = address - base;
-    if (offset < row_bytes * resolved.height && offset % row_bytes == 0) {
+    if (offset < row_bytes * resolved.guest_height && offset % row_bytes == 0 &&
+        (offset / row_bytes) % 32 == 0) {
       row = offset / row_bytes;
       return &resolved;
     }
@@ -851,13 +885,13 @@ Resolved* PlumeCommandProcessor::FindResolvedContaining(uint32_t address, Render
 
 uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint32_t height) {
   if (!r.fitted || r.fitted_width != width || r.fitted_height != height) {
-    if (r.fitted) retired_.push_back(std::move(r.fitted));
+    RetireTexture(r.fitted, r.fitted_descriptor);
     r.fitted = device_->createTexture(RenderTextureDesc::Texture2D(width, height, 1, r.format));
     r.fitted_width = width;
     r.fitted_height = height;
     r.fitted_layout = RenderTextureLayout::UNKNOWN;
     r.fitted_generation = UINT64_MAX;
-    if (!r.fitted_descriptor && next_descriptor_ < kMaxTextures2D) r.fitted_descriptor = next_descriptor_++;
+    r.fitted_descriptor = AllocateTextureDescriptor();
     if (!r.fitted || !r.fitted_descriptor) return 0;
     set_2d_->setTexture(r.fitted_descriptor, r.fitted.get(), RenderTextureLayout::SHADER_READ);
   }
@@ -955,46 +989,14 @@ Resolved& PlumeCommandProcessor::GetResolved(uint32_t address, RenderFormat form
   }
   uint32_t w = std::max(width, resolved.format == format ? resolved.width : 0u);
   uint32_t h = std::max(height, resolved.format == format ? resolved.height : 0u);
-  if (resolved.texture) retired_.push_back(std::move(resolved.texture));
+  RetireTexture(resolved.texture, resolved.descriptor);
   resolved.texture = device_->createTexture(RenderTextureDesc::Texture2D(w, h, 1, format));
   resolved.format = format;
   resolved.width = w;
   resolved.height = h;
   resolved.layout = RenderTextureLayout::UNKNOWN;
-  if (!resolved.descriptor && next_descriptor_ < kMaxTextures2D) {
-    resolved.descriptor = next_descriptor_++;
-  }
+  resolved.descriptor = AllocateTextureDescriptor();
   return resolved;
-}
-
-// The game's own textures: the base level, decoded on the CPU into RGBA8 the
-// first time a fetch constant names it (and again if its bytes change).
-// The fetch describing mip level `level` (>= 1) of a 2D texture, and that
-// level's offset from mip_address. Mips are stored at power-of-two sizes, level
-// 1 first; levels of 16 texels or less sit in a packed tail, not handled here.
-bool MipLevelFetch(const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t level,
-                   xenos::xe_gpu_texture_fetch_t& out, uint32_t& offset) {
-  auto pow2 = [](uint32_t v) { return v <= 1 ? 1u : 1u << (32 - __builtin_clz(v - 1)); };
-  const uint32_t width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
-  offset = 0;
-  for (uint32_t l = 1; l <= level; ++l) {
-    const uint32_t storage_w = std::max(pow2(width) >> l, 1u), storage_h = std::max(pow2(height) >> l, 1u);
-    if (fetch.packed_mips && storage_w <= 16 && storage_h <= 16) return false;
-    xenos::xe_gpu_texture_fetch_t f = fetch;
-    f.pitch = std::max(1u, (storage_w + 31) / 32);
-    f.size_2d.width = storage_w - 1;
-    f.size_2d.height = storage_h - 1;
-    const uint32_t size = (TextureBaseSpan(f) + 4095) & ~4095u;
-    if (!size) return false;
-    if (l == level) {
-      f.size_2d.width = std::max(width >> l, 1u) - 1;
-      f.size_2d.height = std::max(height >> l, 1u) - 1;
-      out = f;
-      return true;
-    }
-    offset += size;
-  }
-  return false;
 }
 
 // A texture's content key. The game streams textures into reused memory and
@@ -1021,20 +1023,24 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   HashCombine(key, fetch.swizzle);
   HashCombine(key, uint32_t(fetch.mip_min_level));
   HashCombine(key, uint32_t(fetch.mip_address));
-  // The top level the fetch lets the sampler use. N&B streams textures in:
-  // until the full resolution arrives, the fetch points at the mip chain and
-  // sets mip_min_level, and the base level's memory holds something else.
-  xenos::xe_gpu_texture_fetch_t top = fetch;
-  const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(address);
-  if (fetch.mip_min_level && fetch.mip_address && !(skip_mask_ & 32768)) {
-    uint32_t offset = 0;
-    if (MipLevelFetch(fetch, fetch.mip_min_level, top, offset)) {
-      data = memory_->TranslatePhysical<const uint8_t*>((fetch.mip_address << 12) + offset);
-    } else {
-      top = fetch;
-    }
+  uint32_t base_page, mip_page, top_level, last_level;
+  gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
+      &base_page, &mip_page, &top_level, &last_level);
+  if (skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
+  if (skip_mask_ & 8192) last_level = top_level;
+  const uint32_t levels = last_level - top_level + 1;
+  HashCombine(key, last_level);
+  HashCombine(key, uint32_t(fetch.packed_mips));
+  std::array<TextureLevel, 14> layouts;
+  std::array<const uint8_t*, 14> data{};
+  uint64_t content = 0;
+  for (uint32_t i = 0; i < levels; ++i) {
+    auto& level = layouts[i];
+    if (!LocateTextureLevel(fetch, top_level + i, level)) return 0;
+    const uint64_t start = (uint64_t(level.from_mips ? mip_page : base_page) << 12) + level.offset;
+    if (!start || start + level.extent > 0x20000000ull) return 0;
+    data[i] = memory_->TranslatePhysical<const uint8_t*>(uint32_t(start));
   }
-  const uint32_t span = TextureBaseSpan(top);
   GuestTexture& texture = guest_textures_[key];
   if (texture.failed) return 0;
   // Checked once per frame; the draws after the first reuse the result.
@@ -1043,15 +1049,15 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     return texture.descriptor;
   }
   texture.checked_frame = swaps_;
-  const uint64_t content = ContentHash(data, span);
+  for (uint32_t i = 0; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
   if (!texdump_directory_.empty() && dumped_.insert(key).second) texture.content = ~content;
   if (texture.texture && texture.content == content) {
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
   std::vector<uint32_t> rgba;
-  uint32_t width = 0, height = 0;
-  if (!span || !DecodeTexture2D(top, data, rgba, width, height)) {
+  const uint32_t width = layouts[0].width, height = layouts[0].height;
+  if (!DecodeTextureLevel(fetch, layouts[0], data[0], 0, rgba)) {
     texture.failed = true;
     ++stats_.texture_failures;
     if (unsupported_formats_.insert(uint32_t(fetch.format)).second) {
@@ -1059,28 +1065,11 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     }
     return 0;
   }
-  if (!texture.descriptor) {
-    if (next_descriptor_ >= kMaxTextures2D) return 0;
-    texture.descriptor = next_descriptor_++;
-  }
   if (!texdump_directory_.empty()) DumpTexture(fetch, rgba, width, height, "2d");
-  const uint32_t top_level = top.size_2d.width == fetch.size_2d.width &&
-                                     top.size_2d.height == fetch.size_2d.height
-                                 ? 0
-                                 : uint32_t(fetch.mip_min_level);
-  // Mip levels: as many as the fetch declares, rebuilt from the base level
-  // with a box filter (the guest's own mips sit in a packed tail the decoder
-  // does not read yet). Without them distant terrain and foliage alias badly.
-  uint32_t levels = 1;
-  if (fetch.mip_filter != xenos::TextureFilter::kBaseMap && !(skip_mask_ & 8192)) {
-    const uint32_t full = 32 - __builtin_clz(std::max(width, height));
-    const uint32_t declared = fetch.mip_max_level >= top_level ? fetch.mip_max_level - top_level + 1 : 1;
-    levels = std::clamp<uint32_t>(declared, 1, full);
-  }
   // New contents reuse the image when its shape is unchanged: earlier draws of
   // this frame may still reference it, and the upload is ordered after them.
   if (!texture.texture || texture.levels != levels || texture.width != width || texture.height != height) {
-    if (texture.texture) retired_.push_back(std::move(texture.texture));
+    RetireTexture(texture.texture, texture.descriptor);
     texture.texture = device_->createTexture(
         RenderTextureDesc::Texture2D(width, height, levels, RenderFormat::R8G8B8A8_UNORM));
     texture.levels = levels;
@@ -1093,32 +1082,14 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     }
   }
   texture.content = content;
+  if (!texture.descriptor) texture.descriptor = AllocateTextureDescriptor();
+  if (!texture.descriptor) return 0;
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
   uint32_t w = width, h = height;
   for (uint32_t level = 0; level < levels; ++level) {
-    if (level) {
-      // 2x2 box filter per channel, clamping at odd edges.
-      const uint32_t nw = std::max(1u, w / 2), nh = std::max(1u, h / 2);
-      std::vector<uint32_t> next(size_t(nw) * nh);
-      for (uint32_t y = 0; y < nh; ++y) {
-        const uint32_t y0 = std::min(2 * y, h - 1), y1 = std::min(2 * y + 1, h - 1);
-        for (uint32_t x = 0; x < nw; ++x) {
-          const uint32_t x0 = std::min(2 * x, w - 1), x1 = std::min(2 * x + 1, w - 1);
-          const uint32_t p[4] = {rgba[size_t(y0) * w + x0], rgba[size_t(y0) * w + x1],
-                                 rgba[size_t(y1) * w + x0], rgba[size_t(y1) * w + x1]};
-          uint32_t out = 0;
-          for (uint32_t c = 0; c < 32; c += 8) {
-            const uint32_t sum = ((p[0] >> c) & 0xFF) + ((p[1] >> c) & 0xFF) + ((p[2] >> c) & 0xFF) +
-                                 ((p[3] >> c) & 0xFF);
-            out |= ((sum + 2) / 4) << c;
-          }
-          next[size_t(y) * nw + x] = out;
-        }
-      }
-      rgba = std::move(next);
-      w = nw;
-      h = nh;
-    }
+    if (level && !DecodeTextureLevel(fetch, layouts[level], data[level], 0, rgba)) return 0;
+    w = layouts[level].width;
+    h = layouts[level].height;
     const uint64_t staging = Allocate(uint64_t(w) * h * 4, 512);
     if (staging == UINT64_MAX) return 0;
     std::memcpy(Pointer(staging), rgba.data(), size_t(w) * h * 4);
@@ -1164,27 +1135,24 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
   HashCombine(key, fetch.swizzle);
   HashCombine(key, uint32_t(fetch.mip_min_level));
   HashCombine(key, uint32_t(fetch.mip_address));
-  xenos::xe_gpu_texture_fetch_t top = fetch;
-  const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(address);
-  // Streamed in like the 2D ones: level 1 of every slice first at mip_address.
-  if (fetch.mip_min_level == 1 && fetch.mip_address && !(skip_mask_ & 32768)) {
-    uint32_t offset = 0;
-    if (MipLevelFetch(fetch, 1, top, offset)) {
-      data = memory_->TranslatePhysical<const uint8_t*>(fetch.mip_address << 12);
-    } else {
-      top = fetch;
-    }
-  }
-  const uint32_t slice_stride = (TextureBaseSpan(top) + 4095) & ~4095u;
-  if (!slice_stride) return 0;
+  uint32_t base_page, mip_page, top_level, last_level;
+  gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
+      &base_page, &mip_page, &top_level, &last_level);
+  if (skip_mask_ & 32768) { base_page = fetch.base_address; top_level = 0; }
+  TextureLevel level;
+  if (!LocateTextureLevel(fetch, top_level, level)) return 0;
+  const uint64_t start = (uint64_t(level.from_mips ? mip_page : base_page) << 12) + level.offset;
+  if (!start || start + level.extent > 0x20000000ull) return 0;
+  const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(uint32_t(start));
   GuestTexture& texture = guest_stacks_[key];
   if (texture.failed) return 0;
-  if (texture.texture && texture.checked_frame == swaps_) {
+  if (texture.texture && texture.checked_frame == swaps_ && texdump_directory_.empty()) {
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
   texture.checked_frame = swaps_;
-  const uint64_t content = ContentHash(data, slice_stride * depth);
+  const uint64_t content = ContentHash(data, level.extent);
+  if (!texdump_directory_.empty() && dumped_.insert(key ^ 2).second) texture.content = ~content;
   if (texture.texture && texture.content == content) {
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
@@ -1192,14 +1160,15 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
   std::vector<uint32_t> all, slice;
   uint32_t width = 0, height = 0;
   for (uint32_t z = 0; z < depth; ++z) {
-    uint32_t w = 0, h = 0;
-    if (!DecodeTexture2D(top, data + size_t(z) * slice_stride, slice, w, h) || (z && (w != width || h != height))) {
+    const uint32_t w = level.width, h = level.height;
+    if (!DecodeTextureLevel(fetch, level, data, z, slice)) {
       texture.failed = true;
       ++stats_.texture_failures;
       return 0;
     }
     width = w;
     height = h;
+    if (!texdump_directory_.empty()) DumpTexture(fetch, slice, w, h, "stack");
     all.insert(all.end(), slice.begin(), slice.end());
   }
   if (!texture.descriptor) {
@@ -1516,6 +1485,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                           FindResolved(fetch.base_address << 12) ? "/R" : "");
     }
     Trace("{}", line);
+    const auto* declared = g_shaderInputElements + vs->entry->inputElementOffset;
+    for (uint32_t i = 0; i < vs->entry->inputElementCount; ++i) {
+      const auto& e = declared[i];
+      if (size_t(e.fetchAddress) * 3 + 2 >= vs->ucode_dword_count()) continue;
+      const auto* f = vs->ucode_dwords() + size_t(e.fetchAddress) * 3;
+      Trace("  fetch L{} @{} {:08X} {:08X} {:08X} exp={}", e.location, e.fetchAddress,
+            f[0], f[1], f[2], int32_t(f[1] << 2) >> 26);
+    }
   }
 
   // Constants: the guest register file, exactly as the recompiled shaders
@@ -2004,18 +1981,23 @@ bool PlumeCommandProcessor::IssueCopy() {
     // a k_24_8 / k_24_8_FLOAT fetch returns in x (shadow maps, and the scene
     // depth the depth-of-field and fog passes read).
     const RenderFormat dest_format = copying_depth ? RenderFormat::R32_FLOAT : source->format;
-    Resolved* inside = FindResolvedContaining(info.copy_dest_base, dest_format, dest_bpp, row);
+    Resolved* inside = FindResolvedContaining(info.copy_dest_base, dest_format, dest_bpp,
+                                              dest_w, dest_h, row);
     Resolved& dest = inside && inside->height >= row + dy + h
                          ? *inside
                          : GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
     const uint32_t dest_y = &dest == inside ? dy + row : dy;
     ++dest.generation;
     dest.written = ++resolve_serial_;
+    dest.written_frame = swaps_;
+    dest.guest_pitch = dest_w;
+    dest.guest_height = dest_h;
+    dest.guest_bpp = dest_bpp;
     // Snapshot of the guest memory under the whole resolved texture.
     {
       uint32_t base_address = info.copy_dest_base;
-      if (&dest == inside) base_address -= row * dest.width * dest_bpp;
-      dest.guest_bytes = dest.width * dest.height * dest_bpp;
+      if (&dest == inside) base_address -= row * dest.guest_pitch * dest_bpp;
+      dest.guest_bytes = dest.guest_pitch * dest.guest_height * dest_bpp;
       dest.guest_hash = ContentHash(memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
       dest.checked_frame = swaps_;
     }

@@ -250,6 +250,91 @@ uint32_t TextureBaseSpan(const xenos::xe_gpu_texture_fetch_t& fetch) {
   return ((pitch_blocks * info->bytes_per_block() + 255) & ~255u) * rows;
 }
 
+bool LocateTextureLevel(const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t level, TextureLevel& out) {
+  namespace tu = rex::graphics::texture_util;
+  const auto* info = rex::graphics::FormatInfo::Get(fetch.format);
+  if (!info || !info->bytes_per_block()) return false;
+  const uint32_t width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
+  const uint32_t depth = fetch.stacked ? uint32_t(fetch.size_2d.stack_depth) + 1 : 1;
+  const uint32_t last_level = Log2(std::max(width, height));
+  if (level > last_level) return false;
+  const uint32_t max_level = std::min(last_level, std::max<uint32_t>(level, fetch.mip_max_level));
+  const tu::TextureGuestLayout layout = tu::GetGuestTextureLayout(
+      xenos::DataDimension::k2DOrStacked, fetch.pitch, width, height, depth, fetch.tiled, fetch.format,
+      fetch.packed_mips, true, max_level);
+  const bool packed = layout.packed_level != UINT32_MAX && level >= layout.packed_level;
+  const tu::TextureGuestLayout::Level* stored;
+  out = TextureLevel();
+  if (level == 0) {
+    stored = &layout.base;
+  } else {
+    const uint32_t index = packed ? layout.packed_level : level;
+    // Even when the packed tail starts at level 0, non-base levels live at
+    // mip_address, with their own power-of-two storage pitch.
+    stored = &layout.mips[index];
+    out.from_mips = true;
+    out.offset = layout.mip_offsets_bytes[index];
+  }
+  if (packed) {
+    uint32_t z = 0;
+    tu::GetPackedMipOffset(width, height, depth, fetch.format, level, out.x_blocks, out.y_blocks, z);
+  }
+  out.extent = stored->level_data_extent_bytes;
+  out.row_pitch = stored->row_pitch_bytes;
+  out.slice_stride = stored->array_slice_stride_bytes;
+  out.width = std::max(width >> level, 1u);
+  out.height = std::max(height >> level, 1u);
+  return out.row_pitch != 0 && out.extent != 0;
+}
+
+bool DecodeTextureLevel(const xenos::xe_gpu_texture_fetch_t& fetch, const TextureLevel& level,
+                        const uint8_t* data, uint32_t slice, std::vector<uint32_t>& rgba) {
+  const auto* info = rex::graphics::FormatInfo::Get(fetch.format);
+  if (!info || !info->bytes_per_block() || !data) return false;
+  const uint32_t bw = info->block_width, bh = info->block_height, bpb = info->bytes_per_block();
+  if (bpb > 16 || bw * bh > 16) return false;
+  const size_t slice_offset = size_t(slice) * level.slice_stride;
+  if (slice_offset >= level.extent) return false;
+  data += slice_offset;
+  const uint32_t width = level.width, height = level.height;
+  const uint32_t pitch_blocks = level.row_pitch / bpb;
+  const uint32_t blocks_x = (width + bw - 1) / bw, blocks_y = (height + bh - 1) / bh;
+  const uint32_t bpb_log2 = Log2(bpb);
+  uint32_t swizzle[4];
+  for (int i = 0; i < 4; ++i) swizzle[i] = (fetch.swizzle >> (3 * i)) & 7;
+  rgba.assign(size_t(width) * height, 0);
+  uint8_t block[16];
+  Texel texels[16];
+  for (uint32_t by = 0; by < blocks_y; ++by) {
+    for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+      const uint32_t x_block = bx + level.x_blocks, y_block = by + level.y_blocks;
+      const size_t offset = fetch.tiled
+                                ? size_t(rex::graphics::texture_util::GetTiledOffset2D(
+                                      int32_t(x_block), int32_t(y_block), pitch_blocks, bpb_log2))
+                                : size_t(y_block) * level.row_pitch + size_t(x_block) * bpb;
+      if (offset + bpb > level.extent - slice_offset) return false;
+      std::memcpy(block, data + offset, bpb);
+      SwapBlock(block, bpb, fetch.endianness);
+      if (!DecodeBlock(fetch.format, block, texels)) return false;
+      for (uint32_t ty = 0; ty < bh; ++ty) {
+        const uint32_t y = by * bh + ty;
+        if (y >= height) break;
+        for (uint32_t tx = 0; tx < bw; ++tx) {
+          const uint32_t x = bx * bw + tx;
+          if (x >= width) break;
+          const Texel& t = texels[ty * bw + tx];
+          uint8_t out[4];
+          for (int c = 0; c < 4; ++c) {
+            out[c] = swizzle[c] < 4 ? t.c[swizzle[c]] : swizzle[c] == 5 ? 255 : 0;
+          }
+          std::memcpy(&rgba[size_t(y) * width + x], out, 4);
+        }
+      }
+    }
+  }
+  return true;
+}
+
 bool DecodeTexture2D(const xenos::xe_gpu_texture_fetch_t& fetch, const uint8_t* data,
                      std::vector<uint32_t>& rgba, uint32_t& width, uint32_t& height) {
   const auto* info = rex::graphics::FormatInfo::Get(fetch.format);

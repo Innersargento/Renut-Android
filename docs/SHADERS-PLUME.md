@@ -1,5 +1,28 @@
 # Shaders recompilados para o Plume — 19/09/2026
 
+## Correções verificadas no aparelho: aura e terreno
+
+- **Aura dourada do menu:** os resolves da máscara de 8 bits e da aura RGBA
+  adjacente eram confundidos porque ambos usam RGBA no host. A união de faixas
+  agora exige o mesmo tamanho, pitch e bytes por pixel no guest, no mesmo quadro.
+  Imagens e descritores substituídos são mantidos até a conclusão da GPU.
+- **Rosetas nas montanhas:** o VS `239A125831F7EB9D` busca `TEXCOORD0` nas
+  instruções 9 e 11, nos offsets de vértice 20 e 24. A deduplicação pelo nome
+  fazia o mapa geral usar o UV repetido da pedra. Buscas repetidas de uma
+  semântica agora recebem entradas independentes na tabela `vfetchLive`, com
+  layout lido do microcódigo em uso. `verify_cache.cpp` verifica esse caso e
+  detecta colisões ou excesso de slots de leitura.
+- Texturas 2D passam a carregar os níveis de mip reais, incluindo o mip tail
+  compactado, usando o layout do SDK. Texturas empilhadas usam o mesmo cálculo
+  de níveis e de distância entre camadas.
+
+Validação: 1.801 shaders recompilados, zero falhas de decodificação ou de
+`spirv-val --target-env vulkan1.1`; APK debug compilado e instalado no SM-S918B
+com Plume/Turnip. Capturas em `out/graphics-20260919/uv-fixed-first.png` e
+`final-menu-check.png`: montanhas sem rosetas e aura dourada sem faixas coloridas.
+O cache em `generated/shaders/` foi regenerado; para reproduzir, usar o script
+abaixo com o XEX e os contêineres capturados em runtime, incluindo os do terreno.
+
 Ferramenta: [masterspike52/reNut-XenosRecomp](https://github.com/masterspike52/reNut-XenosRecomp)
 (commit `8f781f8`, modo `RENUT_RECOMP`) com o patch `tools/shaders/renut-xenosrecomp.patch`.
 Compilada no WSL em `~/rxr`. Reprodução: `tools/shaders/recompile_shaders.sh <entrada> <saída>`.

@@ -35,6 +35,34 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < g_shaderCacheEntryCount; i++)
     {
         const ShaderCacheEntry& entry = g_shaderCacheEntries[i];
+        // Every manual fetch occupies its own host table entry.
+        uint32_t liveSlots = 0;
+        bool terrainDetail = false, terrainWorld = false;
+        for (uint32_t j = 0; j < entry.inputElementCount; ++j)
+        {
+            const auto& element = g_shaderInputElements[entry.inputElementOffset + j];
+            if (element.location == RENUT_LIVE_FETCH_LOCATION)
+            {
+                if (element.slot >= RENUT_LIVE_FETCH_COUNT ||
+                    (liveSlots & (1u << element.slot)))
+                {
+                    std::fprintf(stderr, "%016llX: invalid or aliased live fetch slot\n",
+                        (unsigned long long)entry.hash);
+                    failures++;
+                }
+                else liveSlots |= 1u << element.slot;
+            }
+            terrainDetail |= element.fetchAddress == 9 && element.location == 8;
+            terrainWorld |= element.fetchAddress == 11 &&
+                element.location == RENUT_LIVE_FETCH_LOCATION;
+        }
+        // Captured terrain regression: two TEXCOORD0 instructions read byte
+        // offsets 20 and 24. Collapsing them repeats the world mask as rosettes.
+        if (entry.hash == 0x239A125831F7EB9Dull && (!terrainDetail || !terrainWorld))
+        {
+            std::fprintf(stderr, "terrain detail/world UV fetches were merged\n");
+            failures++;
+        }
         const uint8_t* data = smolv.data() + entry.spirvOffset;
 
         size_t decodedSize = smolv::GetDecodedBufferSize(data, entry.spirvSize);

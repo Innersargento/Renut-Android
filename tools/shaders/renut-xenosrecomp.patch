@@ -349,7 +349,7 @@ index c71e7c9..965158f 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -222,37 +244,115 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -222,37 +244,126 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      // vertex fetch constant 95 - StreamNumber, and the instruction names fetch
      // constant constIndex * 3 + constIndexSelect. So the host binds the stream
      // and this reads it as a raw buffer.
@@ -358,7 +358,18 @@ index c71e7c9..965158f 100644
 +    // indexed by the vertex id, so the host input assembler cannot fetch it.
 +    const bool indexedByComputedRegister =
 +        findResult != vertexElements.end() && isWritten(uint32_t(instr.srcRegister));
-+    if (indexedByComputedRegister)
++    // A declaration semantic is not a unique fetch. Terrain shaders read
++    // TEXCOORD0 twice, at offsets 20 (detail UV) and 24 (world-map UV).
++    // Preserve subsequent instructions independently, including D3D's live
++    // stream/format/offset patching, instead of aliasing the first attribute.
++    const bool repeatedSemantic = findResult != vertexElements.end() &&
++        std::any_of(inputLayout.begin(), inputLayout.end(),
++            [&](const ShaderInputElement& element)
++            {
++                return element.usage == uint8_t(findResult->second.usage) &&
++                    element.usageIndex == uint8_t(findResult->second.usageIndex);
++            });
++    if (indexedByComputedRegister || repeatedSemantic)
      {
 -        const uint32_t fetchConstant =
 -            uint32_t(instr.constIndex) * 3 + uint32_t(instr.constIndexSelect);
@@ -479,7 +490,7 @@ index c71e7c9..965158f 100644
  
              out += '.';
              printDstSwizzle(instr.dstSwizzle, true);
-@@ -292,6 +392,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -292,6 +403,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      case DeclUsage::BlendWeight:
          print("swapFloats(g_SwappedBlendWeights, ");
          break;
@@ -489,7 +500,7 @@ index c71e7c9..965158f 100644
      case DeclUsage::TexCoord:
          print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
          break;
-@@ -372,13 +475,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -372,13 +486,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
              // is the whole point of one, reading a different field of the same
              // vertex.
              element.offsetBytes = uint16_t(uint32_t(instr.offset) * 4);
@@ -508,7 +519,7 @@ index c71e7c9..965158f 100644
  
              for (auto& usageLocation : USAGE_LOCATIONS)
              {
-@@ -406,7 +512,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -406,7 +523,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      }
  #endif
  
@@ -535,7 +546,7 @@ index c71e7c9..965158f 100644
  
  #ifdef RENUT_RECOMP
      switch (findResult->second.usage)
-@@ -423,6 +548,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -423,6 +559,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
          break;
  
      case DeclUsage::BlendWeight:
@@ -543,7 +554,7 @@ index c71e7c9..965158f 100644
      case DeclUsage::Position:
          print(", {})", uint32_t(findResult->second.usageIndex));
          break;
-@@ -517,6 +643,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
+@@ -517,6 +654,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
      }
  
      indent();
@@ -553,7 +564,7 @@ index c71e7c9..965158f 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -1034,6 +1163,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1034,6 +1174,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -563,7 +574,7 @@ index c71e7c9..965158f 100644
              print("r{}.", instr.vectorDest);
          }
  
-@@ -1421,6 +1553,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1421,6 +1564,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -573,7 +584,7 @@ index c71e7c9..965158f 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1689,6 +1824,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1689,6 +1835,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
@@ -584,7 +595,7 @@ index c71e7c9..965158f 100644
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1828,6 +1967,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1828,6 +1978,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
              }
