@@ -565,6 +565,15 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint32_t FittedResolved(Resolved& resolved, uint32_t width, uint32_t height);
   void MergeResolvedTails(uint32_t address, Resolved& dest);
   Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height);
+  // Everything LayoutOf works out from a fetch constant, kept per constant.
+  struct FetchLayout {
+    uint64_t key = 0;
+    uint32_t levels = 0, top_level = 0;
+    std::array<TextureLevel, 14> levels_layout{};
+    std::array<uint32_t, 14> starts{};
+    bool usable = false;
+  };
+  const FetchLayout* LayoutOf(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
@@ -577,6 +586,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint64_t, std::unique_ptr<HostShader>> shaders_;
   std::unordered_set<uint64_t> missed_;
   std::unordered_map<uint64_t, uint64_t> missed_draws_;
+  // Never invalidated: a fetch constant always describes the same layout. The
+  // contents behind it are checked separately, once a frame, in GetGuestTexture.
+  std::unordered_map<uint64_t, FetchLayout> fetch_layouts_;
   std::unordered_set<uint64_t> missed_pairs_;
   std::string miss_dump_directory_;
   // One-frame trace: touching <files>/plume-trace-request records the next
@@ -1110,9 +1122,24 @@ uint64_t ContentHash(const uint8_t* data, uint32_t span) {
   return hash;
 }
 
-uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
-  const uint32_t address = fetch.base_address << 12;
-  if (!address) return 0;
+// The layout of every level a fetch constant names, and the key the decoded
+// texture is kept under. All of it is a pure function of the constant, and the
+// draw path asked for it once per texture slot of every draw: the busiest frame
+// of Showdown Town ran this arithmetic 169 thousand times, a quarter of the
+// command processor's time, for a few hundred distinct textures.
+const PlumeCommandProcessor::FetchLayout* PlumeCommandProcessor::LayoutOf(
+    const xenos::xe_gpu_texture_fetch_t& fetch) {
+  uint64_t fetch_key = 0;
+  HashCombine(fetch_key, fetch.dword_0);
+  HashCombine(fetch_key, fetch.dword_1);
+  HashCombine(fetch_key, fetch.dword_2);
+  HashCombine(fetch_key, fetch.dword_3);
+  HashCombine(fetch_key, fetch.dword_4);
+  HashCombine(fetch_key, fetch.dword_5);
+  auto found = fetch_layouts_.find(fetch_key);
+  if (found != fetch_layouts_.end()) return found->second.usable ? &found->second : nullptr;
+
+  FetchLayout& layout = fetch_layouts_[fetch_key];
   uint64_t key = 0;
   HashCombine(key, fetch.dword_0 & ~0x3FFu);  // pitch, tiling, (not clamp/sign)
   HashCombine(key, fetch.dword_1);            // format, endian, base address
@@ -1125,18 +1152,34 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
       &base_page, &mip_page, &top_level, &last_level);
   if (skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
   if (skip_mask_ & 8192) last_level = top_level;
-  const uint32_t levels = last_level - top_level + 1;
+  layout.levels = last_level - top_level + 1;
+  layout.top_level = top_level;
   HashCombine(key, last_level);
   HashCombine(key, uint32_t(fetch.packed_mips));
-  std::array<TextureLevel, 14> layouts;
+  layout.key = key;
+  for (uint32_t i = 0; i < layout.levels; ++i) {
+    auto& level = layout.levels_layout[i];
+    if (!LocateTextureLevel(fetch, top_level + i, level)) return nullptr;
+    const uint64_t start = (uint64_t(level.from_mips ? mip_page : base_page) << 12) + level.offset;
+    if (!start || start + level.extent > 0x20000000ull) return nullptr;
+    layout.starts[i] = uint32_t(start);
+  }
+  layout.usable = true;
+  return &layout;
+}
+
+uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  const uint32_t address = fetch.base_address << 12;
+  if (!address) return 0;
+  const FetchLayout* fetch_layout = LayoutOf(fetch);
+  if (!fetch_layout) return 0;
+  const uint64_t key = fetch_layout->key;
+  const uint32_t levels = fetch_layout->levels;
+  const std::array<TextureLevel, 14>& layouts = fetch_layout->levels_layout;
   std::array<const uint8_t*, 14> data{};
   uint64_t content = 0;
   for (uint32_t i = 0; i < levels; ++i) {
-    auto& level = layouts[i];
-    if (!LocateTextureLevel(fetch, top_level + i, level)) return 0;
-    const uint64_t start = (uint64_t(level.from_mips ? mip_page : base_page) << 12) + level.offset;
-    if (!start || start + level.extent > 0x20000000ull) return 0;
-    data[i] = memory_->TranslatePhysical<const uint8_t*>(uint32_t(start));
+    data[i] = memory_->TranslatePhysical<const uint8_t*>(fetch_layout->starts[i]);
   }
   GuestTexture& texture = guest_textures_[key];
   if (texture.failed) return 0;
@@ -2615,7 +2658,11 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       if (std::fscanf(file, "%u", &mask) != 1) mask = 0;
       std::fclose(file);
     }
-    if (mask != skip_mask_) REXLOG_INFO("Renut: Plume skip mask {:X}", mask);
+    if (mask != skip_mask_) {
+      REXLOG_INFO("Renut: Plume skip mask {:X}", mask);
+      // Two of its bits change how a level's layout is worked out.
+      fetch_layouts_.clear();
+    }
     skip_mask_ = mask;
     uint32_t address = 0, ordinal = 0;
     if (FILE* file = std::fopen((root + "/plume-snap").c_str(), "r")) {
