@@ -23,8 +23,11 @@ REXCVAR_DEFINE_STRING(renut_renderer, "xenos", "reNut",
 REXCVAR_DEFINE_BOOL(renut_d3d_dump_shaders, true, "reNut",
                     "Save every shader the game creates or registers (Create*Shader, "
                     "XGRegister*Shader) as a complete container, for offline recompilation");
-REXCVAR_DEFINE_INT32(renut_d3d_report_swaps, 600, "reNut",
-                     "Log the most called Direct3D functions every N swaps (0 = off)");
+REXCVAR_DEFINE_INT32(renut_d3d_report_swaps, 0, "reNut",
+                     "Log the most called Direct3D functions every N swaps (0 = off). Off by "
+                     "default: the game polls D3D_CBlocker_Check tens of millions of times a "
+                     "second while it waits for a fence, and counting every call cost a quarter "
+                     "of the process's cycles in one atomic increment");
 
 namespace renut::d3d {
 namespace {
@@ -38,6 +41,17 @@ constexpr const char* kNames[] = {
 std::array<std::atomic<uint64_t>, kFunctionCount> counts;
 std::array<std::atomic<Handler>, kFunctionCount> handlers;
 std::atomic<int> plume_mode{-1};
+// renut_d3d_report_swaps, read once: every intercepted call tests it.
+std::atomic<int32_t> report_every{-1};
+
+inline int32_t ReportEvery() {
+  int32_t every = report_every.load(std::memory_order_relaxed);
+  if (every < 0) {
+    every = std::max(0, REXCVAR_GET(renut_d3d_report_swaps));
+    report_every.store(every, std::memory_order_relaxed);
+  }
+  return every;
+}
 
 std::mutex dump_mutex;
 std::string dump_directory;
@@ -124,12 +138,13 @@ void Report() {
 
 // Called for every intercepted function. Returns true if a handler took it.
 inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
-  counts[function].fetch_add(1, std::memory_order_relaxed);
-  if (function == kD3DDevice_Swap) {
-    static std::atomic<uint32_t> swaps{0};
-    int32_t every = REXCVAR_GET(renut_d3d_report_swaps);
-    if (every > 0 && (++swaps % uint32_t(every)) == 0) {
-      Report();
+  if (int32_t every = ReportEvery()) {
+    counts[function].fetch_add(1, std::memory_order_relaxed);
+    if (function == kD3DDevice_Swap) {
+      static std::atomic<uint32_t> swaps{0};
+      if ((++swaps % uint32_t(every)) == 0) {
+        Report();
+      }
     }
   }
   if (!PlumeActive()) {

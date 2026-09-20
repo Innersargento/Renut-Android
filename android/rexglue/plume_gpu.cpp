@@ -508,6 +508,9 @@ struct Stats {
   uint64_t textures_decoded = 0, texture_failures = 0;
   uint64_t draws = 0, drawn = 0, no_vs = 0, no_ps = 0, bad_shader = 0, skipped_prim = 0,
            no_target = 0, resolves = 0, clears = 0, pipelines = 0, overflow = 0;
+  // Render passes begun. A tiler resolves and reloads the whole target at each
+  // one, so this says how much of the frame is spent moving tile memory.
+  uint64_t passes = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -1059,6 +1062,7 @@ void PlumeCommandProcessor::SetFramebuffer(RenderFramebuffer* framebuffer) {
   if (bound_framebuffer_ != framebuffer) {
     list_->setFramebuffer(framebuffer);
     bound_framebuffer_ = framebuffer;
+    ++stats_.passes;
   }
 }
 
@@ -2617,11 +2621,12 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 void PlumeCommandProcessor::Report() {
   REXLOG_INFO(
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
-      "no_target={} resolves={} clears={} pipelines={} targets={} resolved={} shaders={} "
+      "no_target={} resolves={} clears={} passes={} pipelines={} targets={} resolved={} shaders={} "
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
       "texture_failures={}",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
-      stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.pipelines,
+      stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes,
+      stats_.pipelines,
       targets_.size(), resolved_.size(), shaders_.size(), missed_.size(), stats_.overflow,
       upload_used_ >> 10, guest_textures_.size(), stats_.textures_decoded,
       stats_.texture_failures);
