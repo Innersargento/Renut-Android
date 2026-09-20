@@ -17,8 +17,21 @@ endif()
 string(REPLACE "VkResult res = volkInitialize();"
     "VkResult res = renutInitializeVulkanLoader();" PLUME_SOURCE "${PLUME_SOURCE}")
 string(REPLACE "#include \"plume_vulkan.h\""
-    "#include \"plume_vulkan.h\"\nextern VkResult renutInitializeVulkanLoader();"
+    "#include \"plume_vulkan.h\"\nextern VkResult renutInitializeVulkanLoader();\nextern VkPipelineCache renutVulkanPipelineCache(VkDevice);"
     PLUME_SOURCE "${PLUME_SOURCE}")
+# Upstream compiles every pipeline with no cache, so the driver recompiles all of
+# them on every launch. Entering Showdown Town spent 67% of its frame time inside
+# vkCreateGraphicsPipelines; the cache itself lives in plume_renderer.cpp.
+foreach(PLUME_PIPELINE_CALL vkCreateGraphicsPipelines vkCreateComputePipelines)
+    string(FIND "${PLUME_SOURCE}" "${PLUME_PIPELINE_CALL}(device->vk, VK_NULL_HANDLE," PLUME_PIPELINE_AT)
+    if(PLUME_PIPELINE_AT EQUAL -1)
+        message(FATAL_ERROR "A criacao de pipelines do Plume mudou; revisar o cache de pipelines.")
+    endif()
+    string(REPLACE "${PLUME_PIPELINE_CALL}(device->vk, VK_NULL_HANDLE,"
+        "${PLUME_PIPELINE_CALL}(device->vk, renutVulkanPipelineCache(device->vk),"
+        PLUME_SOURCE "${PLUME_SOURCE}")
+endforeach()
+
 # VdSwap's native path uploads through TRANSFER before touching color output.
 # Waiting only at COLOR_ATTACHMENT_OUTPUT does not protect those writes.
 string(REPLACE "const VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;"

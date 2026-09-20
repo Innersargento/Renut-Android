@@ -5,9 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <vector>
 
 #include <rex/logging.h>
@@ -58,6 +62,51 @@ struct PlumeRenderer::State {
     if (window) ANativeWindow_release(window);
   }
 };
+
+namespace {
+
+// The generated copy of plume_vulkan.cpp asks for this cache on every pipeline
+// it creates; the seam is in android/app/src/main/cpp/CMakeLists.txt. Upstream
+// passes VK_NULL_HANDLE, which makes the driver recompile every pipeline on
+// every launch: the first pass through Showdown Town spent 67% of its frame
+// time inside vkCreateGraphicsPipelines, and none of that work survived.
+std::mutex pipeline_cache_mutex;
+std::string pipeline_cache_path;
+VkDevice pipeline_cache_device = VK_NULL_HANDLE;
+VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+
+}  // namespace
+
+void SetPlumePipelineCachePath(const std::string& path) {
+  std::lock_guard lock(pipeline_cache_mutex);
+  pipeline_cache_path = path;
+}
+
+void SavePlumePipelineCache() {
+  std::lock_guard lock(pipeline_cache_mutex);
+  if (pipeline_cache == VK_NULL_HANDLE || pipeline_cache_path.empty()) return;
+  size_t size = 0;
+  if (vkGetPipelineCacheData(pipeline_cache_device, pipeline_cache, &size, nullptr) != VK_SUCCESS ||
+      !size) {
+    return;
+  }
+  std::vector<uint8_t> data(size);
+  if (vkGetPipelineCacheData(pipeline_cache_device, pipeline_cache, &size, data.data()) !=
+      VK_SUCCESS) {
+    return;
+  }
+  // Write beside the target and rename: Android kills the process without
+  // warning, and a truncated blob is one the driver rejects on the next run.
+  const std::string temporary = pipeline_cache_path + ".tmp";
+  {
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(size));
+    if (!out) return;
+  }
+  std::error_code error;
+  std::filesystem::rename(temporary, pipeline_cache_path, error);
+}
 
 PlumeRenderer::PlumeRenderer() : state_(std::make_unique<State>()) {}
 PlumeRenderer::~PlumeRenderer() = default;
@@ -239,3 +288,32 @@ std::string PlumeRenderer::report() const {
 }
 
 }  // namespace renut
+
+// Called by the generated copy of plume_vulkan.cpp, on the thread that creates
+// pipelines. Seeded from the last run's blob; one the driver does not recognise
+// (another device or driver version) is refused and the cache starts empty.
+VkPipelineCache renutVulkanPipelineCache(VkDevice device) {
+  std::lock_guard lock(renut::pipeline_cache_mutex);
+  if (renut::pipeline_cache != VK_NULL_HANDLE && renut::pipeline_cache_device == device) {
+    return renut::pipeline_cache;
+  }
+  std::vector<uint8_t> blob;
+  if (!renut::pipeline_cache_path.empty()) {
+    std::ifstream in(renut::pipeline_cache_path, std::ios::binary);
+    if (in) blob.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  }
+  VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+  info.initialDataSize = blob.size();
+  info.pInitialData = blob.empty() ? nullptr : blob.data();
+  VkPipelineCache cache = VK_NULL_HANDLE;
+  if (vkCreatePipelineCache(device, &info, nullptr, &cache) != VK_SUCCESS) {
+    info.initialDataSize = 0;
+    info.pInitialData = nullptr;
+    if (vkCreatePipelineCache(device, &info, nullptr, &cache) != VK_SUCCESS) return VK_NULL_HANDLE;
+  }
+  REXLOG_INFO("Renut: Plume pipeline cache {} ({} KB from disk)",
+              blob.empty() ? "criado" : "carregado", blob.size() >> 10);
+  renut::pipeline_cache_device = device;
+  renut::pipeline_cache = cache;
+  return cache;
+}

@@ -17,6 +17,14 @@ struct RenderTexture;
 
 namespace renut {
 
+// Where the driver's compiled pipelines are kept between runs. Call it before
+// the renderer starts: entering a scene for the first time spends most of its
+// frames inside vkCreateGraphicsPipelines, and a warm cache skips that.
+void SetPlumePipelineCachePath(const std::string& path);
+// Writes it out. Worth calling whenever new pipelines were built, since the
+// process is usually killed rather than shut down.
+void SavePlumePipelineCache();
+
 class PlumeRenderer {
  public:
   // Uses the Vulkan loader already opened for the session.

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
@@ -54,6 +55,11 @@ using namespace rex::graphics;
 
 // Where microcode without a recompiled shader is saved (SetPlumeMissDumpDirectory).
 std::string g_miss_dump_directory;
+
+// The game's own VdSwap count, which is what the on-screen counter shows. Plume
+// presents more often than the game swaps, so the two rates have to be read
+// side by side to know which one the player is actually seeing.
+extern "C" uint64_t renut_guest_swap_count();
 
 struct UcodeMapEntry {
   uint64_t ucode;
@@ -511,6 +517,9 @@ struct Stats {
   // Render passes begun. A tiler resolves and reloads the whole target at each
   // one, so this says how much of the frame is spent moving tile memory.
   uint64_t passes = 0;
+  // Wall clock, in microseconds: whole frames, the pipelines built inside them
+  // and the submit that ends them. What is left is the rest of the draw path.
+  uint64_t frame_us = 0, pipeline_us = 0, submit_us = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -582,6 +591,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // the frame into that address is copied aside and presented instead of the
   // front buffer, to see an intermediate pass on screen.
   uint32_t snap_address_ = 0, snap_ordinal_ = 0, snap_seen_ = 0;
+  std::chrono::steady_clock::time_point frame_start_{};
+  uint64_t reported_guest_swaps_ = 0;
   std::unique_ptr<RenderTexture> snap_;
   uint32_t snap_width_ = 0, snap_height_ = 0;
   RenderFormat snap_format_ = RenderFormat::UNKNOWN;
@@ -2069,7 +2080,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     RenderSpecConstant spec_constant(0, spec);
     desc.specConstants = &spec_constant;
     desc.specConstantsCount = 1;
+    const auto pipeline_start = std::chrono::steady_clock::now();
     pipeline = device_->createGraphicsPipeline(desc);
+    stats_.pipeline_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - pipeline_start)
+                                       .count());
     ++stats_.pipelines;
     if (!pipeline) {
       REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
@@ -2553,9 +2568,18 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   frame_draw_ = 0;
   list_->end();
   list_open_ = false;
+  const auto submit_start = std::chrono::steady_clock::now();
   if (renderer) {
     renderer->SubmitAndPresent(list_.get(), source, frontbuffer_width, frontbuffer_height);
   }
+  const auto submit_end = std::chrono::steady_clock::now();
+  stats_.submit_us +=
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(submit_end - submit_start).count());
+  if (frame_start_.time_since_epoch().count()) {
+    stats_.frame_us += uint64_t(
+        std::chrono::duration_cast<std::chrono::microseconds>(submit_end - frame_start_).count());
+  }
+  frame_start_ = submit_end;
   if (trace_) {
     Trace("swap front={:08X} {}x{} found={}", frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
           source != nullptr);
@@ -2623,17 +2647,24 @@ void PlumeCommandProcessor::Report() {
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
       "no_target={} resolves={} clears={} passes={} pipelines={} targets={} resolved={} shaders={} "
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
-      "texture_failures={}",
+      "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={}",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes,
       stats_.pipelines,
       targets_.size(), resolved_.size(), shaders_.size(), missed_.size(), stats_.overflow,
       upload_used_ >> 10, guest_textures_.size(), stats_.textures_decoded,
-      stats_.texture_failures);
+      stats_.texture_failures, stats_.frame_us / 1000, stats_.pipeline_us / 1000,
+      stats_.submit_us / 1000, renut_guest_swap_count() - reported_guest_swaps_);
+  // Keep what the driver compiled this interval, so the next run of this scene
+  // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
+  // shuts the process down cleanly, so waiting for the device's own save would
+  // usually lose the blob.
+  if (stats_.pipelines) SavePlumePipelineCache();
   for (const auto& [hash, count] : missed_draws_) {
     REXLOG_INFO("Renut: Plume   missing VS {:016X}: {} draws", hash, count);
   }
   missed_draws_.clear();
+  reported_guest_swaps_ = renut_guest_swap_count();
   stats_ = {};
 }
 

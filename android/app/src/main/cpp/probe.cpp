@@ -49,6 +49,11 @@ VkResult renutInitializeVulkanLoader() {
     return vkCreateInstance ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
 }
 
+// The other seam in the generated copy of plume_vulkan.cpp. The probe draws a
+// handful of pipelines once, so it has nothing worth caching; the runtime's own
+// definition (android/rexglue/plume_renderer.cpp) is the one that keeps them.
+VkPipelineCache renutVulkanPipelineCache(VkDevice) { return VK_NULL_HANDLE; }
+
 extern "C" JNIEXPORT void JNICALL
 Java_org_renut_android_ProbeActivity_nativeStop(JNIEnv*, jclass) { stopped = true; }
 

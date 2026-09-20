@@ -214,6 +214,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
         // Native renderer: the command stream is parsed as before, but draws,
         // resolves and swaps run on Plume with the recompiled shaders.
         renut::SetPlumeMissDumpDirectory((root / "plume-miss").string());
+        renut::SetPlumePipelineCachePath((root / "plume-pipelines.bin").string());
         config.graphics.reset(renut::CreatePlumeGraphicsSystem());
       }else{
         rex::system::GpuCreateInfo info{sizeof(rex::system::GpuCreateInfo),"vulkan"};
