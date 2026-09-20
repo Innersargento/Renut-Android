@@ -66,7 +66,7 @@ const UcodeMapEntry kUcodeMap[] = {
 constexpr uint32_t kMaxTextures2D = 4096;
 constexpr uint32_t kMaxTextures3D = 128;
 constexpr uint32_t kMaxTexturesCube = 16;
-constexpr uint32_t kMaxSamplers = 16;
+constexpr uint32_t kMaxSamplers = 256;
 constexpr uint64_t kUploadSize = 128ull << 20;
 // Bindings 0..15 are the guest's vertex streams; this one feeds zeros to any
 // input the draw has no data for.
@@ -76,20 +76,8 @@ constexpr uint32_t kZeroBinding = 16;
 // rectangle from vertex fetch constant 0.
 constexpr uint64_t kD3DClearVertexShader = 0xBA454DD8A2FCFCBAull;
 
-enum Sampler : uint32_t {
-  kSamplerLinearWrap,
-  kSamplerLinearClamp,
-  kSamplerLinearMirror,
-  kSamplerPointWrap,
-  kSamplerPointClamp,
-  kSamplerPointMirror,
-  // The same six with the Z axis clamped, for the stacked textures: their Z
-  // picks a slice of an array, which the guest never wraps around.
-  kSamplerStackedBase,
-  kSamplerCount = kSamplerStackedBase * 2
-};
-
-static_assert(kSamplerCount <= kMaxSamplers, "the sampler heap has to hold every combination");
+// Descriptor 0 of the sampler heap, for a fetch whose state cannot be built.
+constexpr uint32_t kSamplerDefault = 0;
 
 uint32_t BSwap32(uint32_t v) { return __builtin_bswap32(v); }
 
@@ -522,6 +510,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
+  uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch);
   void Report();
 
   RenderDevice* device_ = nullptr;
@@ -565,7 +554,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
 
   std::unique_ptr<RenderPipelineLayout> layout_;
   std::unique_ptr<RenderDescriptorSet> set_2d_, set_3d_, set_cube_, set_samplers_;
-  std::array<std::unique_ptr<RenderSampler>, kSamplerCount> samplers_;
+  std::array<std::unique_ptr<RenderSampler>, kMaxSamplers> samplers_;
+  std::unordered_map<uint32_t, uint32_t> sampler_indices_;
+  uint32_t next_sampler_ = 0;
   std::unique_ptr<RenderTexture> white_2d_, white_3d_, white_cube_;
   std::unique_ptr<RenderTextureView> white_cube_view_;
   std::unique_ptr<RenderShader> rect_list_gs_;
@@ -694,19 +685,16 @@ bool PlumeCommandProcessor::SetupContext() {
     return false;
   }
 
-  for (uint32_t i = 0; i < kSamplerCount; ++i) {
-    RenderSamplerDesc desc;
-    const bool point = (i % kSamplerStackedBase) >= kSamplerPointWrap;
-    desc.minFilter = desc.magFilter = point ? RenderFilter::NEAREST : RenderFilter::LINEAR;
-    desc.mipmapMode = point ? RenderMipmapMode::NEAREST : RenderMipmapMode::LINEAR;
-    RenderTextureAddressMode mode = (i % 3) == 0   ? RenderTextureAddressMode::WRAP
-                                    : (i % 3) == 1 ? RenderTextureAddressMode::CLAMP
-                                                   : RenderTextureAddressMode::MIRROR;
-    desc.addressU = desc.addressV = mode;
-    desc.addressW = i >= kSamplerStackedBase ? RenderTextureAddressMode::CLAMP : mode;
-    samplers_[i] = device_->createSampler(desc);
-    set_samplers_->setSampler(i, samplers_[i].get());
+  // Descriptor 0 is the fallback the rest of the heap falls back to; the
+  // samplers a draw actually asks for are built on demand from its fetch
+  // constants.
+  samplers_[kSamplerDefault] = device_->createSampler(RenderSamplerDesc());
+  if (!samplers_[kSamplerDefault]) {
+    REXLOG_ERROR("Renut: Plume default sampler unavailable");
+    return false;
   }
+  set_samplers_->setSampler(kSamplerDefault, samplers_[kSamplerDefault].get());
+  next_sampler_ = kSamplerDefault + 1;
 
   upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
       kUploadSize, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX |
@@ -1168,6 +1156,78 @@ void PlumeCommandProcessor::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fet
   }
 }
 
+// The sampler a fetch constant asks for. The guest states every axis on its
+// own - magnification, minification and mip filters, anisotropy, a clamp mode
+// per axis and a LOD bias - and Plume used to reduce all of that to "point or
+// linear" and the X axis's wrap mode, which cost the textures their sharpness
+// at grazing angles and addressed Y and Z with a mode meant for X.
+//
+// One exception: a stacked texture's Z picks a slice of an array, and the guest
+// clamps a layer to the ends of the stack whatever the mode reads.
+uint32_t PlumeCommandProcessor::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  const uint32_t key = uint32_t(fetch.mag_filter) | (uint32_t(fetch.min_filter) << 2) |
+                       (uint32_t(fetch.mip_filter) << 4) | (uint32_t(fetch.aniso_filter) << 6) |
+                       (uint32_t(fetch.clamp_x) << 9) | (uint32_t(fetch.clamp_y) << 12) |
+                       (uint32_t(fetch.clamp_z) << 15) | (uint32_t(fetch.stacked) << 18) |
+                       ((uint32_t(fetch.lod_bias) & 0x3FF) << 19);
+  // The fallback is the old behaviour: linear everywhere, no anisotropy, and
+  // every axis wrapped, for comparing a capture against.
+  if (skip_mask_ & 524288) return kSamplerDefault;
+  auto found = sampler_indices_.find(key);
+  if (found != sampler_indices_.end()) return found->second;
+  if (next_sampler_ >= kMaxSamplers) return kSamplerDefault;
+
+  auto filter = [](xenos::TextureFilter f) {
+    return f == xenos::TextureFilter::kPoint ? RenderFilter::NEAREST : RenderFilter::LINEAR;
+  };
+  auto address = [](xenos::ClampMode clamp) {
+    switch (clamp) {
+      case xenos::ClampMode::kRepeat: return RenderTextureAddressMode::WRAP;
+      case xenos::ClampMode::kMirroredRepeat: return RenderTextureAddressMode::MIRROR;
+      case xenos::ClampMode::kMirrorClampToEdge:
+      case xenos::ClampMode::kMirrorClampToHalfway:
+        return RenderTextureAddressMode::MIRROR_ONCE;
+      case xenos::ClampMode::kClampToBorder:
+      case xenos::ClampMode::kMirrorClampToBorder:
+        return RenderTextureAddressMode::BORDER;
+      default: return RenderTextureAddressMode::CLAMP;
+    }
+  };
+
+  RenderSamplerDesc desc;
+  desc.magFilter = filter(fetch.mag_filter);
+  desc.minFilter = filter(fetch.min_filter);
+  // kBaseMap is the guest asking for the top level alone, not for a mip filter.
+  desc.mipmapMode = fetch.mip_filter == xenos::TextureFilter::kLinear
+                        ? RenderMipmapMode::LINEAR
+                        : RenderMipmapMode::NEAREST;
+  if (fetch.mip_filter == xenos::TextureFilter::kBaseMap) desc.maxLOD = 0.0f;
+  desc.addressU = address(fetch.clamp_x);
+  desc.addressV = address(fetch.clamp_y);
+  desc.addressW = fetch.stacked ? RenderTextureAddressMode::CLAMP : address(fetch.clamp_z);
+  // The bias has five fractional bits.
+  desc.mipLODBias = float(fetch.lod_bias) / 32.0f;
+  if (fetch.aniso_filter != xenos::AnisoFilter::kDisabled &&
+      fetch.aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
+    desc.anisotropyEnabled = true;
+    desc.maxAnisotropy = 1u << (uint32_t(fetch.aniso_filter) - 1);
+  }
+  if (xenos::ClampModeUsesBorder(fetch.clamp_x) || xenos::ClampModeUsesBorder(fetch.clamp_y) ||
+      xenos::ClampModeUsesBorder(fetch.clamp_z)) {
+    desc.borderColor = fetch.border_color == xenos::BorderColor::k_ABGR_White
+                           ? RenderBorderColor::OPAQUE_WHITE
+                           : RenderBorderColor::TRANSPARENT_BLACK;
+  }
+
+  std::unique_ptr<RenderSampler> sampler = device_->createSampler(desc);
+  if (!sampler) return kSamplerDefault;
+  const uint32_t index = next_sampler_++;
+  samplers_[index] = std::move(sampler);
+  set_samplers_->setSampler(index, samplers_[index].get());
+  sampler_indices_.emplace(key, index);
+  return index;
+}
+
 // Stacked textures (arrays of 2D slices: the terrain's material and normal map
 // sets, and the fur bump map on Banjo, whose 16 slices are one relief at
 // growing amplitude), which the shaders sample with tfetch3D, z picking the
@@ -1513,16 +1573,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   for (uint32_t slot = 0; slot < 32; ++slot) {
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
     if (fetch.type != xenos::FetchConstantType::kTexture) continue;
-    bool point = fetch.min_filter == xenos::TextureFilter::kPoint;
-    uint32_t mode = fetch.clamp_x == xenos::ClampMode::kRepeat           ? 0
-                    : fetch.clamp_x == xenos::ClampMode::kMirroredRepeat ? 2
-                                                                         : 1;
-    // A stack is an array of slices on the guest, and its Z addresses a layer,
-    // which is clamped to the array however the wrap mode reads - the fur bump
-    // map asks for z = -0.5/16, one half slice below the first, and means the
-    // flat slice 0, not slice 15 at the other end of the stack.
-    sampler_descriptor[slot] = (point ? kSamplerPointWrap : kSamplerLinearWrap) + mode +
-                               (fetch.stacked ? kSamplerStackedBase : 0);
+    sampler_descriptor[slot] = GetSampler(fetch);
     Resolved* found = FindResolved(fetch.base_address << 12);
     if (found && found->descriptor) {
       Resolved& r = *found;
@@ -1565,10 +1616,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &t_base,
                                                           &t_mip, &t_top, &t_last);
       line += fmt::format(
-          " t{}={:08X}/f{}/{}x{}/d{}/L{}-{}/c{}{}{}{}{}", slot, fetch.base_address << 12,
+          " t{}={:08X}/f{}/{}x{}/d{}/L{}-{}/c{}{}{}/f{}{}{}/a{}/b{}{}{}", slot,
+          fetch.base_address << 12,
           uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
           uint32_t(fetch.dimension), t_top, t_last, uint32_t(fetch.clamp_x),
-          uint32_t(fetch.clamp_y), uint32_t(fetch.clamp_z),
+          uint32_t(fetch.clamp_y), uint32_t(fetch.clamp_z), uint32_t(fetch.mag_filter),
+          uint32_t(fetch.min_filter), uint32_t(fetch.mip_filter), uint32_t(fetch.aniso_filter),
+          int32_t(fetch.lod_bias),
           fetch.stacked ? fmt::format("/s{}", uint32_t(fetch.size_2d.stack_depth) + 1) : "",
           FindResolved(fetch.base_address << 12) ? "/R" : "");
     }

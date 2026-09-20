@@ -17,6 +17,8 @@ Arquivo: `android/rexglue/plume_gpu.cpp`.
 - Limitar o eixo Z das texturas empilhadas à extremidade da pilha, em vez de repeti-lo com o modo do eixo X, e carregar a cadeia de mipmaps do guest nas pilhas de uma única fatia. Ver a seção 1.
 - Acrescentar ao diagnóstico de desenhos os modos de limite por eixo, a faixa de níveis e a profundidade de cada textura, e as constantes do pixel shader nos desenhos com textura empilhada.
 - Manter a opção de diagnóstico `plume-skip=262144` para desativar temporariamente os mipmaps das pilhas de uma fatia.
+- Construir os amostradores a partir do estado que a constante de busca declara — filtros de ampliação, redução e mipmap, anisotropia, modo de limite por eixo e deslocamento de nível — em vez de reduzir tudo a ponto/linear e ao modo do eixo X. Ver a seção 5.
+- Manter a opção de diagnóstico `plume-skip=524288` para voltar ao amostrador único anterior.
 
 Validação: compilação Android concluída com `BUILD SUCCESSFUL in 21s` em `out/graphics-next/build-culling.log`; APK instalado e observado no aparelho. O menu apresentou melhora visível na TV e no aquário. A passagem inicial da câmera não apresentou inversão geral da geometria. Isso não constitui validação de todos os cenários do jogo. Os pelos do Banjo continuaram incorretos.
 
@@ -76,6 +78,36 @@ O usuário havia apontado sombras projetadas incorretamente em certas superfíci
 Preservar o comportamento atual. A validação visual final é do usuário; não foi estabelecida uma causa isolada para cada manifestação anterior de sombra.
 
 Como histórico técnico, o registro de deslocamento de profundidade mostrou valores não nulos em poucos desenhos de partículas. Não foi aplicada uma correção de depth bias nesta etapa. As hipóteses anteriores sobre filtragem ou stencil não devem ser tratadas como defeitos confirmados nem como trabalho pendente de sombras.
+
+## 5. Nitidez das texturas — corrigido
+
+O Plume montava seis amostradores fixos e escolhia entre eles por dois bits: o
+filtro de redução, para decidir ponto ou linear, e o modo de limite do eixo X,
+aplicado também a Y e a Z. Tudo o mais que a constante de busca declara era
+descartado.
+
+O registro de um quadro da passagem inicial mostra o que o jogo pede:
+
+| Estado pedido | Ocorrências |
+| --- | --- |
+| anisotropia 2× (`aniso_filter=2`) | 12.807 |
+| ampliação e redução lineares com mipmap por ponto (`f110`) | 12.807 |
+| trilinear (`f111`) | 1.002 |
+| só o nível base (`mip_filter=kBaseMap`) | 79 |
+| limite diferente entre X e Y (`c022`, `c202`, `c220`) | 742 |
+| limite por borda em X e Y (`c660`) | 79 |
+
+A anisotropia era o que mais pesava: mais de doze mil vínculos de textura por
+quadro pediam 2×, e nenhum a recebia, o que tirava a nitidez de tudo o que é
+visto em ângulo — o caminho de pedras, o terreno e o Banjo.
+
+Os amostradores passam a ser construídos sob demanda a partir da constante de
+busca, com uma tabela indexada pelo estado pedido, e o descritor 0 continua
+sendo o amostrador padrão para o caso de a tabela encher. O eixo W das texturas
+empilhadas continua limitado, pelo motivo da seção 1.
+
+Evidência: `sampler-trace.txt`. Validação no aparelho com a passagem inicial e o
+menu, sem artefato novo.
 
 ## 3. Água ausente — causa identificada, correção pendente
 
