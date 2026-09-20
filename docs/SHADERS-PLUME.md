@@ -4,7 +4,8 @@
 
 - **Aura dourada do menu:** os resolves da máscara de 8 bits e da aura RGBA
   adjacente eram confundidos porque ambos usam RGBA no host. A união de faixas
-  agora exige o mesmo tamanho, pitch e bytes por pixel no guest, no mesmo quadro.
+  agora exige o mesmo tamanho, pitch e bytes por pixel no guest. Entre quadros,
+  a união também verifica se a memória guest ainda pertence ao mesmo conteúdo.
   Imagens e descritores substituídos são mantidos até a conclusão da GPU.
 - **Rosetas nas montanhas:** o VS `239A125831F7EB9D` busca `TEXCOORD0` nas
   instruções 9 e 11, nos offsets de vértice 20 e 24. A deduplicação pelo nome
@@ -22,6 +23,27 @@ com Plume/Turnip. Capturas em `out/graphics-20260919/uv-fixed-first.png` e
 `final-menu-check.png`: montanhas sem rosetas e aura dourada sem faixas coloridas.
 O cache em `generated/shaders/` foi regenerado; para reproduzir, usar o script
 abaixo com o XEX e os contêineres capturados em runtime, incluindo os do terreno.
+
+## Sombras distantes: montagem do atlas
+
+O mapa estático `t15` tem 2048×2048 pixels e é montado em 16 resolves de
+512×512, ao longo de 16 quadros. Os endereços usam o layout tiled do Xenos:
+um deslocamento horizontal de 512 pixels corresponde a `0x8000` bytes neste
+formato, não a uma linha linear. Além disso, as fileiras chegam de baixo para
+cima, com bases diferentes e alturas restantes de 512, 1024, 1536 e 2048.
+
+`FindResolvedContaining` recupera coluna e linha pelo layout do SDK e permite
+continuar a montagem entre quadros. `MergeResolvedTails` preserva as fileiras
+inferiores quando chega a nova base, validando formato, pitch, altura, endereço
+e conteúdo da memória guest. Texturas absorvidas aguardam a conclusão da GPU
+antes de serem liberadas. A limpeza inicial também precisa sobreviver ao
+primeiro desenho: recriar o buffer depois de limpá-lo deixava o primeiro bloco
+sem profundidade válida.
+
+A leitura da GPU no SM-S918B confirmou 16 atualizações no atlas e nenhuma
+região zerada, contra 93,75% de pixels zerados na implementação original.
+Evidências locais em `out/graphics-20260919/shadows-clear-trace.txt`,
+`shadow-15-clear-2048x2048-f26.raw` e `shadows-complete-flyby.png`.
 
 Ferramenta: [masterspike52/reNut-XenosRecomp](https://github.com/masterspike52/reNut-XenosRecomp)
 (commit `8f781f8`, modo `RENUT_RECOMP`) com o patch `tools/shaders/renut-xenosrecomp.patch`.

@@ -510,8 +510,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void SetFramebuffer(RenderFramebuffer* framebuffer);
   Resolved* FindResolvedContaining(uint32_t address, RenderFormat format, uint32_t bytes_per_pixel,
                                   uint32_t pitch, uint32_t height,
-                                  uint32_t& row);
+                                  uint32_t& column, uint32_t& row);
   uint32_t FittedResolved(Resolved& resolved, uint32_t width, uint32_t height);
+  void MergeResolvedTails(uint32_t address, Resolved& dest);
   Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height);
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
@@ -862,7 +863,7 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
 
 Resolved* PlumeCommandProcessor::FindResolvedContaining(uint32_t address, RenderFormat format,
                                                         uint32_t bytes_per_pixel, uint32_t pitch,
-                                                        uint32_t height, uint32_t& row) {
+                                                        uint32_t height, uint32_t& column, uint32_t& row) {
   for (auto& [key, resolved] : resolved_) {
     const uint32_t base = uint32_t(key);
     if (!resolved.texture || resolved.format != format || address <= base) continue;
@@ -871,16 +872,57 @@ Resolved* PlumeCommandProcessor::FindResolvedContaining(uint32_t address, Render
     // the incoming bpp against an old image's host extent aliases unrelated
     // allocations, notably Banjo's mask and the adjacent golden aura.
     if (resolved.guest_bpp != bytes_per_pixel || resolved.guest_pitch != pitch ||
-        resolved.guest_height != height || resolved.written_frame != swaps_) continue;
-    const uint32_t row_bytes = resolved.guest_pitch * bytes_per_pixel;
+        resolved.guest_height != height) continue;
     const uint32_t offset = address - base;
-    if (offset < row_bytes * resolved.guest_height && offset % row_bytes == 0 &&
-        (offset / row_bytes) % 32 == 0) {
-      row = offset / row_bytes;
-      return &resolved;
+    if (offset >= pitch * height * bytes_per_pixel) continue;
+    if (resolved.written_frame != swaps_ && resolved.guest_bytes &&
+        ContentHash(memory_->TranslatePhysical<const uint8_t*>(base), resolved.guest_bytes) !=
+            resolved.guest_hash) continue;
+    // Resolve addresses use Xenos tiled memory, not linear scanlines. The
+    // persistent far shadow map is assembled from 512x512 rectangles over
+    // multiple frames; horizontal tiles must land in columns of the same image.
+    const uint32_t bpp_log2 = 31 - __builtin_clz(bytes_per_pixel);
+    for (uint32_t y = 0; y < height; y += 32) {
+      for (uint32_t x = 0; x < pitch; x += 32) {
+        if (uint32_t(gfx::texture_util::GetTiledOffset2D(x, y, pitch, bpp_log2)) == offset) {
+          column = x;
+          row = y;
+          return &resolved;
+        }
+      }
     }
   }
   return nullptr;
+}
+
+void PlumeCommandProcessor::MergeResolvedTails(uint32_t address, Resolved& dest) {
+  // The static shadow atlas is built bottom-to-top. Each row's base points
+  // inside the allocation and its height describes the remaining rows. When
+  // an earlier base arrives, preserve the already-rendered tail in that image.
+  const uint32_t bpp_log2 = 31 - __builtin_clz(dest.guest_bpp);
+  for (auto it = resolved_.begin(); it != resolved_.end();) {
+    auto& tail = it->second;
+    const uint32_t tail_address = uint32_t(it->first);
+    if (&tail == &dest || !tail.texture || tail_address <= address ||
+        tail.format != dest.format || tail.guest_bpp != dest.guest_bpp ||
+        tail.guest_pitch != dest.guest_pitch || !tail.guest_height ||
+        tail.guest_height >= dest.guest_height) { ++it; continue; }
+    const uint32_t y = dest.guest_height - tail.guest_height;
+    if (y % 32 || tail_address - address != uint32_t(gfx::texture_util::GetTiledOffset2D(
+        0, y, dest.guest_pitch, bpp_log2)) || y + tail.height > dest.height ||
+        tail.width > dest.width) { ++it; continue; }
+    if (tail.guest_bytes && ContentHash(memory_->TranslatePhysical<const uint8_t*>(tail_address),
+                                      tail.guest_bytes) != tail.guest_hash) { ++it; continue; }
+    Transition(tail.texture.get(), tail.layout, RenderTextureLayout::COPY_SOURCE);
+    Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
+    RenderBox box(0, 0, int32_t(tail.width), int32_t(tail.height), 0, 1);
+    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
+        RenderTextureCopyLocation::Subresource(tail.texture.get()), 0, y, 0, &box);
+    dest.generation += tail.generation;
+    RetireTexture(tail.texture, tail.descriptor);
+    RetireTexture(tail.fitted, tail.fitted_descriptor);
+    it = resolved_.erase(it);
+  }
 }
 
 uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint32_t height) {
@@ -1712,6 +1754,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     Trace("  viewport ({}, {}) {}x{} window ({}, {}) scissor ({}, {})-({}, {}) vte={:X}", viewport.x,
           viewport.y, viewport.width, viewport.height, window_x, window_y, scissor_rect.left,
           scissor_rect.top, scissor_rect.right, scissor_rect.bottom, vte.value);
+    Trace("  zviewport scale={} offset={}", regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
+          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET));
   }
   if (scissor_rect.right <= scissor_rect.left || scissor_rect.bottom <= scissor_rect.top) return true;
 
@@ -1969,11 +2013,9 @@ bool PlumeCommandProcessor::IssueCopy() {
     const uint32_t dest_h = std::max(uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) * 32u, h);
     const uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8;
     const uint32_t dy = info.copy_dest_coordinate_info.offset_y_div_8 * 8;
-    // Predicated tiling resolves each screen band to its own address inside
-    // one texture (the second band of a 1280x720 frame lands 384 rows in), so
-    // an address inside an existing resolved texture of the same format
-    // continues that texture.
-    uint32_t row = 0;
+    // Screen bands and shadow tiles resolve to addresses inside one tiled
+    // guest texture. Recover both coordinates, including across frames.
+    uint32_t column = 0, row = 0;
     const auto* dest_info = rex::graphics::FormatInfo::Get(
         xenos::TextureFormat(uint32_t(info.copy_dest_info.copy_dest_format)));
     const uint32_t dest_bpp = dest_info ? std::max(1u, dest_info->bits_per_pixel / 8) : 4;
@@ -1982,34 +2024,37 @@ bool PlumeCommandProcessor::IssueCopy() {
     // depth the depth-of-field and fog passes read).
     const RenderFormat dest_format = copying_depth ? RenderFormat::R32_FLOAT : source->format;
     Resolved* inside = FindResolvedContaining(info.copy_dest_base, dest_format, dest_bpp,
-                                              dest_w, dest_h, row);
-    Resolved& dest = inside && inside->height >= row + dy + h
+                                              dest_w, dest_h, column, row);
+    Resolved& dest = inside && inside->width >= column + dx + w && inside->height >= row + dy + h
                          ? *inside
                          : GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
     const uint32_t dest_y = &dest == inside ? dy + row : dy;
+    const uint32_t dest_x = &dest == inside ? dx + column : dx;
     ++dest.generation;
     dest.written = ++resolve_serial_;
     dest.written_frame = swaps_;
     dest.guest_pitch = dest_w;
     dest.guest_height = dest_h;
     dest.guest_bpp = dest_bpp;
+    if (&dest != inside) MergeResolvedTails(info.copy_dest_base, dest);
     // Snapshot of the guest memory under the whole resolved texture.
     {
       uint32_t base_address = info.copy_dest_base;
-      if (&dest == inside) base_address -= row * dest.guest_pitch * dest_bpp;
+      if (&dest == inside) base_address -= uint32_t(gfx::texture_util::GetTiledOffset2D(
+          column, row, dest.guest_pitch, 31 - __builtin_clz(dest_bpp)));
       dest.guest_bytes = dest.guest_pitch * dest.guest_height * dest_bpp;
       dest.guest_hash = ContentHash(memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
       dest.checked_frame = swaps_;
     }
     if (dest.texture && copying_depth) {
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
-      CopyDepth(*source, x, y, w, h, dest.texture.get(), dx, dest_y);
+      CopyDepth(*source, x, y, w, h, dest.texture.get(), dest_x, dest_y);
     } else if (dest.texture) {
       Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
       RenderBox box(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h), 0, 1);
       list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
-                               RenderTextureCopyLocation::Subresource(source->texture.get()), dx,
+                               RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
                                dest_y, 0, &box);
     }
     if (dest.texture) {
@@ -2138,6 +2183,8 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
   // 32 bpp target as a 64 bpp one; EDRAM bases are shared between targets of
   // other pitches (the shadow maps), so match the pitch, not just the base.
   const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+  const uint32_t clear_height = std::clamp<uint32_t>(
+      regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y, 16, 4096);
   // Several targets can match (a pitch-640 target from another phase next to
   // the 1280-wide scene target that a 64 bpp clear also names): the one last
   // rendered to is the one the game is about to use.
@@ -2158,6 +2205,14 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
       reg::RB_COLOR_INFO info;
       info.value = regs[kColorInfo[i]];
       Target* target = find(info.color_base, uint32_t(info.color_format), false);
+      // A target nothing has drawn to yet (N&B fills a 320x184 buffer with
+      // point lists only, which are not drawn yet): create it, so the clear
+      // lands and its resolve copies the clear colour instead of leaving the
+      // texture to be decoded from memory the resolve never wrote.
+      if ((!target && i == 0) || (target && target->height < clear_height)) {
+        target = GetTarget(info.color_base, uint32_t(info.color_format), false,
+                           target ? target->width : pitch, clear_height);
+      }
       if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
       cleared[i] = target;
       Trace("  clear colour rt{} base={:X} -> target {}x{}", i, uint32_t(info.color_base), target->width,
@@ -2175,6 +2230,12 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
   if (clear_depth || clear_stencil) {
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     Target* depth = find(depth_info.depth_base, uint32_t(depth_info.depth_format), true);
+    // Allocate the full scissor height before clearing. Growing a 256-row
+    // placeholder on the first draw discarded the clear and blanked the first
+    // 512x512 tile of the static shadow map.
+    if (!depth || depth->height < clear_height)
+      depth = GetTarget(depth_info.depth_base, uint32_t(depth_info.depth_format), true,
+                        depth ? depth->width : pitch, clear_height);
     Trace("  clear depth base={:X} -> {}", uint32_t(depth_info.depth_base),
           depth ? fmt::format("target {}x{}", depth->width, depth->height) : std::string("none"));
     if (depth) {
@@ -2220,6 +2281,11 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     for (auto& [key, target] : targets_) {
       Trace("  target base={:X} fmt={} depth={} {}x{}", key & 0xFFF, (key >> 12) & 0xF, (key >> 16) & 1,
             target.width, target.height);
+    }
+    for (const auto& [key, r] : resolved_) {
+      Trace("  resolved {:08X} host={}x{} f{} guest={}x{}/{} gen={} frame={}", uint32_t(key),
+            r.width, r.height, uint32_t(r.format), r.guest_pitch, r.guest_height, r.guest_bpp,
+            r.generation, r.written_frame);
     }
     std::fclose(trace_);
     trace_ = nullptr;
