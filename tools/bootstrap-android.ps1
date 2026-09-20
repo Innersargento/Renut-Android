@@ -17,15 +17,3 @@ foreach ($dep in $deps) {
     git -C $path submodule update --init --recursive
     if ($LASTEXITCODE) { throw 'Falha nos submodulos.' }
 }
-# Tesselacao no Plume (topologia de patches, estagios hull/domain), que o
-# renderizador precisa para a agua do jogo. Aplicado uma vez, como o patch do
-# SDK: se ja estiver aplicado, o check reverso passa e nada e reescrito.
-$plume = Join-Path $renutRoot 'external/plume'
-$plumePatch = Join-Path $renutRoot 'android/rexglue/plume-tessellation.patch'
-git -C $plume apply --reverse --check $plumePatch 2>$null
-if ($LASTEXITCODE) {
-    git -C $plume apply --check $plumePatch
-    if ($LASTEXITCODE) { throw 'Patch de tesselacao incompativel com alteracoes locais; nenhum arquivo sobrescrito.' }
-    git -C $plume apply $plumePatch
-    if ($LASTEXITCODE) { throw 'Falha ao aplicar a tesselacao no Plume.' }
-}

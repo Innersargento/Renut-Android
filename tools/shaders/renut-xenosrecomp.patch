@@ -1,8 +1,52 @@
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
-index c1b854e..e3a571b 100644
+index c1b854e..6de3535 100644
 --- a/XenosRecomp/main.cpp
 +++ b/XenosRecomp/main.cpp
-@@ -96,7 +96,8 @@ int main(int argc, char** argv)
+@@ -27,6 +27,9 @@ static void writeAllBytes(const char* filePath, const void* data, size_t dataSiz
+ struct RecompiledShader
+ {
+     uint8_t* data = nullptr;
++    // Recompile this container as the domain stage of a tessellated draw
++    // instead of as a vertex shader. See ShaderRecompiler::isDomainShader.
++    bool isDomainShader = false;
+     IDxcBlob* dxil = nullptr;
+     std::vector<uint8_t> spirv;
+     uint32_t specConstantsMask = 0;
+@@ -87,6 +90,33 @@ int main(int argc, char** argv)
+     else if (const char* env = std::getenv("XENOS_RECOMP_HLSL_DUMP"))
+         hlslDumpDir = env;
+ 
++    // Shaders the game also runs as a domain stage, one container hash in hex
++    // per line. Nothing in a container says which stage it is used as, and the
++    // guest decides at draw time, so the list comes from the renderer's draw
++    // log - it names the vertex shader of every patch draw.
++    std::set<XXH64_hash_t> domainShaderHashes;
++    {
++        const char* listPath = argc > 5 ? argv[5] : std::getenv("XENOS_RECOMP_DOMAIN_SHADERS");
++        if (listPath != nullptr && listPath[0] != '\0')
++        {
++            std::ifstream list(listPath);
++            if (!list)
++            {
++                fmt::println(stderr, "Cannot read the domain shader list at {}.", listPath);
++                return 1;
++            }
++            std::string line;
++            while (std::getline(list, line))
++            {
++                const size_t start = line.find_first_not_of(" \t\r");
++                if (start == std::string::npos || line[start] == '#')
++                    continue;
++                domainShaderHashes.insert(std::stoull(line.substr(start), nullptr, 16));
++            }
++            fmt::println("Domain shaders listed: {}", domainShaderHashes.size());
++        }
++    }
++
+     size_t includeSize = 0;
+     auto includeData = readAllBytes(includeInput, includeSize);
+     std::string_view include(reinterpret_cast<const char*>(includeData.get()), includeSize);
+@@ -96,7 +126,8 @@ int main(int argc, char** argv)
          std::vector<std::unique_ptr<uint8_t[]>> files;
          std::map<XXH64_hash_t, RecompiledShader> shaders;
  
@@ -12,7 +56,57 @@ index c1b854e..e3a571b 100644
          {
              if (std::filesystem::is_directory(file))
              {
-@@ -243,7 +244,17 @@ int main(int argc, char** argv)
+@@ -143,6 +174,23 @@ int main(int argc, char** argv)
+                 files.emplace_back(std::move(fileData));
+         }
+ 
++        // A container the game uses both ways is recompiled twice, the second
++        // time as a domain shader, under the tagged hash.
++        for (XXH64_hash_t hash : domainShaderHashes)
++        {
++            auto source = shaders.find(hash);
++            if (source == shaders.end())
++            {
++                fmt::println(stderr, "Domain shader 0x{:016X} is not in the input.", hash);
++                continue;
++            }
++            RecompiledShader variant = source->second;
++            variant.isDomainShader = true;
++            if (!variant.sourceName.empty())
++                variant.sourceName += ".domain";
++            shaders.emplace(hash ^ RENUT_DOMAIN_SHADER_HASH_TAG, std::move(variant));
++        }
++
+         if (!hlslDumpDir.empty())
+             std::filesystem::create_directories(hlslDumpDir);
+ 
+@@ -161,6 +209,7 @@ int main(int argc, char** argv)
+ 
+                 thread_local ShaderRecompiler recompiler;
+                 recompiler = {};
++                recompiler.isDomainShader = shader.isDomainShader;
+                 recompiler.recompile(shader.data, include);
+ 
+                 shader.specConstantsMask = recompiler.specConstantsMask;
+@@ -170,13 +219,15 @@ int main(int argc, char** argv)
+                 {
+                     auto path = std::filesystem::path(hlslDumpDir) /
+                         (shader.sourceName.empty()
+-                            ? fmt::format("{}_{:016X}", recompiler.isPixelShader ? "ps" : "vs", hash)
++                            ? fmt::format("{}_{:016X}",
++                                recompiler.isPixelShader ? "ps" : (shader.isDomainShader ? "ds" : "vs"),
++                                hash)
+                             : shader.sourceName);
+                     path += ".hlsl";
+ 
+                     std::string contents = fmt::format(
+                         "// {} shader  hash=0x{:016X}  specConstants=0x{:X}\n",
+-                        recompiler.isPixelShader ? "pixel" : "vertex",
++                        recompiler.isPixelShader ? "pixel" : (shader.isDomainShader ? "domain" : "vertex"),
+                         hash, recompiler.specConstantsMask);
+                     contents.append(recompiler.out);
+                     writeAllBytes(path.string().c_str(), contents.data(), contents.size());
+@@ -243,7 +294,17 @@ int main(int argc, char** argv)
              fmt::println(stderr, "Recompile failures ({}):", g_failures.size());
              for (const auto& failure : g_failures)
                  fmt::println(stderr, "  hash=0x{:016X} reason={}", failure.hash, failure.reason);
@@ -31,7 +125,7 @@ index c1b854e..e3a571b 100644
          }
  
          fmt::println("Creating shader cache...");
-@@ -288,10 +299,10 @@ int main(int argc, char** argv)
+@@ -288,10 +349,10 @@ int main(int argc, char** argv)
  
          for (const ShaderInputElement& element : inputElements)
          {
@@ -44,11 +138,25 @@ index c1b854e..e3a571b 100644
          }
  
          f.println("}};");
+diff --git a/XenosRecomp/pch.h b/XenosRecomp/pch.h
+index 39f6e81..60c0524 100644
+--- a/XenosRecomp/pch.h
++++ b/XenosRecomp/pch.h
+@@ -23,7 +23,9 @@
+ #include <execution>
+ #include <filesystem>
+ #include <functional>
++#include <fstream>
+ #include <map>
++#include <set>
+ #include <smolv.h>
+ #include <fmt/core.h>
+ #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..9c31dda 100644
+index ee3830d..d195691 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -73,9 +73,20 @@
+@@ -73,9 +73,25 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -58,6 +166,11 @@ index ee3830d..9c31dda 100644
 +//
 +// Entry 16 is vertex fetch constant 0, which Direct3D's own shaders (the
 +// rectangle-list Clear) fetch through; entry 17 pads the table to 16 bytes.
++// A vertex shader the game also runs as the domain stage of a tessellated
++// draw is recompiled a second time and stored under the container's hash xored
++// with this, so one cache holds both forms. See RENUT_STAGE_DOMAIN.
++#define RENUT_DOMAIN_SHADER_HASH_TAG 0xD0A1D0A1D0A1D0A1ull
++
 +#define RENUT_VERTEX_STREAM_COUNT 17
 +#define RENUT_DIRECT_FETCH_STREAM 16
 +#define RENUT_SHARED_STREAMS_OFFSET      (RENUT_SHARED_MISC_OFFSET + 64)                     // 1120 .. 1263
@@ -72,7 +185,19 @@ index ee3830d..9c31dda 100644
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -136,7 +147,7 @@
+@@ -119,6 +135,11 @@
+     X(TexCoord,     9, 21) \
+     X(TexCoord,    10, 22)
+ 
++// Where a domain shader reads the coordinates of the point in the patch it is
++// running for: xyz the barycentric weights, w the patch index. The host fills
++// this stream when it expands a patch draw. See RENUT_DOMAIN_SHADER_HASH_TAG.
++#define RENUT_DOMAIN_INPUT_LOCATION 23
++
+ #ifdef __cplusplus
+ #include <cstdint>
+ 
+@@ -136,7 +157,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -81,7 +206,7 @@ index ee3830d..9c31dda 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +163,13 @@ struct ShaderInputElement
+@@ -152,6 +173,13 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -95,7 +220,7 @@ index ee3830d..9c31dda 100644
  };
  #endif
  
-@@ -224,6 +242,9 @@ struct PushConstants
+@@ -224,6 +252,9 @@ struct PushConstants
  #define g_SwappedBlendWeights vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 28)
  #define g_SwappedPositions    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 32)
  #define g_SintTexcoords       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 36)
@@ -105,7 +230,7 @@ index ee3830d..9c31dda 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -253,6 +274,157 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,6 +284,157 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -263,7 +388,7 @@ index ee3830d..9c31dda 100644
  // Per-stage float4 constant file. The recompiler picks the stage by defining
  // RENUT_STAGE_CONSTANTS to the matching push-constant address.
  #define cReg(INDEX) \
-@@ -289,7 +461,10 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -289,7 +471,10 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint   g_SwappedBlendWeights             : packoffset(c67.w); \
      uint   g_SwappedPositions                : packoffset(c68.x); \
      uint   g_SintTexcoords                   : packoffset(c68.y); \
@@ -275,7 +400,7 @@ index ee3830d..9c31dda 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -483,6 +658,25 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +668,25 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -302,7 +427,7 @@ index ee3830d..9c31dda 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..965158f 100644
+index c71e7c9..4b7b528 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -584,22 +709,82 @@ index c71e7c9..965158f 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1689,6 +1835,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1492,8 +1638,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     isPixelShader = (shaderContainer->flags & 0x1) == 0;
+ 
+ #ifdef RENUT_RECOMP
++    if (isPixelShader)
++        isDomainShader = false;
++    // The tessellator hands the domain stage its barycentric coordinates in r0
++    // and the patch index in r1, so a vfetch indexed by either is not indexed
++    // by a vertex id and cannot be an input assembler attribute. Marking them
++    // written up front sends every one of them down the vfetchLive path, which
++    // reads the stream directly.
++    if (isDomainShader)
++    {
++        markWritten(0);
++        markWritten(1);
++    }
+     // shader_common.h picks derivative-based or explicit-level sampling from
+-    // this, so it has to land ahead of the include rather than after it.
++    // this, so it has to land ahead of the include rather than after it. A
++    // domain shader has no derivatives either, so it reads as a vertex stage.
+     println("#define RENUT_STAGE_{}", isPixelShader ? "PIXEL" : "VERTEX");
+ #endif
+ 
+@@ -1661,6 +1820,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             }
+         #endif
+ 
++#ifdef RENUT_RECOMP
++            // A domain shader has no input assembler of its own: the
++            // tessellator runs it once per generated vertex, and the control
++            // points are read from the streams by patch index. The map of
++            // addresses above is still filled, so the vfetches know their
++            // semantics when they go through vfetchLive, but nothing is
++            // declared as an attribute.
++            if (isDomainShader)
++                continue;
++#endif
++
+             out += '\t';
+ 
+             bool locatedInput = false;
+@@ -1689,6 +1859,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
 +    #ifdef RENUT_RECOMP
 +        // The hardware loads the vertex index into r0.x before the shader runs.
++        // A domain shader is run once per vertex of the expanded patch instead,
++        // and the host names the point in the patch through a stream of its own
++        // rather than through a tessellator the driver may not have.
++        if (isDomainShader)
++        {
++            println("\t[[vk::location({})]] in float4 iDomainPatch : TEXCOORD31,",
++                RENUT_DOMAIN_INPUT_LOCATION);
++        }
 +        out += "\tin uint iVertexId : SV_VertexID,\n";
 +    #endif
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1828,6 +1978,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1828,6 +2010,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
              }
 +        #ifdef RENUT_RECOMP
++            // r0.xyz is the domain location in zyx order and r1.x the patch
++            // index, the way the Xenos hands them to a patch-indexed triangle
++            // domain shader.
++            else if (isDomainShader && i == 0)
++            {
++                out += "float4(iDomainPatch.z, iDomainPatch.y, iDomainPatch.x, 0.0);\n";
++            }
++            else if (isDomainShader && i == 1)
++            {
++                out += "float4(iDomainPatch.w, 0.0, 0.0, 0.0);\n";
++            }
 +            else if (!isPixelShader && i == 0)
 +            {
 +                out += "float4(float(iVertexId), 0.0, 0.0, 0.0);\n";
@@ -609,10 +794,21 @@ index c71e7c9..965158f 100644
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
 diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
-index 9c94800..91f7747 100644
+index 9c94800..eda1bc6 100644
 --- a/XenosRecomp/shader_recompiler.h
 +++ b/XenosRecomp/shader_recompiler.h
-@@ -50,6 +50,17 @@ struct ShaderRecompiler : StringBuffer
+@@ -26,6 +26,10 @@ struct ShaderRecompiler : StringBuffer
+ {
+     uint32_t indentation = 0;
+     bool isPixelShader = false;
++    // A vertex shader the guest runs as the domain stage of a tessellated
++    // draw. The container says nothing about it, so the caller sets this from
++    // the list of shaders seen on a patch draw. See recompile().
++    bool isDomainShader = false;
+     const uint8_t* constantTableData = nullptr;
+     std::unordered_map<uint32_t, VertexElement> vertexElements;
+ 
+@@ -50,6 +54,17 @@ struct ShaderRecompiler : StringBuffer
      // emitted (then-branch close is part of the event, not ifEndLabels).
      std::unordered_set<uint32_t> elseLabels;
      uint32_t specConstantsMask = 0;

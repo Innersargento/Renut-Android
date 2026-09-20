@@ -1,0 +1,8 @@
+# Vertex shaders Nuts & Bolts also runs as the domain stage of a tessellated
+# draw, one container hash in hex per line. Nothing in a container says which
+# stage it is used as - the guest decides at draw time - so this list comes from
+# the renderer's draw log, which names the vertex shader of every patch draw it
+# could not draw ("dropped prim=17 ... vs=...").
+#
+# The water surface of the opening flyby.
+F09B139EE9188255

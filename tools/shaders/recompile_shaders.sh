@@ -35,8 +35,10 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j"$(nproc)"
 
 mkdir -p "$OUT_DIR"
+# The fifth argument lists the vertex shaders to recompile a second time as the
+# domain stage of a tessellated draw - see tools/shaders/domain-shaders.txt.
 ./build/XenosRecomp/XenosRecomp "$INPUT" "$OUT_DIR/shader_cache.cpp" \
-    XenosRecomp/shader_common.h "$OUT_DIR/hlsl" 2>&1 | tee "$OUT_DIR/recompile.log"
+    XenosRecomp/shader_common.h "$OUT_DIR/hlsl" "$HERE/domain-shaders.txt" 2>&1 | tee "$OUT_DIR/recompile.log"
 cp XenosRecomp/shader_common.h "$OUT_DIR/shader_common.h"
 
 # Decode every entry and validate its SPIR-V.

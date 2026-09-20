@@ -71,6 +71,12 @@ constexpr uint64_t kUploadSize = 128ull << 20;
 // Bindings 0..15 are the guest's vertex streams; this one feeds zeros to any
 // input the draw has no data for.
 constexpr uint32_t kZeroBinding = 16;
+// Where the expansion of a patch draw is bound: one float4 per generated
+// vertex, xyz the point's weights within its patch and w the patch's index.
+constexpr uint32_t kPatchDomainBinding = 15;
+// How finely a patch is expanded, in case the guest asks for more than the
+// expansion is willing to build.
+constexpr uint32_t kMaxPatchLevel = 16;
 // Container hash of Direct3D's Clear vertex shader (microcode 1E6883FCCDE1F688,
 // wrapped by tools/shaders/wrap_raw_ucode.py): position and colour of a
 // rectangle from vertex fetch constant 0.
@@ -174,6 +180,8 @@ class HostShader : public gfx::Shader {
       : Shader(type, hash, ucode, count) {}
 
   const ShaderCacheEntry* entry = nullptr;
+  // What the cache is keyed by, which is not this shader's own hash.
+  uint64_t ucode_key = 0;
   CompiledShader* compiled = nullptr;
   // Vertex shaders: the input layout decoded from this variant's vfetches.
   std::vector<LiveElement> elements;
@@ -182,6 +190,13 @@ class HostShader : public gfx::Shader {
   // stride, offset, exp scale bits}.
   std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> live_fetches;
   bool elements_decoded = false;
+  // The same microcode recompiled as the domain stage of a tessellated draw.
+  // It reads its control points by patch index, so every one of its fetches is
+  // a live fetch and the table differs from the vertex form's.
+  const ShaderCacheEntry* domain_entry = nullptr;
+  CompiledShader* domain_compiled = nullptr;
+  std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> domain_live_fetches;
+  bool domain_decoded = false;
 };
 
 class ShaderStore {
@@ -196,11 +211,13 @@ class ShaderStore {
                 size_t(g_spirvCacheEnd - g_spirvCache) >> 20);
   }
 
-  const ShaderCacheEntry* Find(uint64_t ucode_hash) const {
-    auto container = by_ucode_.find(ucode_hash);
-    if (container == by_ucode_.end()) return nullptr;
-    auto entry = by_container_.find(container->second);
-    return entry == by_container_.end() ? nullptr : entry->second;
+  const ShaderCacheEntry* Find(uint64_t ucode_hash) const { return Find(ucode_hash, 0); }
+
+  // The domain stage form of a vertex shader, recompiled a second time under
+  // the container's hash xored with the tag. Absent unless the shader is in
+  // tools/shaders/domain-shaders.txt.
+  const ShaderCacheEntry* FindDomain(uint64_t ucode_hash) const {
+    return Find(ucode_hash, RENUT_DOMAIN_SHADER_HASH_TAG);
   }
 
   CompiledShader* Build(RenderDevice* device, const ShaderCacheEntry* entry, bool vertex) {
@@ -223,6 +240,13 @@ class ShaderStore {
   }
 
  private:
+  const ShaderCacheEntry* Find(uint64_t ucode_hash, uint64_t tag) const {
+    auto container = by_ucode_.find(ucode_hash);
+    if (container == by_ucode_.end()) return nullptr;
+    auto entry = by_container_.find(container->second ^ tag);
+    return entry == by_container_.end() ? nullptr : entry->second;
+  }
+
   std::unordered_map<uint64_t, const ShaderCacheEntry*> by_container_;
   std::unordered_map<uint64_t, uint64_t> by_ucode_;
   std::unordered_map<const ShaderCacheEntry*, CompiledShader> compiled_;
@@ -231,16 +255,17 @@ class ShaderStore {
 // Decodes the vertex layout a bound vertex shader really fetches. Direct3D
 // patched the vfetch instructions for the current vertex declaration; the
 // recompiler recorded which instruction reads each element (fetchAddress).
-void DecodeLiveElements(HostShader& shader) {
-  shader.elements_decoded = true;
+void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
+                        std::vector<LiveElement>& out_elements,
+                        std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>>& out_fetches) {
   const uint32_t* u = shader.ucode_dwords();
   const size_t slots = shader.ucode_dword_count() / 3;
   // Fetch slots in program order, to find the full fetch a mini fetch follows.
   std::vector<uint8_t> be(shader.ucode_dword_count() * 4);
   for (size_t i = 0; i < shader.ucode_dword_count(); ++i) ucode::StoreBE(be.data() + i * 4, u[i]);
   const std::vector<uint32_t> fetch_slots = ucode::FetchSlots(be.data(), be.size());
-  const ShaderInputElement* elements = g_shaderInputElements + shader.entry->inputElementOffset;
-  for (uint32_t i = 0; i < shader.entry->inputElementCount; ++i) {
+  const ShaderInputElement* elements = g_shaderInputElements + entry->inputElementOffset;
+  for (uint32_t i = 0; i < entry->inputElementCount; ++i) {
     const ShaderInputElement& e = elements[i];
     if (e.location == 0xFF || e.fetchAddress >= slots) continue;
     const bool live_fetch = e.location == RENUT_LIVE_FETCH_LOCATION;
@@ -265,7 +290,7 @@ void DecodeLiveElements(HostShader& shader) {
       const float scale = std::ldexp(1.f, exp_adjust);
       uint32_t scale_bits;
       std::memcpy(&scale_bits, &scale, 4);
-      shader.live_fetches.push_back(
+      out_fetches.push_back(
           {e.slot, {(95 - fetch_constant) | (((f[1] >> 16) & 0x3F) << 8) | (flags << 16),
                     (full[2] & 0xFF) * 4, ((f[2] >> 8) & 0x7FFFFF) * 4, scale_bits}});
       continue;
@@ -280,8 +305,13 @@ void DecodeLiveElements(HostShader& shader) {
     live.normalized = !((f[1] >> 13) & 1);
     live.usage = e.usage;
     live.usage_index = e.usageIndex;
-    shader.elements.push_back(live);
+    out_elements.push_back(live);
   }
+}
+
+void DecodeLiveElements(HostShader& shader) {
+  shader.elements_decoded = true;
+  DecodeLiveElements(shader, shader.entry, shader.elements, shader.live_fetches);
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,7 +1448,8 @@ gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, ui
   auto& shader = shaders_[hash];
   if (!shader) {
     shader = std::make_unique<HostShader>(shader_type, hash, host_address, dword_count);
-    shader->entry = store_->Find(ucode::Key(host_address, size_t(dword_count) * sizeof(uint32_t)));
+    shader->ucode_key = ucode::Key(host_address, size_t(dword_count) * sizeof(uint32_t));
+    shader->entry = store_->Find(shader->ucode_key);
     if (!shader->entry && missed_.insert(hash).second && missed_.size() <= 32) {
       REXLOG_WARN("Renut: Plume has no recompiled {} shader for microcode {:016X} ({} dwords)",
                   shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash, dword_count);
@@ -1492,8 +1523,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (!vs->elements_decoded) DecodeLiveElements(*vs);
 
   // Primitive.
-  RenderPrimitiveTopology topology;
-  bool rect_list = false, quad_list = false;
+  RenderPrimitiveTopology topology = RenderPrimitiveTopology::UNKNOWN;
+  bool rect_list = false, quad_list = false, patch_list = false;
   switch (prim_type) {
     case xenos::PrimitiveType::kLineList: topology = RenderPrimitiveTopology::LINE_LIST; break;
     case xenos::PrimitiveType::kLineStrip: topology = RenderPrimitiveTopology::LINE_STRIP; break;
@@ -1508,15 +1539,36 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       topology = RenderPrimitiveTopology::TRIANGLE_LIST;
       quad_list = true;
       break;
+    case xenos::PrimitiveType::kTrianglePatch:
+      // The water. The guest's shader runs as the domain stage, once per point
+      // of a patch that Plume expands itself: the driver here reports no
+      // tessellation stage, and the expansion is the same triangles it would
+      // have made.
+      if (!vs->domain_decoded) {
+        vs->domain_decoded = true;
+        vs->domain_entry = store_->FindDomain(vs->ucode_key);
+        if (vs->domain_entry) {
+          vs->domain_compiled = store_->Build(device_, vs->domain_entry, false);
+          std::vector<LiveElement> unused;
+          DecodeLiveElements(*vs, vs->domain_entry, unused, vs->domain_live_fetches);
+        }
+      }
+      if (!vs->domain_compiled) break;
+      topology = RenderPrimitiveTopology::TRIANGLE_LIST;
+      patch_list = true;
+      break;
     default:
-      ++stats_.skipped_prim;
-      // Point lists and the tessellated patches of the water go through here:
-      // the shader and the tessellation mode say which is which.
-      Trace("dropped prim={} n={} vs={:016X} ps={:016X} tess={} indexed={}", uint32_t(prim_type),
-            index_count, vs->entry->hash, ps ? ps->entry->hash : 0,
-            uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
-            uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().source_select));
-      return true;
+      break;
+  }
+  if (topology == RenderPrimitiveTopology::UNKNOWN) {
+    ++stats_.skipped_prim;
+    // Point lists and the patches Plume could not tessellate go through here:
+    // the shader and the tessellation mode say which is which.
+    Trace("dropped prim={} n={} vs={:016X} ps={:016X} tess={} indexed={}", uint32_t(prim_type),
+          index_count, vs->entry->hash, ps ? ps->entry->hash : 0,
+          uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
+          uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().source_select));
+    return true;
   }
   if (rect_list && !rect_list_gs_) {
     ++stats_.skipped_prim;
@@ -1724,11 +1776,21 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   std::memcpy(sh + RENUT_SHARED_STREAMS_OFFSET, streams, sizeof(streams));
-  for (const auto& [k, entry] : vs->live_fetches) {
+  for (const auto& [k, entry] : patch_list ? vs->domain_live_fetches : vs->live_fetches) {
     std::memcpy(sh + RENUT_SHARED_FETCH_OFFSET + k * 16, entry.data(), 16);
   }
   bool zero_used = false;
+  // A patch draw has one input: where in its patch the generated vertex sits.
+  // What the guest's shader fetches, it fetches by patch index through the
+  // table above.
+  if (patch_list) {
+    input_elements.emplace_back("TEXCOORD", RENUT_DOMAIN_INPUT_LOCATION,
+                                RENUT_DOMAIN_INPUT_LOCATION, RenderFormat::R32G32B32A32_FLOAT,
+                                kPatchDomainBinding, 0);
+    input_slots.emplace_back(kPatchDomainBinding, uint32_t(4 * sizeof(float)));
+  }
   for (auto [location, integer] : vs->compiled->inputs) {
+    if (patch_list) break;
     const LiveElement* element = nullptr;
     for (const LiveElement& e : vs->elements) {
       if (e.location == location) {
@@ -1927,6 +1989,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   HashCombine(key, ps ? ps->compiled : nullptr);
   HashCombine(key, topology);
   HashCombine(key, rect_list);
+  HashCombine(key, patch_list);
   HashCombine(key, cull);
   HashCombine(key, front_face);
   HashCombine(key, color_count);
@@ -1960,7 +2023,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (!pipeline) {
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = layout_.get();
-    desc.vertexShader = vs->compiled->module.get();
+    desc.vertexShader =
+        patch_list ? vs->domain_compiled->module.get() : vs->compiled->module.get();
     desc.geometryShader = rect_list ? rect_list_gs_.get() : nullptr;
     desc.pixelShader = ps ? ps->compiled->module.get() : nullptr;
     desc.primitiveTopology = topology;
@@ -2001,6 +2065,53 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   RenderFormat index_format = RenderFormat::R16_UINT;
   uint64_t index_offset = 0;
   uint32_t index_bytes = 0;
+  uint64_t patch_domain_offset = 0;
+  uint32_t patch_domain_bytes = 0;
+  if (patch_list) {
+    // Every three control points are a patch, and each is expanded into a grid
+    // of level * level triangles over the triangle's own coordinates. The
+    // guest's per-edge factors live where the indices would be, but the draw
+    // that computes them exports to memory, which Plume does not run yet, so
+    // the level is the ceiling the guest set for this draw.
+    const uint32_t patches = index_count / 3;
+    const float wanted = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
+    const uint32_t level =
+        std::clamp(uint32_t(wanted > 1.0f ? wanted : 1.0f), 1u, kMaxPatchLevel);
+    const uint32_t per_patch = level * level * 3;
+    vertex_count = patches * per_patch;
+    indexed = false;
+    if (!patches || !vertex_count) {
+      ++stats_.skipped_prim;
+      return true;
+    }
+    patch_domain_bytes = vertex_count * 4 * uint32_t(sizeof(float));
+    patch_domain_offset = Allocate(patch_domain_bytes, 256);
+    if (patch_domain_offset == UINT64_MAX) return true;
+    auto* out = reinterpret_cast<float*>(Pointer(patch_domain_offset));
+    const float step = 1.0f / float(level);
+    auto corner = [&](uint32_t patch, uint32_t row, uint32_t col) {
+      // Row i of the grid holds level + 1 - i points; a point's weights are its
+      // distance along each edge.
+      *out++ = float(col) * step;
+      *out++ = float(level - row - col) * step;
+      *out++ = float(row) * step;
+      *out++ = float(patch);
+    };
+    for (uint32_t patch = 0; patch < patches; ++patch) {
+      for (uint32_t row = 0; row < level; ++row) {
+        for (uint32_t col = 0; col + row < level; ++col) {
+          corner(patch, row, col);
+          corner(patch, row, col + 1);
+          corner(patch, row + 1, col);
+          if (col + row + 1 < level) {
+            corner(patch, row, col + 1);
+            corner(patch, row + 1, col + 1);
+            corner(patch, row + 1, col);
+          }
+        }
+      }
+    }
+  }
   if (indexed) {
     const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
     index_format = is32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT;
@@ -2053,7 +2164,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   list_->setScissors(&scissor_rect, 1);
   for (const auto& slot : input_slots) {
     RenderVertexBufferView view;
-    if (slot.index == kZeroBinding) {
+    if (patch_list) {
+      view = RenderVertexBufferView(RenderBufferReference(upload_.get(), patch_domain_offset),
+                                    patch_domain_bytes);
+    } else if (slot.index == kZeroBinding) {
       view = RenderVertexBufferView(RenderBufferReference(upload_.get(), zero_offset_), 64);
     } else {
       view = RenderVertexBufferView(RenderBufferReference(upload_.get(), slot_offsets[slot.index]),
@@ -2111,6 +2225,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                index_format);
     list_->setIndexBuffer(&view);
     list_->drawIndexedInstanced(vertex_count, 1, 0, base_vertex, 0);
+  } else if (patch_list) {
+    list_->drawInstanced(vertex_count, 1, 0, 0);
   } else {
     list_->drawInstanced(vertex_count, 1, uint32_t(std::max(base_vertex, 0)), 0);
   }
