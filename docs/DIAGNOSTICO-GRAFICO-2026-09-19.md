@@ -126,7 +126,10 @@ Para resolver são necessários, no mínimo:
 3. Opcionalmente, memory export, para usar os fatores adaptativos reais em vez
    de um fator fixo.
 
-Evidências: `water-trace.txt` (a sequência acima) e `flyby-states.txt`.
+Evidências: `water-trace.txt` (a sequência acima) e `flyby-states.txt`. O plano
+completo, com as definições do Xenos que o domain shader e o hull shader têm de
+respeitar, está em `docs/AGUA-TESSELACAO.md`; a primeira etapa — tesselação na
+interface do Plume — já está no repositório.
 
 A hipótese anterior sobre a leitura do canal Z de uma textura de profundidade
 resolvida entregue como R32 não tem relação com a água ausente e permanece sem
