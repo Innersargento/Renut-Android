@@ -6,20 +6,25 @@ Layout, worked out from x1nixmzeng/project-grabbed and the files themselves:
           then chunk1 size at +0x3C+... see below)
     chunk1: section table (33-byte records + names), name pool, per-resource
             table (u32 index, u32 offset, u32 size, u8, u8)
-    chunk2: fixups / dependencies
+    chunk2: fixups (see Caff.fixups)
     sections, back to back in table order (.data, .texturegpu, .gpu, ...)
 """
+import collections
 import struct
 
 
 class Caff:
-    def __init__(self, path):
+    def __init__(self, path=None, raw=None):
         self.path = path
-        self.raw = raw = open(path, "rb").read()
+        if raw is None:
+            raw = open(path, "rb").read()
+        self.raw = raw
         assert raw[:4] == b"CAFF", path
         h = struct.unpack_from(">13I4B10I", raw, 20)
         self.chunk1_offset = h[0]
         self.resource_count = h[2]
+        # Two fixup lists, each (group count, fixup count); see fixups().
+        self.fixup_lists = [(h[6], h[7]), (h[10], h[11])]
         self.section_count = h[14]
         self.chunk1_size = h[18]
         self.chunk2_size = h[23]
@@ -71,6 +76,56 @@ class Caff:
     def section(self, name):
         base, size = self.sections[name]
         return self.raw[base:base + size]
+
+    def chunk_offset(self, chunk):
+        """File offset of a chunk (1-based index into self.chunks)."""
+        _, sec, offset, _, _ = self.chunks[chunk - 1]
+        return self.sections[sec][0] + offset
+
+    def fixups(self):
+        """{source chunk: [(offset in source, target chunk)]}, chunks 1-based.
+
+        chunk2 opens with two fixup lists back to back, sized by the header.
+        Each is `groups` records (u32 source chunk, u32 target chunk, u32
+        count), then the counts' worth of u32 offsets in group order: the words
+        inside the source chunk that hold an offset into the target chunk,
+        which the loader turns into an address. The loose CAFFs use only the
+        first list; the ones packed in 438cb47c archives put the pointers into
+        the pool's .gpu/.gpucached (and a few more) in the second.
+        """
+        raw, pos = self.raw, self.chunk2_offset
+        out = collections.defaultdict(list)
+        for group_count, fixup_count in self.fixup_lists:
+            groups = [struct.unpack_from(">3I", raw, pos + 12 * i) for i in range(group_count)]
+            assert sum(g[2] for g in groups) == fixup_count, self.path
+            pos += 12 * group_count
+            for source, target, count in groups:
+                for offset in struct.unpack_from(f">{count}I", raw, pos):
+                    out[source].append((offset, target))
+                pos += 4 * count
+        return out
+
+
+def caff_spans(raw):
+    """(offset, size) for every CAFF in a packed file, from its own header."""
+    spans, i = [], raw.find(b"CAFF")
+    while i != -1:
+        try:
+            h = struct.unpack_from(">13I4B10I", raw, i + 20)
+            chunk1_offset, section_count, chunk1_size, chunk2_size = h[0], h[14], h[18], h[23]
+            pos, total = i + chunk1_offset, 0
+            for _ in range(section_count):
+                total += struct.unpack_from(">B8I", raw, pos)[3]
+                pos += 33
+            size = chunk1_offset + chunk1_size + chunk2_size + total
+            if 0 < size <= len(raw) - i:
+                spans.append((i, size))
+                i = raw.find(b"CAFF", i + size)
+                continue
+        except Exception:
+            pass
+        i = raw.find(b"CAFF", i + 4)
+    return spans
 
 
 if __name__ == "__main__":

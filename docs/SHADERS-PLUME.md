@@ -78,41 +78,67 @@ runtime em `android/rexglue/shader_cache.h`.
 4. `main.cpp`: segue symlinks de diretório; `XENOS_RECOMP_ALLOW_FAILURES=1` grava o cache
    sem os shaders que falharam (desligado por padrão).
 
-## Bundles: por que não entram
+## Extração offline dos bundles (21/09/2026)
 
-- Os bundles (`Bundle/*/*`) são CAFF `07.08.06.0036`: cabeçalho, chunk1 (tabela de
-  seções, nomes, e pedaços `u32 recurso, u32 offset, u32 tamanho, u8 seção, u8 log2
-  alinhamento`), chunk2 (fixups: listas crescentes de posições de ponteiros por recurso
-  e seção), depois `.data`, `.texturegpu`, `.gpu`, `.gpucached`, `.stream`, nessa ordem.
-  Leitor em `tools/shaders/caff.py`; formato base do project-grabbed (x1nixmzeng).
-- Os cabeçalhos de shader ficam no `.data` dos recursos `aid_model_*` (dados
-  `rendergraph 26.09.07.0039`), seguidos de 40 bytes (vertex) ou 872 bytes (pixel)
-  zerados: espaço do objeto D3D montado no carregamento. **O microcódigo não vem depois.**
-- Verificação (`tools/shaders/xenos_ucode.py`, `exact_ucode`: control flow bem formado e
-  execs cobrindo exatamente o tamanho declarado; aceita 105/105 do XEX): lidos de forma
-  contígua, só 8 de ~42 mil cabeçalhos dos bundles têm microcódigo válido.
-- Consequência: rodar o XenosRecomp no diretório do jogo "funciona" (4.185 SPIR-V
-  válidos), mas ~78% têm literais com o cabeçalho do contêiner seguinte e corpo sem
-  sentido. **Não usar essa saída.**
-- O microcódigo também não está no pedaço `.gpu` do próprio modelo (varredura exata de
-  todos os offsets, e os 17 ponteiros `.data→.gpu` do modelo apontam para vertex/index
-  buffers). Falta descobrir de onde o motor tira a parte física.
+`tools/shaders/extract_caff_shaders.py <Bundle> <saída> [dumps de runtime]` extrai os
+contêineres completos direto dos dados do jogo, sem rodar o jogo.
 
-## Próximo passo: captura em runtime pelo objeto em uso
+- Os bundles são CAFF `07.08.06.0036` (leitor em `tools/shaders/caff.py`, formato base do
+  project-grabbed): cabeçalho, chunk1 (seções, nomes, pedaços), chunk2 (fixups), depois
+  `.data`, `.texturegpu`, `.gpu`, `.gpucached`, `.stream`. `Bundle/50/*` (magic
+  `438cb47c`) são CAFFs colados de ponta a ponta (14.330 no total); `Bundle/4f` tem 9
+  CAFFs soltos e 142 arquivos XCTD.
+- **chunk2** abre com duas listas de fixups, dimensionadas pelos pares de contagem do
+  cabeçalho (`h[6]/h[7]` e `h[10]/h[11]`): registros `(u32 pedaço origem, u32 pedaço
+  destino, u32 n)`, depois os `n` offsets u32 de cada grupo — palavras dentro do pedaço de
+  origem que contêm um offset no pedaço de destino. Os CAFFs soltos usam só a primeira
+  lista; os empacotados põem os ponteiros para o pool na segunda. O resto do chunk2 são
+  registros de 16 bytes ainda não usados.
+- A **parte virtual** (cabeçalho) de cada shader fica no `.data` do modelo; a **parte
+  física** fica no recurso `pool` do mesmo CAFF: `.gpu` para pixel shaders (flag
+  `0x102A1100`), `.gpucached` para vertex shaders (`0x102A1141`). O modelo tem uma tabela
+  de fixups para cada um desses dois pedaços, um ponteiro por shader, **na ordem dos
+  cabeçalhos**. É esse ponteiro que vira `objeto+24` / `objeto+32` no carregamento.
+  Três recursos avulsos `aid_*shader_banjox_microcode_*` guardam o contêiner contíguo.
+- Por isso a leitura contígua falhava e o pareamento por tamanho era ambíguo: o vínculo é
+  posicional, via fixup.
 
-Os shaders dos modelos parecem ser objetos in-place (`XGSetVertexShaderHeader` +
-`XGRegisterVertexShader`), que **não passam por `CreateVertexShader`/`CreatePixelShader`**,
-os únicos pontos que `DumpShader` (`android/rexglue/d3d_layer.cpp`) captura hoje — por
-isso só 238 capturas até o menu. `D3DDevice_SetVertexShader` (`sub_8222A0A8`) e
-`D3DDevice_SetPixelShader` (`sub_82226730`) já são interceptados. Plano:
+Resultado: **42.145 de 42.145 cabeçalhos** pareados, todos passando em `exact_ucode`,
+**2.906 contêineres únicos** (490 VS, 2.416 PS). Contra os 1.708 dumps locais: 28.626
+extrações idênticas byte a byte a uma captura, 4.922 iguais depois de zerar os campos de
+`vfetch` que o D3D reescreve no bind. Dos 3.149 dumps do aparelho (`~/rxr/in-full/dump`),
+2.647 dos 2.906 estão lá com o mesmo hash FNV-1a; 259 são novos. As diferenças restantes
+são cabeçalhos idênticos com microcódigo diferente (variantes legítimas), conferidas à mão.
 
-1. Nesses dois, para cada objeto novo, salvar os bytes ao redor do objeto (cabeçalho +
-   reserva) e procurar no objeto o ponteiro físico cujo destino passa em `exact_ucode`.
-2. Montar o contêiner completo (virtual + físico) e gravar em `shader-dump`, com o mesmo
-   hash que o Plume vai usar na busca.
-3. Rodar `recompile_shaders.sh` sobre `xex.bin` + dumps.
-4. Opcional: com o layout do objeto conhecido, seguir o fixup correspondente no CAFF e
-   extrair tudo offline.
+**XCTD (`Bundle/4f`).** Os 142 arquivos `0FF512ED` são xcompress LZX decodificado por
+segmento com `XMemDecompressSegmentTD`, que só existe na biblioteca da Microsoft. O
+build Windows do QuickBMS a inclui (o de Linux não); `tools/shaders/decompress_xctd.sh`
+roda o `quickbms.exe` pelo interop do WSL e grava CAFFs comuns (142 de 142, 3,0 GB).
+Deles saem mais **140.860 de 140.860 cabeçalhos**, 3.997 contêineres únicos.
+
+**Cobertura final.** Dos 3.149 dumps do aparelho, 2.982 saem byte a byte da extração
+offline e 17 vêm do XEX. Os 150 restantes não existem em nenhum dado do jogo (busca pelo
+microcódigo inteiro em todos os arquivos, inclusive os descomprimidos): 139 não têm nenhum
+shader com o mesmo cabeçalho, 11 são variantes de 1 a 75 bytes de shaders extraídos. São
+gerados ou alterados em runtime e só entram pelos dumps.
+
+Recompilação de tudo (XEX, 3.149 dumps, internos do D3D, 259 novos do `Bundle/50` e
+1.385 novos do XCTD): **4.887 entradas, 0 falhas de decodificação, 0 falhas no
+`spirv-val --target-env vulkan1.1`**, `shader_ucode_map.inc` com 4.886 contêineres (antes
+3.242).
+
+No aparelho (SM-S918B, 21/09, quadros 6.901 a 10.501): todos os 35 relatórios com
+`no_vs=0 no_ps=0 missing_ucode=0`, até 1.623 shaders em uso, `files/plume-miss` vazio.
+
+Reprodução:
+
+```bash
+tools/shaders/decompress_xctd.sh "<jogo>/Bundle/4f" ~/xctd/out
+python3 tools/shaders/extract_caff_shaders.py "<jogo>/Bundle" <saída>
+python3 tools/shaders/extract_caff_shaders.py ~/xctd/out <saída-xctd>
+# entrada: xex.bin + dumps de runtime + internal/ + as duas saídas
+tools/shaders/recompile_shaders.sh <entrada> <saída-spirv>
+```
 
 ## Shaders internos do Direct3D (19/09/2026)
 

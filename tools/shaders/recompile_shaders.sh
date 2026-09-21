@@ -7,11 +7,11 @@
 #
 # <input dir> holds files with complete shader containers (header followed by
 # microcode): the decrypted xex.bin and the runtime capture (files/shader-dump
-# on the device, written by android/rexglue/d3d_layer.cpp). Do not point
-# it at the extracted game data - the CAFF bundles store only the headers of
-# their shaders (the microcode lives elsewhere), and XenosRecomp would turn
-# whatever bytes follow each header into a shader that compiles but is garbage.
-# See docs/SHADERS-PLUME.md.
+# on the device, written by android/rexglue/d3d_layer.cpp), and the output of
+# tools/shaders/extract_caff_shaders.py. Do not point it at the game data
+# itself - the CAFF bundles keep a shader's header apart from its microcode,
+# and XenosRecomp would turn whatever bytes follow each header into a shader
+# that compiles but is garbage. See docs/SHADERS-PLUME.md.
 set -euo pipefail
 
 INPUT=$1
