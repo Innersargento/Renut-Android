@@ -576,6 +576,8 @@ struct Stats {
   uint64_t passes = 0;
   // Render passes ended early by a layout change, by destination layout.
   std::array<uint64_t, 8> split_by{};
+  // vkCmdPipelineBarrier calls for texture layouts, each a wait for idle on Turnip.
+  uint64_t barriers = 0;
   // Wall clock, in microseconds: whole frames, the pipelines built inside them
   // and the submit that ends them. What is left is the rest of the draw path.
   uint64_t frame_us = 0, pipeline_us = 0, submit_us = 0;
@@ -1184,6 +1186,7 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
                                    ? RenderBarrierStage::COPY
                                    : RenderBarrierStage::GRAPHICS;
   list_->barriers(stages, RenderTextureBarrier(texture, layout));
+  ++stats_.barriers;
   current = layout;
   // A barrier ends the render pass, so every layout change made while one is
   // bound splits it in two. Counting them by destination says which is worth
@@ -2665,6 +2668,9 @@ bool PlumeCommandProcessor::IssueCopy() {
   const uint32_t pitch_tiles = std::max(1u, uint32_t(edram.pitch_tiles));
   const uint32_t x = (tiles % pitch_tiles) * tile_width + info.coordinate_info.edram_offset_x_div_8 * 8;
   const uint32_t y = (tiles / pitch_tiles) * 16 + info.coordinate_info.edram_offset_y_div_8 * 8;
+  // plume-skip bit 134217728 drops every clear, these and Direct3D's. The
+  // picture is wrong; it measures what the clear-only passes cost.
+  const bool skip_clears = skip_mask_ & 134217728;
 
   Trace("resolve {} base={:X} fmt={} src=({},{}) {}x{} found={} -> {:08X} dfmt={} ({},{}) pitch={} h={} clear={}{}",
         copying_depth ? "depth" : "color", original, uint32_t(edram.format), x, y, width, height,
@@ -2719,10 +2725,14 @@ bool PlumeCommandProcessor::IssueCopy() {
     } else if (dest.texture) {
       Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
-      RenderBox box(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h), 0, 1);
-      list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
-                               RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
-                               dest_y, 0, &box);
+      // plume-skip bit 268435456 keeps the resolve's barriers and pass breaks
+      // but drops the copies themselves, colour and depth (see CopyDepth).
+      if (!(skip_mask_ & 268435456)) {
+        RenderBox box(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h), 0, 1);
+        list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
+                                 RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
+                                 dest_y, 0, &box);
+      }
     }
     if (dest.texture) {
       if (snap_address_ && info.copy_dest_base == snap_address_ && ++snap_seen_ == snap_ordinal_) {
@@ -2750,7 +2760,7 @@ bool PlumeCommandProcessor::IssueCopy() {
 
   // Clears that ride along with the resolve.
   const RenderRect rect(int32_t(x), int32_t(y), int32_t(x + width), int32_t(y + height));
-  if (info.IsClearingColor() && source) {
+  if (info.IsClearingColor() && source && !skip_clears) {
     Transition(source->texture.get(), source->layout, RenderTextureLayout::COLOR_WRITE);
     std::array<Target*, 4> colors{source};
     SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
@@ -2771,7 +2781,7 @@ bool PlumeCommandProcessor::IssueCopy() {
     list_->clearColor(0, color, &rect, 1);
     ++stats_.clears;
   }
-  if (info.IsClearingDepth()) {
+  if (info.IsClearingDepth() && !skip_clears) {
     Target* depth = FindTarget(info.depth_original_base, info.depth_edram_info.format, true,
                                std::max(1u, uint32_t(info.depth_edram_info.pitch_tiles)) * 80);
     if (depth) {
@@ -2799,8 +2809,12 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
   // Always a barrier call, which also ends any open render pass before the
   // raw Vulkan commands below.
   list_->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source.texture.get(), RenderTextureLayout::COPY_SOURCE));
+  ++stats_.barriers;
   source.layout = RenderTextureLayout::COPY_SOURCE;
   bound_framebuffer_ = nullptr;
+  // plume-skip bit 536870912 keeps that barrier and drops the round trip
+  // through the staging buffer, to price it; 268435456 drops every copy.
+  if (skip_mask_ & (268435456 | 536870912)) return true;
   VkCommandBuffer cb = static_cast<VulkanCommandList*>(list_)->vk;
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2837,6 +2851,7 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
               fetch.endian);
   float v[7];
   std::memcpy(v, vertex, sizeof(v));
+  if (skip_mask_ & 134217728) return;  // clears dropped, see IssueCopy
   ++stats_.clears;
   Trace("clear mode={} pitch={} depth={} color=({}, {}, {}, {}) colormask={:X}", uint32_t(edram_mode),
         uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch), v[2], v[3], v[4], v[5], v[6],
@@ -3057,12 +3072,12 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 void PlumeCommandProcessor::Report() {
   REXLOG_INFO(
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
-      "no_target={} resolves={} clears={} passes={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
+      "no_target={} resolves={} clears={} passes={} barriers={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
       "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={} "
       "const_reused={}",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
-      stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes,
+      stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes, stats_.barriers,
       stats_.split_by[uint32_t(RenderTextureLayout::COLOR_WRITE) & 7],
       stats_.split_by[uint32_t(RenderTextureLayout::DEPTH_WRITE) & 7],
       stats_.split_by[uint32_t(RenderTextureLayout::SHADER_READ) & 7],

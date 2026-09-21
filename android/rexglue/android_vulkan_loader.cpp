@@ -10,7 +10,8 @@ namespace {
 std::mutex loader_mutex;
 void* loader=nullptr; // Retained until the isolated runtime process exits.
 }
-void renutConfigureXenosDriver(const std::string& hooks,const std::string& directory,const std::string& library,bool one_ui_fix) {
+void renutConfigureXenosDriver(const std::string& hooks,const std::string& directory,const std::string& library,bool one_ui_fix,
+                               const std::string& tu_debug) {
   std::lock_guard lock(loader_mutex);
   if(loader)throw std::runtime_error("O driver já foi inicializado nesta sessão.");
   // Turnip reads its device-feature overrides when the driver initialises, so
@@ -23,6 +24,9 @@ void renutConfigureXenosDriver(const std::string& hooks,const std::string& direc
   // GPU. Never overwrites a value the session already set, so it stays
   // overridable from outside.
   if(one_ui_fix)setenv("FD_DEV_FEATURES","enable_tp_ubwc_flag_hint=1",0);
+  // Turnip's debug flags, read at the same point. "perf" logs to logcat why
+  // each render pass went to GMEM or sysmem; "sysmem" / "gmem" force one mode.
+  if(!tu_debug.empty())setenv("TU_DEBUG",tu_debug.c_str(),0);
   // adrenotools concatenates directory + library name, so it needs the slash.
   std::string driver_dir=directory;
   if(!driver_dir.empty()&&driver_dir.back()!='/')driver_dir+='/';

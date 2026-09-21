@@ -18,7 +18,8 @@ import java.util.zip.*;
 public final class MainActivity extends Activity {
     private static final int ISO=10, XEX=11, DRIVER=12, EXPORT=13;
     private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
-    private TextView status, library, driver, renderer, fpsCounter, oneUiFix;
+    private static final String[] TU_DEBUG={"","perf","sysmem","gmem"};
+    private TextView status, library, driver, renderer, fpsCounter, oneUiFix, tuDebug;
     private ProgressBar progress;
     private Button cancel;
     private volatile Thread worker;
@@ -50,7 +51,8 @@ public final class MainActivity extends Activity {
             i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
             i.putExtra("renderer",getPreferences(0).getString("renderer","xenos"));
             i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
-            i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));startActivity(i);
+            i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));
+            i.putExtra("tuDebug",getPreferences(0).getString("tuDebug",""));startActivity(i);
         });
         button(game,"Validar runtime ARM64",()->startActivity(new Intent(this,RuntimeActivity.class)));
         button(game,"Testar runtime com Plume",()->{
@@ -76,6 +78,12 @@ public final class MainActivity extends Activity {
             getPreferences(0).edit().putBoolean("oneui",!getPreferences(0).getBoolean("oneui",true)).apply(); refresh();
         });
         graphics.addView(text("Pede ao Turnip a dica de flag UBWC do processador de texturas (FD_DEV_FEATURES). Sem ela, amostrar uma imagem comprimida que a GPU acabou de escrever devolve dado velho: a tela pisca preta e os quadros saem em blocos. Não tem efeito no driver do sistema.",13,muted));
+        tuDebug=text("",16,ink); graphics.addView(tuDebug);
+        button(graphics,"Alternar TU_DEBUG",()->{
+            int next=(Arrays.asList(TU_DEBUG).indexOf(getPreferences(0).getString("tuDebug",""))+1)%TU_DEBUG.length;
+            getPreferences(0).edit().putString("tuDebug",TU_DEBUG[next]).apply(); refresh();
+        });
+        graphics.addView(text("Depuração do Turnip. \"perf\" registra no logcat por que cada render pass foi para GMEM ou sysmem; \"sysmem\" e \"gmem\" forçam um dos modos. Só para medição. Não tem efeito no driver do sistema.",13,muted));
         button(graphics,"Testar Plume no aparelho",()->{
             Intent intent=new Intent(this,ProbeActivity.class);
             intent.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
@@ -122,6 +130,8 @@ public final class MainActivity extends Activity {
             ?"Renderizador: Plume nativo (em desenvolvimento)":"Renderizador: RexGlue (emulação Xenos)");
         fpsCounter.setText(getPreferences(0).getBoolean("fps",false)?"Contador de FPS: ativado":"Contador de FPS: desativado");
         oneUiFix.setText(getPreferences(0).getBoolean("oneui",true)?"One UI fix: ativado":"One UI fix: desativado");
+        String debug=getPreferences(0).getString("tuDebug","");
+        tuDebug.setText("TU_DEBUG: "+(debug.isEmpty()?"desativado":debug));
         File diagnostic=new File(getFilesDir(),"probe-report.txt");
         try{if(diagnostic.lastModified()>reportReadAt){report=new String(Files.readAllBytes(diagnostic.toPath()),java.nio.charset.StandardCharsets.UTF_8);reportReadAt=diagnostic.lastModified();if(worker==null)status.setText(report);}}catch(IOException ignored){}
         File runtimeReport=new File(getFilesDir(),"runtime-report.txt");
