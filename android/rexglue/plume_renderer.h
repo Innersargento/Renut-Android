@@ -17,6 +17,12 @@ struct RenderTexture;
 
 namespace renut {
 
+// Frames the renderer keeps in flight. The command processor records frame N
+// while the GPU runs N-1, so a frame costs the larger of the two instead of
+// their sum; it sizes the per-frame resources on both sides (command lists,
+// fences, acquire semaphores and the slices of the upload ring).
+inline constexpr uint32_t kPlumeFramesInFlight = 2;
+
 // Where the driver's compiled pipelines are kept between runs. Call it before
 // the renderer starts: entering a scene for the first time spends most of its
 // frames inside vkCreateGraphicsPipelines, and a warm cache skips that.
@@ -41,10 +47,17 @@ class PlumeRenderer {
 
   // Executes `frame` (already ended), then scales `source` (in COPY_SOURCE
   // layout after `frame`; width x height of it is shown) onto the swapchain and
-  // presents, in one submission. Returns once the GPU finished, so everything
-  // `frame` used may be reused. `source` null presents the clear colour.
+  // presents, in one submission on `slot`'s resources. `source` null presents
+  // the clear colour.
+  //
+  // Returns as soon as the work is queued: what `frame` used stays in use until
+  // WaitForSlot(slot) returns, and the caller owns that wait.
   void SubmitAndPresent(plume::RenderCommandList* frame, plume::RenderTexture* source,
-                        uint32_t width, uint32_t height);
+                        uint32_t width, uint32_t height, uint32_t slot);
+  // Waits for whatever SubmitAndPresent left running on `slot`, if anything.
+  void WaitForSlot(uint32_t slot);
+  // Waits for every slot. For teardown and the ring's overflow path.
+  void WaitForAllSlots();
 
   ~PlumeRenderer();
 

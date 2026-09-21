@@ -38,9 +38,16 @@ struct PlumeRenderer::State {
   std::unique_ptr<RenderDevice> device;
   std::unique_ptr<RenderCommandQueue> queue;
   std::unique_ptr<RenderSwapChain> swap;
-  std::unique_ptr<RenderCommandList> commands;
-  std::unique_ptr<RenderCommandFence> fence;
-  std::unique_ptr<RenderCommandSemaphore> acquire;
+  // One set per frame in flight. A slot's fence guards everything that frame
+  // submitted, including the command list the processor recorded into it, so
+  // reusing a slot means waiting on it first.
+  struct Slot {
+    std::unique_ptr<RenderCommandList> commands;
+    std::unique_ptr<RenderCommandFence> fence;
+    std::unique_ptr<RenderCommandSemaphore> acquire;
+    bool pending = false;
+  };
+  std::array<Slot, kPlumeFramesInFlight> slots;
   std::vector<std::unique_ptr<RenderCommandSemaphore>> release;
   RenderFormat format = RenderFormat::UNKNOWN;
   std::mutex color_mutex;
@@ -52,9 +59,11 @@ struct PlumeRenderer::State {
       vkDeviceWaitIdle(static_cast<VulkanDevice*>(device.get())->vk);
     }
     release.clear();
-    acquire.reset();
-    fence.reset();
-    commands.reset();
+    for (auto& slot : slots) {
+      slot.acquire.reset();
+      slot.fence.reset();
+      slot.commands.reset();
+    }
     swap.reset();
     queue.reset();
     device.reset();
@@ -152,13 +161,16 @@ bool PlumeRenderer::Start(ANativeWindow* window, std::string* error) {
     Require(s.format != RenderFormat::UNKNOWN, "Plume: superfície sem RGBA8/BGRA8.");
     s.swap = s.queue->createSwapChain(RenderSwapChainDesc(window, s.format, 3));
     Require(s.swap && s.swap->resize() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
-    s.commands = s.queue->createCommandList();
-    s.fence = s.device->createCommandFence();
-    s.acquire = s.device->createCommandSemaphore();
+    for (auto& slot : s.slots) {
+      slot.commands = s.queue->createCommandList();
+      slot.fence = s.device->createCommandFence();
+      slot.acquire = s.device->createCommandSemaphore();
+      Require(slot.commands && slot.fence && slot.acquire,
+              "Plume: falha ao alocar a apresentação.");
+    }
     for (uint32_t i = 0; i < s.swap->getTextureCount(); ++i) {
       s.release.push_back(s.device->createCommandSemaphore());
     }
-    Require(s.commands && s.fence && s.acquire, "Plume: falha ao alocar a apresentação.");
     REXLOG_INFO("Renut: Plume renderer started on {} ({}x{})", s.gpu, s.swap->getWidth(),
                 s.swap->getHeight());
     instance = std::move(renderer);
@@ -189,30 +201,34 @@ void PlumeRenderer::Present() {
     std::lock_guard lock(s.color_mutex);
     color = s.clear_color;
   }
+  // Before the game draws anything there is no pipelining to preserve, so this
+  // path keeps slot 0 and waits.
+  WaitForAllSlots();
+  auto& slot = s.slots[0];
   uint32_t index = 0;
-  if (!s.swap->acquireTexture(s.acquire.get(), &index)) {
+  if (!s.swap->acquireTexture(slot.acquire.get(), &index)) {
     s.swap->resize();
     return;
   }
   auto* target = s.swap->getTexture(index);
-  s.commands->begin();
-  s.commands->barriers(RenderBarrierStage::COPY,
-                       RenderTextureBarrier(target, RenderTextureLayout::COPY_DEST));
+  slot.commands->begin();
+  slot.commands->barriers(RenderBarrierStage::COPY,
+                          RenderTextureBarrier(target, RenderTextureLayout::COPY_DEST));
   VkClearColorValue value{};
   for (int i = 0; i < 4; ++i) value.float32[i] = color[i];
   VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  vkCmdClearColorImage(static_cast<VulkanCommandList*>(s.commands.get())->vk,
+  vkCmdClearColorImage(static_cast<VulkanCommandList*>(slot.commands.get())->vk,
                        static_cast<VulkanTexture*>(target)->vk,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
-  s.commands->barriers(RenderBarrierStage::NONE,
-                       RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
-  s.commands->end();
-  const RenderCommandList* list = s.commands.get();
-  auto* wait = s.acquire.get();
+  slot.commands->barriers(RenderBarrierStage::NONE,
+                          RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
+  slot.commands->end();
+  const RenderCommandList* list = slot.commands.get();
+  auto* wait = slot.acquire.get();
   auto* signal = s.release[index].get();
-  s.queue->executeCommandLists(&list, 1, &wait, 1, &signal, 1, s.fence.get());
+  s.queue->executeCommandLists(&list, 1, &wait, 1, &signal, 1, slot.fence.get());
   s.swap->present(index, &signal, 1);
-  s.queue->waitForCommandFence(s.fence.get());
+  s.queue->waitForCommandFence(slot.fence.get());
   if (s.frames.fetch_add(1) == 0) {
     REXLOG_INFO("Renut: Plume presented its first frame");
   }
@@ -221,26 +237,41 @@ void PlumeRenderer::Present() {
 RenderDevice* PlumeRenderer::device() const { return state_->device.get(); }
 RenderCommandQueue* PlumeRenderer::queue() const { return state_->queue.get(); }
 
-void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* source,
-                                     uint32_t width, uint32_t height) {
+void PlumeRenderer::WaitForSlot(uint32_t slot) {
   auto& s = *state_;
+  auto& entry = s.slots[slot % kPlumeFramesInFlight];
+  if (!entry.pending) return;
+  s.queue->waitForCommandFence(entry.fence.get());
+  entry.pending = false;
+}
+
+void PlumeRenderer::WaitForAllSlots() {
+  for (uint32_t i = 0; i < kPlumeFramesInFlight; ++i) WaitForSlot(i);
+}
+
+void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* source,
+                                     uint32_t width, uint32_t height, uint32_t slot_index) {
+  auto& s = *state_;
+  auto& slot = s.slots[slot_index % kPlumeFramesInFlight];
+  // The caller waits before it reuses a slot, so this one is free by now.
+  WaitForSlot(slot_index);
   uint32_t index = 0;
-  bool acquired = s.swap->acquireTexture(s.acquire.get(), &index);
+  bool acquired = s.swap->acquireTexture(slot.acquire.get(), &index);
   if (!acquired) {
     // Still run the frame: the guest's fences and resolved textures depend on it.
     if (frame) {
       const RenderCommandList* list = frame;
-      s.queue->executeCommandLists(&list, 1, nullptr, 0, nullptr, 0, s.fence.get());
-      s.queue->waitForCommandFence(s.fence.get());
+      s.queue->executeCommandLists(&list, 1, nullptr, 0, nullptr, 0, slot.fence.get());
+      slot.pending = true;
     }
     s.swap->resize();
     return;
   }
   auto* target = s.swap->getTexture(index);
-  s.commands->begin();
-  s.commands->barriers(RenderBarrierStage::COPY,
-                       RenderTextureBarrier(target, RenderTextureLayout::COPY_DEST));
-  VkCommandBuffer cb = static_cast<VulkanCommandList*>(s.commands.get())->vk;
+  slot.commands->begin();
+  slot.commands->barriers(RenderBarrierStage::COPY,
+                          RenderTextureBarrier(target, RenderTextureLayout::COPY_DEST));
+  VkCommandBuffer cb = static_cast<VulkanCommandList*>(slot.commands.get())->vk;
   VkImage dst = static_cast<VulkanTexture*>(target)->vk;
   VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   // Black around a letterboxed frame; the game's last clear colour otherwise.
@@ -266,16 +297,17 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    1, &blit, VK_FILTER_LINEAR);
   }
-  s.commands->barriers(RenderBarrierStage::NONE,
-                       RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
-  s.commands->end();
-  const RenderCommandList* lists[] = {frame, s.commands.get()};
-  auto* wait = s.acquire.get();
+  slot.commands->barriers(RenderBarrierStage::NONE,
+                          RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
+  slot.commands->end();
+  const RenderCommandList* lists[] = {frame, slot.commands.get()};
+  auto* wait = slot.acquire.get();
   auto* signal = s.release[index].get();
   s.queue->executeCommandLists(frame ? lists : lists + 1, frame ? 2 : 1, &wait, 1, &signal, 1,
-                               s.fence.get());
+                               slot.fence.get());
   s.swap->present(index, &signal, 1);
-  s.queue->waitForCommandFence(s.fence.get());
+  // No wait: the caller records the next frame while this one runs.
+  slot.pending = true;
   if (s.frames.fetch_add(1) == 0) {
     REXLOG_INFO("Renut: Plume presented its first frame");
   }

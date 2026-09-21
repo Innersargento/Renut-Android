@@ -1,5 +1,7 @@
 #include <adrenotools/driver.h>
 #include <dlfcn.h>
+#include <stdlib.h>
+
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -8,9 +10,19 @@ namespace {
 std::mutex loader_mutex;
 void* loader=nullptr; // Retained until the isolated runtime process exits.
 }
-void renutConfigureXenosDriver(const std::string& hooks,const std::string& directory,const std::string& library) {
+void renutConfigureXenosDriver(const std::string& hooks,const std::string& directory,const std::string& library,bool one_ui_fix) {
   std::lock_guard lock(loader_mutex);
   if(loader)throw std::runtime_error("O driver já foi inicializado nesta sessão.");
+  // Turnip reads its device-feature overrides when the driver initialises, so
+  // this has to be in the environment before the library is opened.
+  //
+  // Without the hint, sampling a UBWC-compressed image the GPU wrote earlier
+  // can return stale or undecoded data: with two frames in flight it showed up
+  // as whole frames coming out black, and before that as every second frame
+  // rendering blocky and dark. Same workaround the Winlator builds use on this
+  // GPU. Never overwrites a value the session already set, so it stays
+  // overridable from outside.
+  if(one_ui_fix)setenv("FD_DEV_FEATURES","enable_tp_ubwc_flag_hint=1",0);
   // adrenotools concatenates directory + library name, so it needs the slash.
   std::string driver_dir=directory;
   if(!driver_dir.empty()&&driver_dir.back()!='/')driver_dir+='/';

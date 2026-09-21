@@ -28,7 +28,7 @@ using rex::X_STATUS;
 extern const rex::PPCImageInfo PPCImageConfig;
 extern "C" rex::system::IGraphicsSystem* rex_gpu_create(uint32_t, const rex::system::GpuCreateInfo*);
 void renutSetContentActivity(JNIEnv*, jobject);
-void renutConfigureXenosDriver(const std::string&,const std::string&,const std::string&);
+void renutConfigureXenosDriver(const std::string&,const std::string&,const std::string&,bool);
 // Own this entry point so the loader cannot resolve SDL's JNI_OnLoad through
 // our transitive dependencies. SDL is explicitly loaded/initialized by Java.
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) { return JNI_VERSION_1_6; }
@@ -139,7 +139,8 @@ static void validateFibers() {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activity, jstring directory,
-    jobject surface,jstring hooks,jstring driverDirectory,jstring driverLibrary,jstring renderer,jboolean launch) {
+    jobject surface,jstring hooks,jstring driverDirectory,jstring driverLibrary,jstring renderer,jboolean launch,
+    jboolean oneUiFix) {
   const char* chars = env->GetStringUTFChars(directory, nullptr);
   if (!chars) return nullptr;
   std::filesystem::path root(chars);
@@ -189,7 +190,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       if(!surface)throw std::runtime_error("Superfície indisponível para o jogo.");
       if(!std::filesystem::is_directory(game / "Bundle"))
         throw std::runtime_error("Importe a ISO completa: os assets Bundle não estão presentes.");
-      renutConfigureXenosDriver(javaString(env,hooks),javaString(env,driverDirectory),javaString(env,driverLibrary));
+      renutConfigureXenosDriver(javaString(env,hooks),javaString(env,driverDirectory),javaString(env,driverLibrary),oneUiFix);
       note("Driver solicitado: "+(javaString(env,driverLibrary).empty()?std::string("sistema"):javaString(env,driverLibrary)));
       auto* window=ANativeWindow_fromSurface(env,surface);
       if(!window)throw std::runtime_error("Janela Android indisponível.");

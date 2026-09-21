@@ -74,6 +74,10 @@ constexpr uint32_t kMaxTextures2D = 4096;
 constexpr uint32_t kMaxTextures3D = 128;
 constexpr uint32_t kMaxTexturesCube = 16;
 constexpr uint32_t kMaxSamplers = 256;
+// Per frame in flight. Showdown Town fills about 66 MB of it a frame and has
+// peaked at 126, so a slice is sized like the old single ring rather than half
+// of it: an overflow costs a full drain of the GPU in the middle of a frame,
+// which is exactly what the pipelining is there to avoid.
 constexpr uint64_t kUploadSize = 128ull << 20;
 // Bindings 0..15 are the guest's vertex streams; this one feeds zeros to any
 // input the draw has no data for.
@@ -578,6 +582,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool CommitConstants(uint8_t* shadow, const void* source, size_t size, uint64_t& offset);
 
   void BeginFrame();
+  void StartList();
+  void FlushImagesForNextFrame();
   void Flush();
   void Transition(RenderTexture* texture, RenderTextureLayout& current, RenderTextureLayout layout);
   Target* GetTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, uint32_t height);
@@ -695,7 +701,17 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // three blocks are the ones already bound.
   uint64_t pushed_constants_[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 
-  std::unique_ptr<RenderCommandList> list_;
+  // One command list per frame in flight, and `list_` is the one being
+  // recorded. The slot also owns the slice of the upload ring that list reads
+  // from and the host resources it retired, all released together once the
+  // renderer's fence for that slot has been waited on.
+  std::array<std::unique_ptr<RenderCommandList>, kPlumeFramesInFlight> lists_;
+  RenderCommandList* list_ = nullptr;
+  uint32_t slot_ = kPlumeFramesInFlight - 1;
+  // Where the current slot's slice of the ring starts.
+  uint64_t slice_base_ = 0;
+  // Permanent allocations (white texel, zeros) live before the first slice.
+  uint64_t slice_origin_ = 0;
   std::unique_ptr<RenderCommandFence> fence_;
   bool list_open_ = false;
   RenderFramebuffer* bound_framebuffer_ = nullptr;
@@ -711,10 +727,11 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint64_t, Resolved> resolved_;
   // Textures replaced while the frame's commands may still use them; freed
   // once the frame has run (IssueSwap waits for it).
-  std::vector<std::unique_ptr<RenderTexture>> retired_;
+  std::array<std::vector<std::unique_ptr<RenderTexture>>, kPlumeFramesInFlight> retired_slots_;
   // A recorded draw stores a bindless index, not a snapshot of that binding.
   // Keep old image bindings alive until the submission has finished as well.
-  std::vector<uint32_t> retired_descriptors_, free_descriptors_;
+  std::array<std::vector<uint32_t>, kPlumeFramesInFlight> retired_descriptor_slots_;
+  std::vector<uint32_t> free_descriptors_;
   uint32_t AllocateTextureDescriptor() {
     if (!free_descriptors_.empty()) {
       uint32_t index = free_descriptors_.back();
@@ -724,11 +741,12 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     return next_descriptor_ < kMaxTextures2D ? next_descriptor_++ : 0;
   }
   void RetireTexture(std::unique_ptr<RenderTexture>& texture, uint32_t& descriptor) {
-    if (texture) retired_.push_back(std::move(texture));
-    if (descriptor) retired_descriptors_.push_back(descriptor);
+    if (texture) retired_slots_[slot_].push_back(std::move(texture));
+    if (descriptor) retired_descriptor_slots_[slot_].push_back(descriptor);
     descriptor = 0;
   }
-  std::vector<std::unique_ptr<RenderFramebuffer>> retired_framebuffers_;
+  std::array<std::vector<std::unique_ptr<RenderFramebuffer>>, kPlumeFramesInFlight>
+      retired_framebuffer_slots_;
   static uint64_t ResolvedKey(uint32_t address, RenderFormat format) {
     return uint64_t(address) | (uint64_t(format) << 32);
   }
@@ -823,9 +841,11 @@ bool PlumeCommandProcessor::SetupContext() {
   set_samplers_->setSampler(kSamplerDefault, samplers_[kSamplerDefault].get());
   next_sampler_ = kSamplerDefault + 1;
 
+  // One slice per frame in flight, after the permanent allocations.
+  const uint64_t upload_bytes = kUploadSize * kPlumeFramesInFlight + 4096;
   upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
-      kUploadSize, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX |
-                       RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::STORAGE));
+      upload_bytes, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX |
+                        RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::STORAGE));
   if (!upload_) {
     REXLOG_ERROR("Renut: Plume upload buffer unavailable");
     return false;
@@ -833,7 +853,8 @@ bool PlumeCommandProcessor::SetupContext() {
   upload_data_ = static_cast<uint8_t*>(upload_->map());
   upload_address_ = upload_->getDeviceAddress();
 
-  list_ = queue_->createCommandList();
+  for (auto& list : lists_) list = queue_->createCommandList();
+  list_ = lists_[0].get();
   fence_ = device_->createCommandFence();
 
   // Fallback textures: opaque white, for every slot without a texture yet.
@@ -855,6 +876,8 @@ bool PlumeCommandProcessor::SetupContext() {
   std::memset(Pointer(white), 0xFF, 4 * 6);
   zero_offset_ = Allocate(64, 16);
   std::memset(Pointer(zero_offset_), 0, 64);
+  // Everything after these belongs to a frame's slice.
+  slice_origin_ = (upload_used_ + 255) & ~255ull;
   list_->begin();
   list_->barriers(RenderBarrierStage::COPY,
                   std::array{RenderTextureBarrier(white_2d_.get(), RenderTextureLayout::COPY_DEST),
@@ -876,7 +899,7 @@ bool PlumeCommandProcessor::SetupContext() {
                       .data(),
                   3);
   list_->end();
-  const RenderCommandList* lists = list_.get();
+  const RenderCommandList* lists = list_;
   queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
   queue_->waitForCommandFence(fence_.get());
   for (uint32_t i = 0; i < kMaxTextures2D; ++i) {
@@ -890,8 +913,8 @@ bool PlumeCommandProcessor::SetupContext() {
                           white_cube_view_.get());
   }
   BeginFrame();
-  REXLOG_INFO("Renut: Plume command processor ready (upload {} MB at {:X})", kUploadSize >> 20,
-              upload_address_);
+  REXLOG_INFO("Renut: Plume command processor ready ({} frames in flight, upload {} MB at {:X})",
+              kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);
   return true;
 }
 
@@ -900,9 +923,8 @@ void PlumeCommandProcessor::ShutdownContext() {
     list_->end();
     list_open_ = false;
   }
-  if (queue_ && fence_) {
-    // Nothing is in flight: every submission is awaited.
-  }
+  // Frames may still be running; nothing below may be freed under them.
+  if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForAllSlots();
   pipelines_.clear();
   framebuffers_.clear();
   targets_.clear();
@@ -914,12 +936,13 @@ void PlumeCommandProcessor::ShutdownContext() {
 }
 
 uint64_t PlumeCommandProcessor::Allocate(uint64_t size, uint64_t alignment) {
+  const uint64_t limit = slice_base_ + kUploadSize;
   uint64_t offset = (upload_used_ + alignment - 1) & ~(alignment - 1);
-  if (offset + size > kUploadSize) {
+  if (offset + size > limit) {
     ++stats_.overflow;
     Flush();
     offset = (upload_used_ + alignment - 1) & ~(alignment - 1);
-    if (offset + size > kUploadSize) return UINT64_MAX;
+    if (offset + size > limit) return UINT64_MAX;
   }
   upload_used_ = offset + size;
   return offset;
@@ -958,17 +981,29 @@ bool PlumeCommandProcessor::CommitConstants(uint8_t* shadow, const void* source,
   return true;
 }
 
+// Moves to the next frame in flight and opens its command list. Waiting here,
+// rather than after the submission that ended the last frame, is what lets the
+// GPU run a frame while this one is recorded.
 void PlumeCommandProcessor::BeginFrame() {
-  // Both callers wait for the GPU before starting a new command list.
-  for (uint32_t index : retired_descriptors_) {
+  slot_ = (slot_ + 1) % kPlumeFramesInFlight;
+  // The slot's command list, ring slice and retired resources are all still in
+  // use until the frame that last held it has finished.
+  if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForSlot(slot_);
+  list_ = lists_[slot_].get();
+  slice_base_ = slice_origin_ + uint64_t(slot_) * kUploadSize;
+  for (uint32_t index : retired_descriptor_slots_[slot_]) {
     set_2d_->setTexture(index, white_2d_.get(), RenderTextureLayout::SHADER_READ);
     free_descriptors_.push_back(index);
   }
-  retired_descriptors_.clear();
-  retired_framebuffers_.clear();
-  retired_.clear();
-  // Keep the permanent allocations (white texel, zeros) at the start.
-  upload_used_ = zero_offset_ + 64;
+  retired_descriptor_slots_[slot_].clear();
+  retired_framebuffer_slots_[slot_].clear();
+  retired_slots_[slot_].clear();
+  StartList();
+}
+
+// Resets the per-frame state that lives in the ring slice and opens the list.
+void PlumeCommandProcessor::StartList() {
+  upload_used_ = slice_base_;
   uploaded_streams_.clear();
   ++upload_generation_;
   vs_constants_offset_ = ps_constants_offset_ = shared_offset_ = UINT64_MAX;
@@ -979,16 +1014,31 @@ void PlumeCommandProcessor::BeginFrame() {
   bound_framebuffer_ = nullptr;
   bound_pipeline_ = nullptr;
   state_bound_ = false;
+  // Two frames share the render targets, and a target whose layout does not
+  // change gets no barrier of its own, so nothing would otherwise stop this
+  // frame's writes from reaching the GPU alongside the last one's. One barrier
+  // at the top orders this submission after everything already queued. It costs
+  // GPU/GPU overlap, which is not what the pipelining is for - the win is this
+  // list being recorded while the previous one runs.
+  VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vkCmdPipelineBarrier(static_cast<VulkanCommandList*>(list_)->vk,
+                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                       &barrier, 0, nullptr, 0, nullptr);
 }
 
 // Runs what was recorded so far and waits, to make room in the upload ring.
+// A full drain: the slice cannot be rewritten while any frame still reads it.
 void PlumeCommandProcessor::Flush() {
   if (!list_open_) return;
   list_->end();
-  const RenderCommandList* lists = list_.get();
+  list_open_ = false;
+  if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForAllSlots();
+  const RenderCommandList* lists = list_;
   queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
   queue_->waitForCommandFence(fence_.get());
-  BeginFrame();
+  StartList();
 }
 
 void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayout& current,
@@ -1115,7 +1165,7 @@ Target* PlumeCommandProcessor::GetTarget(uint32_t base, uint32_t format, bool de
                           : ColorFormat(xenos::ColorRenderTargetFormat(format));
   RenderTextureDesc desc = depth ? RenderTextureDesc::DepthTarget(pitch, new_height, rf)
                                  : RenderTextureDesc::ColorTarget(pitch, new_height, rf);
-  if (target.texture) retired_.push_back(std::move(target.texture));
+  if (target.texture) retired_slots_[slot_].push_back(std::move(target.texture));
   target.texture = device_->createTexture(desc);
   if (!target.texture) {
     targets_.erase(key);
@@ -1127,7 +1177,8 @@ Target* PlumeCommandProcessor::GetTarget(uint32_t base, uint32_t format, bool de
   target.depth = depth;
   target.layout = RenderTextureLayout::UNKNOWN;
   // Framebuffers referencing the old texture are stale.
-  for (auto& [key, framebuffer] : framebuffers_) retired_framebuffers_.push_back(std::move(framebuffer));
+  for (auto& [key, framebuffer] : framebuffers_)
+    retired_framebuffer_slots_[slot_].push_back(std::move(framebuffer));
   framebuffers_.clear();
   bound_framebuffer_ = nullptr;
   return &target;
@@ -1484,7 +1535,7 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
   }
   if (!texture.texture || texture.width != width || texture.height != height ||
       texture.depth != depth || texture.levels != levels) {
-    if (texture.texture) retired_.push_back(std::move(texture.texture));
+    if (texture.texture) retired_slots_[slot_].push_back(std::move(texture.texture));
     texture.texture = device_->createTexture(
         RenderTextureDesc::Texture3D(width, height, depth, levels, RenderFormat::R8G8B8A8_UNORM));
     texture.width = width;
@@ -2582,7 +2633,7 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
   list_->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source.texture.get(), RenderTextureLayout::COPY_SOURCE));
   source.layout = RenderTextureLayout::COPY_SOURCE;
   bound_framebuffer_ = nullptr;
-  VkCommandBuffer cb = static_cast<VulkanCommandList*>(list_.get())->vk;
+  VkCommandBuffer cb = static_cast<VulkanCommandList*>(list_)->vk;
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2708,9 +2759,32 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
   }
 }
 
+// Puts every image a frame wrote into one known layout before the frame ends.
+//
+// Two frames in flight share these textures, and Transition only emits a
+// barrier when the layout it tracks changes - so without this the next frame
+// would write a target the last frame wrote with no image barrier in between.
+// An execution barrier is not enough: these are UBWC-compressed on an Adreno,
+// and writing one from two submissions with no layout transition between them
+// leaves the compression metadata inconsistent, which shows up as a blocky,
+// darkened frame. Landing on SHADER_READ here guarantees the next frame's first
+// use transitions back, and a layout transition preserves the contents.
+void PlumeCommandProcessor::FlushImagesForNextFrame() {
+  for (auto& [key, target] : targets_) {
+    if (target.texture) Transition(target.texture.get(), target.layout, RenderTextureLayout::SHADER_READ);
+  }
+  for (auto& [key, r] : resolved_) {
+    if (r.texture) Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
+    if (r.fitted) Transition(r.fitted.get(), r.fitted_layout, RenderTextureLayout::SHADER_READ);
+  }
+}
+
 void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
+  // Before anything is picked for presenting: the one that is moves on to
+  // COPY_SOURCE below, which is a transition of its own.
+  FlushImagesForNextFrame();
   RenderTexture* source = nullptr;
   Resolved* found = FindResolved(frontbuffer_ptr);
   if (found && found->texture) {
@@ -2733,7 +2807,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   list_open_ = false;
   const auto submit_start = std::chrono::steady_clock::now();
   if (renderer) {
-    renderer->SubmitAndPresent(list_.get(), source, frontbuffer_width, frontbuffer_height);
+    renderer->SubmitAndPresent(list_, source, frontbuffer_width, frontbuffer_height, slot_);
   }
   const auto submit_end = std::chrono::steady_clock::now();
   stats_.submit_us +=
@@ -2820,7 +2894,7 @@ void PlumeCommandProcessor::Report() {
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes,
       stats_.pipelines,
       targets_.size(), resolved_.size(), shaders_.size(), missed_.size(), stats_.overflow,
-      upload_used_ >> 10, guest_textures_.size(), stats_.textures_decoded,
+      (upload_used_ - slice_base_) >> 10, guest_textures_.size(), stats_.textures_decoded,
       stats_.texture_failures, stats_.frame_us / 1000, stats_.pipeline_us / 1000,
       stats_.submit_us / 1000, renut_guest_swap_count() - reported_guest_swaps_,
       stats_.constants_reused);
