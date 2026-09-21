@@ -1,6 +1,10 @@
 #include "plume_gpu.h"
 
 #include "plume_renderer.h"
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include "plume_textures.h"
 #include "plume_vulkan.h"
 #include "shader_cache.h"
@@ -99,16 +103,36 @@ constexpr uint32_t kSamplerDefault = 0;
 uint32_t BSwap32(uint32_t v) { return __builtin_bswap32(v); }
 
 // Copies guest data into host order, as the fetch constant's endian field says.
+// Swaps the guest's big-endian data into the upload ring.
+//
+// Sixteen bytes at a time where the size allows it. That matters twice over:
+// the byte reversal is one instruction instead of a load, a bswap and a store,
+// and the ring is write-combined memory, where four-byte stores leave most of
+// each write-combine buffer unused. Measured on the thread that records the
+// command list, this was its single largest cost at ~19% of it.
 void CopySwapped(uint8_t* dst, const uint8_t* src, size_t size, xenos::Endian endian) {
+  size_t i = 0;
   switch (endian) {
     case xenos::Endian::k8in16:
-      for (size_t i = 0; i + 1 < size; i += 2) {
-        dst[i] = src[i + 1];
-        dst[i + 1] = src[i];
+#if defined(__aarch64__)
+      for (; i + 16 <= size; i += 16) {
+        vst1q_u8(dst + i, vrev16q_u8(vld1q_u8(src + i)));
+      }
+#endif
+      for (; i + 1 < size; i += 2) {
+        // Read both before writing either: the tail may overlap in place.
+        const uint8_t low = src[i], high = src[i + 1];
+        dst[i] = high;
+        dst[i + 1] = low;
       }
       break;
     case xenos::Endian::k8in32:
-      for (size_t i = 0; i + 3 < size; i += 4) {
+#if defined(__aarch64__)
+      for (; i + 16 <= size; i += 16) {
+        vst1q_u8(dst + i, vrev32q_u8(vld1q_u8(src + i)));
+      }
+#endif
+      for (; i + 3 < size; i += 4) {
         uint32_t v;
         std::memcpy(&v, src + i, 4);
         v = BSwap32(v);
@@ -116,7 +140,13 @@ void CopySwapped(uint8_t* dst, const uint8_t* src, size_t size, xenos::Endian en
       }
       break;
     case xenos::Endian::k16in32:
-      for (size_t i = 0; i + 3 < size; i += 4) {
+#if defined(__aarch64__)
+      for (; i + 16 <= size; i += 16) {
+        vst1q_u8(dst + i,
+                 vreinterpretq_u8_u16(vrev32q_u16(vreinterpretq_u16_u8(vld1q_u8(src + i)))));
+      }
+#endif
+      for (; i + 3 < size; i += 4) {
         uint32_t v;
         std::memcpy(&v, src + i, 4);
         v = (v >> 16) | (v << 16);
