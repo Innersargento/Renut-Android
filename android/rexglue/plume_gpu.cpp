@@ -578,6 +578,10 @@ struct Stats {
   std::array<uint64_t, 8> split_by{};
   // vkCmdPipelineBarrier calls for texture layouts, each a wait for idle on Turnip.
   uint64_t barriers = 0;
+  // Per-draw GPU work: pipeline changes, vertices submitted, and the draws
+  // that take a geometry shader (rectangle lists) or are CPU-tessellated
+  // patches (the water) and the vertices those patches expand to.
+  uint64_t pipeline_binds = 0, vertices = 0, gs_draws = 0, patch_draws = 0, patch_vertices = 0;
   // Wall clock, in microseconds: whole frames, the pipelines built inside them
   // and the submit that ends them. What is left is the rest of the draw path.
   uint64_t frame_us = 0, pipeline_us = 0, submit_us = 0;
@@ -2564,6 +2568,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (bound_pipeline_ != pipeline.get()) {
     list_->setPipeline(pipeline.get());
     bound_pipeline_ = pipeline.get();
+    ++stats_.pipeline_binds;
   }
   const uint64_t push[3] = {Address(vs_constants_offset_), Address(ps_constants_offset_),
                             Address(shared_offset_)};
@@ -2636,16 +2641,25 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   // plume-skip bit 1073741824 records everything but the draw itself: the
   // state, pipeline and constant changes are all that reach the GPU.
+  stats_.vertices += vertex_count;
+  if (rect_list) ++stats_.gs_draws;
+  if (patch_list) {
+    ++stats_.patch_draws;
+    stats_.patch_vertices += vertex_count;
+  }
+  // plume-skip bit 2147483648 submits only each draw's first triangle: the
+  // per-draw state and setup stay, the vertex work goes.
+  const uint32_t draw_count = (skip_mask_ & 2147483648u) ? std::min(vertex_count, 3u) : vertex_count;
   if (skip_mask_ & 1073741824) {
   } else if (indexed) {
     RenderIndexBufferView view(RenderBufferReference(upload_.get(), index_offset), index_bytes,
                                index_format);
     list_->setIndexBuffer(&view);
-    list_->drawIndexedInstanced(vertex_count, 1, 0, base_vertex, 0);
+    list_->drawIndexedInstanced(draw_count, 1, 0, base_vertex, 0);
   } else if (patch_list) {
-    list_->drawInstanced(vertex_count, 1, 0, 0);
+    list_->drawInstanced(draw_count, 1, 0, 0);
   } else {
-    list_->drawInstanced(vertex_count, 1, uint32_t(std::max(base_vertex, 0)), 0);
+    list_->drawInstanced(draw_count, 1, uint32_t(std::max(base_vertex, 0)), 0);
   }
   ++stats_.drawn;
   if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
@@ -3085,12 +3099,13 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 void PlumeCommandProcessor::Report() {
   REXLOG_INFO(
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
-      "no_target={} resolves={} clears={} passes={} barriers={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
+      "no_target={} resolves={} clears={} passes={} barriers={} pipeline_binds={} vertices={} gs_draws={} patch_draws={} patch_vertices={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
       "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={} "
       "const_reused={}",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes, stats_.barriers,
+      stats_.pipeline_binds, stats_.vertices, stats_.gs_draws, stats_.patch_draws, stats_.patch_vertices,
       stats_.split_by[uint32_t(RenderTextureLayout::COLOR_WRITE) & 7],
       stats_.split_by[uint32_t(RenderTextureLayout::DEPTH_WRITE) & 7],
       stats_.split_by[uint32_t(RenderTextureLayout::SHADER_READ) & 7],
