@@ -2109,6 +2109,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // so that a draw whose constants did not change can keep the last one.
   uint8_t* sh = shared_built_;
   std::memset(sh, 0, RENUT_SHARED_SIZE);
+  // plume-skip bit 16777216 points every fetch at the 1x1 white texture in
+  // slot 0: the sampling instructions stay, the texture bandwidth goes.
+  if (skip_mask_ & 16777216) {
+    std::memset(texture_descriptor, 0, sizeof(texture_descriptor));
+    std::memset(cube_descriptor, 0, sizeof(cube_descriptor));
+    std::memset(stack_descriptor, 0, sizeof(stack_descriptor));
+  }
   std::memcpy(sh + RENUT_SHARED_TEXTURE2D_OFFSET, texture_descriptor, sizeof(texture_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURE3D_OFFSET, stack_descriptor, sizeof(stack_descriptor));
@@ -2565,6 +2572,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     std::memcpy(pushed_constants_, push, sizeof(push));
   }
   list_->setViewports(&viewport, 1);
+  // plume-skip bit 8388608 scissors every draw to one pixel: vertex work and
+  // binning stay, fragment work goes. What is left is the per-draw cost.
+  if (skip_mask_ & 8388608) scissor_rect = RenderRect(0, 0, 1, 1);
   list_->setScissors(&scissor_rect, 1);
   for (const auto& slot : input_slots) {
     RenderVertexBufferView view;
@@ -2624,7 +2634,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     Trace("{}", line);
   }
-  if (indexed) {
+  // plume-skip bit 1073741824 records everything but the draw itself: the
+  // state, pipeline and constant changes are all that reach the GPU.
+  if (skip_mask_ & 1073741824) {
+  } else if (indexed) {
     RenderIndexBufferView view(RenderBufferReference(upload_.get(), index_offset), index_bytes,
                                index_format);
     list_->setIndexBuffer(&view);
