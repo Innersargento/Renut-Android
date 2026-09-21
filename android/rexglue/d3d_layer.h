@@ -27,6 +27,8 @@ using Handler = bool (*)(PPCContext& ctx, uint8_t* base);
 bool PlumeActive();
 void SetHandler(Function function, Handler handler);
 void SetShaderDumpDirectory(std::string directory);
+// The runtime's files directory, where plume_d3d.cpp reads plume-spin.
+void SetRuntimeFilesDirectory(std::string directory);
 // Installs the plume-mode handlers (plume_d3d.cpp).
 void RegisterPlumeHandlers();
 

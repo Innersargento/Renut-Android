@@ -198,6 +198,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       game_window=std::make_unique<renut::GameWindow>(*game_context,window);
       if(!game_window->Open())throw std::runtime_error("Falha ao abrir a superfície do jogo.");
       renut::d3d::SetShaderDumpDirectory((root / "shader-dump").string());
+      renut::d3d::SetRuntimeFilesDirectory(root.string());
       if(renut::d3d::PlumeActive()){
         // The emulated Xenos keeps fences, vertical blank and swaps but does not
         // present: without an app context it creates no presenter, so the
