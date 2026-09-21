@@ -574,6 +574,8 @@ struct Stats {
   // Render passes begun. A tiler resolves and reloads the whole target at each
   // one, so this says how much of the frame is spent moving tile memory.
   uint64_t passes = 0;
+  // Render passes ended early by a layout change, by destination layout.
+  std::array<uint64_t, 8> split_by{};
   // Wall clock, in microseconds: whole frames, the pipelines built inside them
   // and the submit that ends them. What is left is the rest of the draw path.
   uint64_t frame_us = 0, pipeline_us = 0, submit_us = 0;
@@ -746,6 +748,10 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   struct PassMark {
     uint32_t width = 0, height = 0, colors = 0, draws = 0;
     bool depth = false;
+    // A resolve's copies run between two framebuffer marks, so without a mark
+    // of their own their cost is charged to whatever pass preceded them.
+    // 1 = the barrier that ends the open pass, 2 = the copies themselves.
+    uint8_t resolve = 0;
   };
   std::array<std::vector<PassMark>, kPlumeFramesInFlight> pass_marks_;
   std::array<uint32_t, kPlumeFramesInFlight> timestamp_count_{};
@@ -1052,7 +1058,13 @@ bool PlumeCommandProcessor::CommitConstants(uint8_t* shadow, const void* source,
 }
 
 void PlumeCommandProcessor::WriteTimestamp() {
-  if (timestamp_pool_ == VK_NULL_HANDLE || timestamps_used_ >= kMaxTimestamps) return;
+  // plume-skip bit 67108864 turns the per-pass timing off. It writes ~138
+  // timestamps a frame, mostly at render pass boundaries, and a timestamp there
+  // can make a tiler flush - so its own cost has to be measurable.
+  if (timestamp_pool_ == VK_NULL_HANDLE || (skip_mask_ & 67108864) ||
+      timestamps_used_ >= kMaxTimestamps) {
+    return;
+  }
   vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(list_)->vk,
                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
                       slot_ * kMaxTimestamps + timestamps_used_);
@@ -1084,6 +1096,7 @@ void PlumeCommandProcessor::ReadTimestamps(uint32_t slot) {
       const PassMark& m = marks[i];
       key = (uint64_t(m.width) << 32) | (uint64_t(m.height) << 8) | (uint64_t(m.colors) << 1) |
             uint64_t(m.depth);
+      key |= uint64_t(m.resolve) << 62;
       draws = m.draws;
     }
     PassTotal& total = pass_totals_[key];
@@ -1172,6 +1185,20 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
                                    : RenderBarrierStage::GRAPHICS;
   list_->barriers(stages, RenderTextureBarrier(texture, layout));
   current = layout;
+  // A barrier ends the render pass, so every layout change made while one is
+  // bound splits it in two. Counting them by destination says which is worth
+  // chasing: the frame runs 82 passes, and one carrying a single draw costs
+  // about 0.3 ms of GPU whatever it draws.
+  if (bound_framebuffer_) {
+    ++stats_.split_by[uint32_t(layout) & 7];
+    // On a tiler the pass's fragment work runs at vkCmdEndRenderPass, which
+    // this barrier just triggered - so the mark belongs here, after it, for the
+    // interval since the pass opened to be that pass's own cost.
+    PassMark mark;
+    mark.resolve = 1;
+    pass_marks_[slot_].push_back(mark);
+    WriteTimestamp();
+  }
   bound_framebuffer_ = nullptr;  // barriers end the render pass
 }
 
@@ -2614,6 +2641,12 @@ bool PlumeCommandProcessor::IssueCopy() {
   draw_util::ResolveInfo info;
   if (!draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, info)) return true;
   ++stats_.resolves;
+  // plume-skip bit 33554432 drops the resolve entirely. Attributing intervals
+  // between timestamps proved unreliable on this tiler - the same frame read as
+  // 83% resolve or 89% between-passes depending only on which side of the
+  // pass-closing barrier the mark sat. Removing a category of work and
+  // measuring the difference does not depend on that.
+  if (skip_mask_ & 33554432) return true;
   const uint32_t width = info.coordinate_info.width_div_8 * 8;
   const uint32_t height = info.height_div_8 * 8;
   if (!width || !height) return true;
@@ -3024,12 +3057,17 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 void PlumeCommandProcessor::Report() {
   REXLOG_INFO(
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
-      "no_target={} resolves={} clears={} passes={} pipelines={} targets={} resolved={} shaders={} "
+      "no_target={} resolves={} clears={} passes={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
       "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={} "
       "const_reused={}",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes,
+      stats_.split_by[uint32_t(RenderTextureLayout::COLOR_WRITE) & 7],
+      stats_.split_by[uint32_t(RenderTextureLayout::DEPTH_WRITE) & 7],
+      stats_.split_by[uint32_t(RenderTextureLayout::SHADER_READ) & 7],
+      stats_.split_by[uint32_t(RenderTextureLayout::COPY_SOURCE) & 7],
+      stats_.split_by[uint32_t(RenderTextureLayout::COPY_DEST) & 7],
       stats_.pipelines,
       targets_.size(), resolved_.size(), shaders_.size(), missed_.size(), stats_.overflow,
       (upload_used_ - slice_base_) >> 10, guest_textures_.size(), stats_.textures_decoded,
@@ -3049,7 +3087,9 @@ void PlumeCommandProcessor::Report() {
     for (size_t i = 0; i < std::min<size_t>(ranked.size(), 8); ++i) {
       const PassTotal& total = pass_totals_[ranked[i].second];
       const uint64_t key = ranked[i].second;
-      line += fmt::format(" [{}x{} c{}{} {}ms {}% {}passes {}draws]", uint32_t(key >> 32),
+      line += fmt::format(" [{}{}x{} c{}{} {}ms {}% {}passes {}draws]",
+                          (key >> 62) == 1 ? "entre-passes " : "",
+                          uint32_t((key >> 32) & 0x3FFFFFFF),
                           uint32_t((key >> 8) & 0xFFFFFF), uint32_t((key >> 1) & 0x7F),
                           (key & 1) ? "+d" : "", total.ns / 1000000, 100 * total.ns / gpu_ns_,
                           total.passes, total.draws);

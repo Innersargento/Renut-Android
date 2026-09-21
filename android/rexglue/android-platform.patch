@@ -37,6 +37,23 @@ index d26cd4f..5f4f662 100644
    // Hard limit, originating from the half-pixel offset filling hack in the
    // resolve shaders only filling up to 3 pixels, due to the bit counts used for
    // passing the scale to shaders, and because the full 490 MB EDRAM buffer is
+diff --git a/include/rex/graphics/register_file.h b/include/rex/graphics/register_file.h
+index 36e07dd..56d5d9d 100644
+--- a/include/rex/graphics/register_file.h
++++ b/include/rex/graphics/register_file.h
+@@ -36,6 +36,12 @@ class RegisterFile {
+   RegisterFile();
+ 
+   static const RegisterInfo* GetRegisterInfo(uint32_t index);
++  // Whether the register table names this index. GetRegisterInfo is a switch
++  // over sparse indices, which compiles to a binary search over hundreds of
++  // cases; WriteRegister called it on every write only to decide whether to log
++  // an unknown one, and it was 2.8% of the thread that records the command
++  // list. This answers the same question with one load and a shift.
++  static bool IsKnownRegister(uint32_t index);
+ 
+   static constexpr size_t kRegisterCount = 0x5003;
+   uint32_t values[kRegisterCount];
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
 index 696ff48..f9d441d 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
@@ -625,7 +642,7 @@ index 9ac8d15..5093d10 100644
      int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
  #endif
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..fd4f065 100644
+index a744375..a0a0ecf 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,7 +10,9 @@
@@ -714,6 +731,15 @@ index a744375..fd4f065 100644
    read_ptr_index_ = 0;
    primary_buffer_ptr_ = ptr;
    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+@@ -355,7 +398,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+-  if (!regs.GetRegisterInfo(index)) {
++  if (!regs.IsKnownRegister(index)) {
+     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+   }
+ 
 @@ -958,7 +1001,34 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
    uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
    reader->AdvanceRead((count - 4) * sizeof(uint32_t));
@@ -886,6 +912,35 @@ index 76f5600..cc3961a 100644
        return;
    }
  
+diff --git a/src/graphics/register_file.cpp b/src/graphics/register_file.cpp
+index 03ce18c..df21990 100644
+--- a/src/graphics/register_file.cpp
++++ b/src/graphics/register_file.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <cstring>
+ 
++#include <array>
++
+ #include <rex/graphics/register_file.h>
+ #include <rex/math.h>
+ 
+@@ -37,4 +39,15 @@ const RegisterInfo* RegisterFile::GetRegisterInfo(uint32_t index) {
+   }
+ }
+ 
++bool RegisterFile::IsKnownRegister(uint32_t index) {
++  static const auto known = [] {
++    std::array<uint64_t, (kRegisterCount + 63) / 64> bits{};
++#define XE_GPU_REGISTER(index, type, name) bits[(index) >> 6] |= 1ull << ((index) & 63);
++#include <rex/graphics/register_table.inc>
++#undef XE_GPU_REGISTER
++    return bits;
++  }();
++  return index < kRegisterCount && ((known[index >> 6] >> (index & 63)) & 1) != 0;
++}
++
+ }  // namespace rex::graphics
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index 001f36b..5230772 100644
 --- a/src/graphics/vulkan/command_processor.cpp
