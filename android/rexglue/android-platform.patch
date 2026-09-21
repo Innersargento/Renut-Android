@@ -427,7 +427,7 @@ index b52bf39..0b1d219 100644
  
  #include <dlfcn.h>
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..c56800d 100644
+index 9ac8d15..5093d10 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -49,7 +49,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -457,16 +457,153 @@ index 9ac8d15..c56800d 100644
      auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
      int lock_result = pthread_mutex_lock(native_mutex);
      if (lock_result == EOWNERDEAD) {
-@@ -344,7 +344,7 @@ class PosixConditionBase {
-       locks.reserve(handles.size());
+@@ -337,41 +337,59 @@ class PosixConditionBase {
  
-       for (size_t i = 0; i < handles.size(); ++i) {
+     while (true) {
+       size_t first_signaled = std::numeric_limits<size_t>::max();
+-      bool condition_met = false;
+-      bool all_locked = true;
+-
+-      std::vector<std::unique_lock<std::mutex>> locks;
+-      locks.reserve(handles.size());
+-
+-      for (size_t i = 0; i < handles.size(); ++i) {
 -#if REX_PLATFORM_LINUX
+-        auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+-        int result = pthread_mutex_trylock(native_mutex);
+-        if (result == 0 || result == EOWNERDEAD) {
+-          if (result == EOWNERDEAD) {
+-            pthread_mutex_consistent(native_mutex);
++
++      if (!wait_all) {
++        // Waiting for any one of them needs no simultaneous hold: a handle's
++        // own mutex already makes its check and its consume atomic, and only
++        // one handle is ever consumed. Taking all of them at once instead gave
++        // up whenever a single one was held, and that retry path had no backoff
++        // at all - it yielded and went straight round again. Measured on the
++        // audio thread, which waits on seven handles: 94% of its cycles were
++        // inside this function, 85% of them pthread_mutex_trylock and
++        // pthread_mutex_unlock, for 79% of a core spent finding nothing.
++        for (size_t i = 0; i < handles.size(); ++i) {
++          std::unique_lock<std::mutex> lock(handles[i]->mutex_);
++          if (handles[i]->signaled()) {
++            handles[i]->post_execution();
++            return std::make_pair(WaitResult::kSuccess, i);
+           }
+-          locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
+-        } else {
+-          all_locked = false;
+-          break;
+         }
++      } else {
++        bool all_locked = true;
++
++        std::vector<std::unique_lock<std::mutex>> locks;
++        locks.reserve(handles.size());
++
++        for (size_t i = 0; i < handles.size(); ++i) {
 +#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
-         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
-         int result = pthread_mutex_trylock(native_mutex);
-         if (result == 0 || result == EOWNERDEAD) {
-@@ -876,8 +876,18 @@ class PosixCondition<Thread> : public PosixConditionBase {
++          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
++          int result = pthread_mutex_trylock(native_mutex);
++          if (result == 0 || result == EOWNERDEAD) {
++            if (result == EOWNERDEAD) {
++              pthread_mutex_consistent(native_mutex);
++            }
++            locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
++          } else {
++            all_locked = false;
++            break;
++          }
+ #else
+-        locks.emplace_back(handles[i]->mutex_, std::try_to_lock);
+-        if (!locks.back().owns_lock()) {
+-          all_locked = false;
+-          break;
+-        }
++          locks.emplace_back(handles[i]->mutex_, std::try_to_lock);
++          if (!locks.back().owns_lock()) {
++            all_locked = false;
++            break;
++          }
+ #endif
+-      }
++        }
+ 
+-      if (!all_locked) {
+-        locks.clear();
+-        std::this_thread::yield();
+-        continue;
+-      }
++        if (!all_locked) {
++          locks.clear();
++          // Back off rather than spin: a bare yield here burns a core for as
++          // long as one of the handles stays busy.
++          std::this_thread::sleep_for(std::chrono::microseconds(100));
++          continue;
++        }
+ 
+-      if (wait_all) {
+         bool all_signaled = true;
+         for (size_t i = 0; i < handles.size(); ++i) {
+           if (!handles[i]->signaled()) {
+@@ -382,29 +400,16 @@ class PosixConditionBase {
+             first_signaled = i;
+           }
+         }
+-        condition_met = all_signaled;
+-      } else {
+-        for (size_t i = 0; i < handles.size(); ++i) {
+-          if (handles[i]->signaled()) {
+-            first_signaled = i;
+-            condition_met = true;
+-            break;
+-          }
+-        }
+-      }
+ 
+-      if (condition_met) {
+-        if (wait_all) {
++        if (all_signaled) {
+           for (size_t i = 0; i < handles.size(); ++i) {
+             handles[i]->post_execution();
+           }
+-        } else {
+-          handles[first_signaled]->post_execution();
++          return std::make_pair(WaitResult::kSuccess, first_signaled);
+         }
+-        return std::make_pair(WaitResult::kSuccess, first_signaled);
+-      }
+ 
+-      locks.clear();
++        locks.clear();
++      }
+ 
+       auto now = std::chrono::steady_clock::now();
+       if (now >= end_time) {
+@@ -414,9 +419,19 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+-        std::this_thread::sleep_for(sleep_time);
++        // Microseconds, not milliseconds. The alertable wrapper above calls in
++        // with a one millisecond slice, so `end_time - now` is a few hundred
++        // microseconds short of a millisecond on the first pass - and a cast to
++        // milliseconds truncated that to zero. sleep_for(0) returns at once, so
++        // the loop spun through the whole slice, returned kTimeout, and the
++        // wrapper started another one. That cost a full core per thread waiting
++        // this way: on the audio thread it was 78% of one, a third of it in
++        // clock_gettime and the rest locking and unlocking the handles.
++        auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(end_time - now);
++        auto sleep_time = std::min(remaining, std::chrono::microseconds(1000));
++        if (sleep_time > std::chrono::microseconds::zero()) {
++          std::this_thread::sleep_for(sleep_time);
++        }
+       }
+     }
+   }
+@@ -876,8 +891,18 @@ class PosixCondition<Thread> : public PosixConditionBase {
      sigval value{};
      value.sival_ptr = this;
  #if REX_PLATFORM_ANDROID
