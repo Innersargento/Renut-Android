@@ -735,6 +735,31 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // recorded. The slot also owns the slice of the upload ring that list reads
   // from and the host resources it retired, all released together once the
   // renderer's fence for that slot has been waited on.
+  // GPU time per render pass, from Vulkan timestamps written at every pass
+  // boundary. setFramebuffer ends the active pass before it binds the new one
+  // and the pass only reopens at the next draw, so those points are outside a
+  // render pass - which is where a timestamp on a tiler means anything. Read
+  // back once the slot's fence has been waited on, so nothing stalls for it.
+  static constexpr uint32_t kMaxTimestamps = 512;
+  VkQueryPool timestamp_pool_ = VK_NULL_HANDLE;
+  double timestamp_ns_ = 0.0;
+  struct PassMark {
+    uint32_t width = 0, height = 0, colors = 0, draws = 0;
+    bool depth = false;
+  };
+  std::array<std::vector<PassMark>, kPlumeFramesInFlight> pass_marks_;
+  std::array<uint32_t, kPlumeFramesInFlight> timestamp_count_{};
+  uint32_t timestamps_used_ = 0;
+  uint32_t color_count_of_pass_ = 0;
+  bool depth_of_pass_ = false;
+  struct PassTotal {
+    uint64_t ns = 0, passes = 0, draws = 0;
+  };
+  std::unordered_map<uint64_t, PassTotal> pass_totals_;
+  uint64_t gpu_ns_ = 0;
+  void WriteTimestamp();
+  void ReadTimestamps(uint32_t slot);
+
   std::array<std::unique_ptr<RenderCommandList>, kPlumeFramesInFlight> lists_;
   RenderCommandList* list_ = nullptr;
   uint32_t slot_ = kPlumeFramesInFlight - 1;
@@ -883,6 +908,17 @@ bool PlumeCommandProcessor::SetupContext() {
   upload_data_ = static_cast<uint8_t*>(upload_->map());
   upload_address_ = upload_->getDeviceAddress();
 
+  {
+    auto* vulkan_device = static_cast<VulkanDevice*>(device_);
+    timestamp_ns_ = vulkan_device->physicalDeviceProperties.limits.timestampPeriod;
+    VkQueryPoolCreateInfo info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = kMaxTimestamps * kPlumeFramesInFlight;
+    if (vkCreateQueryPool(vulkan_device->vk, &info, nullptr, &timestamp_pool_) != VK_SUCCESS) {
+      timestamp_pool_ = VK_NULL_HANDLE;
+      REXLOG_WARN("Renut: Plume timestamp queries unavailable; no per-pass GPU time");
+    }
+  }
   for (auto& list : lists_) list = queue_->createCommandList();
   list_ = lists_[0].get();
   fence_ = device_->createCommandFence();
@@ -960,6 +996,10 @@ void PlumeCommandProcessor::ShutdownContext() {
   targets_.clear();
   resolved_.clear();
   shaders_.clear();
+  if (timestamp_pool_ != VK_NULL_HANDLE) {
+    vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_, nullptr);
+    timestamp_pool_ = VK_NULL_HANDLE;
+  }
   if (upload_) upload_->unmap();
   upload_.reset();
   CommandProcessor::ShutdownContext();
@@ -1011,6 +1051,48 @@ bool PlumeCommandProcessor::CommitConstants(uint8_t* shadow, const void* source,
   return true;
 }
 
+void PlumeCommandProcessor::WriteTimestamp() {
+  if (timestamp_pool_ == VK_NULL_HANDLE || timestamps_used_ >= kMaxTimestamps) return;
+  vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(list_)->vk,
+                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
+                      slot_ * kMaxTimestamps + timestamps_used_);
+  ++timestamps_used_;
+}
+
+// Folds the timings a finished frame left behind into the running totals. The
+// interval between two marks is the pass that ran between them.
+void PlumeCommandProcessor::ReadTimestamps(uint32_t slot) {
+  const uint32_t count = timestamp_count_[slot];
+  timestamp_count_[slot] = 0;
+  if (timestamp_pool_ == VK_NULL_HANDLE || count < 2) return;
+  std::array<uint64_t, kMaxTimestamps> ticks{};
+  if (vkGetQueryPoolResults(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_,
+                            slot * kMaxTimestamps, count, count * sizeof(uint64_t), ticks.data(),
+                            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+    return;
+  }
+  const auto& marks = pass_marks_[slot];
+  for (uint32_t i = 0; i + 1 < count; ++i) {
+    if (ticks[i + 1] <= ticks[i]) continue;
+    const uint64_t ns = uint64_t(double(ticks[i + 1] - ticks[i]) * timestamp_ns_);
+    gpu_ns_ += ns;
+    // Mark i opened the pass that the interval measures; the first interval is
+    // whatever ran before any framebuffer was bound.
+    uint64_t key = 0;
+    uint32_t draws = 0;
+    if (i < marks.size()) {
+      const PassMark& m = marks[i];
+      key = (uint64_t(m.width) << 32) | (uint64_t(m.height) << 8) | (uint64_t(m.colors) << 1) |
+            uint64_t(m.depth);
+      draws = m.draws;
+    }
+    PassTotal& total = pass_totals_[key];
+    total.ns += ns;
+    total.passes += 1;
+    total.draws += draws;
+  }
+}
+
 // Moves to the next frame in flight and opens its command list. Waiting here,
 // rather than after the submission that ended the last frame, is what lets the
 // GPU run a frame while this one is recorded.
@@ -1019,6 +1101,7 @@ void PlumeCommandProcessor::BeginFrame() {
   // The slot's command list, ring slice and retired resources are all still in
   // use until the frame that last held it has finished.
   if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForSlot(slot_);
+  ReadTimestamps(slot_);
   list_ = lists_[slot_].get();
   slice_base_ = slice_origin_ + uint64_t(slot_) * kUploadSize;
   for (uint32_t index : retired_descriptor_slots_[slot_]) {
@@ -1029,6 +1112,15 @@ void PlumeCommandProcessor::BeginFrame() {
   retired_framebuffer_slots_[slot_].clear();
   retired_slots_[slot_].clear();
   StartList();
+  // Only here, never from Flush: a mid-frame flush keeps recording into the
+  // same range, and resetting it would drop what the first submission wrote.
+  pass_marks_[slot_].clear();
+  timestamps_used_ = 0;
+  if (timestamp_pool_ != VK_NULL_HANDLE) {
+    vkCmdResetQueryPool(static_cast<VulkanCommandList*>(list_)->vk, timestamp_pool_,
+                        slot_ * kMaxTimestamps, kMaxTimestamps);
+    WriteTimestamp();
+  }
 }
 
 // Resets the per-frame state that lives in the ring slice and opens the list.
@@ -1216,6 +1308,9 @@ Target* PlumeCommandProcessor::GetTarget(uint32_t base, uint32_t format, bool de
 
 RenderFramebuffer* PlumeCommandProcessor::GetFramebuffer(const std::array<Target*, 4>& colors,
                                                          uint32_t color_count, Target* depth) {
+  // What SetFramebuffer labels the next pass with.
+  color_count_of_pass_ = color_count;
+  depth_of_pass_ = depth != nullptr;
   uint64_t key = 0;
   for (uint32_t i = 0; i < color_count; ++i) HashCombine(key, colors[i]->texture.get());
   HashCombine(key, depth ? depth->texture.get() : nullptr);
@@ -1240,9 +1335,18 @@ void PlumeCommandProcessor::SetFramebuffer(RenderFramebuffer* framebuffer) {
     state_bound_ = true;
   }
   if (bound_framebuffer_ != framebuffer) {
+    // setFramebuffer ends the pass that was open, and the next one starts at
+    // the first draw, so the mark lands between the two.
     list_->setFramebuffer(framebuffer);
     bound_framebuffer_ = framebuffer;
     ++stats_.passes;
+    PassMark mark;
+    mark.width = framebuffer->getWidth();
+    mark.height = framebuffer->getHeight();
+    mark.colors = color_count_of_pass_;
+    mark.depth = depth_of_pass_;
+    pass_marks_[slot_].push_back(mark);
+    WriteTimestamp();
   }
 }
 
@@ -2501,6 +2605,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     list_->drawInstanced(vertex_count, 1, uint32_t(std::max(base_vertex, 0)), 0);
   }
   ++stats_.drawn;
+  if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
   return true;
 }
 
@@ -2833,6 +2938,9 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   snap_taken_ = false;
   snap_seen_ = 0;
   frame_draw_ = 0;
+  // FlushImagesForNextFrame already closed any open pass with its barriers.
+  WriteTimestamp();
+  timestamp_count_[slot_] = timestamps_used_;
   list_->end();
   list_open_ = false;
   const auto submit_start = std::chrono::steady_clock::now();
@@ -2932,6 +3040,24 @@ void PlumeCommandProcessor::Report() {
   // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
   // shuts the process down cleanly, so waiting for the device's own save would
   // usually lose the blob.
+  if (gpu_ns_) {
+    std::vector<std::pair<uint64_t, uint64_t>> ranked;  // ns, key
+    for (const auto& [key, total] : pass_totals_) ranked.emplace_back(total.ns, key);
+    std::sort(ranked.rbegin(), ranked.rend());
+    std::string line = fmt::format("Renut: Plume GPU {} ms over {} swaps, by pass:",
+                                   gpu_ns_ / 1000000, swaps_ - reported_guest_swaps_);
+    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 8); ++i) {
+      const PassTotal& total = pass_totals_[ranked[i].second];
+      const uint64_t key = ranked[i].second;
+      line += fmt::format(" [{}x{} c{}{} {}ms {}% {}passes {}draws]", uint32_t(key >> 32),
+                          uint32_t((key >> 8) & 0xFFFFFF), uint32_t((key >> 1) & 0x7F),
+                          (key & 1) ? "+d" : "", total.ns / 1000000, 100 * total.ns / gpu_ns_,
+                          total.passes, total.draws);
+    }
+    REXLOG_INFO("{}", line);
+    pass_totals_.clear();
+    gpu_ns_ = 0;
+  }
   if (stats_.pipelines) SavePlumePipelineCache();
   for (const auto& [hash, count] : missed_draws_) {
     REXLOG_INFO("Renut: Plume   missing VS {:016X}: {} draws", hash, count);
