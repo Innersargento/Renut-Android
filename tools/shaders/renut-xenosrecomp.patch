@@ -153,10 +153,10 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..d195691 100644
+index ee3830d..0c6846e 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -73,9 +73,25 @@
+@@ -73,9 +73,54 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -181,11 +181,40 @@ index ee3830d..d195691 100644
 +#define RENUT_LIVE_FETCH_COUNT           32
 +#define RENUT_LIVE_FETCH_LOCATION        0xFE
 +#define RENUT_SHARED_FETCH_OFFSET        (RENUT_SHARED_INPUTS_OFFSET + 16)                   // 1280 .. 1791
-+#define RENUT_SHARED_SIZE                (RENUT_SHARED_FETCH_OFFSET + RENUT_LIVE_FETCH_COUNT * 16)   // 1792
++// Point sprites. A float4 in guest pixels - PA_SU_POINT_SIZE's width and
++// height, the diameter used when the vertex shader writes none, then
++// PA_SU_POINT_MINMAX's min and max, which clamp the one it writes - and a
++// float2 that turns a diameter in guest pixels into a radius in host NDC. The
++// second is signed like the viewport, so -y is always the top of the screen.
++#define RENUT_SHARED_POINT_OFFSET        (RENUT_SHARED_FETCH_OFFSET + RENUT_LIVE_FETCH_COUNT * 16)   // 1792 .. 1823
++// Memory export. The guest memory a vertex shader may write this draw, as up
++// to eight ranges of uint4 (guest physical base in bytes, size in bytes,
++// device address low, high). The host keeps each exported range in a buffer
++// of its own and hands later draws that fetch from it that buffer instead of
++// guest memory; a store outside every range is dropped. See renutMemExport.
++#define RENUT_EXPORT_RANGE_COUNT         8
++#define RENUT_SHARED_EXPORT_OFFSET       (RENUT_SHARED_POINT_OFFSET + 32)                    // 1824 .. 1951
++#define RENUT_SHARED_SIZE                (RENUT_SHARED_EXPORT_OFFSET + RENUT_EXPORT_RANGE_COUNT * 16)  // 1952
++
++// Set in a cache entry's specConstantsMask when the shader exports to memory,
++// so the host knows to look for the streams it writes. Not a specialization
++// constant. Bits 8..15 and 16..23 then hold the first and last float constant
++// the export addresses are built from.
++#define RENUT_SHADER_FLAG_MEMEXPORT      (1u << 31)
++#define RENUT_SHADER_EXPORT_FIRST(mask)  (((mask) >> 8) & 0xFF)
++#define RENUT_SHADER_EXPORT_LAST(mask)   (((mask) >> 16) & 0xFF)
++
++// The interpolator location after RENUT_INTERPOLATORS that carries a point
++// sprite from the vertex shader through the host's point expansion to the
++// pixel shader. The vertex shader writes the sprite's radius in NDC to .xy;
++// the expansion replaces the whole value with (-1, 0, s, t), and the pixel
++// shader reads a negative .x as "this is a point" and .zw as the coordinate
++// inside it, the way the Xenos hands them over in its param-gen register.
++#define RENUT_POINT_SPRITE_LOCATION      23
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -119,6 +135,11 @@
+@@ -119,6 +164,11 @@
      X(TexCoord,     9, 21) \
      X(TexCoord,    10, 22)
  
@@ -197,7 +226,7 @@ index ee3830d..d195691 100644
  #ifdef __cplusplus
  #include <cstdint>
  
-@@ -136,7 +157,7 @@
+@@ -136,7 +186,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -206,7 +235,7 @@ index ee3830d..d195691 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +173,13 @@ struct ShaderInputElement
+@@ -152,6 +202,13 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -220,7 +249,7 @@ index ee3830d..d195691 100644
  };
  #endif
  
-@@ -224,6 +252,9 @@ struct PushConstants
+@@ -224,6 +281,9 @@ struct PushConstants
  #define g_SwappedBlendWeights vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 28)
  #define g_SwappedPositions    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 32)
  #define g_SintTexcoords       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 36)
@@ -230,7 +259,17 @@ index ee3830d..d195691 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -253,6 +284,157 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -235,6 +295,9 @@ struct PushConstants
+ // pipeline a pixel-space rectangle and disables the viewport.
+ #define g_ViewportScaleOffset vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + RENUT_SHARED_VIEWPORT_OFFSET, 0x10)
+ 
++#define g_PointSize           vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + RENUT_SHARED_POINT_OFFSET, 0x10)
++#define g_PointScreenToNdc    vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + RENUT_SHARED_POINT_OFFSET + 16, 0x8)
++
+ // A vfetch the vertex declaration does not describe - see the stream table's
+ // comment. `index` is whatever register the instruction named, so it arrives as
+ // a float holding an integer; `strideBytes` and `offsetBytes` are the
+@@ -253,6 +316,157 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -388,7 +427,7 @@ index ee3830d..d195691 100644
  // Per-stage float4 constant file. The recompiler picks the stage by defining
  // RENUT_STAGE_CONSTANTS to the matching push-constant address.
  #define cReg(INDEX) \
-@@ -289,7 +471,10 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -289,7 +503,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint   g_SwappedBlendWeights             : packoffset(c67.w); \
      uint   g_SwappedPositions                : packoffset(c68.x); \
      uint   g_SintTexcoords                   : packoffset(c68.y); \
@@ -396,11 +435,196 @@ index ee3830d..d195691 100644
 +    uint   g_SwappedBlendIndices             : packoffset(c68.z); \
 +    uint   g_PackedInputs                    : packoffset(c68.w); \
 +    float4 g_ViewportScaleOffset             : packoffset(c69); \
-+    uint   g_IntInputs                       : packoffset(c78.x);
++    uint   g_IntInputs                       : packoffset(c78.x); \
++    float4 g_PointSize                       : packoffset(c112); \
++    float2 g_PointScreenToNdc                : packoffset(c113);
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -483,6 +668,25 @@ float4 tfetchR11G11B10(float4 value)
+@@ -317,6 +536,182 @@ uint g_SpecConstants();
+ #ifdef RENUT_RECOMP
+ // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
+ #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
++
++// The radius in host NDC of the sprite a point becomes. `size` is the diameter
++// the vertex shader exported in guest pixels, or -1 if it exported none; as on
++// the hardware, one it did export is clamped to PA_SU_POINT_MINMAX.
++float2 renutPointRadius(float size)
++{
++    float4 sizes = g_PointSize;
++    float2 diameter = size >= 0.0 ? clamp(size, sizes.z, sizes.w).xx : sizes.xy;
++    return diameter * g_PointScreenToNdc;
++}
++
++// Memory export, as the Xenos does it. eA is a stream constant with the index
++// added in: X the base in dwords (with 01 in the top bits), Y the element
++// index, Z the format (bits 8..13), signedness (16), integer rather than
++// normalized (17), red/blue swap (19) and endianness (0..2), W the stream's
++// element count - Y, Z and W as integers in the mantissa of 2^23. eM0..eM4 are
++// consecutive elements from that index; `written` says which were set. The
++// host keeps exported memory the way it keeps every vertex stream: guest
++// memory with each dword byte-swapped (k8in32). So an element is packed as the
++// hardware packs it - a pair of 16-bit fields X in the high half, where the
++// host's input assembler finds the X of every 16-bit vertex element the CPU
++// writes (Direct3D gives all their fetches a .yx.. swizzle, which the
++// recompiled shaders do not carry) - and each dword then goes through the
++// export's own endian swap and the host's k8in32 one. The two cancel for a
++// k8in32 export; a k8in16 one comes out with its halves exchanged, which is
++// what the game relies on when it reads back a stream it exported that way.
++// Formats narrower than a dword are not stored.
++#ifdef __spirv__
++// The export's endian swap followed by k8in32.
++uint renutExportEndian(uint value, uint endian)
++{
++    switch (endian)
++    {
++    case 0:  // none
++        return (value >> 24) | ((value >> 8) & 0xFF00) | ((value << 8) & 0xFF0000) | (value << 24);
++    case 1:  // k8in16
++        return (value >> 16) | (value << 16);
++    case 3:  // k16in32
++        return ((value >> 8) & 0x00FF00FF) | ((value & 0x00FF00FF) << 8);
++    default: // k8in32, and the 64/128-bit forms taken as it
++        return value;
++    }
++}
++
++void renutExportDword(uint address, uint value, uint endian)
++{
++    value = renutExportEndian(value, endian);
++    for (uint i = 0; i < RENUT_EXPORT_RANGE_COUNT; ++i)
++    {
++        uint4 range = vk::RawBufferLoad<uint4>(
++            g_PushConstants.SharedConstants + RENUT_SHARED_EXPORT_OFFSET + i * 16, 0x10);
++        if (address - range.x < range.y)
++        {
++            uint64_t device = (uint64_t(range.w) << 32) | uint64_t(range.z);
++            vk::RawBufferStore<uint>(device + (address - range.x), value, 4);
++            return;
++        }
++    }
++}
++
++// Packs up to four fixed-point fields, X in the low bits, by the Direct3D
++// conversion rules: clamped, scaled if normalized, rounded half away from
++// zero. A zero width ends the list.
++uint renutExportFixed(float4 value, uint4 widths, bool isSigned, bool isNorm)
++{
++    uint packed = 0;
++    uint offset = 0;
++    [unroll] for (uint i = 0; i < 4; ++i)
++    {
++        uint width = widths[i];
++        if (width != 0)
++        {
++            float c = isnan(value[i]) ? 0.0 : value[i];
++            uint field;
++            if (isSigned)
++            {
++                float maxValue = float((1u << (width - 1)) - 1);
++                c = isNorm ? clamp(c, -1.0, 1.0) * maxValue : clamp(c, -maxValue - 1.0, maxValue);
++                field = uint(int(c + (c < 0.0 ? -0.5 : 0.5))) & ((1u << width) - 1);
++            }
++            else
++            {
++                float maxValue = float((1u << width) - 1);
++                c = isNorm ? saturate(c) * maxValue : clamp(c, 0.0, maxValue);
++                field = uint(c + 0.5);
++            }
++            packed |= field << offset;
++            offset += width;
++        }
++    }
++    return packed;
++}
++
++void renutMemExport(float4 eA, float4 eM0, float4 eM1, float4 eM2, float4 eM3, float4 eM4, uint written)
++{
++    uint4 a = asuint(eA);
++    if (written == 0 || any((a >> uint4(30, 23, 23, 23)) != uint4(1, 0x96, 0x96, 0x96)))
++        return;
++    uint info = a.z;
++    uint format = (info >> 8) & 0x3F;
++    bool isSigned = (info & (1u << 16)) != 0;
++    bool isNorm = (info & (1u << 17)) == 0;
++    bool swapRedBlue = (info & (1u << 19)) != 0;
++    uint index = a.y & 0x7FFFFF;
++    uint count = a.w & 0x7FFFFF;
++    uint base = a.x << 2;
++    uint endian = info & 7;
++
++    // kind: 0 fixed point in one dword, 1 16_16_16_16, 2 16_16_FLOAT,
++    // 3 16_16_16_16_FLOAT, 4.. 32-bit floats, one to four.
++    uint kind;
++    uint bytesLog2;
++    uint4 widths = 0;
++    switch (format)
++    {
++    case 6: case 14: case 50:  kind = 0; bytesLog2 = 2; widths = uint4(8, 8, 8, 8);    break;  // 8_8_8_8
++    case 7: case 54:           kind = 0; bytesLog2 = 2; widths = uint4(10, 10, 10, 2); break;  // 2_10_10_10
++    case 16: case 55:          kind = 0; bytesLog2 = 2; widths = uint4(11, 11, 10, 0); break;  // 10_11_11
++    case 17: case 56:          kind = 0; bytesLog2 = 2; widths = uint4(10, 11, 11, 0); break;  // 11_11_10
++    case 25:                   kind = 0; bytesLog2 = 2; widths = uint4(16, 16, 0, 0);  break;  // 16_16
++    case 26:                   kind = 1; bytesLog2 = 3; widths = uint4(16, 16, 0, 0);  break;  // 16_16_16_16
++    case 31:                   kind = 2; bytesLog2 = 2; break;  // 16_16_FLOAT
++    case 32:                   kind = 3; bytesLog2 = 3; break;  // 16_16_16_16_FLOAT
++    case 36:                   kind = 4; bytesLog2 = 2; break;  // 32_FLOAT
++    case 37:                   kind = 5; bytesLog2 = 3; break;  // 32_32_FLOAT
++    case 38:                   kind = 6; bytesLog2 = 4; break;  // 32_32_32_32_FLOAT
++    default:
++        return;
++    }
++
++    // 16_16, 16_16_16_16 and their float forms.
++    bool halvesSwapped = format == 25 || format == 26 || format == 31 || format == 32;
++
++    float4 eM[5] = { eM0, eM1, eM2, eM3, eM4 };
++    [unroll] for (uint k = 0; k < 5; ++k)
++    {
++        if (((written >> k) & 1) == 0 || index + k >= count)
++            continue;
++        float4 v = swapRedBlue ? eM[k].zyxw : eM[k];
++        if (halvesSwapped)
++            v = v.yxwz;
++        uint address = base + ((index + k) << bytesLog2);
++        switch (kind)
++        {
++        case 0:
++            renutExportDword(address, renutExportFixed(v, widths, isSigned, isNorm), endian);
++            break;
++        case 1:
++            renutExportDword(address, renutExportFixed(v.xyxy, widths, isSigned, isNorm), endian);
++            renutExportDword(address + 4, renutExportFixed(v.zwzw, widths, isSigned, isNorm), endian);
++            break;
++        case 2:
++            renutExportDword(address, f32tof16(v.x) | (f32tof16(v.y) << 16), endian);
++            break;
++        case 3:
++            renutExportDword(address, f32tof16(v.x) | (f32tof16(v.y) << 16), endian);
++            renutExportDword(address + 4, f32tof16(v.z) | (f32tof16(v.w) << 16), endian);
++            break;
++        default:
++            renutExportDword(address, asuint(v.x), endian);
++            if (kind >= 5)
++                renutExportDword(address + 4, asuint(v.y), endian);
++            if (kind >= 6)
++            {
++                renutExportDword(address + 8, asuint(v.z), endian);
++                renutExportDword(address + 12, asuint(v.w), endian);
++            }
++            break;
++        }
++    }
++}
++#else
++void renutMemExport(float4 eA, float4 eM0, float4 eM1, float4 eM2, float4 eM3, float4 eM4, uint written)
++{
++}
++#endif
+ #endif
+ 
+ #ifdef RENUT_RECOMP
+@@ -483,6 +878,25 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -427,7 +651,7 @@ index ee3830d..d195691 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..4b7b528 100644
+index c71e7c9..cda5140 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -503,7 +727,11 @@ index c71e7c9..4b7b528 100644
 +            lastFullFetch = instr;
 +            haveLastFullFetch = true;
 +        }
-+
+ 
+-        // The fetch constants above 95 are not stream sources at all, and a
+-        // negative stream is not one either. Either way there is nothing to
+-        // read, and guessing would bind the wrong buffer.
+-        if (fetchConstant > 95 || (95 - fetchConstant) >= RENUT_VERTEX_STREAM_COUNT)
 +        // D3D rewrites the vfetch at bind time for the vertex buffer actually
 +        // bound, so the stream, format, stride and offset in the microcode as
 +        // registered are not the ones in use. The host decodes the live
@@ -534,11 +762,7 @@ index c71e7c9..4b7b528 100644
 +        }
 +        return;
 +    }
- 
--        // The fetch constants above 95 are not stream sources at all, and a
--        // negative stream is not one either. Either way there is nothing to
--        // read, and guessing would bind the wrong buffer.
--        if (fetchConstant > 95 || (95 - fetchConstant) >= RENUT_VERTEX_STREAM_COUNT)
++
 +    if (findResult == vertexElements.end() || indexedByComputedRegister)
 +    {
 +        if (!instr.isMiniFetch)
@@ -689,7 +913,44 @@ index c71e7c9..4b7b528 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -1034,6 +1174,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -949,17 +1089,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+                     exportRegister = "oPointSizeEdgeKill";
+                     break;
+ 
+-                // Memory export (streamout). Not emulated; the writes go to a
+-                // scratch value so the surrounding arithmetic still compiles
+-                // and is dead-code eliminated.
++                // Memory export. The data registers collect the elements, and
++                // they are stored when the address is written again or the
++                // shader ends - the address in effect is the one they were
++                // written under (renutMemExport in shader_common.h).
+                 case ExportRegister::ExportAddress:
++                    indent();
++                    out += "renutMemExport(eA, eM0, eM1, eM2, eM3, eM4, eMWritten);\n";
++                    indent();
++                    out += "eMWritten = 0;\n";
++                    exportRegister = "eA";
++                    specConstantsMask |= RENUT_SHADER_FLAG_MEMEXPORT;
++                    break;
+                 case ExportRegister::ExportData0:
+                 case ExportRegister::ExportData1:
+                 case ExportRegister::ExportData2:
+                 case ExportRegister::ExportData3:
+                 case ExportRegister::ExportData4:
+-                    exportRegister = "oMemExport";
++                {
++                    static constexpr std::string_view kDataRegisters[] = {"eM0", "eM1", "eM2", "eM3", "eM4"};
++                    const uint32_t element = uint32_t(instr.vectorDest) - uint32_t(ExportRegister::ExportData0);
++                    indent();
++                    println("eMWritten |= {}u;", 1u << element);
++                    exportRegister = kDataRegisters[element];
++                    specConstantsMask |= RENUT_SHADER_FLAG_MEMEXPORT;
+                     break;
++                }
+ 
+                 default:
+                 {
+@@ -1034,6 +1189,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -699,7 +960,7 @@ index c71e7c9..4b7b528 100644
              print("r{}.", instr.vectorDest);
          }
  
-@@ -1421,6 +1564,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1421,6 +1579,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -709,7 +970,7 @@ index c71e7c9..4b7b528 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1492,8 +1638,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1492,8 +1653,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      isPixelShader = (shaderContainer->flags & 0x1) == 0;
  
  #ifdef RENUT_RECOMP
@@ -732,7 +993,18 @@ index c71e7c9..4b7b528 100644
      println("#define RENUT_STAGE_{}", isPixelShader ? "PIXEL" : "VERTEX");
  #endif
  
-@@ -1661,6 +1820,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1603,6 +1777,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ #endif
+             println("\tin {3}float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)], interpolation);
+         }
++#ifdef RENUT_RECOMP
++        // Declared last so it takes RENUT_POINT_SPRITE_LOCATION.
++        out += "\tin float4 iPointSprite : POINTSPRITE,\n";
++#endif
+ 
+         out += "#ifdef __spirv__\n";
+         out += "\tin bool iFace : SV_IsFrontFace\n";
+@@ -1661,6 +1839,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
          #endif
  
@@ -750,7 +1022,7 @@ index c71e7c9..4b7b528 100644
              out += '\t';
  
              bool locatedInput = false;
-@@ -1689,6 +1859,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1689,6 +1878,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
@@ -769,9 +1041,42 @@ index c71e7c9..4b7b528 100644
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1828,6 +2010,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1701,6 +1902,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         for (auto& [usage, usageIndex] : INTERPOLATORS)
+             print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
++    #ifdef RENUT_RECOMP
++        // Declared last so it takes RENUT_POINT_SPRITE_LOCATION.
++        out += ",\n\tout float4 oPointSprite : POINTSPRITE";
++    #endif
+     }
+ 
+     out += ")\n";
+@@ -1815,6 +2020,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         for (auto& [usage, usageIndex] : INTERPOLATORS)
+             println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
++    #ifdef RENUT_RECOMP
++        out += "\toPointSprite = 0.0;\n";
++    #endif
+ 
+         out += "\n";
+     }
+@@ -1826,8 +2034,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             print("\tfloat4 r{} = ", i);
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
++            #ifdef RENUT_RECOMP
++                // The param-gen register. X is the pixel's x with back-facing in
++                // the sign bit, Y its y with "is a point" in the sign bit, and
++                // ZW the coordinate inside a point sprite - what the host's
++                // point expansion hands over in iPointSprite, and zero for
++                // anything else. A point is never back-facing.
++                out += "float4((iPos.xy - 0.5) * float2((iPointSprite.x < 0.0) ? 1.0 : (iFace ? 1.0 : -1.0), "
++                       "(iPointSprite.x < 0.0) ? -1.0 : 1.0), (iPointSprite.x < 0.0) ? saturate(iPointSprite.zw) : 0.0);\n";
++            #else
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++            #endif
              }
 +        #ifdef RENUT_RECOMP
 +            // r0.xyz is the domain location in zyx order and r1.x the patch
@@ -793,6 +1098,84 @@ index c71e7c9..4b7b528 100644
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
+@@ -1849,11 +2084,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ #ifdef RENUT_RECOMP
+     if (!isPixelShader)
+     {
+-        // Point size (.x), edge flag (.y), kill vertex (.z). Only the kill is
+-        // acted on below; the rest is kept so the writes have somewhere to go.
+-        out += "\tfloat4 oPointSizeEdgeKill = float4(1.0, 0.0, 0.0, 0.0);\n";
+-        // Memory export destination. Not emulated, so this is write-only.
+-        out += "\tfloat4 oMemExport = 0.0;\n";
++        // Point size (.x), edge flag (.y), kill vertex (.z). The size starts
++        // at -1, which renutPointRadius reads as "not written" and replaces
++        // with PA_SU_POINT_SIZE; the edge flag is not acted on.
++        out += "\tfloat4 oPointSizeEdgeKill = float4(-1.0, 0.0, 0.0, 0.0);\n";
++        // Memory export: the address, the five data registers, and which
++        // of those have been written since the address last was.
++        out += "\tfloat4 eA = 0.0;\n";
++        out += "\tfloat4 eM0 = 0.0, eM1 = 0.0, eM2 = 0.0, eM3 = 0.0, eM4 = 0.0;\n";
++        out += "\tuint eMWritten = 0;\n";
+     }
+ #endif
+     if (isPixelShader)
+@@ -2463,6 +2702,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     // Kill vertex: a non-zero .z means the vertex is discarded.
+                     // Feeding SV_Position a NaN drops every primitive that uses
+                     // it, which is the closest a raster pipeline gets.
++                    // What the shader exported last is stored as it ends.
++                    indent();
++                    out += "renutMemExport(eA, eM0, eM1, eM2, eM3, eM4, eMWritten);\n";
+                     indent();
+                     out += "if (oPointSizeEdgeKill.z != 0.0)\n";
+                     indent();
+@@ -2484,6 +2726,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         // multiply-add and changes nothing in the common case.
+                         out += "\toPos.xy = oPos.xy * g_ViewportScaleOffset.xy + "
+                                "(g_ViewportScaleOffset.zw + g_HalfPixelOffset) * oPos.w;\n";
++                        // Only a point-list draw reads this, in the host's
++                        // expansion into a sprite; see RENUT_POINT_SPRITE_LOCATION.
++                        out += "\toPointSprite = float4(renutPointRadius(oPointSizeEdgeKill.x), 0.0, 0.0);\n";
+                     #else
+                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+                     #endif
+@@ -2553,5 +2798,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+ #endif
+ 
++#ifdef RENUT_RECOMP
++    // The float constants the export addresses are built from, so the host
++    // looks for the streams a draw exports into there and nowhere else: the
++    // register file keeps the stream constants of earlier draws too. Stored
++    // as the range [first, last] in the flags (RENUT_SHADER_FLAG_MEMEXPORT).
++    if (specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)
++    {
++        uint32_t first = 255, last = 0;
++        size_t at = out.find("void main(");
++        while (at != std::string::npos && (at = out.find("\teA.", at)) != std::string::npos)
++        {
++            size_t end = out.find('\n', at);
++            if (end == std::string::npos)
++                end = out.size();
++            for (size_t c = out.find("cReg(", at); c != std::string::npos && c < end; c = out.find("cReg(", c + 5))
++            {
++                uint32_t index = uint32_t(std::strtoul(out.c_str() + c + 5, nullptr, 10));
++                first = std::min(first, index);
++                last = std::max(last, index);
++            }
++            at = end;
++        }
++        if (first > last)
++        {
++            first = 0;
++            last = 255;
++        }
++        specConstantsMask |= (first << 8) | (last << 16);
++    }
++#endif
++
+     out += "}";
+ }
 diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
 index 9c94800..eda1bc6 100644
 --- a/XenosRecomp/shader_recompiler.h

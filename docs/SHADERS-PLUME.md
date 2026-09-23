@@ -158,3 +158,64 @@ reais no hardware. `IssueD3DClear` lê a cor e a profundidade do primeiro vérti
 os alvos reais de mesma base, formato e pitch (ou o dobro do pitch). Sem ele, o depth que
 o passe de DOF restaura no fim do quadro continuava lá quando a primeira faixa do
 predicated tiling do quadro seguinte desenhava, e a metade de cima da tela saía preta.
+
+## Partículas: point sprites e memory export (22/09/2026)
+
+As partículas do jogo (borboletas, folhas, faíscas, o brilho ao pegar uma nota) têm duas
+partes, e o Plume não fazia nenhuma das duas:
+
+1. **Point sprites.** São listas de pontos (`prim=1`) que o Xenos transforma em quadrados
+   alinhados à tela. O Plume descartava todas em `skipped_prim`. Além disso, o VS calculava
+   o tamanho do ponto (`oPointSizeEdgeKill.x`) numa variável local, e o PS recebia a
+   coordenada dentro do sprite (`zw` do registrador param-gen) como zero fixo.
+2. **Memory export.** A simulação roda na GPU. `4CCF520F7AFFA26A` cria as partículas da
+   coleta. `26AC9C907CBAEDD4`, `D075408508A3BC6E` e `D38D10B70F954F86` simulam as
+   partículas a cada quadro. Todos gravam o estado na memória por `eA`/`eM0`–`eM4`, e os
+   desenhos seguintes (`9BC8…`, `ABD6…`, `8070…`) leem esse estado como stream de
+   vértices. O recompilador jogava as gravações numa variável `oMemExport` descartada.
+
+**Recompilador** (`renut-xenosrecomp.patch`):
+- Todo VS declara por último `oPointSprite` (localização 23,
+  `RENUT_POINT_SPRITE_LOCATION`), com o raio em NDC calculado por `renutPointRadius`. O
+  tamanho exportado é limitado por `PA_SU_POINT_MINMAX`; `PA_SU_POINT_SIZE` vale quando o
+  VS não exporta nenhum (o tamanho começa em -1).
+- Todo PS lê `iPointSprite` e monta o param-gen como o hardware.
+- `eA` e `eM0`–`eM4` são registradores separados. `renutMemExport` grava o que foi escrito
+  quando `eA` é reescrito e no fim do shader. Ela empacota no formato do stream e grava num
+  buffer da GPU: `RENUT_SHARED_EXPORT_OFFSET`, com até 8 faixas `(base, tamanho, endereço)`.
+- O shader que exporta ganha `RENUT_SHADER_FLAG_MEMEXPORT` no `specConstantsMask`, com a
+  primeira e a última constante que alimentam o `eA` nos bits 8–23. O host só procura
+  streams nessas constantes: constantes velhas de outros desenhos criavam faixas falsas,
+  que engoliam buffers dinâmicos do CPU (triângulos esticados).
+
+**Plume** (`plume_gpu.cpp`, `shaders/point_list.geom`):
+- As listas de pontos viram `POINT_LIST`, com um GS que emite quatro vértices por ponto.
+  O GS descarta pontos de tamanho zero (pontos usados só para exportar) e pontos com o
+  centro fora dos planos próximo e distante.
+- `rect_list.geom` repassa a localização 23.
+- Cada stream exportado vira uma `ExportRange` persistente: um buffer da GPU que substitui
+  a memória do guest para os desenhos seguintes. Barreiras separam gravação e leitura.
+- A faixa é comparada uma vez por quadro com a memória do guest, e o que o CPU escreveu
+  entra por cima. O que a GPU exportou volta ao guest depois do quadro (writeback), senão
+  um reset feito pelo CPU com os mesmos bytes passaria despercebido.
+- As faixas ficam sempre em `k8in32`, a forma de qualquer stream de vértices no host.
+
+**Formato 16 bits e endian (a causa das folhas gigantes).** A regra que ficou é: pares de
+16 bits (`16_16`, `16_16_16_16` e as versões float) são gravados com X na metade alta; em
+seguida, cada dword passa pelo endian da própria exportação (`renutExportEndian`) e fica
+na forma `k8in32`. Duas observações sustentam essa regra:
+
+- **`26AC…` exporta `16_16_16_16_FLOAT` em `k8in32`.** A vida útil da partícula (campo W)
+  só foi lida certa, ~8 s, com as metades trocadas. Sem a troca, a vida lida era enorme e
+  o tamanho só crescia.
+- **`D38D…` exporta `16_16_16_16_FLOAT` em `k8in16` (c193)**, e simula no lugar o pool
+  das folhas que o `8070…` desenha como quads. Tratado como `k8in32`, X↔Y e Z↔W se
+  invertiam: a velocidade explodia a cada quadro, e o campo `+24` (tamanho) chegava a
+  valores como 29, 139 e 424. Com o endian convertido, as folhas ficaram pequenas, como no
+  renderizador Xenos.
+
+O rexglue empacota X nos bits baixos (`PackHalf2x16`). A troca extra existe porque as
+buscas de 16 bits do jogo levam um swizzle `.yx` que o contêiner recompilado não tem.
+Quem mexer nisso precisa manter as duas observações verdadeiras: um dump das faixas
+(`files/exportdump`, gravado nos quadros com trace) permite conferir vida útil, idade e
+tamanho diretamente.

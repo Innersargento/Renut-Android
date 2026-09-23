@@ -37,4 +37,12 @@ bool DecodeTextureLevel(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetc
 // Bytes the base level of the texture spans in guest memory (for hashing).
 uint32_t TextureBaseSpan(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch);
 
+// The base level of a volume texture (dimension k3D, sized by size_3d), every
+// Z slice one after the other in `rgba`. `extent` is how many bytes of guest
+// memory the level spans from `data`, for hashing; call with data null to get
+// the extent and the size alone.
+bool DecodeTexture3D(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch, const uint8_t* data,
+                     std::vector<uint32_t>& rgba, uint32_t& width, uint32_t& height,
+                     uint32_t& depth, uint32_t& extent);
+
 }  // namespace renut

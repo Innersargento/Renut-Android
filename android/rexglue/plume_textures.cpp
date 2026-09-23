@@ -335,6 +335,68 @@ bool DecodeTextureLevel(const xenos::xe_gpu_texture_fetch_t& fetch, const Textur
   return true;
 }
 
+bool DecodeTexture3D(const xenos::xe_gpu_texture_fetch_t& fetch, const uint8_t* data,
+                     std::vector<uint32_t>& rgba, uint32_t& width, uint32_t& height,
+                     uint32_t& depth, uint32_t& extent) {
+  namespace tu = rex::graphics::texture_util;
+  const auto* info = rex::graphics::FormatInfo::Get(fetch.format);
+  if (!info || !info->bytes_per_block()) return false;
+  const uint32_t bw = info->block_width, bh = info->block_height, bpb = info->bytes_per_block();
+  if (bpb > 16 || bw * bh > 16) return false;
+  width = fetch.size_3d.width + 1;
+  height = fetch.size_3d.height + 1;
+  depth = fetch.size_3d.depth + 1;
+  const tu::TextureGuestLayout layout =
+      tu::GetGuestTextureLayout(xenos::DataDimension::k3D, fetch.pitch, width, height, depth,
+                                fetch.tiled, fetch.format, fetch.packed_mips, true, 0);
+  const auto& base = layout.base;
+  extent = base.level_data_extent_bytes;
+  if (!base.row_pitch_bytes || !extent) return false;
+  if (!data) return true;
+  // Tiled, a slice's blocks are addressed in 32x32x4 tiles over the pitch and
+  // the height rounded to the tile; linear, slices follow each other at the
+  // layout's stride in block rows.
+  const uint32_t pitch_blocks = base.row_pitch_bytes / bpb;
+  const uint32_t slice_rows = base.z_slice_stride_block_rows;
+  const uint32_t blocks_x = (width + bw - 1) / bw, blocks_y = (height + bh - 1) / bh;
+  const uint32_t bpb_log2 = Log2(bpb);
+  uint32_t swizzle[4];
+  for (int i = 0; i < 4; ++i) swizzle[i] = (fetch.swizzle >> (3 * i)) & 7;
+  rgba.assign(size_t(width) * height * depth, 0);
+  uint8_t block[16];
+  Texel texels[16];
+  for (uint32_t z = 0; z < depth; ++z) {
+    uint32_t* slice = rgba.data() + size_t(z) * width * height;
+    for (uint32_t by = 0; by < blocks_y; ++by) {
+      for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+        const size_t offset =
+            fetch.tiled ? size_t(tu::GetTiledOffset3D(int32_t(bx), int32_t(by), int32_t(z), pitch_blocks,
+                                                      slice_rows, bpb_log2))
+                        : (size_t(z) * slice_rows + by) * base.row_pitch_bytes + size_t(bx) * bpb;
+        if (offset + bpb > extent) return false;
+        std::memcpy(block, data + offset, bpb);
+        SwapBlock(block, bpb, fetch.endianness);
+        if (!DecodeBlock(fetch.format, block, texels)) return false;
+        for (uint32_t ty = 0; ty < bh; ++ty) {
+          const uint32_t y = by * bh + ty;
+          if (y >= height) break;
+          for (uint32_t tx = 0; tx < bw; ++tx) {
+            const uint32_t x = bx * bw + tx;
+            if (x >= width) break;
+            const Texel& t = texels[ty * bw + tx];
+            uint8_t out[4];
+            for (int c = 0; c < 4; ++c) {
+              out[c] = swizzle[c] < 4 ? t.c[swizzle[c]] : swizzle[c] == 5 ? 255 : 0;
+            }
+            std::memcpy(&slice[size_t(y) * width + x], out, 4);
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
+
 bool DecodeTexture2D(const xenos::xe_gpu_texture_fetch_t& fetch, const uint8_t* data,
                      std::vector<uint32_t>& rgba, uint32_t& width, uint32_t& height) {
   const auto* info = rex::graphics::FormatInfo::Get(fetch.format);

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -55,6 +56,7 @@ namespace draw_util = rex::graphics::draw_util;
 using rex::graphics::Register;
 using namespace rex::graphics;
 
+#include "shaders/point_list.geom.inc"
 #include "shaders/rect_list.geom.inc"
 
 // Where microcode without a recompiled shader is saved (SetPlumeMissDumpDirectory).
@@ -567,6 +569,29 @@ struct GuestTexture {
 
 uint64_t ContentHash(const uint8_t* data, uint32_t span);
 
+// Bytes per element of a memory export format, 0 for the ones renutMemExport
+// does not store (narrower than a dword).
+uint32_t ExportElementBytes(uint32_t format) {
+  switch (format) {
+    case 6: case 14: case 50:  // 8_8_8_8
+    case 7: case 54:           // 2_10_10_10
+    case 16: case 55:          // 10_11_11
+    case 17: case 56:          // 11_11_10
+    case 25:                   // 16_16
+    case 31:                   // 16_16_FLOAT
+    case 36:                   // 32_FLOAT
+      return 4;
+    case 26:  // 16_16_16_16
+    case 32:  // 16_16_16_16_FLOAT
+    case 37:  // 32_32_FLOAT
+      return 8;
+    case 38:  // 32_32_32_32_FLOAT
+      return 16;
+    default:
+      return 0;
+  }
+}
+
 struct Stats {
   uint64_t textures_decoded = 0, texture_failures = 0;
   uint64_t draws = 0, drawn = 0, no_vs = 0, no_ps = 0, bad_shader = 0, skipped_prim = 0,
@@ -587,6 +612,11 @@ struct Stats {
   uint64_t frame_us = 0, pipeline_us = 0, submit_us = 0;
   // Constant blocks a draw found already in the ring, out of three per draw.
   uint64_t constants_reused = 0;
+  // Memory export: draws that export, ranges created, streams read from an
+  // exported range whole or pieced together over guest memory, ranges the
+  // CPU wrote into again, and the barriers ordering all of that.
+  uint64_t export_draws = 0, export_ranges = 0, export_reads = 0, export_merges = 0,
+           export_refreshes = 0, export_barriers = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -617,6 +647,42 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint8_t* Pointer(uint64_t offset) { return upload_data_ + offset; }
   uint64_t Address(uint64_t offset) const { return upload_address_ + offset; }
   bool UploadGuest(uint32_t address, uint32_t size, xenos::Endian endian, uint64_t& offset);
+  // Memory export (renutMemExport in shader_common.h). A range of guest memory
+  // a vertex shader has written lives in a buffer of its own from then on, and
+  // later draws that fetch from it read that buffer: guest memory never sees
+  // what the GPU wrote. The CPU's own writes there still win - each frame the
+  // range is compared with the guest bytes it was last in step with, and what
+  // changed is copied in.
+  struct ExportRange {
+    uint32_t base = 0, size = 0;
+    xenos::Endian endian = xenos::Endian::k8in32;
+    std::unique_ptr<RenderBuffer> buffer;
+    uint64_t address = 0;
+    std::vector<uint8_t> snapshot;
+    uint64_t checked_frame = UINT64_MAX, exported_frame = 0;
+    // Since the last ExportBarrier: written by a shader or a copy, read by a draw.
+    bool written = false, read = false;
+  };
+  ExportRange* GetExport(uint32_t base, uint32_t size, xenos::Endian endian);
+  void RefreshExport(ExportRange& range);
+  bool BindStream(uint32_t address, uint32_t size, xenos::Endian endian, RenderBuffer*& buffer,
+                  uint64_t& offset);
+  void ExportBarrier();
+  // What a frame's shaders exported goes back to guest memory once the frame
+  // has run, as the hardware would have left it there: the CPU may read it,
+  // and a CPU that clears a range again has to be seen doing so - zeros
+  // written over the zeros guest memory still held would otherwise go
+  // unnoticed and leave the GPU's old contents in place.
+  void RecordWritebacks();
+  void ApplyWritebacks(uint32_t slot);
+  struct Writeback {
+    uint32_t base = 0, size = 0;
+    uint64_t offset = 0;
+    const RenderBuffer* buffer = nullptr;
+  };
+  std::array<std::unique_ptr<RenderBuffer>, kPlumeFramesInFlight> writeback_buffers_;
+  std::array<uint64_t, kPlumeFramesInFlight> writeback_capacity_{};
+  std::array<std::vector<Writeback>, kPlumeFramesInFlight> writebacks_;
   bool CommitConstants(uint8_t* shadow, const void* source, size_t size, uint64_t& offset);
 
   void BeginFrame();
@@ -647,6 +713,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
+  uint32_t GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch);
   void Report();
 
@@ -704,6 +771,11 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unique_ptr<RenderTexture> white_2d_, white_3d_, white_cube_;
   std::unique_ptr<RenderTextureView> white_cube_view_;
   std::unique_ptr<RenderShader> rect_list_gs_;
+  std::unique_ptr<RenderShader> point_list_gs_;
+
+  // Keyed by guest base. Never overlapping: a new range swallows the ones it touches.
+  std::map<uint32_t, ExportRange> exports_;
+  std::array<std::vector<std::unique_ptr<RenderBuffer>>, kPlumeFramesInFlight> retired_buffers_;
 
   std::unique_ptr<RenderBuffer> upload_;
   uint8_t* upload_data_ = nullptr;
@@ -854,6 +926,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint64_t, GuestTexture> guest_cubes_;
   uint32_t next_cube_descriptor_ = 1;
   std::unordered_map<uint64_t, GuestTexture> guest_stacks_;
+  std::unordered_map<uint64_t, GuestTexture> guest_volumes_;
   uint32_t next_3d_descriptor_ = 1;
 
   Stats stats_;
@@ -948,6 +1021,8 @@ bool PlumeCommandProcessor::SetupContext() {
 
   rect_list_gs_ = device_->createShader(k_rect_list_geom, sizeof(k_rect_list_geom), "main",
                                         RenderShaderFormat::SPIRV);
+  point_list_gs_ = device_->createShader(k_point_list_geom, sizeof(k_point_list_geom), "main",
+                                         RenderShaderFormat::SPIRV);
 
   upload_used_ = 0;
   uint64_t white = Allocate(4 * 6, 256);
@@ -1007,6 +1082,10 @@ void PlumeCommandProcessor::ShutdownContext() {
   framebuffers_.clear();
   targets_.clear();
   resolved_.clear();
+  exports_.clear();
+  for (auto& retired : retired_buffers_) retired.clear();
+  for (auto& buffer : writeback_buffers_) buffer.reset();
+  for (auto& list : writebacks_) list.clear();
   shaders_.clear();
   if (timestamp_pool_ != VK_NULL_HANDLE) {
     vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_, nullptr);
@@ -1043,6 +1122,247 @@ bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::
   if (offset == UINT64_MAX) return false;
   CopySwapped(Pointer(offset), memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
   uploaded_streams_.emplace(key, offset);
+  return true;
+}
+
+// Orders memory export against everything around it: shader stores and the
+// copies into exported ranges before the vertex fetches, stores and copies
+// that follow, and earlier fetches before later stores. It has to end the
+// render pass; the pass reopens on the same framebuffer at the next draw.
+void PlumeCommandProcessor::ExportBarrier() {
+  auto* vulkan = static_cast<VulkanCommandList*>(list_);
+  vulkan->endActiveRenderPass();
+  VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                          VK_ACCESS_TRANSFER_WRITE_BIT;
+  const VkPipelineStageFlags stages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                      VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
+                                      VK_PIPELINE_STAGE_TRANSFER_BIT;
+  vkCmdPipelineBarrier(vulkan->vk, stages, stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+  ++stats_.export_barriers;
+  for (auto& [base, range] : exports_) range.written = range.read = false;
+}
+
+// The range a vertex shader exports into, holding [base, base + size). A new
+// one starts as a copy of guest memory and takes over, with their contents,
+// every range it overlaps.
+PlumeCommandProcessor::ExportRange* PlumeCommandProcessor::GetExport(uint32_t base, uint32_t size,
+                                                                     xenos::Endian endian) {
+  uint32_t lo = base, hi = base + size;
+  for (auto& [key, range] : exports_) {
+    if (range.base <= lo && hi <= range.base + range.size) return &range;
+  }
+  std::vector<uint32_t> merged;
+  for (bool grew = true; grew;) {
+    grew = false;
+    for (auto& [key, range] : exports_) {
+      if (range.base < hi && lo < range.base + range.size &&
+          std::find(merged.begin(), merged.end(), key) == merged.end()) {
+        merged.push_back(key);
+        lo = std::min(lo, range.base);
+        hi = std::max(hi, range.base + range.size);
+        grew = true;
+      }
+    }
+  }
+  ExportRange fresh;
+  fresh.base = lo;
+  fresh.size = hi - lo;
+  // Held the way every vertex stream is, k8in32, whatever the endianness of
+  // the exports into it: renutMemExport converts each store to that form.
+  fresh.endian = xenos::Endian::k8in32;
+  fresh.buffer = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+      fresh.size, RenderBufferFlag::VERTEX | RenderBufferFlag::STORAGE | RenderBufferFlag::CONSTANT |
+                      RenderBufferFlag::DEVICE_ADDRESSABLE));
+  if (!fresh.buffer) return nullptr;
+  fresh.address = fresh.buffer->getDeviceAddress();
+  const uint64_t offset = Allocate(fresh.size, 256);
+  if (offset == UINT64_MAX) return nullptr;
+  const uint8_t* memory = memory_->TranslatePhysical<const uint8_t*>(lo);
+  fresh.snapshot.assign(memory, memory + fresh.size);
+  CopySwapped(Pointer(offset), memory, fresh.size, fresh.endian);
+  bool pending = false;
+  for (uint32_t key : merged) pending |= exports_[key].written;
+  if (pending) ExportBarrier();
+  list_->copyBufferRegion(RenderBufferReference(fresh.buffer.get(), 0),
+                          RenderBufferReference(upload_.get(), offset), fresh.size);
+  if (!merged.empty()) {
+    // The guest's bytes first, then what the GPU wrote over them.
+    ExportBarrier();
+    for (uint32_t key : merged) {
+      ExportRange& old = exports_[key];
+      list_->copyBufferRegion(RenderBufferReference(fresh.buffer.get(), old.base - lo),
+                              RenderBufferReference(old.buffer.get(), 0), old.size);
+      retired_buffers_[slot_].push_back(std::move(old.buffer));
+      exports_.erase(key);
+    }
+  }
+  fresh.written = true;
+  fresh.checked_frame = swaps_;
+  fresh.exported_frame = swaps_;
+  ++stats_.export_ranges;
+  static uint32_t logged = 0;
+  if (logged < 64) {
+    ++logged;
+    REXLOG_INFO("Renut: Plume export range {:08X}+{:X} endian {} (asked {:08X}+{:X}, merged {})", lo,
+                fresh.size, uint32_t(endian), base, size, merged.size());
+  }
+  return &exports_.emplace(lo, std::move(fresh)).first->second;
+}
+
+void PlumeCommandProcessor::RecordWritebacks() {
+  auto& list = writebacks_[slot_];
+  list.clear();
+  uint64_t total = 0;
+  for (const auto& [key, range] : exports_) {
+    if (range.exported_frame == swaps_) total += range.size;
+  }
+  if (!total) return;
+  if (total > writeback_capacity_[slot_]) {
+    // The slot's last frame has finished (BeginFrame waited for it), so the
+    // old buffer is free to go.
+    const uint64_t capacity = std::max<uint64_t>(total + total / 2, 1u << 20);
+    writeback_buffers_[slot_] = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(capacity));
+    writeback_capacity_[slot_] = writeback_buffers_[slot_] ? capacity : 0;
+    if (!writeback_buffers_[slot_]) return;
+  }
+  ExportBarrier();
+  uint64_t at = 0;
+  for (const auto& [key, range] : exports_) {
+    if (range.exported_frame != swaps_) continue;
+    list_->copyBufferRegion(RenderBufferReference(writeback_buffers_[slot_].get(), at),
+                            RenderBufferReference(range.buffer.get(), 0), range.size);
+    list.push_back({range.base, range.size, at, range.buffer.get()});
+    at += range.size;
+  }
+}
+
+void PlumeCommandProcessor::ApplyWritebacks(uint32_t slot) {
+  auto& list = writebacks_[slot];
+  if (list.empty()) return;
+  const auto* data = static_cast<const uint8_t*>(writeback_buffers_[slot]->map());
+  constexpr uint32_t kBlock = 256;
+  alignas(16) uint8_t block[kBlock];
+  for (const Writeback& w : list) {
+    auto found = exports_.find(w.base);
+    if (found == exports_.end() || found->second.buffer.get() != w.buffer ||
+        found->second.size != w.size) {
+      continue;
+    }
+    ExportRange& range = found->second;
+    uint8_t* guest = memory_->TranslatePhysical<uint8_t*>(range.base);
+    for (uint32_t at = 0; at < range.size; at += kBlock) {
+      const uint32_t length = std::min(kBlock, range.size - at);
+      // A block the CPU wrote since is left alone: its bytes win, and the
+      // next RefreshExport takes them in.
+      if (std::memcmp(guest + at, range.snapshot.data() + at, length) != 0) continue;
+      CopySwapped(block, data + w.offset + at, length, range.endian);
+      if (std::memcmp(block, range.snapshot.data() + at, length) == 0) continue;
+      std::memcpy(guest + at, block, length);
+      std::memcpy(range.snapshot.data() + at, block, length);
+    }
+  }
+  writeback_buffers_[slot]->unmap();
+  list.clear();
+}
+
+// Brings in what the CPU wrote to an exported range since it was last looked
+// at, once a frame.
+void PlumeCommandProcessor::RefreshExport(ExportRange& range) {
+  if (range.checked_frame == swaps_) return;
+  range.checked_frame = swaps_;
+  const uint8_t* memory = memory_->TranslatePhysical<const uint8_t*>(range.base);
+  if (std::memcmp(memory, range.snapshot.data(), range.size) == 0) return;
+  if (range.written) ExportBarrier();
+  constexpr uint32_t kBlock = 256;
+  auto differs = [&](uint32_t at) {
+    return std::memcmp(memory + at, range.snapshot.data() + at, std::min(kBlock, range.size - at)) != 0;
+  };
+  for (uint32_t at = 0; at < range.size;) {
+    if (!differs(at)) {
+      at += kBlock;
+      continue;
+    }
+    uint32_t end = at;
+    while (end < range.size && differs(end)) end += kBlock;
+    end = std::min(end, range.size);
+    const uint64_t offset = Allocate(end - at, 256);
+    if (offset == UINT64_MAX) break;
+    CopySwapped(Pointer(offset), memory + at, end - at, range.endian);
+    list_->copyBufferRegion(RenderBufferReference(range.buffer.get(), at),
+                            RenderBufferReference(upload_.get(), offset), end - at);
+    std::memcpy(range.snapshot.data() + at, memory + at, end - at);
+    at = end;
+  }
+  range.written = true;
+  ++stats_.export_refreshes;
+}
+
+// Where a draw reads a vertex stream: the exported range that holds it whole,
+// or the upload ring - with the exported stretches of a stream that is only
+// partly exported copied over the guest's bytes.
+bool PlumeCommandProcessor::BindStream(uint32_t address, uint32_t size, xenos::Endian endian,
+                                       RenderBuffer*& buffer, uint64_t& offset) {
+  buffer = upload_.get();
+  if (exports_.empty()) return UploadGuest(address, size, endian, offset);
+  std::vector<ExportRange*> overlapping;
+  for (auto& [key, range] : exports_) {
+    if (address >= range.base && uint64_t(address) + size <= uint64_t(range.base) + range.size) {
+      RefreshExport(range);
+      if (range.written) ExportBarrier();
+      range.read = true;
+      buffer = range.buffer.get();
+      offset = address - range.base;
+      ++stats_.export_reads;
+      Trace("  stream {:08X}+{:X} from export {:08X}+{:X}", address, size, range.base, range.size);
+      return true;
+    }
+    if (range.base < address + size && address < range.base + range.size) overlapping.push_back(&range);
+  }
+  if (overlapping.empty()) return UploadGuest(address, size, endian, offset);
+  // A stream that is mostly exported is typically the pool the particle
+  // emitters export into piece by piece, drawn whole. Growing a range over it
+  // lets every later draw read it straight away instead of piecing it
+  // together again, two barriers each time. One that is mostly guest data is
+  // pieced together instead: a range only catches up with the CPU's writes
+  // once a frame, and the rest of such a buffer may be written between draws.
+  uint32_t exported = 0;
+  for (ExportRange* range : overlapping) {
+    exported += std::min(address + size, range->base + range->size) - std::max(address, range->base);
+  }
+  if (size <= (4u << 20) && exported * 2 >= size) {
+    if (ExportRange* range = GetExport(address, size, endian)) {
+      RefreshExport(*range);
+      ExportBarrier();
+      range->read = true;
+      buffer = range->buffer.get();
+      offset = address - range->base;
+      ++stats_.export_reads;
+      return true;
+    }
+  }
+  if (!address || !size || size > (32u << 20)) return false;
+  offset = Allocate(size, 256);
+  if (offset == UINT64_MAX) return false;
+  CopySwapped(Pointer(offset), memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
+  bool pending = false;
+  for (ExportRange* range : overlapping) {
+    RefreshExport(*range);
+    pending |= range->written;
+  }
+  if (pending) ExportBarrier();
+  for (ExportRange* range : overlapping) {
+    const uint32_t lo = std::max(address, range->base);
+    const uint32_t hi = std::min(address + size, range->base + range->size);
+    list_->copyBufferRegion(RenderBufferReference(upload_.get(), offset + (lo - address)),
+                            RenderBufferReference(range->buffer.get(), lo - range->base), hi - lo);
+  }
+  ExportBarrier();
+  for (ExportRange* range : overlapping) range->read = true;
+  ++stats_.export_merges;
   return true;
 }
 
@@ -1121,6 +1441,7 @@ void PlumeCommandProcessor::BeginFrame() {
   // use until the frame that last held it has finished.
   if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForSlot(slot_);
   ReadTimestamps(slot_);
+  ApplyWritebacks(slot_);
   list_ = lists_[slot_].get();
   slice_base_ = slice_origin_ + uint64_t(slot_) * kUploadSize;
   for (uint32_t index : retired_descriptor_slots_[slot_]) {
@@ -1130,6 +1451,7 @@ void PlumeCommandProcessor::BeginFrame() {
   retired_descriptor_slots_[slot_].clear();
   retired_framebuffer_slots_[slot_].clear();
   retired_slots_[slot_].clear();
+  retired_buffers_[slot_].clear();
   StartList();
   // Only here, never from Flush: a mid-frame flush keeps recording into the
   // same range, and resetting it would drop what the first submission wrote.
@@ -1734,6 +2056,82 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
   return texture.descriptor;
 }
 
+// Volume textures (dimension k3D). The particle simulations draw their wind
+// and turbulence from one: D38D10B70F954F86 turns a texel of it into the push
+// every falling leaf gets each frame. Unbound, the slot read the white
+// fallback, the same (1, 1, 1) push for every leaf, and the leaves streamed
+// off along one diagonal into sheets across the screen. Only the base level:
+// the vertex shaders that sample these do so at level 0, and a host 3D image
+// would halve its depth at each mip anyway.
+uint32_t PlumeCommandProcessor::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  const uint32_t address = fetch.base_address << 12;
+  if (!address) return 0;
+  std::vector<uint32_t> rgba;
+  uint32_t width = 0, height = 0, depth = 0, extent = 0;
+  if (!DecodeTexture3D(fetch, nullptr, rgba, width, height, depth, extent) ||
+      uint64_t(address) + extent > 0x20000000ull) {
+    return 0;
+  }
+  uint64_t key = 0;
+  HashCombine(key, fetch.dword_0 & ~0x3FFu);
+  HashCombine(key, fetch.dword_1);
+  HashCombine(key, fetch.dword_2);
+  HashCombine(key, fetch.swizzle);
+  const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(address);
+  GuestTexture& texture = guest_volumes_[key];
+  if (texture.failed) return 0;
+  if (texture.texture && texture.checked_frame == swaps_) {
+    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    return texture.descriptor;
+  }
+  texture.checked_frame = swaps_;
+  const uint64_t content = ContentHash(data, extent);
+  if (texture.texture && texture.content == content) {
+    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    return texture.descriptor;
+  }
+  if (!DecodeTexture3D(fetch, data, rgba, width, height, depth, extent)) {
+    texture.failed = true;
+    ++stats_.texture_failures;
+    REXLOG_WARN("Renut: Plume could not decode volume texture {:08X} f{} {}x{}x{}", address,
+                uint32_t(fetch.format), width, height, depth);
+    return 0;
+  }
+  if (!texture.descriptor) {
+    if (next_3d_descriptor_ >= kMaxTextures3D) return 0;
+    texture.descriptor = next_3d_descriptor_++;
+  }
+  if (!texture.texture || texture.width != width || texture.height != height || texture.depth != depth) {
+    if (texture.texture) retired_slots_[slot_].push_back(std::move(texture.texture));
+    texture.texture = device_->createTexture(
+        RenderTextureDesc::Texture3D(width, height, depth, 1, RenderFormat::R8G8B8A8_UNORM));
+    texture.width = width;
+    texture.height = height;
+    texture.depth = depth;
+    texture.levels = 1;
+    texture.layout = RenderTextureLayout::UNKNOWN;
+    if (!texture.texture) {
+      texture.failed = true;
+      return 0;
+    }
+    REXLOG_INFO("Renut: Plume volume texture {:08X} f{} {}x{}x{} tiled={}", address, uint32_t(fetch.format),
+                width, height, depth, uint32_t(fetch.tiled));
+  }
+  texture.content = content;
+  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
+  const uint64_t staging = Allocate(uint64_t(rgba.size()) * 4, 512);
+  if (staging == UINT64_MAX) return 0;
+  std::memcpy(Pointer(staging), rgba.data(), rgba.size() * 4);
+  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0),
+                           RenderTextureCopyLocation::PlacedFootprint(
+                               upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, depth, width,
+                               staging));
+  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
+  ++stats_.textures_decoded;
+  return texture.descriptor;
+}
+
 // Cube maps (the sky dome): six 2D faces, +X -X +Y -Y +Z -Z, one after the
 // other at a 4 KB aligned stride, each decoded like a 2D texture.
 uint32_t PlumeCommandProcessor::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
@@ -1895,8 +2293,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
 
   // Primitive.
   RenderPrimitiveTopology topology = RenderPrimitiveTopology::UNKNOWN;
-  bool rect_list = false, quad_list = false, patch_list = false;
+  bool point_list = false, rect_list = false, quad_list = false, patch_list = false;
   switch (prim_type) {
+    case xenos::PrimitiveType::kPointList:
+      // Particles. Every point becomes a sprite in point_list.geom, sized by
+      // what the recompiled vertex shader exports at the point-sprite location.
+      topology = RenderPrimitiveTopology::POINT_LIST;
+      point_list = true;
+      break;
     case xenos::PrimitiveType::kLineList: topology = RenderPrimitiveTopology::LINE_LIST; break;
     case xenos::PrimitiveType::kLineStrip: topology = RenderPrimitiveTopology::LINE_STRIP; break;
     case xenos::PrimitiveType::kTriangleList: topology = RenderPrimitiveTopology::TRIANGLE_LIST; break;
@@ -1933,15 +2337,15 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   if (topology == RenderPrimitiveTopology::UNKNOWN) {
     ++stats_.skipped_prim;
-    // Point lists and the patches Plume could not tessellate go through here:
-    // the shader and the tessellation mode say which is which.
+    // The patches Plume could not tessellate go through here: the shader and
+    // the tessellation mode say which.
     Trace("dropped prim={} n={} vs={:016X} ps={:016X} tess={} indexed={}", uint32_t(prim_type),
           index_count, vs->entry->hash, ps ? ps->entry->hash : 0,
           uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
           uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().source_select));
     return true;
   }
-  if (rect_list && !rect_list_gs_) {
+  if ((rect_list && !rect_list_gs_) || (point_list && !point_list_gs_)) {
     ++stats_.skipped_prim;
     return true;
   }
@@ -2029,6 +2433,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       if (fetch.stacked) stack_descriptor[slot] = GetGuestStackedTexture(fetch);
     } else if (fetch.dimension == xenos::DataDimension::kCube) {
       cube_descriptor[slot] = GetGuestCubeTexture(fetch);
+    } else if (fetch.dimension == xenos::DataDimension::k3D) {
+      // tfetch3D reads the same table as a stack's.
+      stack_descriptor[slot] = GetGuestVolumeTexture(fetch);
     }
   }
 
@@ -2148,6 +2555,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   std::vector<RenderInputElement> input_elements;
   std::vector<RenderInputSlot> input_slots;
   std::array<uint64_t, 17> slot_offsets{};
+  std::array<RenderBuffer*, 17> slot_buffers{};
   std::array<uint32_t, 17> slot_sizes{};
   std::array<bool, 17> slot_used{};
   uint32_t swapped[7] = {};  // texcoord, normal, binormal, tangent, blendweight, position, blendindices
@@ -2160,13 +2568,71 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         regs.GetVertexFetch(stream == RENUT_DIRECT_FETCH_STREAM ? 0 : 95 - stream);
     if (fetch.type != xenos::FetchConstantType::kVertex) continue;
     uint64_t offset;
-    if (UploadGuest(fetch.address << 2, fetch.size << 2, fetch.endian, offset)) {
-      streams[stream] = Address(offset);
+    RenderBuffer* buffer;
+    Trace("  stream{} {:08X}+{:X} e{}", stream, fetch.address << 2, fetch.size << 2, uint32_t(fetch.endian));
+    if (BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset)) {
+      streams[stream] = buffer == upload_.get() ? Address(offset) : buffer->getDeviceAddress() + offset;
       slot_offsets[stream] = offset;
+      slot_buffers[stream] = buffer;
       slot_sizes[stream] = fetch.size << 2;
     }
   }
   std::memcpy(sh + RENUT_SHARED_STREAMS_OFFSET, streams, sizeof(streams));
+
+  // Memory export. What a shader exports into is named by the stream
+  // constants it was handed - Direct3D's own layout, recognisable by its bit
+  // pattern (see renutMemExport) - and each of those streams becomes an
+  // exported range. The shader stores only into the ranges listed here.
+  if (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) {
+    uint32_t ranges[RENUT_EXPORT_RANGE_COUNT * 4] = {};
+    uint32_t range_count = 0;
+    const uint32_t* constants = &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X];
+    // Only the constants the shader builds its addresses from: the register
+    // file still holds the stream constants of earlier draws, and a range made
+    // from one of those would shadow guest memory the CPU is still writing.
+    const uint32_t flags = vs->entry->specConstantsMask;
+    const uint32_t last = std::min<uint32_t>(RENUT_SHADER_EXPORT_LAST(flags), 255);
+    for (uint32_t i = RENUT_SHADER_EXPORT_FIRST(flags); i <= last && range_count < RENUT_EXPORT_RANGE_COUNT;
+         ++i) {
+      const uint32_t* k = constants + i * 4;
+      if ((k[0] >> 30) != 1 || (k[1] >> 23) != 0x96 || (k[2] >> 23) != 0x96 || (k[3] >> 23) != 0x96) {
+        continue;
+      }
+      const uint32_t element_bytes = ExportElementBytes((k[2] >> 8) & 0x3F);
+      const uint32_t elements = k[3] & 0x7FFFFF;
+      const uint32_t base = k[0] << 2;
+      if (!element_bytes || !elements || base >= 0x20000000u ||
+          uint64_t(elements) * element_bytes > (32u << 20)) {
+        continue;
+      }
+      Trace("  eA c{} {:08X} {:08X} {:08X} {:08X} -> {:08X}+{:X} f{}", i, k[0], k[1], k[2], k[3], base,
+            elements * element_bytes, (k[2] >> 8) & 0x3F);
+      const uint32_t endian_bits = k[2] & 7;
+      ExportRange* range = GetExport(base, elements * element_bytes,
+                                     endian_bits <= 3 ? xenos::Endian(endian_bits) : xenos::Endian::k8in32);
+      if (!range) continue;
+      if (range->read) ExportBarrier();
+      range->written = true;
+      range->exported_frame = swaps_;
+      bool listed = false;
+      for (uint32_t r = 0; r < range_count; ++r) listed |= ranges[r * 4] == range->base;
+      if (listed) continue;
+      ranges[range_count * 4 + 0] = range->base;
+      ranges[range_count * 4 + 1] = range->size;
+      ranges[range_count * 4 + 2] = uint32_t(range->address);
+      ranges[range_count * 4 + 3] = uint32_t(range->address >> 32);
+      ++range_count;
+    }
+    std::memcpy(sh + RENUT_SHARED_EXPORT_OFFSET, ranges, sizeof(ranges));
+    ++stats_.export_draws;
+    if (trace_) {
+      std::string line = "  export";
+      for (uint32_t r = 0; r < range_count; ++r) {
+        line += fmt::format(" {:08X}+{:X}", ranges[r * 4], ranges[r * 4 + 1]);
+      }
+      Trace("{}", line);
+    }
+  }
   for (const auto& [k, entry] : patch_list ? vs->domain_live_fetches : vs->live_fetches) {
     std::memcpy(sh + RENUT_SHARED_FETCH_OFFSET + k * 16, entry.data(), 16);
   }
@@ -2329,6 +2795,23 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   std::memcpy(sh + RENUT_SHARED_VIEWPORT_OFFSET, scale_offset, sizeof(scale_offset));
 
+  // Point sprites. The sizes are 12.4 fixed point radii in guest pixels; the
+  // shaders want diameters. One unit of host NDC is half the viewport, so a
+  // diameter over the viewport's extent is the radius in NDC - signed with the
+  // viewport, so that -y is the top of the screen whichever way it is flipped.
+  if (point_list) {
+    const auto point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
+    const auto point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
+    const float point[6] = {float(point_size.width) * (2.f / 16.f),
+                            float(point_size.height) * (2.f / 16.f),
+                            float(point_minmax.min_size) * (2.f / 16.f),
+                            float(point_minmax.max_size) * (2.f / 16.f),
+                            1.f / viewport.width, 1.f / viewport.height};
+    std::memcpy(sh + RENUT_SHARED_POINT_OFFSET, point, sizeof(point));
+    Trace("  points size={}x{} min={} max={} ndc/px={}x{} regs {:08X} {:08X}", point[0], point[1], point[2],
+          point[3], point[4], point[5], point_size.value, point_minmax.value);
+  }
+
   // The shared block is complete; place all three where the shaders will read
   // them. A block that overflows the ring flushes it, which drops the two
   // placed before it, so the generation says whether to lay them down again.
@@ -2396,6 +2879,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   HashCombine(key, ps ? ps->compiled : nullptr);
   HashCombine(key, topology);
   HashCombine(key, rect_list);
+  HashCombine(key, point_list);
   HashCombine(key, patch_list);
   HashCombine(key, cull);
   HashCombine(key, front_face);
@@ -2432,7 +2916,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.pipelineLayout = layout_.get();
     desc.vertexShader =
         patch_list ? vs->domain_compiled->module.get() : vs->compiled->module.get();
-    desc.geometryShader = rect_list ? rect_list_gs_.get() : nullptr;
+    desc.geometryShader = rect_list ? rect_list_gs_.get() : point_list ? point_list_gs_.get() : nullptr;
     desc.pixelShader = ps ? ps->compiled->module.get() : nullptr;
     desc.primitiveTopology = topology;
     desc.cullMode = cull;
@@ -2589,7 +3073,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     } else if (slot.index == kZeroBinding) {
       view = RenderVertexBufferView(RenderBufferReference(upload_.get(), zero_offset_), 64);
     } else {
-      view = RenderVertexBufferView(RenderBufferReference(upload_.get(), slot_offsets[slot.index]),
+      view = RenderVertexBufferView(RenderBufferReference(slot_buffers[slot.index], slot_offsets[slot.index]),
                                     slot_sizes[slot.index]);
     }
     list_->setVertexBuffers(slot.index, &view, 1, &slot);
@@ -2608,7 +3092,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     std::string line = fmt::format("  indices {}..{} base={} count={}", lo, hi, base_vertex, vertex_count);
     for (const LiveElement& e : vs->elements) {
-      if (e.usage != 0 || !e.stride || !slot_sizes[e.slot]) continue;
+      if (e.usage != 0 || !e.stride || !slot_sizes[e.slot] || slot_buffers[e.slot] != upload_.get()) continue;
       const uint32_t capacity = slot_sizes[e.slot] / e.stride;
       line += fmt::format(" pos(slot {} fmt {} cap {})", e.slot, e.format, capacity);
       // Decode the referenced positions as the host will read them.
@@ -2642,7 +3126,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // plume-skip bit 1073741824 records everything but the draw itself: the
   // state, pipeline and constant changes are all that reach the GPU.
   stats_.vertices += vertex_count;
-  if (rect_list) ++stats_.gs_draws;
+  if (rect_list || point_list) ++stats_.gs_draws;
   if (patch_list) {
     ++stats_.patch_draws;
     stats_.patch_vertices += vertex_count;
@@ -3013,6 +3497,26 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   snap_taken_ = false;
   snap_seen_ = 0;
   frame_draw_ = 0;
+  // A traced frame also copies every exported range aside, written out below
+  // once the frame has run, next to the guest bytes it started from.
+  std::unique_ptr<RenderBuffer> export_dump;
+  std::vector<std::pair<uint64_t, const ExportRange*>> export_dump_at;
+  if (trace_ && !exports_.empty()) {
+    uint64_t total = 0;
+    for (const auto& [key, range] : exports_) total += range.size;
+    if (total <= (16u << 20)) export_dump = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(total));
+    if (export_dump) {
+      ExportBarrier();
+      uint64_t at = 0;
+      for (const auto& [key, range] : exports_) {
+        list_->copyBufferRegion(RenderBufferReference(export_dump.get(), at),
+                                RenderBufferReference(range.buffer.get(), 0), range.size);
+        export_dump_at.emplace_back(at, &range);
+        at += range.size;
+      }
+    }
+  }
+  RecordWritebacks();
   // FlushImagesForNextFrame already closed any open pass with its barriers.
   WriteTimestamp();
   timestamp_count_[slot_] = timestamps_used_;
@@ -3045,6 +3549,26 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     std::fclose(trace_);
     trace_ = nullptr;
     REXLOG_INFO("Renut: Plume frame trace written");
+    if (export_dump && renderer && !miss_dump_directory_.empty()) {
+      renderer->WaitForAllSlots();
+      const std::string directory =
+          miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/exportdump";
+      mkdir(directory.c_str(), 0755);
+      const auto* data = static_cast<const uint8_t*>(export_dump->map());
+      for (const auto& [at, range] : export_dump_at) {
+        const std::string name = fmt::format("{}/{:08X}", directory, range->base);
+        if (FILE* file = std::fopen((name + ".gpu").c_str(), "wb")) {
+          std::fwrite(data + at, 1, range->size, file);
+          std::fclose(file);
+        }
+        if (FILE* file = std::fopen((name + ".guest").c_str(), "wb")) {
+          std::fwrite(memory_->TranslatePhysical<const uint8_t*>(range->base), 1, range->size, file);
+          std::fclose(file);
+        }
+      }
+      export_dump->unmap();
+      REXLOG_INFO("Renut: Plume wrote {} exported ranges", export_dump_at.size());
+    }
   }
   if (++swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
@@ -3092,6 +3616,15 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     drawskip_first_ = first;
     drawskip_end_ = end;
   }
+  // A range nothing has exported into for a while goes back to guest memory.
+  for (auto it = exports_.begin(); it != exports_.end();) {
+    if (it->second.exported_frame + 600 < swaps_) {
+      retired_buffers_[slot_].push_back(std::move(it->second.buffer));
+      it = exports_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   if (swaps_ % 300 == 1) Report();
   BeginFrame();
 }
@@ -3102,7 +3635,7 @@ void PlumeCommandProcessor::Report() {
       "no_target={} resolves={} clears={} passes={} barriers={} pipeline_binds={} vertices={} gs_draws={} patch_draws={} patch_vertices={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
       "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={} "
-      "const_reused={}",
+      "const_reused={} export(draws={} ranges={}/{} reads={} merges={} refreshes={} barriers={})",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes, stats_.barriers,
       stats_.pipeline_binds, stats_.vertices, stats_.gs_draws, stats_.patch_draws, stats_.patch_vertices,
@@ -3116,7 +3649,8 @@ void PlumeCommandProcessor::Report() {
       (upload_used_ - slice_base_) >> 10, guest_textures_.size(), stats_.textures_decoded,
       stats_.texture_failures, stats_.frame_us / 1000, stats_.pipeline_us / 1000,
       stats_.submit_us / 1000, renut_guest_swap_count() - reported_guest_swaps_,
-      stats_.constants_reused);
+      stats_.constants_reused, stats_.export_draws, exports_.size(), stats_.export_ranges,
+      stats_.export_reads, stats_.export_merges, stats_.export_refreshes, stats_.export_barriers);
   // Keep what the driver compiled this interval, so the next run of this scene
   // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
   // shuts the process down cleanly, so waiting for the device's own save would

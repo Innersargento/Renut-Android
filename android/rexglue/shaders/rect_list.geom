@@ -7,7 +7,8 @@
 //
 // Interpolators are locations 0..22, the RENUT_INTERPOLATORS list of the
 // recompiled shaders (TEXCOORD0..15, COLOR0..1, NORMAL0..2, TANGENT0,
-// BINORMAL0). Compiled by tools/shaders/build_host_shaders.sh.
+// BINORMAL0), and 23 is the point sprite, which the pixel shader reads too.
+// Compiled by tools/shaders/build_host_shaders.sh.
 
 layout(triangles) in;
 layout(triangle_strip, max_vertices = 4) out;
@@ -21,13 +22,13 @@ INTERPOLATOR(4) INTERPOLATOR(5) INTERPOLATOR(6) INTERPOLATOR(7)
 INTERPOLATOR(8) INTERPOLATOR(9) INTERPOLATOR(10) INTERPOLATOR(11)
 INTERPOLATOR(12) INTERPOLATOR(13) INTERPOLATOR(14) INTERPOLATOR(15)
 INTERPOLATOR(16) INTERPOLATOR(17) INTERPOLATOR(18) INTERPOLATOR(19)
-INTERPOLATOR(20) INTERPOLATOR(21) INTERPOLATOR(22)
+INTERPOLATOR(20) INTERPOLATOR(21) INTERPOLATOR(22) INTERPOLATOR(23)
 
 #define COPY(n, v) o##n = i##n[v];
 #define COPY_ALL(v) \
     COPY(0, v) COPY(1, v) COPY(2, v) COPY(3, v) COPY(4, v) COPY(5, v) COPY(6, v) COPY(7, v) \
     COPY(8, v) COPY(9, v) COPY(10, v) COPY(11, v) COPY(12, v) COPY(13, v) COPY(14, v) \
-    COPY(15, v) COPY(16, v) COPY(17, v) COPY(18, v) COPY(19, v) COPY(20, v) COPY(21, v) COPY(22, v)
+    COPY(15, v) COPY(16, v) COPY(17, v) COPY(18, v) COPY(19, v) COPY(20, v) COPY(21, v) COPY(22, v) COPY(23, v)
 
 #define FOURTH(n, a, b, c) o##n = i##n[a] + i##n[b] - i##n[c];
 #define FOURTH_ALL(a, b, c) \
@@ -36,7 +37,7 @@ INTERPOLATOR(20) INTERPOLATOR(21) INTERPOLATOR(22)
     FOURTH(8, a, b, c) FOURTH(9, a, b, c) FOURTH(10, a, b, c) FOURTH(11, a, b, c) \
     FOURTH(12, a, b, c) FOURTH(13, a, b, c) FOURTH(14, a, b, c) FOURTH(15, a, b, c) \
     FOURTH(16, a, b, c) FOURTH(17, a, b, c) FOURTH(18, a, b, c) FOURTH(19, a, b, c) \
-    FOURTH(20, a, b, c) FOURTH(21, a, b, c) FOURTH(22, a, b, c)
+    FOURTH(20, a, b, c) FOURTH(21, a, b, c) FOURTH(22, a, b, c) FOURTH(23, a, b, c)
 
 void emitVertex(int v)
 {
