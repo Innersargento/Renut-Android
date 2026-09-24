@@ -69,6 +69,12 @@ public final class MainActivity extends Activity {
             String next="plume".equals(getPreferences(0).getString("renderer","xenos"))?"xenos":"plume";
             getPreferences(0).edit().putString("renderer",next).apply(); refresh();
         });
+        button(graphics,"Apagar cache de shaders",()->new AlertDialog.Builder(this)
+            .setTitle("Apagar cache de shaders?")
+            .setMessage("Remove o cache Vulkan salvo pelo Plume. Os shaders serão compilados novamente na próxima execução; seus jogos e saves serão preservados.")
+            .setNegativeButton("Cancelar",null)
+            .setPositiveButton("Apagar",(dialog,which)->clearShaderCache())
+            .show());
         fpsCounter=text("",16,ink); graphics.addView(fpsCounter);
         button(graphics,"Ativar/desativar contador de FPS",()->{
             getPreferences(0).edit().putBoolean("fps",!getPreferences(0).getBoolean("fps",false)).apply(); refresh();
@@ -115,6 +121,14 @@ public final class MainActivity extends Activity {
         b.setOnClickListener(v->action.run());box.addView(b,new LinearLayout.LayoutParams(-1,dp(54)));actions.add(b);
     }
     private void pick(int code){startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE),code);}
+    private void clearShaderCache(){
+        File root=getFilesDir();
+        try{
+            boolean removed=Files.deleteIfExists(new File(root,"plume-pipelines.bin").toPath());
+            removed=Files.deleteIfExists(new File(root,"plume-pipelines.bin.tmp").toPath())||removed;
+            status.setText(removed?"Cache de shaders apagado. Será recriado na próxima execução.":"Nenhum cache de shaders salvo para apagar.");
+        }catch(IOException e){status.setText("Não foi possível apagar o cache de shaders: "+e.getMessage());}
+    }
     @Override protected void onResume(){super.onResume();refresh();}
     private void refresh(){
         if(library==null)return;
