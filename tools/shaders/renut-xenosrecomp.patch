@@ -1,5 +1,5 @@
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
-index c1b854e..6de3535 100644
+index c1b854e..c7a4957 100644
 --- a/XenosRecomp/main.cpp
 +++ b/XenosRecomp/main.cpp
 @@ -27,6 +27,9 @@ static void writeAllBytes(const char* filePath, const void* data, size_t dataSiz
@@ -130,11 +130,11 @@ index c1b854e..6de3535 100644
          for (const ShaderInputElement& element : inputElements)
          {
 -            f.println("\t{{ {}, {}, {}, {}, {}, {}, {}, {}, {}, 0 }},",
-+            f.println("\t{{ {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, {} }},",
++            f.println("\t{{ {}, {}, {}, {}, {}, {}, {}, {}, {}, 0, {}, {} }},",
                  element.usage, element.usageIndex, element.location, element.slot,
                  element.offsetBytes, element.strideBytes, element.format, element.isSigned,
 -                element.isNormalized);
-+                element.isNormalized, element.fetchAddress);
++                element.isNormalized, element.fetchAddress, element.dstSwizzle);
          }
  
          f.println("}};");
@@ -153,10 +153,10 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..0c6846e 100644
+index ee3830d..8a5bcb5 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -73,9 +73,54 @@
+@@ -73,9 +73,58 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -180,6 +180,10 @@ index ee3830d..0c6846e 100644
 +// | flags << 16, stride bytes, offset bytes, exp scale as float bits.
 +#define RENUT_LIVE_FETCH_COUNT           32
 +#define RENUT_LIVE_FETCH_LOCATION        0xFE
++// Set in a live fetch's first word when its components come in with the halves
++// of each pair exchanged (.yxwz) relative to the swizzle the shader was
++// recompiled with - see ShaderInputElement::dstSwizzle.
++#define RENUT_LIVE_FETCH_SWAP_HALVES     (1u << 24)
 +#define RENUT_SHARED_FETCH_OFFSET        (RENUT_SHARED_INPUTS_OFFSET + 16)                   // 1280 .. 1791
 +// Point sprites. A float4 in guest pixels - PA_SU_POINT_SIZE's width and
 +// height, the diameter used when the vertex shader writes none, then
@@ -214,7 +218,7 @@ index ee3830d..0c6846e 100644
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -119,6 +164,11 @@
+@@ -119,6 +168,11 @@
      X(TexCoord,     9, 21) \
      X(TexCoord,    10, 22)
  
@@ -226,7 +230,7 @@ index ee3830d..0c6846e 100644
  #ifdef __cplusplus
  #include <cstdint>
  
-@@ -136,7 +186,7 @@
+@@ -136,7 +190,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -235,7 +239,7 @@ index ee3830d..0c6846e 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +202,13 @@ struct ShaderInputElement
+@@ -152,6 +206,19 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -246,10 +250,16 @@ index ee3830d..0c6846e 100644
 +    // above only describe the shader as registered; a host that sees the
 +    // bound microcode decodes the live values from this instruction.
 +    uint16_t fetchAddress;
++    // The destination swizzle of that vfetch as this shader was recompiled
++    // with it, baked into the code. Direct3D rewrites it too - a 16-bit
++    // element gets .yxwz - and a shader found by its loose key was compiled
++    // from microcode that may predate the rewrite, so the host compares the
++    // two and puts the difference back (swapFloats, RENUT_LIVE_FETCH_SWAP_HALVES).
++    uint16_t dstSwizzle;
  };
  #endif
  
-@@ -224,6 +281,9 @@ struct PushConstants
+@@ -224,6 +291,9 @@ struct PushConstants
  #define g_SwappedBlendWeights vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 28)
  #define g_SwappedPositions    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 32)
  #define g_SintTexcoords       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 36)
@@ -259,7 +269,7 @@ index ee3830d..0c6846e 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -235,6 +295,9 @@ struct PushConstants
+@@ -235,6 +305,9 @@ struct PushConstants
  // pipeline a pixel-space rectangle and disables the viewport.
  #define g_ViewportScaleOffset vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + RENUT_SHARED_VIEWPORT_OFFSET, 0x10)
  
@@ -269,7 +279,7 @@ index ee3830d..0c6846e 100644
  // A vfetch the vertex declaration does not describe - see the stream table's
  // comment. `index` is whatever register the instruction named, so it arrives as
  // a float holding an integer; `strideBytes` and `offsetBytes` are the
-@@ -253,6 +316,157 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,6 +326,158 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -421,13 +431,14 @@ index ee3830d..0c6846e 100644
 +float4 vfetchLive(uint k, float index)
 +{
 +    uint4 d = vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + RENUT_SHARED_FETCH_OFFSET + k * 16, 0x10);
-+    return vfetchStreamFormat(d.x & 0xFF, index, d.y, d.z, (d.x >> 8) & 0xFF, (d.x >> 16) & 0xFF, asfloat(d.w));
++    float4 value = vfetchStreamFormat(d.x & 0xFF, index, d.y, d.z, (d.x >> 8) & 0xFF, (d.x >> 16) & 0xFF, asfloat(d.w));
++    return (d.x & RENUT_LIVE_FETCH_SWAP_HALVES) != 0 ? value.yxwz : value;
 +}
 +
  // Per-stage float4 constant file. The recompiler picks the stage by defining
  // RENUT_STAGE_CONSTANTS to the matching push-constant address.
  #define cReg(INDEX) \
-@@ -289,7 +503,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -289,7 +514,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint   g_SwappedBlendWeights             : packoffset(c67.w); \
      uint   g_SwappedPositions                : packoffset(c68.x); \
      uint   g_SintTexcoords                   : packoffset(c68.y); \
@@ -441,7 +452,7 @@ index ee3830d..0c6846e 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -317,6 +536,182 @@ uint g_SpecConstants();
+@@ -317,6 +547,198 @@ uint g_SpecConstants();
  #ifdef RENUT_RECOMP
  // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
  #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
@@ -464,14 +475,14 @@ index ee3830d..0c6846e 100644
 +// consecutive elements from that index; `written` says which were set. The
 +// host keeps exported memory the way it keeps every vertex stream: guest
 +// memory with each dword byte-swapped (k8in32). So an element is packed as the
-+// hardware packs it - a pair of 16-bit fields X in the high half, where the
-+// host's input assembler finds the X of every 16-bit vertex element the CPU
-+// writes (Direct3D gives all their fetches a .yx.. swizzle, which the
-+// recompiled shaders do not carry) - and each dword then goes through the
++// hardware packs it - X in the low bits - and each dword then goes through the
 +// export's own endian swap and the host's k8in32 one. The two cancel for a
 +// k8in32 export; a k8in16 one comes out with its halves exchanged, which is
 +// what the game relies on when it reads back a stream it exported that way.
-+// Formats narrower than a dword are not stored.
++// The readers see exactly the dwords the hardware's would: their Direct3D
++// fetch swizzle (.yxwz for 16-bit elements) is put back by the host, see
++// ShaderInputElement::dstSwizzle. Formats narrower than a dword are not
++// stored.
 +#ifdef __spirv__
 +// The export's endian swap followed by k8in32.
 +uint renutExportEndian(uint value, uint endian)
@@ -503,6 +514,27 @@ index ee3830d..0c6846e 100644
 +            return;
 +        }
 +    }
++}
++
++// A float to half precision, rounded to nearest even. f32tof16 becomes
++// packHalf2x16, whose rounding is the driver's choice, and Turnip truncates:
++// state a shader reads, updates and exports again every frame - the falling
++// leaves' rotation, whose length is also their size - then shrinks by up to
++// 2^-11 a frame, to a third of itself in a minute and a half.
++uint renutHalf(float value)
++{
++    uint bits = asuint(value);
++    uint sign = (bits >> 16) & 0x8000;
++    uint magnitude = bits & 0x7FFFFFFF;
++    if (magnitude >= 0x47800000)  // 65536 and up, infinity, NaN
++        return sign | (magnitude > 0x7F800000 ? 0x7E00 : 0x7C00);
++    if (magnitude < 0x38800000)   // below 2^-14: a subnormal half, or zero
++        return sign | uint(round(asfloat(magnitude) * 16777216.0));
++    uint result = (magnitude >> 13) - ((127 - 15) << 10);
++    uint rest = magnitude & 0x1FFF;
++    if (rest > 0x1000 || (rest == 0x1000 && (result & 1) != 0))
++        ++result;
++    return sign | result;
 +}
 +
 +// Packs up to four fixed-point fields, X in the low bits, by the Direct3D
@@ -575,17 +607,12 @@ index ee3830d..0c6846e 100644
 +        return;
 +    }
 +
-+    // 16_16, 16_16_16_16 and their float forms.
-+    bool halvesSwapped = format == 25 || format == 26 || format == 31 || format == 32;
-+
 +    float4 eM[5] = { eM0, eM1, eM2, eM3, eM4 };
 +    [unroll] for (uint k = 0; k < 5; ++k)
 +    {
 +        if (((written >> k) & 1) == 0 || index + k >= count)
 +            continue;
 +        float4 v = swapRedBlue ? eM[k].zyxw : eM[k];
-+        if (halvesSwapped)
-+            v = v.yxwz;
 +        uint address = base + ((index + k) << bytesLog2);
 +        switch (kind)
 +        {
@@ -597,11 +624,11 @@ index ee3830d..0c6846e 100644
 +            renutExportDword(address + 4, renutExportFixed(v.zwzw, widths, isSigned, isNorm), endian);
 +            break;
 +        case 2:
-+            renutExportDword(address, f32tof16(v.x) | (f32tof16(v.y) << 16), endian);
++            renutExportDword(address, renutHalf(v.x) | (renutHalf(v.y) << 16), endian);
 +            break;
 +        case 3:
-+            renutExportDword(address, f32tof16(v.x) | (f32tof16(v.y) << 16), endian);
-+            renutExportDword(address + 4, f32tof16(v.z) | (f32tof16(v.w) << 16), endian);
++            renutExportDword(address, renutHalf(v.x) | (renutHalf(v.y) << 16), endian);
++            renutExportDword(address + 4, renutHalf(v.z) | (renutHalf(v.w) << 16), endian);
 +            break;
 +        default:
 +            renutExportDword(address, asuint(v.x), endian);
@@ -624,7 +651,7 @@ index ee3830d..0c6846e 100644
  #endif
  
  #ifdef RENUT_RECOMP
-@@ -483,6 +878,25 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +905,25 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -651,7 +678,7 @@ index ee3830d..0c6846e 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..cda5140 100644
+index c71e7c9..952bde3 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -698,7 +725,7 @@ index c71e7c9..cda5140 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -222,37 +244,126 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -222,37 +244,127 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      // vertex fetch constant 95 - StreamNumber, and the instruction names fetch
      // constant constIndex * 3 + constIndexSelect. So the host binds the stream
      // and this reads it as a raw buffer.
@@ -743,6 +770,7 @@ index c71e7c9..cda5140 100644
 +        element.location = RENUT_LIVE_FETCH_LOCATION;
 +        element.slot = uint8_t(k);
 +        element.fetchAddress = uint16_t(address);
++        element.dstSwizzle = uint16_t(instr.dstSwizzle);
 +        inputLayout.push_back(element);
 +
 +        indent();
@@ -839,7 +867,7 @@ index c71e7c9..cda5140 100644
  
              out += '.';
              printDstSwizzle(instr.dstSwizzle, true);
-@@ -292,6 +403,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -292,6 +404,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      case DeclUsage::BlendWeight:
          print("swapFloats(g_SwappedBlendWeights, ");
          break;
@@ -849,11 +877,12 @@ index c71e7c9..cda5140 100644
      case DeclUsage::TexCoord:
          print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
          break;
-@@ -372,13 +486,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -372,13 +487,17 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
              // is the whole point of one, reading a different field of the same
              // vertex.
              element.offsetBytes = uint16_t(uint32_t(instr.offset) * 4);
 +            element.fetchAddress = uint16_t(address);
++            element.dstSwizzle = uint16_t(instr.dstSwizzle);
              element.strideBytes = uint16_t(uint32_t(source.stride) * 4);
              element.format = uint8_t(source.format);
  
@@ -868,7 +897,7 @@ index c71e7c9..cda5140 100644
  
              for (auto& usageLocation : USAGE_LOCATIONS)
              {
-@@ -406,7 +523,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -406,7 +525,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      }
  #endif
  
@@ -895,7 +924,7 @@ index c71e7c9..cda5140 100644
  
  #ifdef RENUT_RECOMP
      switch (findResult->second.usage)
-@@ -423,6 +559,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -423,6 +561,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
          break;
  
      case DeclUsage::BlendWeight:
@@ -903,7 +932,7 @@ index c71e7c9..cda5140 100644
      case DeclUsage::Position:
          print(", {})", uint32_t(findResult->second.usageIndex));
          break;
-@@ -517,6 +654,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
+@@ -517,6 +656,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
      }
  
      indent();
@@ -913,7 +942,7 @@ index c71e7c9..cda5140 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -949,17 +1089,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -949,17 +1091,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                      exportRegister = "oPointSizeEdgeKill";
                      break;
  
@@ -950,7 +979,7 @@ index c71e7c9..cda5140 100644
  
                  default:
                  {
-@@ -1034,6 +1189,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1034,6 +1191,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -960,7 +989,7 @@ index c71e7c9..cda5140 100644
              print("r{}.", instr.vectorDest);
          }
  
-@@ -1421,6 +1579,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1421,6 +1581,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -970,7 +999,7 @@ index c71e7c9..cda5140 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1492,8 +1653,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1492,8 +1655,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      isPixelShader = (shaderContainer->flags & 0x1) == 0;
  
  #ifdef RENUT_RECOMP
@@ -993,7 +1022,7 @@ index c71e7c9..cda5140 100644
      println("#define RENUT_STAGE_{}", isPixelShader ? "PIXEL" : "VERTEX");
  #endif
  
-@@ -1603,6 +1777,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1603,6 +1779,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #endif
              println("\tin {3}float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)], interpolation);
          }
@@ -1004,7 +1033,7 @@ index c71e7c9..cda5140 100644
  
          out += "#ifdef __spirv__\n";
          out += "\tin bool iFace : SV_IsFrontFace\n";
-@@ -1661,6 +1839,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1661,6 +1841,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
          #endif
  
@@ -1022,7 +1051,7 @@ index c71e7c9..cda5140 100644
              out += '\t';
  
              bool locatedInput = false;
-@@ -1689,6 +1878,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1689,6 +1880,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
@@ -1041,7 +1070,7 @@ index c71e7c9..cda5140 100644
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1701,6 +1902,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1701,6 +1904,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
@@ -1052,7 +1081,7 @@ index c71e7c9..cda5140 100644
      }
  
      out += ")\n";
-@@ -1815,6 +2020,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1815,6 +2022,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
@@ -1062,7 +1091,7 @@ index c71e7c9..cda5140 100644
  
          out += "\n";
      }
-@@ -1826,8 +2034,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1826,8 +2036,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
@@ -1098,7 +1127,7 @@ index c71e7c9..cda5140 100644
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
-@@ -1849,11 +2084,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1849,11 +2086,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #ifdef RENUT_RECOMP
      if (!isPixelShader)
      {
@@ -1119,7 +1148,7 @@ index c71e7c9..cda5140 100644
      }
  #endif
      if (isPixelShader)
-@@ -2463,6 +2702,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2463,6 +2704,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      // Kill vertex: a non-zero .z means the vertex is discarded.
                      // Feeding SV_Position a NaN drops every primitive that uses
                      // it, which is the closest a raster pipeline gets.
@@ -1129,7 +1158,7 @@ index c71e7c9..cda5140 100644
                      indent();
                      out += "if (oPointSizeEdgeKill.z != 0.0)\n";
                      indent();
-@@ -2484,6 +2726,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2484,6 +2728,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                          // multiply-add and changes nothing in the common case.
                          out += "\toPos.xy = oPos.xy * g_ViewportScaleOffset.xy + "
                                 "(g_ViewportScaleOffset.zw + g_HalfPixelOffset) * oPos.w;\n";
@@ -1139,7 +1168,7 @@ index c71e7c9..cda5140 100644
                      #else
                          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                      #endif
-@@ -2553,5 +2798,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2553,5 +2800,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
  #endif
  

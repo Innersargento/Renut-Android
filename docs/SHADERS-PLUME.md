@@ -200,22 +200,33 @@ partes, e o Plume não fazia nenhuma das duas:
   um reset feito pelo CPU com os mesmos bytes passaria despercebido.
 - As faixas ficam sempre em `k8in32`, a forma de qualquer stream de vértices no host.
 
-**Formato 16 bits e endian (a causa das folhas gigantes).** A regra que ficou é: pares de
-16 bits (`16_16`, `16_16_16_16` e as versões float) são gravados com X na metade alta; em
-seguida, cada dword passa pelo endian da própria exportação (`renutExportEndian`) e fica
-na forma `k8in32`. Duas observações sustentam essa regra:
+**As folhas gigantes (resolvido em 25/09/2026).** Eram três defeitos empilhados, todos
+visíveis no dump das faixas (`files/exportdump`, gravado nos quadros com trace):
 
-- **`26AC…` exporta `16_16_16_16_FLOAT` em `k8in32`.** A vida útil da partícula (campo W)
-  só foi lida certa, ~8 s, com as metades trocadas. Sem a troca, a vida lida era enorme e
-  o tamanho só crescia.
-- **`D38D…` exporta `16_16_16_16_FLOAT` em `k8in16` (c193)**, e simula no lugar o pool
-  das folhas que o `8070…` desenha como quads. Tratado como `k8in32`, X↔Y e Z↔W se
-  invertiam: a velocidade explodia a cada quadro, e o campo `+24` (tamanho) chegava a
-  valores como 29, 139 e 424. Com o endian convertido, as folhas ficaram pequenas, como no
-  renderizador Xenos.
+1. **Endian da exportação.** `D38D…` grava o estado das folhas em `16_16_16_16_FLOAT`
+   com `k8in16` (c193), e os desenhos leem em `k8in32`. `renutExportEndian` aplica o
+   endian da exportação e depois o `k8in32` do host, como o hardware.
+2. **Textura 3D sem ligação.** `D38D…` tira o empurrão do vento de uma textura 3D
+   (`tfetch3D`, 512×512×1 DXT1 em `19ACF000`). O Plume só ligava texturas 2D, empilhadas
+   e cube, então o slot lia o fallback branco. O ruído `×2−1` dava (1,1,1) para todas as
+   folhas, e todas andavam na mesma diagonal: no dump, `y−x` e `z−x` eram iguais em
+   todo o pool. `GetGuestVolumeTexture` (`plume_gpu.cpp`) e `DecodeTexture3D`
+   (`plume_textures.cpp`) decodificam o nível base de texturas `k3D`, tiled ou linear.
+3. **Swizzle de 16 bits.** O Direct3D reescreve os `vfetch` no bind, e um elemento de 16
+   bits ganha o swizzle `.yxwz`. Um shader que o cache encontra pela chave "loose" foi
+   recompilado a partir do microcódigo sem essa reescrita: os contêineres tirados dos
+   bundles, como `D38D…`, `ABD6…` e `8070…`. Esses shaders liam X↔Y e Z↔W trocados.
+   - O eixo de giro das folhas (`+32`) saía com norma 1,78 em vez de 1,00, e o quaternion
+     (`+16`) crescia a cada quadro.
+   - O `8070…` gira os cantos do quad por esse quaternion sem normalizar, então a folha
+     escalava por |q|²: no dump havia |q|² ≈ 35 e componentes de ±24.000.
+   - Correção: o recompilador grava em `ShaderInputElement::dstSwizzle` o swizzle com que
+     compilou cada busca. `CompareFetchSwizzle` compara esse swizzle com o da busca viva.
+     Quando a diferença é exatamente a troca de metades, o host liga `swapFloats` (input
+     assembler) ou `RENUT_LIVE_FETCH_SWAP_HALVES` (`vfetchLive`). Outras divergências,
+     como `zyxw` em cores `8_8_8_8`, vão para o log.
 
-O rexglue empacota X nos bits baixos (`PackHalf2x16`). A troca extra existe porque as
-buscas de 16 bits do jogo levam um swizzle `.yx` que o contêiner recompilado não tem.
-Quem mexer nisso precisa manter as duas observações verdadeiras: um dump das faixas
-(`files/exportdump`, gravado nos quadros com trace) permite conferir vida útil, idade e
-tamanho diretamente.
+Com a leitura corrigida, a exportação grava exatamente como o hardware: X nos bits baixos
+(como `PackHalf2x16` no rexglue) e depois o endian. A troca prévia de metades
+(`halvesSwapped`), tentada antes, só compensava o defeito 3 para quem lia sem o
+swizzle, e errava para os shaders que o têm.

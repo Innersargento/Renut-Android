@@ -215,6 +215,9 @@ struct LiveElement {
   uint32_t format;
   bool is_signed, normalized;
   uint32_t usage, usage_index;
+  // The live fetch's swizzle is the recompiled one with the halves of each
+  // pair exchanged; see CompareFetchSwizzle.
+  bool swap_halves = false;
 };
 
 class HostShader : public gfx::Shader {
@@ -336,6 +339,26 @@ uint32_t TextureMask(const gfx::Shader& shader) {
 
 // patched the vfetch instructions for the current vertex declaration; the
 // recompiler recorded which instruction reads each element (fetchAddress).
+//
+// Direct3D patches the destination swizzle as well - every 16-bit element
+// gets .yxwz, which puts back the component order the k8in32 swap reversed -
+// and a shader the store found by its loose key was recompiled from microcode
+// without that patch (the containers extracted from the game's bundles). Such
+// a shader read the halves of every 16-bit pair exchanged: the falling leaves'
+// spin axis came out of unit length, so their rotation quaternion grew each
+// frame and the leaves with it, into sheets across the screen. The recompiler
+// records the swizzle it compiled each fetch with (dstSwizzle), and the
+// exchange is put back here when that is the whole difference.
+enum class SwizzleFix { kNone, kSwapHalves, kOther };
+SwizzleFix CompareFetchSwizzle(uint32_t compiled, uint32_t live) {
+  if (compiled == live) return SwizzleFix::kNone;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t c = (compiled >> (3 * i)) & 7, l = (live >> (3 * i)) & 7;
+    if (c < 4 ? l != (c ^ 1) : l != c) return SwizzleFix::kOther;
+  }
+  return SwizzleFix::kSwapHalves;
+}
+
 void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
                         std::vector<LiveElement>& out_elements,
                         std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>>& out_fetches) {
@@ -364,6 +387,15 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
     }
     const uint32_t fetch_constant = ((full[0] >> 20) & 0x1F) * 3 + ((full[0] >> 25) & 0x3);
     if (fetch_constant > 95 || 95 - fetch_constant >= 16) continue;
+    const SwizzleFix fix = CompareFetchSwizzle(e.dstSwizzle, f[1] & 0xFFF);
+    if (fix == SwizzleFix::kOther) {
+      static uint32_t logged = 0;
+      if (logged < 32) {
+        ++logged;
+        REXLOG_WARN("Renut: Plume vs {:016X} fetch @{} reads swizzle {:03X}, recompiled with {:03X}",
+                    shader.ucode_data_hash(), e.fetchAddress, f[1] & 0xFFF, uint32_t(e.dstSwizzle));
+      }
+    }
     if (live_fetch) {
       if (e.slot >= RENUT_LIVE_FETCH_COUNT) continue;
       const uint32_t flags = ((f[1] >> 12) & 1) | (((f[1] >> 13) & 1) << 1) | (((f[1] >> 14) & 1) << 2);
@@ -372,7 +404,8 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
       uint32_t scale_bits;
       std::memcpy(&scale_bits, &scale, 4);
       out_fetches.push_back(
-          {e.slot, {(95 - fetch_constant) | (((f[1] >> 16) & 0x3F) << 8) | (flags << 16),
+          {e.slot, {(95 - fetch_constant) | (((f[1] >> 16) & 0x3F) << 8) | (flags << 16) |
+                        (fix == SwizzleFix::kSwapHalves ? RENUT_LIVE_FETCH_SWAP_HALVES : 0u),
                     (full[2] & 0xFF) * 4, ((f[2] >> 8) & 0x7FFFFF) * 4, scale_bits}});
       continue;
     }
@@ -386,6 +419,7 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
     live.normalized = !((f[1] >> 13) & 1);
     live.usage = e.usage;
     live.usage_index = e.usageIndex;
+    live.swap_halves = fix == SwizzleFix::kSwapHalves;
     out_elements.push_back(live);
   }
 }
@@ -2687,12 +2721,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       slot_used[element->slot] = true;
       input_slots.emplace_back(element->slot, element->stride);
     }
-    // 16-bit elements need no swapFloats(): after the k8in32 swap the input
-    // assembler reads the hardware's component order (X in the low half), and
-    // Direct3D already patched the vfetch swizzle (.yxwz) to put the halves
-    // back in memory order. Swapping here as well mangled every mesh with
-    // half-float positions; only the manually fetched grass survived.
-    if (IsSixteenBitFormat(element->format) && (skip_mask_ & 512)) {
+    // After the k8in32 swap the input assembler reads the hardware's component
+    // order (X in the low half), and Direct3D's patched vfetch swizzle (.yxwz)
+    // puts 16-bit halves back in memory order. A shader recompiled with that
+    // swizzle needs nothing more - swapping every 16-bit element here mangled
+    // every mesh with half-float positions. One recompiled without it gets the
+    // exchange from swapFloats (see CompareFetchSwizzle); plume-skip bit 512
+    // still forces it on every 16-bit element, the old behaviour.
+    if (element->swap_halves || (IsSixteenBitFormat(element->format) && (skip_mask_ & 512))) {
       // Debug: the old behaviour, reversing the 16-bit pairs a second time.
       int which = -1;
       switch (element->usage) {
