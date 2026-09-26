@@ -5,7 +5,7 @@
 # does not need glslang.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")/../../android/rexglue/shaders" && pwd)"
-for src in "$DIR"/*.geom "$DIR"/*.frag; do
+for src in "$DIR"/*.geom "$DIR"/*.frag "$DIR"/*.vert; do
     name=$(basename "$src" | tr '.' '_')
     spv=$(mktemp)
     glslangValidator -V --target-env vulkan1.1 -o "$spv" "$src" > /dev/null

@@ -8,6 +8,8 @@
 #include <rex/thread/fiber.h>
 #include <android/log.h>
 #include <fstream>
+#include <functional>
+#include <stdlib.h>
 #include <sstream>
 #include <thread>
 #include <atomic>
@@ -190,6 +192,23 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       if(!surface)throw std::runtime_error("Superfície indisponível para o jogo.");
       if(!std::filesystem::is_directory(game / "Bundle"))
         throw std::runtime_error("Importe a ISO completa: os assets Bundle não estão presentes.");
+      // Debug: <files>/plume-env holds KEY=VALUE lines put in the environment
+      // before the driver loads, to try Turnip and ir3 flags (TU_DEBUG,
+      // IR3_SHADER_DEBUG, FD_DEV_FEATURES...) without a build. The pipeline
+      // cache is kept apart per content, so binaries compiled under other flags
+      // are not handed back.
+      std::string plume_env;
+      {
+        std::ifstream env_file(root / "plume-env");
+        for(std::string line;std::getline(env_file,line);){
+          while(!line.empty()&&(line.back()=='\r'||line.back()==' '))line.pop_back();
+          const auto equals=line.find('=');
+          if(line.empty()||line[0]=='#'||equals==std::string::npos||equals==0)continue;
+          setenv(line.substr(0,equals).c_str(),line.substr(equals+1).c_str(),1);
+          note("Ambiente: "+line);
+          plume_env+=line+"\n";
+        }
+      }
       renutConfigureXenosDriver(javaString(env,hooks),javaString(env,driverDirectory),javaString(env,driverLibrary),oneUiFix,
                                 javaString(env,tuDebug));
       note("Driver solicitado: "+(javaString(env,driverLibrary).empty()?std::string("sistema"):javaString(env,driverLibrary)));
@@ -218,7 +237,8 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
         // Native renderer: the command stream is parsed as before, but draws,
         // resolves and swaps run on Plume with the recompiled shaders.
         renut::SetPlumeMissDumpDirectory((root / "plume-miss").string());
-        renut::SetPlumePipelineCachePath((root / "plume-pipelines.bin").string());
+        renut::SetPlumePipelineCachePath((root / (plume_env.empty() ? std::string("plume-pipelines.bin")
+            : "plume-pipelines-" + std::to_string(std::hash<std::string>{}(plume_env)) + ".bin")).string());
         config.graphics.reset(renut::CreatePlumeGraphicsSystem());
       }else{
         rex::system::GpuCreateInfo info{sizeof(rex::system::GpuCreateInfo),"vulkan"};

@@ -153,10 +153,10 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..c23d67a 100644
+index ee3830d..1bd84a1 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -73,9 +73,64 @@
+@@ -73,9 +73,70 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -204,7 +204,13 @@ index ee3830d..c23d67a 100644
 +#define RENUT_INPUT_REMAP_COUNT          32
 +#define RENUT_INPUT_REMAP_IDENTITY       0x688u
 +#define RENUT_SHARED_REMAP_OFFSET        (RENUT_SHARED_EXPORT_OFFSET + RENUT_EXPORT_RANGE_COUNT * 16)  // 1952 .. 2079
-+#define RENUT_SHARED_SIZE                (RENUT_SHARED_REMAP_OFFSET + RENUT_INPUT_REMAP_COUNT * 4)     // 2080
++// User clip planes: PA_CL_UCP_0..5 in the guest's clip space, then the mask
++// of enabled ones (PA_CL_CLIP_CNTL.ucp_ena, zero under clip_disable). A vertex
++// shader turns them into SV_ClipDistance0 - see renutUserClipDistance.
++#define RENUT_USER_CLIP_PLANE_COUNT      6
++#define RENUT_SHARED_UCP_OFFSET          (RENUT_SHARED_REMAP_OFFSET + RENUT_INPUT_REMAP_COUNT * 4)     // 2080 .. 2175
++#define RENUT_SHARED_UCP_MASK_OFFSET     (RENUT_SHARED_UCP_OFFSET + RENUT_USER_CLIP_PLANE_COUNT * 16)  // 2176
++#define RENUT_SHARED_SIZE                (RENUT_SHARED_UCP_MASK_OFFSET + 16)                           // 2192
 +
 +// Set in a cache entry's specConstantsMask when the shader exports to memory,
 +// so the host knows to look for the streams it writes. Not a specialization
@@ -224,7 +230,7 @@ index ee3830d..c23d67a 100644
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -119,6 +174,11 @@
+@@ -119,6 +180,11 @@
      X(TexCoord,     9, 21) \
      X(TexCoord,    10, 22)
  
@@ -236,7 +242,7 @@ index ee3830d..c23d67a 100644
  #ifdef __cplusplus
  #include <cstdint>
  
-@@ -136,7 +196,7 @@
+@@ -136,7 +202,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -245,7 +251,7 @@ index ee3830d..c23d67a 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +212,20 @@ struct ShaderInputElement
+@@ -152,6 +218,20 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -266,27 +272,124 @@ index ee3830d..c23d67a 100644
  };
  #endif
  
-@@ -224,6 +298,9 @@ struct PushConstants
- #define g_SwappedBlendWeights vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 28)
- #define g_SwappedPositions    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 32)
- #define g_SintTexcoords       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 36)
-+#define g_SwappedBlendIndices vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 40)
-+#define g_PackedInputs        vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 44)
-+#define g_IntInputs           vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_INPUTS_OFFSET + 0)
+@@ -203,27 +283,60 @@ struct PushConstants
+ 
+ #ifdef RENUT_RECOMP
+ 
++// The two stages' float4 constant files and the shared block, as uniform
++// buffers in set 4 that the host binds with a dynamic offset per draw. They
++// used to be raw buffer loads from the addresses in the push constants, and
++// on Adreno that is the slow way to read a constant: every one became a global
++// load in the shader - hoisted into a preamble each draw waits on, or repeated
++// in every wave - where a uniform buffer read at a constant offset is
++// promoted into the constant file, which the command processor fills before
++// the draw starts. Measured on Turnip, that load latency was most of what a
++// draw of the guest's shaders cost the GPU.
++[[vk::binding(0, 4)]] cbuffer RenutVertexShaderConstants
++{
++    float4 g_VertexShaderConstants[RENUT_SHADER_CONSTANT_COUNT];
++};
++[[vk::binding(1, 4)]] cbuffer RenutPixelShaderConstants
++{
++    float4 g_PixelShaderConstants[RENUT_SHADER_CONSTANT_COUNT];
++};
++[[vk::binding(2, 4)]] cbuffer RenutSharedConstants
++{
++    uint4 g_SharedWords[RENUT_SHARED_SIZE / 16];
++};
++
++// The shared block by byte offset, in the RENUT_SHARED_* layout above.
++#define renutSharedU(OFFSET)   (g_SharedWords[(OFFSET) >> 4][((OFFSET) >> 2) & 3])
++#define renutSharedF(OFFSET)   asfloat(renutSharedU(OFFSET))
++#define renutSharedF2(OFFSET)  float2(renutSharedF(OFFSET), renutSharedF((OFFSET) + 4))
++#define renutSharedU4(OFFSET)  (g_SharedWords[(OFFSET) >> 4])
++#define renutSharedF4(OFFSET)  asfloat(renutSharedU4(OFFSET))
++#define renutSharedU64(OFFSET) (uint64_t(renutSharedU(OFFSET)) | (uint64_t(renutSharedU((OFFSET) + 4)) << 32))
++
+ #define texture2DDescriptorIndex(SLOT) \
+-    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_TEXTURE2D_OFFSET + (SLOT) * 4)
++    renutSharedU(RENUT_SHARED_TEXTURE2D_OFFSET + (SLOT) * 4)
+ #define texture3DDescriptorIndex(SLOT) \
+-    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_TEXTURE3D_OFFSET + (SLOT) * 4)
++    renutSharedU(RENUT_SHARED_TEXTURE3D_OFFSET + (SLOT) * 4)
+ #define textureCubeDescriptorIndex(SLOT) \
+-    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_TEXTURECUBE_OFFSET + (SLOT) * 4)
++    renutSharedU(RENUT_SHARED_TEXTURECUBE_OFFSET + (SLOT) * 4)
+ #define samplerDescriptorIndex(SLOT) \
+-    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_SAMPLER_OFFSET + (SLOT) * 4)
+-
+-#define g_Booleans(i)         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_BOOLEANS_OFFSET + (i) * 4)
+-#define g_LoopConstant(i)     vk::RawBufferLoad<int4>(g_PushConstants.SharedConstants + RENUT_SHARED_LOOP_OFFSET + (i) * 16, 0x10)
+-
+-#define g_SwappedTexcoords    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 0)
+-#define g_HalfPixelOffset     vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 4)
+-#define g_AlphaThreshold      vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 12)
+-#define g_SwappedNormals      vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 16)
+-#define g_SwappedBinormals    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 20)
+-#define g_SwappedTangents     vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 24)
+-#define g_SwappedBlendWeights vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 28)
+-#define g_SwappedPositions    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 32)
+-#define g_SintTexcoords       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 36)
++    renutSharedU(RENUT_SHARED_SAMPLER_OFFSET + (SLOT) * 4)
++
++#define g_Booleans(i)         renutSharedU(RENUT_SHARED_BOOLEANS_OFFSET + (i) * 4)
++#define g_LoopConstant(i)     asint(renutSharedU4(RENUT_SHARED_LOOP_OFFSET + (i) * 16))
++
++#define g_SwappedTexcoords    renutSharedU(RENUT_SHARED_MISC_OFFSET + 0)
++#define g_HalfPixelOffset     renutSharedF2(RENUT_SHARED_MISC_OFFSET + 4)
++#define g_AlphaThreshold      renutSharedF(RENUT_SHARED_MISC_OFFSET + 12)
++#define g_SwappedNormals      renutSharedU(RENUT_SHARED_MISC_OFFSET + 16)
++#define g_SwappedBinormals    renutSharedU(RENUT_SHARED_MISC_OFFSET + 20)
++#define g_SwappedTangents     renutSharedU(RENUT_SHARED_MISC_OFFSET + 24)
++#define g_SwappedBlendWeights renutSharedU(RENUT_SHARED_MISC_OFFSET + 28)
++#define g_SwappedPositions    renutSharedU(RENUT_SHARED_MISC_OFFSET + 32)
++#define g_SintTexcoords       renutSharedU(RENUT_SHARED_MISC_OFFSET + 36)
++#define g_SwappedBlendIndices renutSharedU(RENUT_SHARED_MISC_OFFSET + 40)
++#define g_PackedInputs        renutSharedU(RENUT_SHARED_MISC_OFFSET + 44)
++#define g_IntInputs           renutSharedU(RENUT_SHARED_INPUTS_OFFSET + 0)
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -235,6 +312,9 @@ struct PushConstants
+@@ -233,7 +346,27 @@ struct PushConstants
+ // coordinates, and without a scale everything outside the 1x1 corner of the
+ // clip volume is culled. N&B's FMV renderer does exactly that: it hands the
  // pipeline a pixel-space rectangle and disables the viewport.
- #define g_ViewportScaleOffset vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + RENUT_SHARED_VIEWPORT_OFFSET, 0x10)
- 
-+#define g_PointSize           vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + RENUT_SHARED_POINT_OFFSET, 0x10)
-+#define g_PointScreenToNdc    vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + RENUT_SHARED_POINT_OFFSET + 16, 0x8)
+-#define g_ViewportScaleOffset vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + RENUT_SHARED_VIEWPORT_OFFSET, 0x10)
++#define g_ViewportScaleOffset renutSharedF4(RENUT_SHARED_VIEWPORT_OFFSET)
 +
++#define g_PointSize           renutSharedF4(RENUT_SHARED_POINT_OFFSET)
++#define g_PointScreenToNdc    renutSharedF2(RENUT_SHARED_POINT_OFFSET + 16)
++
++// The distance to the nearest enabled user clip plane, from the position the
++// guest shader wrote (clip space, before g_ViewportScaleOffset), as xenia does.
++// Clipping keeps what is >= 0 on every plane, which is the minimum of them; a
++// draw with no plane enabled gets a distance that clips nothing.
++float renutUserClipDistance(float4 position)
++{
++    uint mask = renutSharedU(RENUT_SHARED_UCP_MASK_OFFSET);
++    float distance = 3.0e38;
++    [unroll] for (uint i = 0; i < RENUT_USER_CLIP_PLANE_COUNT; ++i)
++    {
++        if (mask & (1u << i))
++            distance = min(distance, dot(position,
++                renutSharedF4(RENUT_SHARED_UCP_OFFSET + i * 16)));
++    }
++    return distance;
++}
+ 
  // A vfetch the vertex declaration does not describe - see the stream table's
  // comment. `index` is whatever register the instruction named, so it arrives as
- // a float holding an integer; `strideBytes` and `offsetBytes` are the
-@@ -253,6 +333,160 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -244,8 +377,7 @@ struct PushConstants
+ // a draw that binds fewer streams than the shader fetches would otherwise do.
+ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes)
+ {
+-    uint64_t address = vk::RawBufferLoad<uint64_t>(
+-        g_PushConstants.SharedConstants + RENUT_SHARED_STREAMS_OFFSET + stream * 8, 0x8);
++    uint64_t address = renutSharedU64(RENUT_SHARED_STREAMS_OFFSET + stream * 8);
+ 
+     if (address == 0)
+         return 0.0;
+@@ -253,14 +385,167 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -324,8 +427,7 @@ index ee3830d..c23d67a 100644
 +float4 vfetchStreamFormat(uint stream, float index, uint strideBytes, uint offsetBytes,
 +    uint format, uint flags, float expScale)
 +{
-+    uint64_t address = vk::RawBufferLoad<uint64_t>(
-+        g_PushConstants.SharedConstants + RENUT_SHARED_STREAMS_OFFSET + stream * 8, 0x8);
++    uint64_t address = renutSharedU64(RENUT_SHARED_STREAMS_OFFSET + stream * 8);
 +
 +    if (address == 0)
 +        return 0.0;
@@ -439,15 +541,27 @@ index ee3830d..c23d67a 100644
 +
 +float4 vfetchLive(uint k, float index)
 +{
-+    uint4 d = vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + RENUT_SHARED_FETCH_OFFSET + k * 16, 0x10);
++    uint4 d = renutSharedU4(RENUT_SHARED_FETCH_OFFSET + k * 16);
 +    float4 value = vfetchStreamFormat(d.x & 0xFF, index, d.y & 0xFFFF, d.z, (d.x >> 8) & 0xFF, (d.x >> 16) & 0xFF, asfloat(d.w));
 +    return renutRemap(value, (d.y >> 16) & 0xFFF);
 +}
 +
  // Per-stage float4 constant file. The recompiler picks the stage by defining
- // RENUT_STAGE_CONSTANTS to the matching push-constant address.
+-// RENUT_STAGE_CONSTANTS to the matching push-constant address.
++// RENUT_STAGE_CONSTANTS to the matching uniform buffer's array.
  #define cReg(INDEX) \
-@@ -289,7 +523,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+-    vk::RawBufferLoad<float4>(RENUT_STAGE_CONSTANTS + min(uint(INDEX), uint(RENUT_SHADER_CONSTANT_COUNT - 1)) * 16, 0x10)
++    RENUT_STAGE_CONSTANTS[min(uint(INDEX), uint(RENUT_SHADER_CONSTANT_COUNT - 1))]
+ 
+ #else
+-#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+-#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
++#define g_Booleans                 renutSharedU(256)
++#define g_SwappedTexcoords         renutSharedU(260)
+ #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+ #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
+ #endif
+@@ -289,7 +574,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint   g_SwappedBlendWeights             : packoffset(c67.w); \
      uint   g_SwappedPositions                : packoffset(c68.x); \
      uint   g_SintTexcoords                   : packoffset(c68.y); \
@@ -461,7 +575,7 @@ index ee3830d..c23d67a 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -317,6 +556,198 @@ uint g_SpecConstants();
+@@ -317,6 +607,197 @@ uint g_SpecConstants();
  #ifdef RENUT_RECOMP
  // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
  #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
@@ -514,8 +628,7 @@ index ee3830d..c23d67a 100644
 +    value = renutExportEndian(value, endian);
 +    for (uint i = 0; i < RENUT_EXPORT_RANGE_COUNT; ++i)
 +    {
-+        uint4 range = vk::RawBufferLoad<uint4>(
-+            g_PushConstants.SharedConstants + RENUT_SHARED_EXPORT_OFFSET + i * 16, 0x10);
++        uint4 range = renutSharedU4(RENUT_SHARED_EXPORT_OFFSET + i * 16);
 +        if (address - range.x < range.y)
 +        {
 +            uint64_t device = (uint64_t(range.w) << 32) | uint64_t(range.z);
@@ -660,7 +773,22 @@ index ee3830d..c23d67a 100644
  #endif
  
  #ifdef RENUT_RECOMP
-@@ -483,6 +914,53 @@ float4 tfetchR11G11B10(float4 value)
+@@ -349,7 +830,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return RENUT_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    // 93% of the game's 2D fetches have no offset, and the division by the
++    // texture's size - a size query per sample - cannot fold away on its own:
++    // 0 / 0 is NaN. With a literal zero offset this branch is compiled out.
++    float2 coord = texCoord;
++    if (any(offset != 0.0))
++        coord += offset / getTexture2DDimensions(texture);
++    return RENUT_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], coord);
+ }
+ 
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+@@ -483,6 +970,53 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -682,7 +810,7 @@ index ee3830d..c23d67a 100644
 +
 +#ifdef __spirv__
 +#define g_InputRemap(LOCATION) \
-+    ((LOCATION) < RENUT_INPUT_REMAP_COUNT ? vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_REMAP_OFFSET + (LOCATION) * 4) : 0u)
++    ((LOCATION) < RENUT_INPUT_REMAP_COUNT ? renutSharedU(RENUT_SHARED_REMAP_OFFSET + (LOCATION) * 4) : 0u)
 +#else
 +#define g_InputRemap(LOCATION) 0u
 +#endif
@@ -715,7 +843,7 @@ index ee3830d..c23d67a 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..f229fb5 100644
+index c71e7c9..64dea27 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -752,17 +880,24 @@ index c71e7c9..f229fb5 100644
  struct DeclUsageLocation
  {
      DeclUsage usage;
-@@ -196,6 +215,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -196,6 +215,16 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      }
  
      indent();
 +#ifdef RENUT_RECOMP
++    // Whether the index register was written before this fetch, read ahead of
++    // the fetch marking its own destination: r0 = vfetch(r0.x), the commonest
++    // fetch there is, is indexed by the vertex id and not by itself. Marking
++    // first sent 800 of the 874 vertex shaders down vfetchLive - a raw buffer
++    // load and a switch over every format for each input, the GPU fetching
++    // what its input assembler would have.
++    const bool indexWritten = isWritten(uint32_t(instr.srcRegister));
 +    markWritten(uint32_t(instr.dstRegister));
 +#endif
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -222,37 +244,127 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -222,37 +251,127 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      // vertex fetch constant 95 - StreamNumber, and the instruction names fetch
      // constant constIndex * 3 + constIndexSelect. So the host binds the stream
      // and this reads it as a raw buffer.
@@ -770,7 +905,7 @@ index c71e7c9..f229fb5 100644
 +    // A declared input indexed by a register the shader computed is not
 +    // indexed by the vertex id, so the host input assembler cannot fetch it.
 +    const bool indexedByComputedRegister =
-+        findResult != vertexElements.end() && isWritten(uint32_t(instr.srcRegister));
++        findResult != vertexElements.end() && indexWritten;
 +    // A declaration semantic is not a unique fetch. Terrain shaders read
 +    // TEXCOORD0 twice, at offsets 20 (detail UV) and 24 (world-map UV).
 +    // Preserve subsequent instructions independently, including D3D's live
@@ -904,7 +1039,7 @@ index c71e7c9..f229fb5 100644
  
              out += '.';
              printDstSwizzle(instr.dstSwizzle, true);
-@@ -292,6 +404,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -292,6 +411,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      case DeclUsage::BlendWeight:
          print("swapFloats(g_SwappedBlendWeights, ");
          break;
@@ -914,7 +1049,7 @@ index c71e7c9..f229fb5 100644
      case DeclUsage::TexCoord:
          print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
          break;
-@@ -372,13 +487,17 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -372,13 +494,17 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
              // is the whole point of one, reading a different field of the same
              // vertex.
              element.offsetBytes = uint16_t(uint32_t(instr.offset) * 4);
@@ -934,7 +1069,7 @@ index c71e7c9..f229fb5 100644
  
              for (auto& usageLocation : USAGE_LOCATIONS)
              {
-@@ -406,7 +525,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -406,7 +532,26 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
      }
  #endif
  
@@ -961,7 +1096,7 @@ index c71e7c9..f229fb5 100644
  
  #ifdef RENUT_RECOMP
      switch (findResult->second.usage)
-@@ -423,6 +561,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -423,6 +568,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
          break;
  
      case DeclUsage::BlendWeight:
@@ -969,7 +1104,7 @@ index c71e7c9..f229fb5 100644
      case DeclUsage::Position:
          print(", {})", uint32_t(findResult->second.usageIndex));
          break;
-@@ -517,6 +656,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
+@@ -517,6 +663,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
      }
  
      indent();
@@ -979,7 +1114,7 @@ index c71e7c9..f229fb5 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -567,7 +709,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
+@@ -567,7 +716,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
          out += dimension;
  
          print("(texture{}DescriptorIndex({}), samplerDescriptorIndex({}), ", heapDimension, slot, slot);
@@ -999,7 +1134,7 @@ index c71e7c9..f229fb5 100644
  
          switch (instr.dimension)
          {
-@@ -949,17 +1103,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -949,17 +1110,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                      exportRegister = "oPointSizeEdgeKill";
                      break;
  
@@ -1036,7 +1171,7 @@ index c71e7c9..f229fb5 100644
  
                  default:
                  {
-@@ -987,7 +1156,14 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -987,7 +1163,14 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
      if (instr.vectorOpcode >= AluVectorOpcode::SetpEqPush && instr.vectorOpcode <= AluVectorOpcode::SetpGePush)
      {
          indent();
@@ -1051,7 +1186,7 @@ index c71e7c9..f229fb5 100644
  
          switch (instr.vectorOpcode)
          {
-@@ -1024,20 +1200,41 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1024,20 +1207,41 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          vectorWriteMask &= 0b1;
  #endif
  
@@ -1095,7 +1230,7 @@ index c71e7c9..f229fb5 100644
          {
              if ((vectorWriteMask >> i) & 0x1)
                  out += SWIZZLES[i];
-@@ -1142,8 +1339,23 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1142,8 +1346,23 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          case AluVectorOpcode::SetpNePush:
          case AluVectorOpcode::SetpGtPush:
          case AluVectorOpcode::SetpGePush:
@@ -1119,7 +1254,7 @@ index c71e7c9..f229fb5 100644
  
          case AluVectorOpcode::KillEq:
              print("any({} == {})", op(VECTOR_0, true), op(VECTOR_1, true));
-@@ -1402,6 +1614,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1402,6 +1621,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
      }
  
@@ -1144,7 +1279,7 @@ index c71e7c9..f229fb5 100644
      uint32_t scalarWriteMask = instr.scalarWriteMask;
      if (instr.exportData)
          scalarWriteMask &= ~instr.vectorWriteMask;
-@@ -1421,6 +1651,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1421,6 +1658,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -1154,7 +1289,7 @@ index c71e7c9..f229fb5 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1492,8 +1725,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1492,8 +1732,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      isPixelShader = (shaderContainer->flags & 0x1) == 0;
  
  #ifdef RENUT_RECOMP
@@ -1177,7 +1312,16 @@ index c71e7c9..f229fb5 100644
      println("#define RENUT_STAGE_{}", isPixelShader ? "PIXEL" : "VERTEX");
  #endif
  
-@@ -1603,6 +1849,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1562,7 +1815,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     // shader_common.h. Aliasing the names would only help the handful of
+     // shaders that carry a table, so the body always uses raw indices.
+     out += "#ifdef __spirv__\n\n";
+-    println("#define RENUT_STAGE_CONSTANTS g_PushConstants.{}ShaderConstants", stageName);
++    println("#define RENUT_STAGE_CONSTANTS g_{}ShaderConstants", stageName);
+     out += "\n#else\n\n";
+ 
+     println("cbuffer {}ShaderConstants : register(b{}, space4)", stageName, isPixelShader ? 1 : 0);
+@@ -1603,6 +1856,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #endif
              println("\tin {3}float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)], interpolation);
          }
@@ -1188,7 +1332,7 @@ index c71e7c9..f229fb5 100644
  
          out += "#ifdef __spirv__\n";
          out += "\tin bool iFace : SV_IsFrontFace\n";
-@@ -1661,6 +1911,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1661,6 +1918,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
          #endif
  
@@ -1206,7 +1350,7 @@ index c71e7c9..f229fb5 100644
              out += '\t';
  
              bool locatedInput = false;
-@@ -1689,6 +1950,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1689,6 +1957,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
@@ -1225,18 +1369,21 @@ index c71e7c9..f229fb5 100644
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1701,6 +1974,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1701,6 +1981,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
 +    #ifdef RENUT_RECOMP
 +        // Declared last so it takes RENUT_POINT_SPRITE_LOCATION.
 +        out += ",\n\tout float4 oPointSprite : POINTSPRITE";
++        // The guest's user clip planes (PA_CL_UCP_*), for the passes that ask
++        // for them - N&B's quarter-resolution mirrored pass clips at a plane.
++        out += ",\n\tout float oClipDistance : SV_ClipDistance0";
 +    #endif
      }
  
      out += ")\n";
-@@ -1792,14 +2069,29 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1792,14 +2079,29 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          if (isPixelShader)
          {
              value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
@@ -1266,17 +1413,18 @@ index c71e7c9..f229fb5 100644
          }
      }
  
-@@ -1815,6 +2107,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1815,6 +2117,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
 +    #ifdef RENUT_RECOMP
 +        out += "\toPointSprite = 0.0;\n";
++        out += "\toClipDistance = 0.0;\n";
 +    #endif
  
          out += "\n";
      }
-@@ -1826,8 +2121,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1826,8 +2132,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
@@ -1312,7 +1460,7 @@ index c71e7c9..f229fb5 100644
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
-@@ -1849,11 +2171,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1849,11 +2182,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #ifdef RENUT_RECOMP
      if (!isPixelShader)
      {
@@ -1333,7 +1481,7 @@ index c71e7c9..f229fb5 100644
      }
  #endif
      if (isPixelShader)
-@@ -2463,6 +2789,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2463,6 +2800,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      // Kill vertex: a non-zero .z means the vertex is discarded.
                      // Feeding SV_Position a NaN drops every primitive that uses
                      // it, which is the closest a raster pipeline gets.
@@ -1343,8 +1491,11 @@ index c71e7c9..f229fb5 100644
                      indent();
                      out += "if (oPointSizeEdgeKill.z != 0.0)\n";
                      indent();
-@@ -2484,6 +2813,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2482,8 +2822,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         // (2/w, 2/h, -1, -1) for those draws and an identity
+                         // (1, 1, 0, 0) for every normal one, so this costs a
                          // multiply-add and changes nothing in the common case.
++                        out += "\toClipDistance = renutUserClipDistance(oPos);\n";
                          out += "\toPos.xy = oPos.xy * g_ViewportScaleOffset.xy + "
                                 "(g_ViewportScaleOffset.zw + g_HalfPixelOffset) * oPos.w;\n";
 +                        // Only a point-list draw reads this, in the host's
@@ -1353,7 +1504,7 @@ index c71e7c9..f229fb5 100644
                      #else
                          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                      #endif
-@@ -2553,5 +2885,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2553,5 +2897,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
  #endif
  
