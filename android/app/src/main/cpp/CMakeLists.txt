@@ -9,6 +9,9 @@ if(NOT EXISTS "${PLUME_ROOT}/plume_vulkan.cpp")
 endif()
 
 # Generate the loader seam without changing the pinned upstream checkout.
+# The copy is written at configure time, so an edit to the source has to
+# reconfigure: otherwise the build keeps compiling the stale copy.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PLUME_ROOT}/plume_vulkan.cpp")
 file(READ "${PLUME_ROOT}/plume_vulkan.cpp" PLUME_SOURCE)
 string(FIND "${PLUME_SOURCE}" "VkResult res = volkInitialize();" LOADER_POSITION)
 if(LOADER_POSITION EQUAL -1)

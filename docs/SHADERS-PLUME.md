@@ -196,8 +196,17 @@ partes, e o Plume não fazia nenhuma das duas:
 - Cada stream exportado vira uma `ExportRange` persistente: um buffer da GPU que substitui
   a memória do guest para os desenhos seguintes. Barreiras separam gravação e leitura.
 - A faixa é comparada uma vez por quadro com a memória do guest, e o que o CPU escreveu
-  entra por cima. O que a GPU exportou volta ao guest depois do quadro (writeback), senão
-  um reset feito pelo CPU com os mesmos bytes passaria despercebido.
+  entra por cima. Um reset feito pelo CPU com os mesmos bytes do snapshot passa
+  despercebido.
+- **O que a GPU exportou não volta ao guest** (desligado em 25/09/2026). A cópia de volta
+  (writeback) chegava alguns quadros depois do desenho, mas o jogo vê a fence do desenho
+  já quando o Plume o grava, e então libera e reusa a memória. A cópia caía por cima:
+  o jogo disparava traps de asserção (`tw/td trap hit`), escrevia por ponteiros com lixo
+  (`write of guest 0x00000000`/`0x00000008` na Main XThread, em `sub_8224C010` e na
+  lista de fences do D3D `sub_82657978`) ou mandava lixo ao CP (`RingBuffer::ReadAndSwap`
+  num indirect buffer), sempre 1–2 min depois de entrar na fase. Sem a cópia: 7 min sem
+  nenhum desses sintomas. Os desenhos que leem o export são servidos pelos buffers da
+  GPU e não precisam dela. `files/plume-writeback` a religa para depuração.
 - As faixas ficam sempre em `k8in32`, a forma de qualquer stream de vértices no host.
 
 **As folhas gigantes (resolvido em 25/09/2026).** Eram três defeitos empilhados, todos
@@ -221,12 +230,65 @@ visíveis no dump das faixas (`files/exportdump`, gravado nos quadros com trace)
    - O `8070…` gira os cantos do quad por esse quaternion sem normalizar, então a folha
      escalava por |q|²: no dump havia |q|² ≈ 35 e componentes de ±24.000.
    - Correção: o recompilador grava em `ShaderInputElement::dstSwizzle` o swizzle com que
-     compilou cada busca. `CompareFetchSwizzle` compara esse swizzle com o da busca viva.
-     Quando a diferença é exatamente a troca de metades, o host liga `swapFloats` (input
-     assembler) ou `RENUT_LIVE_FETCH_SWAP_HALVES` (`vfetchLive`). Outras divergências,
-     como `zyxw` em cores `8_8_8_8`, vão para o log.
+     compilou cada busca. `FetchRemap` compara esse swizzle com o da busca viva e monta
+     um remapeamento dos componentes buscados: permutação, 0 ou 1. `unpackInput` e
+     `vfetchLive` aplicam o remapeamento, lido de `RENUT_SHARED_REMAP_OFFSET` ou dos bits
+     altos do stride. Isso cobre a troca de metades, o `zyxw` das cores `D3DCOLOR` e os
+     componentes que a declaração força em 0/1. Conflitos que um remapeamento por
+     componente não resolve vão para o log.
 
 Com a leitura corrigida, a exportação grava exatamente como o hardware: X nos bits baixos
 (como `PackHalf2x16` no rexglue) e depois o endian. A troca prévia de metades
 (`halvesSwapped`), tentada antes, só compensava o defeito 3 para quem lia sem o
 swizzle, e errava para os shaders que o têm.
+
+## Água da fase 1: patches de quad (25/09/2026)
+
+A água do primeiro mundo são dois desenhos tesselados em modo adaptativo, que o Plume
+descartava: `631D40DF78B583F7`, um patch de triângulos, e `8EDDB32357201CD0`, um patch de
+quads. Os dois entraram em `tools/shaders/domain-shaders.txt`. O Plume agora expande
+`kQuadPatch` numa grade de quads, com 4 pontos de controle por patch. Um domain shader de
+quad indexado por patch recebe r0 = (patch, u, v) e r1.x = 0 (referência:
+`spirv_translator.cpp` do rexglue). O recompilado lê r0 de `iDomainPatch.zyx` e r1.x de
+`.w`, então o host entrega `(v, u, patch, 0)`.
+
+Pendência: o nível de tesselação ainda é o máximo do desenho
+(`VGT_HOS_MAX_TESS_LEVEL`), e não os fatores por aresta que o jogo calcula com memory
+export. Na tela de carregamento houve ~290 ms por quadro com 287 milhões de vértices de
+patch em 300 quadros. O custo em jogo ainda não foi medido.
+
+## Banjo se desfazendo no portal: vértices 2_10_10_10 sem sinal (25/09/2026)
+
+Ao entrar num portal de mundo, o jogo tira uma foto de 128×128 do Banjo (um resolve,
+feito uma vez) e desenha ~3.500 quads com `35D0D3DF02172D01`/`A95227C3F47660F8`, cada um
+com um pedaço dessa foto. A posição de cada vértice é um `2_10_10_10` **sem sinal
+normalizado** (stride 8): `pos * c4.w + c4.xyz`, depois `c0..c3`. O `vfetch` vivo é `xyz1`,
+e o remap força o `w`. A UV é `16_16_FLOAT` no segundo dword, lida por `vfetchLive`.
+
+- `unpackInput` decodifica todo `2_10_10_10` como *signed normalized* (normais e
+  tangentes). Lido assim, o efeito tinha x/y/z acima de 0,5 negativos, e todos os
+  vértices projetavam atrás da câmera: riscos longos e cópias pequenas do Banjo.
+- Correção: `VertexFormat` liga um `2_10_10_10` sem sinal como `R10G10B10A2_UNORM`
+  (ou `_UINT`, inteiro), que a GPU decodifica como o Xenos. O Plume não tinha esse
+  formato: `android/plume-formats.patch` o acrescenta (`A2B10G10R10_*_PACK32`), e o
+  `tools/bootstrap-android.ps1` o aplica. Um `2_10_10_10` com sinal e inteiro (não
+  normalizado) ainda sairia normalizado pelo shader; nenhum foi visto.
+- O build compila uma cópia do `plume_vulkan.cpp` gerada na configuração do CMake. Uma
+  edição no original não chegava à cópia: o formato caía no `default` e virava
+  `VK_FORMAT_UNDEFINED` (quads do tamanho da tela). `CMAKE_CONFIGURE_DEPENDS` agora
+  refaz a cópia.
+- Conferência: decodificados no PC com as constantes do trace, os 3.570 quads têm
+  7–12 px, e nenhum atravessa o limite dos 10 bits.
+
+## Ferramentas de depuração do Plume (arquivos em `files/`)
+
+- `plume-trace-request`: trace do próximo quadro (verificado a cada 30 quadros).
+- `plume-trace-arm`: trace armado. Vazio, aprende os pares VS/PS de 150 quadros e depois
+  grava os 3 quadros seguintes a um par novo. Com um hash (hex), dispara só com esse
+  shader. Até 6 rajadas, em `plume-trace-arm-<rajada>-<quadro>.txt` e
+  `exportdump-arm-*`. O trace do shader-alvo traz o stream inteiro (`data<n>`).
+- O trace de cada desenho traz os primeiros dwords de cada stream (`data<n>`, já no
+  endian do host), as constantes `c0..c7` do VS (`vsc`) e os fetches próprios do shader
+  (`live<k>`).
+- `plume-skip-shader`: descarta os desenhos com esse hash (VS ou PS).
+- `plume-writeback`: religa a cópia de volta do memory export.

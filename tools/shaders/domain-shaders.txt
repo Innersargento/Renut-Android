@@ -6,3 +6,8 @@
 #
 # The water surface of the opening flyby.
 F09B139EE9188255
+
+# The sea of the first world: a triangle patch and a quad patch, both with
+# adaptive tessellation.
+631D40DF78B583F7
+8EDDB32357201CD0

@@ -145,6 +145,18 @@ index 9b9cf9e..377167a 100644
    // Must be guarded by the global critical region.
    util::NativeList dpc_list_;
    std::condition_variable_any dispatch_cond_;
+diff --git a/include/rex/system/mmio_handler.h b/include/rex/system/mmio_handler.h
+index 7ae42a8..c0dd194 100644
+--- a/include/rex/system/mmio_handler.h
++++ b/include/rex/system/mmio_handler.h
+@@ -74,6 +74,7 @@ class MMIOHandler {
+ 
+   static bool ExceptionCallbackThunk(arch::Exception* ex, void* data);
+   bool ExceptionCallback(arch::Exception* ex);
++  static void LogUnhandledFault(arch::Exception* ex);
+ 
+   uint8_t* virtual_membase_;
+   uint8_t* physical_membase_;
 diff --git a/include/rex/system/xevent.h b/include/rex/system/xevent.h
 index e81df52..ec9a0d0 100644
 --- a/include/rex/system/xevent.h
@@ -364,6 +376,35 @@ index 7a711a8..bd487c3 100644
  
    // Drain the semaphore of its count.
    auto client_semaphore = client_semaphores_[index].get();
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..1cba64a 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -586,8 +586,23 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+ 
+   const uint8_t skip_count = xma::GetPacketSkipCount(packet);
+ 
++  // A first-frame offset past the packet also means no frame begins in it, as
++  // GetNextPacketReadOffset already reads it; GetPacketInfo cannot parse such
++  // a packet (its bit stream asserts), so it is skipped like a full skip.
++  const bool no_frame_starts = packet_first_frame_offset > kBitsPerPacket;
++  if (no_frame_starts) {
++    static uint32_t logged = 0;
++    if (logged < 16) {
++      ++logged;
++      REXAPU_WARN("XmaContext {}: packet {} at {:08X} starts its first frame at bit {}, past the packet; skipped",
++                  id(), packet_index,
++                  data->GetCurrentInputBufferAddress() + uint32_t(packet_index) * kBytesPerPacket,
++                  packet_first_frame_offset);
++    }
++  }
++
+   // Full packet skip (0xFF) -- no new frames begin in this packet.
+-  if (skip_count == 0xFF) {
++  if (skip_count == 0xFF || no_frame_starts) {
+     uint32_t next_input_offset =
+         GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
+     if (next_input_offset == kBitsPerPacketHeader) {
 diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
 index a0a178d..f1396c5 100644
 --- a/src/audio/xma_decoder.cpp
@@ -1711,6 +1752,151 @@ index 697399c..d50e6fa 100644
 +
    LoadAchievementsData();
  }
+ 
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b93005..f64cf51 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -11,7 +11,16 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <mutex>
+ #include <utility>
++#include <vector>
++
++#if !defined(_WIN32)
++#include <dlfcn.h>
++#if defined(__ANDROID__)
++#include <android/log.h>
++#endif
++#endif
+ 
+ #include <rex/assert.h>
+ #include <rex/exception_handler.h>
+@@ -19,6 +28,8 @@
+ #include <rex/memory.h>
+ #include <rex/platform.h>
+ #include <rex/system/mmio_handler.h>
++#include <rex/system/thread_state.h>
++#include <rex/system/xmemory.h>
+ #include <rex/types.h>
+ 
+ using namespace rex::arch;
+@@ -364,6 +375,63 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
+ #endif  // REX_ARCH
+ }
+ 
++// An unhandled guest fault re-executes the faulting instruction forever, so
++// name the host code once per faulting instruction (as a library offset, for
++// llvm-addr2line on the unstripped library) with its caller.
++void MMIOHandler::LogUnhandledFault(arch::Exception* ex) {
++#if (REX_PLATFORM_ANDROID || REX_PLATFORM_LINUX) && REX_ARCH_ARM64
++  static std::mutex mutex;
++  static std::vector<uint64_t> seen;
++  std::lock_guard<std::mutex> guard(mutex);
++  const uint64_t pc = ex->pc();
++  if (std::find(seen.begin(), seen.end(), pc) != seen.end() || seen.size() > 64) return;
++  seen.push_back(pc);
++  auto where = [](uint64_t address) {
++    Dl_info info{};
++    if (dladdr(reinterpret_cast<void*>(address), &info) && info.dli_fname) {
++      return fmt::format("{}+0x{:X} ({})", info.dli_fname,
++                         address - reinterpret_cast<uint64_t>(info.dli_fbase),
++                         info.dli_sname ? info.dli_sname : "?");
++    }
++    return fmt::format("0x{:X}", address);
++  };
++  const auto& c = *ex->thread_context();
++  const std::string line =
++      fmt::format("Unhandled guest fault at {} called from {}; x0={:X} x1={:X} x2={:X} x3={:X}", where(pc),
++                  where(c.x[30]), c.x[0], c.x[1], c.x[2], c.x[3]);
++  REXLOG_ERROR("{}", line);
++#if defined(__ANDROID__)
++  // The runtime log rotates away within seconds of a fault loop; logcat keeps
++  // this line where it can still be found.
++  __android_log_write(ANDROID_LOG_ERROR, "rex-fault", line.c_str());
++#endif
++  // The guest registers name the object the guest code was working on; the
++  // host registers alone do not.
++  if (auto* ts = runtime::ThreadState::Get()) {
++    const PPCContext& g = *ts->context();
++    const PPCRegister* r[32] = {&g.r0,  &g.r1,  &g.r2,  &g.r3,  &g.r4,  &g.r5,  &g.r6,  &g.r7,
++                                &g.r8,  &g.r9,  &g.r10, &g.r11, &g.r12, &g.r13, &g.r14, &g.r15,
++                                &g.r16, &g.r17, &g.r18, &g.r19, &g.r20, &g.r21, &g.r22, &g.r23,
++                                &g.r24, &g.r25, &g.r26, &g.r27, &g.r28, &g.r29, &g.r30, &g.r31};
++    std::string regs = fmt::format("Guest regs: lr={:08X}", uint32_t(g.lr));
++    for (int i = 0; i < 32; ++i) regs += fmt::format(" r{}={:08X}", i, r[i]->u32);
++    std::string stack = fmt::format("Guest stack at {:08X}:", g.r1.u32);
++    for (uint32_t i = 0; i < 48; ++i) {
++      const uint32_t a = g.r1.u32 + i * 4;
++      stack += fmt::format(" {:08X}", rex::byte_swap(*ts->memory()->TranslateVirtual<const uint32_t*>(a)));
++    }
++    REXLOG_ERROR("{}", regs);
++    REXLOG_ERROR("{}", stack);
++#if defined(__ANDROID__)
++    __android_log_write(ANDROID_LOG_ERROR, "rex-fault", regs.c_str());
++    __android_log_write(ANDROID_LOG_ERROR, "rex-fault", stack.c_str());
++#endif
++  }
++#else
++  (void)ex;
++#endif
++}
++
+ bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
+   return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
+ }
+@@ -416,10 +484,12 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     }
+     // The address is not found within any range, so either a write watch or an
+     // actual access violation.
+-    if (access_violation_callback_) {
+-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
+-                                        fault_host_address, is_write);
++    if (access_violation_callback_ &&
++        access_violation_callback_(std::move(lock), access_violation_callback_context_,
++                                   fault_host_address, is_write)) {
++      return true;
+     }
++    LogUnhandledFault(ex);
+     return false;
+   }
+ 
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..bf65bf3 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -543,10 +544,18 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+   uint32_t virtual_address = HostToGuestVirtual(host_address);
+   BaseHeap* heap = LookupHeap(virtual_address);
+   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+-    REXSYS_ERROR(
+-        "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+-        is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+-        rex::thread::current_thread_id());
++    // The faulting instruction runs again as soon as this returns, so an
++    // unhandled fault repeats a thousand times a second; logging every one
++    // slowed the game to a crawl and rotated the log that named the faulting
++    // code (MMIOHandler::LogUnhandledFault) out of existence within seconds.
++    static std::atomic<uint64_t> unhandled{0};
++    const uint64_t count = unhandled.fetch_add(1) + 1;
++    if (count <= 16 || count % 100000 == 0) {
++      REXSYS_ERROR(
++          "Unhandled guest access violation #{}: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
++          count, is_write ? "write" : "read", virtual_address,
++          reinterpret_cast<uintptr_t>(host_address), rex::thread::current_thread_id());
++    }
+     return false;
+   }
  
 diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
 index d358f39..dc86180 100644

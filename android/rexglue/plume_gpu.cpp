@@ -12,6 +12,7 @@
 #include "smolv.h"
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -215,9 +216,9 @@ struct LiveElement {
   uint32_t format;
   bool is_signed, normalized;
   uint32_t usage, usage_index;
-  // The live fetch's swizzle is the recompiled one with the halves of each
-  // pair exchanged; see CompareFetchSwizzle.
-  bool swap_halves = false;
+  // What the live fetch does to the fetched components that the recompiled
+  // one does not, as RENUT_SHARED_REMAP_OFFSET stores it; see FetchRemap.
+  uint32_t remap = 0;
 };
 
 class HostShader : public gfx::Shader {
@@ -340,23 +341,45 @@ uint32_t TextureMask(const gfx::Shader& shader) {
 // patched the vfetch instructions for the current vertex declaration; the
 // recompiler recorded which instruction reads each element (fetchAddress).
 //
-// Direct3D patches the destination swizzle as well - every 16-bit element
-// gets .yxwz, which puts back the component order the k8in32 swap reversed -
-// and a shader the store found by its loose key was recompiled from microcode
-// without that patch (the containers extracted from the game's bundles). Such
-// a shader read the halves of every 16-bit pair exchanged: the falling leaves'
-// spin axis came out of unit length, so their rotation quaternion grew each
-// frame and the leaves with it, into sheets across the screen. The recompiler
-// records the swizzle it compiled each fetch with (dstSwizzle), and the
-// exchange is put back here when that is the whole difference.
-enum class SwizzleFix { kNone, kSwapHalves, kOther };
-SwizzleFix CompareFetchSwizzle(uint32_t compiled, uint32_t live) {
-  if (compiled == live) return SwizzleFix::kNone;
+// Direct3D patches the destination swizzle as well - .yxwz for a 16-bit
+// element, which puts back the component order the k8in32 swap reversed,
+// .zyxw for a D3DCOLOR, and the constants 0 and 1 for components the vertex
+// declaration does not have - and a shader the store found by its loose key
+// was recompiled from microcode without that patch (the containers extracted
+// from the game's bundles). Such a shader read the halves of every 16-bit pair
+// exchanged: the falling leaves' spin axis came out of unit length, so their
+// rotation quaternion grew each frame and the leaves with it, into sheets
+// across the screen. Colours came out with red and blue exchanged, and alpha
+// from memory where the hardware reads 1.
+//
+// The recompiler records the swizzle it compiled each fetch with (dstSwizzle).
+// Every register lane the recompiled code fills from fetched component c the
+// live code fills from component l, or with a constant, so component c is
+// remapped to l before the recompiled swizzle reads it. Returns the remap as
+// the shaders store it (xored with the identity, 0 for none), or ~0u when two
+// lanes want one component two ways.
+uint32_t FetchRemap(uint32_t compiled, uint32_t live) {
+  if (compiled == live) return 0;
+  uint32_t remap = RENUT_INPUT_REMAP_IDENTITY;
+  uint32_t set = 0;
   for (uint32_t i = 0; i < 4; ++i) {
     const uint32_t c = (compiled >> (3 * i)) & 7, l = (live >> (3 * i)) & 7;
-    if (c < 4 ? l != (c ^ 1) : l != c) return SwizzleFix::kOther;
+    if (c >= 4 || l == 7) {
+      // A lane the recompiled code fills with a constant or leaves alone, or
+      // one the live code leaves alone: nothing to take from memory.
+      if (c != l && c != 7 && l != 7) return ~0u;
+      continue;
+    }
+    if (l == 6) return ~0u;
+    const uint32_t shift = 3 * c;
+    if ((set >> c) & 1) {
+      if (((remap >> shift) & 7) != l) return ~0u;
+      continue;
+    }
+    set |= 1u << c;
+    remap = (remap & ~(7u << shift)) | (l << shift);
   }
-  return SwizzleFix::kSwapHalves;
+  return remap ^ RENUT_INPUT_REMAP_IDENTITY;
 }
 
 void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
@@ -387,8 +410,9 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
     }
     const uint32_t fetch_constant = ((full[0] >> 20) & 0x1F) * 3 + ((full[0] >> 25) & 0x3);
     if (fetch_constant > 95 || 95 - fetch_constant >= 16) continue;
-    const SwizzleFix fix = CompareFetchSwizzle(e.dstSwizzle, f[1] & 0xFFF);
-    if (fix == SwizzleFix::kOther) {
+    uint32_t remap = FetchRemap(e.dstSwizzle, f[1] & 0xFFF);
+    if (remap == ~0u) {
+      remap = 0;
       static uint32_t logged = 0;
       if (logged < 32) {
         ++logged;
@@ -404,9 +428,8 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
       uint32_t scale_bits;
       std::memcpy(&scale_bits, &scale, 4);
       out_fetches.push_back(
-          {e.slot, {(95 - fetch_constant) | (((f[1] >> 16) & 0x3F) << 8) | (flags << 16) |
-                        (fix == SwizzleFix::kSwapHalves ? RENUT_LIVE_FETCH_SWAP_HALVES : 0u),
-                    (full[2] & 0xFF) * 4, ((f[2] >> 8) & 0x7FFFFF) * 4, scale_bits}});
+          {e.slot, {(95 - fetch_constant) | (((f[1] >> 16) & 0x3F) << 8) | (flags << 16),
+                    (full[2] & 0xFF) * 4 | (remap << 16), ((f[2] >> 8) & 0x7FFFFF) * 4, scale_bits}});
       continue;
     }
     LiveElement live;
@@ -419,7 +442,7 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
     live.normalized = !((f[1] >> 13) & 1);
     live.usage = e.usage;
     live.usage_index = e.usageIndex;
-    live.swap_halves = fix == SwizzleFix::kSwapHalves;
+    live.remap = remap;
     out_elements.push_back(live);
   }
 }
@@ -489,6 +512,14 @@ RenderFormat VertexFormat(uint32_t format, bool is_signed, bool normalized, Inpu
     case 38: return RenderFormat::R32G32B32A32_FLOAT;
     case 57: return RenderFormat::R32G32B32_FLOAT;
     case 7:
+      // unpackInput decodes only the signed normalized form (normals and
+      // tangents). An unsigned one read that way turned its 2-bit W of 1 into
+      // -1 and its halves above 0.5 negative: the pieces of Banjo that fly
+      // into a world portal (35D0D3DF02172D01) streaked across the screen.
+      if (!is_signed) {
+        return normalized ? RenderFormat::R10G10B10A2_UNORM
+                          : integer(RenderFormat::R10G10B10A2_UINT, RenderFormat::R10G10B10A2_UINT);
+      }
       decode = InputDecode::kPacked1010102;
       return RenderFormat::R32_FLOAT;
     case 16:
@@ -765,11 +796,34 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // One-frame trace: touching <files>/plume-trace-request records the next
   // frame's draws and resolves into <files>/plume-trace.txt.
   FILE* trace_ = nullptr;
+  // Armed trace, for effects too short to hit by request: while
+  // <files>/plume-trace-arm exists, the shader pairs of 150 frames are learned,
+  // and then a frame that draws a pair not seen before has the next 3 frames
+  // traced into <files>/plume-trace-arm-<burst>-<frame>.txt (6 bursts at most).
+  bool arm_ = false;
+  uint32_t arm_learn_ = 0, arm_burst_ = 0, arm_left_ = 0;
+  std::unordered_set<uint64_t> arm_pairs_;
+  std::vector<std::pair<uint64_t, uint64_t>> arm_new_;
+  // A shader hash (hex) in the arm file: no learning, only draws with that
+  // vertex or pixel shader fire a burst.
+  uint64_t arm_target_ = 0;
+  // Where the traced frame's exported ranges go: "exportdump", or a folder of
+  // its own for an armed frame.
+  std::string trace_dump_name_ = "exportdump";
   // Debug: <files>/plume-skip holds a bit mask of draw kinds to drop (see IssueDraw).
   uint32_t skip_mask_ = 0;
+  // What exporting shaders write stays on the GPU: the draws that read it are
+  // served from the export buffers. Copying it back to guest memory a few
+  // frames late overwrote memory the game had freed and reused (its asserts
+  // fired, then it wrote through garbage pointers or fed the CP garbage), so
+  // it is only done, for debugging, while <files>/plume-writeback exists.
+  bool writeback_ = false;
   // Debug: <files>/plume-drawskip holds "<first> <end>": draws of each frame
   // with an index in that range are dropped (to bisect a rendering bug).
   uint32_t drawskip_first_ = 0, drawskip_end_ = 0, frame_draw_ = 0;
+  // Debug: <files>/plume-skip-shader holds a shader hash (hex); draws with
+  // that vertex or pixel shader are dropped.
+  uint64_t skip_shader_ = 0;
   // Debug: <files>/plume-snap holds "<hex address> <n>": the n-th resolve of
   // the frame into that address is copied aside and presented instead of the
   // front buffer, to see an intermediate pass on screen.
@@ -1250,6 +1304,7 @@ PlumeCommandProcessor::ExportRange* PlumeCommandProcessor::GetExport(uint32_t ba
 void PlumeCommandProcessor::RecordWritebacks() {
   auto& list = writebacks_[slot_];
   list.clear();
+  if (!writeback_) return;
   uint64_t total = 0;
   for (const auto& [key, range] : exports_) {
     if (range.exported_frame == swaps_) total += range.size;
@@ -1277,6 +1332,10 @@ void PlumeCommandProcessor::RecordWritebacks() {
 void PlumeCommandProcessor::ApplyWritebacks(uint32_t slot) {
   auto& list = writebacks_[slot];
   if (list.empty()) return;
+  if (!writeback_) {
+    list.clear();
+    return;
+  }
   const auto* data = static_cast<const uint8_t*>(writeback_buffers_[slot]->map());
   constexpr uint32_t kBlock = 256;
   alignas(16) uint8_t block[kBlock];
@@ -2328,6 +2387,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // Primitive.
   RenderPrimitiveTopology topology = RenderPrimitiveTopology::UNKNOWN;
   bool point_list = false, rect_list = false, quad_list = false, patch_list = false;
+  bool quad_patch = false;
   switch (prim_type) {
     case xenos::PrimitiveType::kPointList:
       // Particles. Every point becomes a sprite in point_list.geom, sized by
@@ -2348,6 +2408,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       topology = RenderPrimitiveTopology::TRIANGLE_LIST;
       quad_list = true;
       break;
+    case xenos::PrimitiveType::kQuadPatch:
+      // The sea of the first world, as a grid of quads.
+      quad_patch = true;
+      [[fallthrough]];
     case xenos::PrimitiveType::kTrianglePatch:
       // The water. The guest's shader runs as the domain stage, once per point
       // of a patch that Plume expands itself: the driver here reports no
@@ -2473,6 +2537,19 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
 
+  if (skip_shader_ && (vs->entry->hash == skip_shader_ || (ps && ps->entry->hash == skip_shader_))) {
+    return true;
+  }
+  if (arm_) {
+    const uint64_t ps_hash = ps ? ps->entry->hash : 0;
+    if (arm_target_) {
+      if ((vs->entry->hash == arm_target_ || ps_hash == arm_target_) && arm_new_.empty()) {
+        arm_new_.emplace_back(vs->entry->hash, ps_hash);
+      }
+    } else if (arm_pairs_.insert(vs->entry->hash * 0x9E3779B97F4A7C15ull ^ ps_hash).second && !arm_learn_) {
+      arm_new_.emplace_back(vs->entry->hash, ps_hash);
+    }
+  }
   if (trace_) {
     std::string line = fmt::format("draw #{} vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X}",
                                    draw_index,
@@ -2593,6 +2670,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   std::array<uint32_t, 17> slot_sizes{};
   std::array<bool, 17> slot_used{};
   uint32_t swapped[7] = {};  // texcoord, normal, binormal, tangent, blendweight, position, blendindices
+  uint32_t input_remap[RENUT_INPUT_REMAP_COUNT] = {};
   uint32_t packed_inputs = 0, int_inputs = 0;
   bool r11g11b10_normals = false;
   uint64_t streams[RENUT_VERTEX_STREAM_COUNT] = {};
@@ -2726,9 +2804,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     // puts 16-bit halves back in memory order. A shader recompiled with that
     // swizzle needs nothing more - swapping every 16-bit element here mangled
     // every mesh with half-float positions. One recompiled without it gets the
-    // exchange from swapFloats (see CompareFetchSwizzle); plume-skip bit 512
-    // still forces it on every 16-bit element, the old behaviour.
-    if (element->swap_halves || (IsSixteenBitFormat(element->format) && (skip_mask_ & 512))) {
+    // difference remapped (see FetchRemap).
+    if (location < RENUT_INPUT_REMAP_COUNT) input_remap[location] = element->remap;
+    // Debug: plume-skip bit 512 reverses every 16-bit pair a second time, the
+    // old behaviour.
+    if (IsSixteenBitFormat(element->format) && (skip_mask_ & 512)) {
       // Debug: the old behaviour, reversing the 16-bit pairs a second time.
       int which = -1;
       switch (element->usage) {
@@ -2761,6 +2841,34 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                           e->stride, e->offset, uint32_t(fetch.endian));
     }
     Trace("{}", line);
+    // The first vertices' dwords as the host reads them (already swapped), by
+    // stream, and the fetches the shader does on its own.
+    for (uint32_t stream = 0; stream < slot_sizes.size(); ++stream) {
+      if (!slot_sizes[stream] || slot_buffers[stream] != upload_.get()) continue;
+      const auto* words = reinterpret_cast<const uint32_t*>(Pointer(slot_offsets[stream]));
+      line = fmt::format("  data{}", stream);
+      // All of it for the shader an armed trace is after.
+      const uint32_t shown = vs->entry->hash == arm_target_ ? 4096 : 16;
+      for (uint32_t i = 0; i < std::min<uint32_t>(shown, slot_sizes[stream] / 4); ++i) {
+        line += fmt::format(" {:08X}", words[i]);
+      }
+      Trace("{}", line);
+    }
+    line = "  vsc";
+    for (uint32_t i = 0; i < 8; ++i) {
+      line += fmt::format(" c{}=({},{},{},{})", i, regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 0),
+                          regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 1),
+                          regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 2),
+                          regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 3));
+    }
+    Trace("{}", line);
+    for (const auto& [k, entry] : patch_list ? vs->domain_live_fetches : vs->live_fetches) {
+      float scale;
+      std::memcpy(&scale, &entry[3], 4);
+      Trace("  live{} stream={} format={} flags={} stride={} remap={:X} offset={} scale={}", k,
+            entry[0] & 0xFF, (entry[0] >> 8) & 0xFF, entry[0] >> 16, entry[1] & 0xFFFF, entry[1] >> 16,
+            entry[2], scale);
+    }
   }
   if (skip_mask_) {
     bool skinned = false, half_position = false;
@@ -2779,6 +2887,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (zero_used) input_slots.emplace_back(kZeroBinding, 0);
   // g_SwappedTexcoords +0, Normals +16, Binormals +20, Tangents +24,
   // BlendWeights +28, Positions +32.
+  std::memcpy(sh + RENUT_SHARED_REMAP_OFFSET, input_remap, sizeof(input_remap));
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 0, &swapped[0], 4);
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 16, &swapped[1], 4);
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 20, &swapped[2], 4);
@@ -2999,16 +3108,17 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   uint64_t patch_domain_offset = 0;
   uint32_t patch_domain_bytes = 0;
   if (patch_list) {
-    // Every three control points are a patch, and each is expanded into a grid
-    // of level * level triangles over the triangle's own coordinates. The
-    // guest's per-edge factors live where the indices would be, but the draw
-    // that computes them exports to memory, which Plume does not run yet, so
-    // the level is the ceiling the guest set for this draw.
-    const uint32_t patches = index_count / 3;
+    // Every three control points are a patch - four for a quad patch - and
+    // each is expanded into a grid of level * level triangles over the
+    // triangle's own coordinates, or level * level quads over the quad's. The
+    // guest's per-edge factors live where the indices would be, computed by a
+    // draw that exports them to memory; the level is still the ceiling the
+    // guest set for this draw.
+    const uint32_t patches = index_count / (quad_patch ? 4 : 3);
     const float wanted = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
     const uint32_t level =
         std::clamp(uint32_t(wanted > 1.0f ? wanted : 1.0f), 1u, kMaxPatchLevel);
-    const uint32_t per_patch = level * level * 3;
+    const uint32_t per_patch = level * level * (quad_patch ? 6 : 3);
     vertex_count = patches * per_patch;
     indexed = false;
     if (!patches || !vertex_count) {
@@ -3028,7 +3138,28 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       *out++ = float(row) * step;
       *out++ = float(patch);
     };
-    for (uint32_t patch = 0; patch < patches; ++patch) {
+    // A patch-indexed quad domain shader takes the patch index in r0.x and
+    // the domain location in r0.yz, and r1.x is zero; the recompiled shader
+    // reads r0 as iDomainPatch.zyx and r1.x as its w.
+    auto quad_corner = [&](uint32_t patch, uint32_t u, uint32_t v) {
+      *out++ = float(v) * step;
+      *out++ = float(u) * step;
+      *out++ = float(patch);
+      *out++ = 0.0f;
+    };
+    for (uint32_t patch = 0; quad_patch && patch < patches; ++patch) {
+      for (uint32_t v = 0; v < level; ++v) {
+        for (uint32_t u = 0; u < level; ++u) {
+          quad_corner(patch, u, v);
+          quad_corner(patch, u + 1, v);
+          quad_corner(patch, u + 1, v + 1);
+          quad_corner(patch, u, v);
+          quad_corner(patch, u + 1, v + 1);
+          quad_corner(patch, u, v + 1);
+        }
+      }
+    }
+    for (uint32_t patch = 0; !quad_patch && patch < patches; ++patch) {
       for (uint32_t row = 0; row < level; ++row) {
         for (uint32_t col = 0; col + row < level; ++col) {
           corner(patch, row, col);
@@ -3588,7 +3719,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     if (export_dump && renderer && !miss_dump_directory_.empty()) {
       renderer->WaitForAllSlots();
       const std::string directory =
-          miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/exportdump";
+          miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/" + trace_dump_name_;
       mkdir(directory.c_str(), 0755);
       const auto* data = static_cast<const uint8_t*>(export_dump->map());
       for (const auto& [at, range] : export_dump_at) {
@@ -3606,10 +3737,53 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       REXLOG_INFO("Renut: Plume wrote {} exported ranges", export_dump_at.size());
     }
   }
-  if (++swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
+  ++swaps_;
+  if (!miss_dump_directory_.empty()) {
+    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    if (swaps_ % 30 == 0) {
+      const bool arm = access((root + "/plume-trace-arm").c_str(), F_OK) == 0;
+      if (arm && !arm_) {
+        arm_pairs_.clear();
+        arm_target_ = 0;
+        if (FILE* file = std::fopen((root + "/plume-trace-arm").c_str(), "r")) {
+          unsigned long long target = 0;
+          if (std::fscanf(file, "%llx", &target) == 1) arm_target_ = target;
+          std::fclose(file);
+        }
+        arm_learn_ = arm_target_ ? 0 : 150;
+        arm_burst_ = arm_left_ = 0;
+        if (arm_target_) {
+          REXLOG_INFO("Renut: Plume trace armed on shader {:016X}", arm_target_);
+        } else {
+          REXLOG_INFO("Renut: Plume trace armed, learning the scene's shaders");
+        }
+      }
+      arm_ = arm;
+    }
+    if (arm_learn_ && !--arm_learn_) REXLOG_INFO("Renut: Plume trace armed with {} shader pairs", arm_pairs_.size());
+    if (arm_ && !trace_ && !arm_left_ && !arm_new_.empty() && arm_burst_ < 6) {
+      ++arm_burst_;
+      arm_left_ = 3;
+      for (const auto& [vs_hash, ps_hash] : arm_new_) {
+        REXLOG_INFO("Renut: Plume trace burst {} on new pair vs={:016X} ps={:016X}", arm_burst_, vs_hash,
+                    ps_hash);
+      }
+    }
+    arm_new_.clear();
+    if (arm_left_ && !trace_) {
+      const std::string name = fmt::format("{}/plume-trace-arm-{}-{}.txt", root, arm_burst_, 4 - arm_left_);
+      trace_ = std::fopen(name.c_str(), "w");
+      trace_dump_name_ = fmt::format("exportdump-arm-{}-{}", arm_burst_, 4 - arm_left_);
+      --arm_left_;
+    }
+  }
+  if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
     const std::string request = root + "/plume-trace-request";
-    if (std::remove(request.c_str()) == 0) trace_ = std::fopen((root + "/plume-trace.txt").c_str(), "w");
+    if (!trace_ && std::remove(request.c_str()) == 0) {
+      trace_ = std::fopen((root + "/plume-trace.txt").c_str(), "w");
+      trace_dump_name_ = "exportdump";
+    }
     texdump_directory_.clear();
     if (std::remove((root + "/plume-texdump-request").c_str()) == 0) {
       texdump_directory_ = root + "/texdump";
@@ -3631,6 +3805,11 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       fetch_layouts_.clear();
     }
     skip_mask_ = mask;
+    const bool writeback = access((root + "/plume-writeback").c_str(), F_OK) == 0;
+    if (writeback != writeback_) {
+      REXLOG_INFO("Renut: Plume export writeback {}", writeback ? "on" : "off");
+    }
+    writeback_ = writeback;
     uint32_t address = 0, ordinal = 0;
     if (FILE* file = std::fopen((root + "/plume-snap").c_str(), "r")) {
       if (std::fscanf(file, "%x %u", &address, &ordinal) != 2) address = ordinal = 0;
@@ -3651,6 +3830,13 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     drawskip_first_ = first;
     drawskip_end_ = end;
+    unsigned long long skip_shader = 0;
+    if (FILE* file = std::fopen((root + "/plume-skip-shader").c_str(), "r")) {
+      if (std::fscanf(file, "%llx", &skip_shader) != 1) skip_shader = 0;
+      std::fclose(file);
+    }
+    if (skip_shader != skip_shader_) REXLOG_INFO("Renut: Plume dropping shader {:016X}", skip_shader);
+    skip_shader_ = skip_shader;
   }
   // A range nothing has exported into for a while goes back to guest memory.
   for (auto it = exports_.begin(); it != exports_.end();) {

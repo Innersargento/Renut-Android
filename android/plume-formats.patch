@@ -1,0 +1,47 @@
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+index 9dcfedf..093ece3 100644
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -160,6 +160,9 @@ namespace plume {
+         BC7_TYPELESS,
+         BC7_UNORM,
+         BC7_UNORM_SRGB,
++        // X in the low bits, the 2-bit W on top (Vulkan's A2B10G10R10 packs).
++        R10G10B10A2_UNORM,
++        R10G10B10A2_UINT,
+         MAX
+     };
+ 
+@@ -548,6 +551,8 @@ namespace plume {
+         case RenderFormat::R16G16_SINT:
+         case RenderFormat::R32_TYPELESS:
+         case RenderFormat::D32_FLOAT:
++        case RenderFormat::R10G10B10A2_UNORM:
++        case RenderFormat::R10G10B10A2_UINT:
+         case RenderFormat::R32_FLOAT:
+         case RenderFormat::R32_UINT:
+         case RenderFormat::R32_SINT:
+@@ -632,6 +637,8 @@ namespace plume {
+         case RenderFormat::R32_TYPELESS:
+         case RenderFormat::D32_FLOAT:
+         case RenderFormat::D32_FLOAT_S8_UINT:
++        case RenderFormat::R10G10B10A2_UNORM:
++        case RenderFormat::R10G10B10A2_UINT:
+         case RenderFormat::R32_FLOAT:
+         case RenderFormat::R32_UINT:
+         case RenderFormat::R32_SINT:
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index f1dd503..124ed8c 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -249,6 +249,10 @@ namespace plume {
+             return VK_FORMAT_BC7_UNORM_BLOCK;
+         case RenderFormat::BC7_UNORM_SRGB:
+             return VK_FORMAT_BC7_SRGB_BLOCK;
++        case RenderFormat::R10G10B10A2_UNORM:
++            return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++        case RenderFormat::R10G10B10A2_UINT:
++            return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+         default:
+             assert(false && "Unknown format.");
+             return VK_FORMAT_UNDEFINED;

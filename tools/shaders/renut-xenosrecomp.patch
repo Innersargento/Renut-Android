@@ -153,10 +153,10 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..8a5bcb5 100644
+index ee3830d..c23d67a 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -73,9 +73,58 @@
+@@ -73,9 +73,64 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -180,10 +180,8 @@ index ee3830d..8a5bcb5 100644
 +// | flags << 16, stride bytes, offset bytes, exp scale as float bits.
 +#define RENUT_LIVE_FETCH_COUNT           32
 +#define RENUT_LIVE_FETCH_LOCATION        0xFE
-+// Set in a live fetch's first word when its components come in with the halves
-+// of each pair exchanged (.yxwz) relative to the swizzle the shader was
-+// recompiled with - see ShaderInputElement::dstSwizzle.
-+#define RENUT_LIVE_FETCH_SWAP_HALVES     (1u << 24)
++// A live fetch's second word carries its stride in the low 16 bits and, in
++// bits 16..27, the component remap of RENUT_SHARED_REMAP_OFFSET for it.
 +#define RENUT_SHARED_FETCH_OFFSET        (RENUT_SHARED_INPUTS_OFFSET + 16)                   // 1280 .. 1791
 +// Point sprites. A float4 in guest pixels - PA_SU_POINT_SIZE's width and
 +// height, the diameter used when the vertex shader writes none, then
@@ -198,7 +196,15 @@ index ee3830d..8a5bcb5 100644
 +// guest memory; a store outside every range is dropped. See renutMemExport.
 +#define RENUT_EXPORT_RANGE_COUNT         8
 +#define RENUT_SHARED_EXPORT_OFFSET       (RENUT_SHARED_POINT_OFFSET + 32)                    // 1824 .. 1951
-+#define RENUT_SHARED_SIZE                (RENUT_SHARED_EXPORT_OFFSET + RENUT_EXPORT_RANGE_COUNT * 16)  // 1952
++// Vertex input component remap, a uint per input location: which fetched
++// component (0..3), or the constant 0 (4) or 1 (5), each of the four
++// components becomes, three bits each, stored xored with the identity (0x688)
++// so that zero changes nothing. It turns what the recompiled vfetch reads into
++// what the live one does - see ShaderInputElement::dstSwizzle.
++#define RENUT_INPUT_REMAP_COUNT          32
++#define RENUT_INPUT_REMAP_IDENTITY       0x688u
++#define RENUT_SHARED_REMAP_OFFSET        (RENUT_SHARED_EXPORT_OFFSET + RENUT_EXPORT_RANGE_COUNT * 16)  // 1952 .. 2079
++#define RENUT_SHARED_SIZE                (RENUT_SHARED_REMAP_OFFSET + RENUT_INPUT_REMAP_COUNT * 4)     // 2080
 +
 +// Set in a cache entry's specConstantsMask when the shader exports to memory,
 +// so the host knows to look for the streams it writes. Not a specialization
@@ -218,7 +224,7 @@ index ee3830d..8a5bcb5 100644
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -119,6 +168,11 @@
+@@ -119,6 +174,11 @@
      X(TexCoord,     9, 21) \
      X(TexCoord,    10, 22)
  
@@ -230,7 +236,7 @@ index ee3830d..8a5bcb5 100644
  #ifdef __cplusplus
  #include <cstdint>
  
-@@ -136,7 +190,7 @@
+@@ -136,7 +196,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -239,7 +245,7 @@ index ee3830d..8a5bcb5 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +206,19 @@ struct ShaderInputElement
+@@ -152,6 +212,20 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -251,15 +257,16 @@ index ee3830d..8a5bcb5 100644
 +    // bound microcode decodes the live values from this instruction.
 +    uint16_t fetchAddress;
 +    // The destination swizzle of that vfetch as this shader was recompiled
-+    // with it, baked into the code. Direct3D rewrites it too - a 16-bit
-+    // element gets .yxwz - and a shader found by its loose key was compiled
-+    // from microcode that may predate the rewrite, so the host compares the
-+    // two and puts the difference back (swapFloats, RENUT_LIVE_FETCH_SWAP_HALVES).
++    // with it, baked into the code. Direct3D rewrites it too - .yxwz for a
++    // 16-bit element, .zyxw for a D3DCOLOR, 0 and 1 for the components a
++    // declaration does not have - and a shader found by its loose key was
++    // compiled from microcode that predates the rewrite, so the host compares
++    // the two and remaps the fetched components (RENUT_SHARED_REMAP_OFFSET).
 +    uint16_t dstSwizzle;
  };
  #endif
  
-@@ -224,6 +291,9 @@ struct PushConstants
+@@ -224,6 +298,9 @@ struct PushConstants
  #define g_SwappedBlendWeights vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 28)
  #define g_SwappedPositions    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 32)
  #define g_SintTexcoords       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_MISC_OFFSET + 36)
@@ -269,7 +276,7 @@ index ee3830d..8a5bcb5 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -235,6 +305,9 @@ struct PushConstants
+@@ -235,6 +312,9 @@ struct PushConstants
  // pipeline a pixel-space rectangle and disables the viewport.
  #define g_ViewportScaleOffset vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + RENUT_SHARED_VIEWPORT_OFFSET, 0x10)
  
@@ -279,7 +286,7 @@ index ee3830d..8a5bcb5 100644
  // A vfetch the vertex declaration does not describe - see the stream table's
  // comment. `index` is whatever register the instruction named, so it arrives as
  // a float holding an integer; `strideBytes` and `offsetBytes` are the
-@@ -253,6 +326,158 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,6 +333,160 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -428,17 +435,19 @@ index ee3830d..8a5bcb5 100644
 +
 +// A vertex input indexed by a register the shader computed, with the stream,
 +// format, stride and offset of the live (bind-time patched) instruction.
++float4 renutRemap(float4 value, uint code);
++
 +float4 vfetchLive(uint k, float index)
 +{
 +    uint4 d = vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + RENUT_SHARED_FETCH_OFFSET + k * 16, 0x10);
-+    float4 value = vfetchStreamFormat(d.x & 0xFF, index, d.y, d.z, (d.x >> 8) & 0xFF, (d.x >> 16) & 0xFF, asfloat(d.w));
-+    return (d.x & RENUT_LIVE_FETCH_SWAP_HALVES) != 0 ? value.yxwz : value;
++    float4 value = vfetchStreamFormat(d.x & 0xFF, index, d.y & 0xFFFF, d.z, (d.x >> 8) & 0xFF, (d.x >> 16) & 0xFF, asfloat(d.w));
++    return renutRemap(value, (d.y >> 16) & 0xFFF);
 +}
 +
  // Per-stage float4 constant file. The recompiler picks the stage by defining
  // RENUT_STAGE_CONSTANTS to the matching push-constant address.
  #define cReg(INDEX) \
-@@ -289,7 +514,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -289,7 +523,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint   g_SwappedBlendWeights             : packoffset(c67.w); \
      uint   g_SwappedPositions                : packoffset(c68.x); \
      uint   g_SintTexcoords                   : packoffset(c68.y); \
@@ -452,7 +461,7 @@ index ee3830d..8a5bcb5 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -317,6 +547,198 @@ uint g_SpecConstants();
+@@ -317,6 +556,198 @@ uint g_SpecConstants();
  #ifdef RENUT_RECOMP
  // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
  #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
@@ -651,14 +660,37 @@ index ee3830d..8a5bcb5 100644
  #endif
  
  #ifdef RENUT_RECOMP
-@@ -483,6 +905,25 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +914,53 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
++// The fetched components as the live vfetch has them; `code` is a remap
++// stored xored with the identity (see RENUT_SHARED_REMAP_OFFSET).
++float4 renutRemap(float4 value, uint code)
++{
++    if (code == 0)
++        return value;
++    code ^= RENUT_INPUT_REMAP_IDENTITY;
++    float4 result;
++    [unroll] for (uint i = 0; i < 4; ++i)
++    {
++        uint source = (code >> (3 * i)) & 7;
++        result[i] = source < 4 ? value[source] : (source == 5 ? 1.0 : 0.0);
++    }
++    return result;
++}
++
++#ifdef __spirv__
++#define g_InputRemap(LOCATION) \
++    ((LOCATION) < RENUT_INPUT_REMAP_COUNT ? vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + RENUT_SHARED_REMAP_OFFSET + (LOCATION) * 4) : 0u)
++#else
++#define g_InputRemap(LOCATION) 0u
++#endif
++
 +// 2_10_10_10 signed normalized (N&B's normals, tangents and some texcoords):
 +// no host vertex format matches, so the host binds the 32 bits as R32_FLOAT
 +// and flags the input's location in g_PackedInputs.
-+float4 unpackInput(float4 value, uint location)
++float4 unpackInputDecoded(float4 value, uint location)
 +{
 +    if ((g_PackedInputs & (1u << location)) != 0)
 +    {
@@ -672,6 +704,11 @@ index ee3830d..8a5bcb5 100644
 +    if ((g_IntInputs & (1u << location)) != 0)
 +        return float4(asint(value));
 +    return value;
++}
++
++float4 unpackInput(float4 value, uint location)
++{
++    return renutRemap(unpackInputDecoded(value, location), g_InputRemap(location));
 +}
 +
  // Undo the engine bswap32 16-bit-pair swap (.yxwz) for any 16-bit-packed semantic flagged in the mask.

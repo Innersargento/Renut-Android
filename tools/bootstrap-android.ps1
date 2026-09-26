@@ -17,3 +17,13 @@ foreach ($dep in $deps) {
     git -C $path submodule update --init --recursive
     if ($LASTEXITCODE) { throw 'Falha nos submodulos.' }
 }
+# Formatos que o Plume nao tem (vertices 2_10_10_10 sem sinal), aplicados sobre a revisao fixada.
+$plume = Join-Path $renutRoot 'external/plume'
+$patch = Join-Path $renutRoot 'android/plume-formats.patch'
+git -C $plume apply --reverse --check $patch 2>$null
+if ($LASTEXITCODE) {
+    git -C $plume apply --check $patch
+    if ($LASTEXITCODE) { throw 'Patch do Plume incompativel com alteracoes locais; nenhum arquivo sobrescrito.' }
+    git -C $plume apply $patch
+    if ($LASTEXITCODE) { throw 'Falha ao aplicar o patch do Plume.' }
+}
