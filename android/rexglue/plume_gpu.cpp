@@ -620,6 +620,18 @@ struct Resolved {
   uint32_t fitted_width = 0, fitted_height = 0, fitted_descriptor = 0;
   uint64_t fitted_generation = UINT64_MAX;
   RenderTextureLayout fitted_layout = RenderTextureLayout::UNKNOWN;
+  // A depth resolve (R32_FLOAT, depth in x) seen through the fetch
+  // constant's swizzle, keyed by swizzle | fitted << 12. A Xenos depth
+  // texture returns the depth in every channel; the game's depth restore
+  // reads it as .w, which an R32_FLOAT view gives as 1.
+  struct SwizzledView {
+    const RenderTexture* texture = nullptr;
+    std::unique_ptr<RenderTextureView> view;
+    uint32_t descriptor = 0;
+  };
+  std::map<uint32_t, SwizzledView> swizzled;
+  // Last written by a depth resolve.
+  bool depth = false;
 };
 
 struct GuestTexture {
@@ -834,7 +846,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // culling, to show where they land and what colour they come out.
   uint64_t debug_shader_ = 0;
   // "<hash> <mode>": 1 drops the depth test, 2 blending, 4 alpha test and
-  // culling (7 when left out); 8 draws a point list's sprite coordinate.
+  // culling (7 when left out); 8 draws a point list's sprite coordinate; 16
+  // and 32 whiten textures (see the shared block).
   uint32_t debug_mode_ = 7;
   std::map<std::tuple<std::string, uint64_t, uint64_t, bool>, uint64_t> drops_;
   // Debug: <files>/plume-snap holds "<hex address> <n>": the n-th resolve of
@@ -969,6 +982,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Textures replaced while the frame's commands may still use them; freed
   // once the frame has run (IssueSwap waits for it).
   std::array<std::vector<std::unique_ptr<RenderTexture>>, kPlumeFramesInFlight> retired_slots_;
+  std::array<std::vector<std::unique_ptr<RenderTextureView>>, kPlumeFramesInFlight> retired_views_;
   // A recorded draw stores a bindless index, not a snapshot of that binding.
   // Keep old image bindings alive until the submission has finished as well.
   std::array<std::vector<uint32_t>, kPlumeFramesInFlight> retired_descriptor_slots_;
@@ -986,6 +1000,14 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     if (descriptor) retired_descriptor_slots_[slot_].push_back(descriptor);
     descriptor = 0;
   }
+  void RetireSwizzled(Resolved& r) {
+    for (auto& [key, s] : r.swizzled) {
+      if (s.view) retired_views_[slot_].push_back(std::move(s.view));
+      if (s.descriptor) retired_descriptor_slots_[slot_].push_back(s.descriptor);
+    }
+    r.swizzled.clear();
+  }
+  uint32_t SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle);
   std::array<std::vector<std::unique_ptr<RenderFramebuffer>>, kPlumeFramesInFlight>
       retired_framebuffer_slots_;
   static uint64_t ResolvedKey(uint32_t address, RenderFormat format) {
@@ -1008,6 +1030,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
         // Something else lives here now; forget every resolve at the address.
         for (auto it = resolved_.begin(); it != resolved_.end();) {
           if (uint32_t(it->first) == address) {
+            RetireSwizzled(it->second);
             RetireTexture(it->second.texture, it->second.descriptor);
             RetireTexture(it->second.fitted, it->second.fitted_descriptor);
             it = resolved_.erase(it);
@@ -1560,6 +1583,7 @@ void PlumeCommandProcessor::BeginFrame() {
   retired_descriptor_slots_[slot_].clear();
   retired_framebuffer_slots_[slot_].clear();
   retired_slots_[slot_].clear();
+  retired_views_[slot_].clear();
   retired_buffers_[slot_].clear();
   StartList();
   // Only here, never from Flush: a mid-frame flush keeps recording into the
@@ -1698,14 +1722,40 @@ void PlumeCommandProcessor::MergeResolvedTails(uint32_t address, Resolved& dest)
     list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
         RenderTextureCopyLocation::Subresource(tail.texture.get()), 0, y, 0, &box);
     dest.generation += tail.generation;
+    RetireSwizzled(tail);
     RetireTexture(tail.texture, tail.descriptor);
     RetireTexture(tail.fitted, tail.fitted_descriptor);
     it = resolved_.erase(it);
   }
 }
 
+uint32_t PlumeCommandProcessor::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle) {
+  RenderTexture* texture = fitted ? r.fitted.get() : r.texture.get();
+  if (!texture) return 0;
+  Resolved::SwizzledView& s = r.swizzled[swizzle | (uint32_t(fitted) << 12)];
+  if (s.texture != texture || !s.view || !s.descriptor) {
+    if (s.view) retired_views_[slot_].push_back(std::move(s.view));
+    if (s.descriptor) retired_descriptor_slots_[slot_].push_back(s.descriptor);
+    // Xenos swizzle lanes: 0..3 pick a channel, every one of them the
+    // depth; 4 is 0, 5 is 1.
+    auto lane = [](uint32_t code) {
+      return code < 4 ? RenderSwizzle::R : code == 5 ? RenderSwizzle::ONE : RenderSwizzle::ZERO;
+    };
+    RenderTextureViewDesc desc = RenderTextureViewDesc::Texture2D(r.format);
+    desc.componentMapping = RenderComponentMapping(lane(swizzle & 7), lane((swizzle >> 3) & 7),
+                                                   lane((swizzle >> 6) & 7), lane((swizzle >> 9) & 7));
+    s.view = texture->createTextureView(desc);
+    s.descriptor = AllocateTextureDescriptor();
+    s.texture = texture;
+    if (!s.view || !s.descriptor) return 0;
+    set_2d_->setTexture(s.descriptor, texture, RenderTextureLayout::SHADER_READ, s.view.get());
+  }
+  return s.descriptor;
+}
+
 uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint32_t height) {
   if (!r.fitted || r.fitted_width != width || r.fitted_height != height) {
+    RetireSwizzled(r);
     RetireTexture(r.fitted, r.fitted_descriptor);
     r.fitted = device_->createTexture(RenderTextureDesc::Texture2D(width, height, 1, r.format));
     r.fitted_width = width;
@@ -1824,6 +1874,7 @@ Resolved& PlumeCommandProcessor::GetResolved(uint32_t address, RenderFormat form
   }
   uint32_t w = std::max(width, resolved.format == format ? resolved.width : 0u);
   uint32_t h = std::max(height, resolved.format == format ? resolved.height : 0u);
+  RetireSwizzled(resolved);
   RetireTexture(resolved.texture, resolved.descriptor);
   resolved.texture = device_->createTexture(RenderTextureDesc::Texture2D(w, h, 1, format));
   resolved.format = format;
@@ -2545,11 +2596,18 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     if (found && found->descriptor) {
       Resolved& r = *found;
       const uint32_t fw = fetch.size_2d.width + 1, fh = fetch.size_2d.height + 1;
+      // A depth resolve goes through a view that repeats the depth (see
+      // Resolved::swizzled). A colour resolve already holds the channels in
+      // the order its fetch swizzle expects; applying it again swapped red
+      // and blue across the UI.
+      const uint32_t swizzle = uint32_t(fetch.swizzle) & 0xFFF;
+      const bool depth_view = r.depth;
       if (fw < r.width || fh < r.height) {
         texture_descriptor[slot] = FittedResolved(r, std::min(fw, r.width), std::min(fh, r.height));
+        if (depth_view && texture_descriptor[slot]) texture_descriptor[slot] = SwizzledResolved(r, true, swizzle);
       } else {
         Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
-        texture_descriptor[slot] = r.descriptor;
+        texture_descriptor[slot] = depth_view ? SwizzledResolved(r, false, swizzle) : r.descriptor;
       }
     } else if (fetch.dimension == xenos::DataDimension::k2DOrStacked) {
       texture_descriptor[slot] = GetGuestTexture(fetch);
@@ -2599,7 +2657,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &t_base,
                                                           &t_mip, &t_top, &t_last);
       line += fmt::format(
-          " t{}={:08X}/f{}/{}x{}/d{}/L{}-{}/c{}{}{}/f{}{}{}/a{}/b{}{}{}", slot,
+          " t{}={:08X}/f{}/{}x{}/d{}/L{}-{}/c{}{}{}/f{}{}{}/a{}/b{}{}{}/sw{:03X}", slot,
           fetch.base_address << 12,
           uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
           uint32_t(fetch.dimension), t_top, t_last, uint32_t(fetch.clamp_x),
@@ -2607,7 +2665,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           uint32_t(fetch.min_filter), uint32_t(fetch.mip_filter), uint32_t(fetch.aniso_filter),
           int32_t(fetch.lod_bias),
           fetch.stacked ? fmt::format("/s{}", uint32_t(fetch.size_2d.stack_depth) + 1) : "",
-          FindResolved(fetch.base_address << 12) ? "/R" : "");
+          FindResolved(fetch.base_address << 12) ? "/R" : "", uint32_t(fetch.swizzle) & 0xFFF);
     }
     Trace("{}", line);
     Trace("  raster mode={:08X} offset=({},{},{},{}) blend={:08X} constants=({},{},{},{}) alpha={}",
@@ -2662,6 +2720,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     std::memset(texture_descriptor, 0, sizeof(texture_descriptor));
     std::memset(cube_descriptor, 0, sizeof(cube_descriptor));
     std::memset(stack_descriptor, 0, sizeof(stack_descriptor));
+  }
+  // plume-debug-shader mode 16 points every 2D fetch but slot 0 at white, 32
+  // only slot 0: which texture of a draw takes its output away.
+  if (debug_shader_ && (vs->entry->hash == debug_shader_ || (ps && ps->entry->hash == debug_shader_))) {
+    if (debug_mode_ & 16) {
+      for (uint32_t i = 1; i < 32; ++i) texture_descriptor[i] = 0;
+    }
+    if (debug_mode_ & 32) texture_descriptor[0] = 0;
   }
   std::memcpy(sh + RENUT_SHARED_TEXTURE2D_OFFSET, texture_descriptor, sizeof(texture_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
@@ -2887,6 +2953,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                           regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 3));
     }
     Trace("{}", line);
+    if (ps && (ps->entry->hash == debug_shader_ || ps->entry->hash == arm_target_)) {
+      for (uint32_t i = 0; i < 32; ++i) {
+        float c[4];
+        for (uint32_t j = 0; j < 4; ++j) c[j] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + j);
+        if (c[0] || c[1] || c[2] || c[3]) Trace("  psc{}=({},{},{},{})", i, c[0], c[1], c[2], c[3]);
+      }
+    }
     if (vs->entry->hash == debug_shader_ || vs->entry->hash == arm_target_) {
       // Every constant for the shader under study, to run it by hand.
       for (uint32_t i = 8; i < 256; ++i) {
@@ -3433,6 +3506,7 @@ bool PlumeCommandProcessor::IssueCopy() {
     const uint32_t dest_y = &dest == inside ? dy + row : dy;
     const uint32_t dest_x = &dest == inside ? dx + column : dx;
     ++dest.generation;
+    dest.depth = copying_depth;
     dest.written = ++resolve_serial_;
     dest.written_frame = swaps_;
     dest.guest_pitch = dest_w;
