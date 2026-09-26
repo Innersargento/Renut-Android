@@ -9,6 +9,8 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -91,7 +93,8 @@ void SetPlumePipelineCachePath(const std::string& path) {
   pipeline_cache_path = path;
 }
 
-void SavePlumePipelineCache() {
+namespace {
+void WritePlumePipelineCache() {
   std::lock_guard lock(pipeline_cache_mutex);
   if (pipeline_cache == VK_NULL_HANDLE || pipeline_cache_path.empty()) return;
   size_t size = 0;
@@ -115,6 +118,30 @@ void SavePlumePipelineCache() {
   }
   std::error_code error;
   std::filesystem::rename(temporary, pipeline_cache_path, error);
+}
+
+std::atomic<bool> pipeline_cache_saving{false};
+std::chrono::steady_clock::time_point pipeline_cache_saved{};
+}  // namespace
+
+// On a thread of its own, at most once a minute. The blob grows past 300 MB,
+// and writing it from the command list thread - after every report interval
+// that compiled a pipeline - stalled the game for seconds at a time and was
+// the thread's largest cost while a new area was being seen. A pipeline cache
+// is internally synchronized, so reading it here while that thread keeps
+// creating pipelines is allowed.
+void SavePlumePipelineCache() {
+  const auto now = std::chrono::steady_clock::now();
+  if (pipeline_cache_saved.time_since_epoch().count() && now - pipeline_cache_saved < std::chrono::seconds(60)) {
+    return;
+  }
+  bool idle = false;
+  if (!pipeline_cache_saving.compare_exchange_strong(idle, true)) return;
+  pipeline_cache_saved = now;
+  std::thread([] {
+    WritePlumePipelineCache();
+    pipeline_cache_saving = false;
+  }).detach();
 }
 
 PlumeRenderer::PlumeRenderer() : state_(std::make_unique<State>()) {}

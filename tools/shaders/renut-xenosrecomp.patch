@@ -153,7 +153,7 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..1bd84a1 100644
+index ee3830d..e15872e 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
 @@ -73,9 +73,70 @@
@@ -272,7 +272,7 @@ index ee3830d..1bd84a1 100644
  };
  #endif
  
-@@ -203,27 +283,60 @@ struct PushConstants
+@@ -203,27 +283,94 @@ struct PushConstants
  
  #ifdef RENUT_RECOMP
  
@@ -285,18 +285,52 @@ index ee3830d..1bd84a1 100644
 +// promoted into the constant file, which the command processor fills before
 +// the draw starts. Measured on Turnip, that load latency was most of what a
 +// draw of the guest's shaders cost the GPU.
-+[[vk::binding(0, 4)]] cbuffer RenutVertexShaderConstants
-+{
-+    float4 g_VertexShaderConstants[RENUT_SHADER_CONSTANT_COUNT];
-+};
-+[[vk::binding(1, 4)]] cbuffer RenutPixelShaderConstants
-+{
-+    float4 g_PixelShaderConstants[RENUT_SHADER_CONSTANT_COUNT];
-+};
-+[[vk::binding(2, 4)]] cbuffer RenutSharedConstants
++//
++// Each stage's file is split into RENUT_CONSTANT_CHUNK_COUNT blocks of
++// RENUT_CONSTANT_CHUNK_SIZE float4s, bound separately, so that a draw that
++// changes a few registers - its matrices, nearly always - uploads the block
++// holding them and keeps the others where they are.
++#define RENUT_CONSTANT_CHUNK_SIZE  64
++#define RENUT_CONSTANT_CHUNK_COUNT 4
++[[vk::binding(0, 4)]] cbuffer RenutVertexConstants0 { float4 g_VertexConstants0[RENUT_CONSTANT_CHUNK_SIZE]; };
++[[vk::binding(1, 4)]] cbuffer RenutVertexConstants1 { float4 g_VertexConstants1[RENUT_CONSTANT_CHUNK_SIZE]; };
++[[vk::binding(2, 4)]] cbuffer RenutVertexConstants2 { float4 g_VertexConstants2[RENUT_CONSTANT_CHUNK_SIZE]; };
++[[vk::binding(3, 4)]] cbuffer RenutVertexConstants3 { float4 g_VertexConstants3[RENUT_CONSTANT_CHUNK_SIZE]; };
++[[vk::binding(4, 4)]] cbuffer RenutPixelConstants0 { float4 g_PixelConstants0[RENUT_CONSTANT_CHUNK_SIZE]; };
++[[vk::binding(5, 4)]] cbuffer RenutPixelConstants1 { float4 g_PixelConstants1[RENUT_CONSTANT_CHUNK_SIZE]; };
++[[vk::binding(6, 4)]] cbuffer RenutPixelConstants2 { float4 g_PixelConstants2[RENUT_CONSTANT_CHUNK_SIZE]; };
++[[vk::binding(7, 4)]] cbuffer RenutPixelConstants3 { float4 g_PixelConstants3[RENUT_CONSTANT_CHUNK_SIZE]; };
++[[vk::binding(8, 4)]] cbuffer RenutSharedConstants
 +{
 +    uint4 g_SharedWords[RENUT_SHARED_SIZE / 16];
 +};
++
++// A constant index known when the shader is compiled folds to one block and
++// offset; a relative one (a0, aL) picks the block at run time.
++float4 g_VertexShaderConstant(uint index)
++{
++    index = min(index, uint(RENUT_SHADER_CONSTANT_COUNT - 1));
++    const uint i = index % RENUT_CONSTANT_CHUNK_SIZE;
++    switch (index / RENUT_CONSTANT_CHUNK_SIZE)
++    {
++    case 0: return g_VertexConstants0[i];
++    case 1: return g_VertexConstants1[i];
++    case 2: return g_VertexConstants2[i];
++    default: return g_VertexConstants3[i];
++    }
++}
++float4 g_PixelShaderConstant(uint index)
++{
++    index = min(index, uint(RENUT_SHADER_CONSTANT_COUNT - 1));
++    const uint i = index % RENUT_CONSTANT_CHUNK_SIZE;
++    switch (index / RENUT_CONSTANT_CHUNK_SIZE)
++    {
++    case 0: return g_PixelConstants0[i];
++    case 1: return g_PixelConstants1[i];
++    case 2: return g_PixelConstants2[i];
++    default: return g_PixelConstants3[i];
++    }
++}
 +
 +// The shared block by byte offset, in the RENUT_SHARED_* layout above.
 +#define renutSharedU(OFFSET)   (g_SharedWords[(OFFSET) >> 4][((OFFSET) >> 2) & 3])
@@ -350,7 +384,7 @@ index ee3830d..1bd84a1 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -233,7 +346,27 @@ struct PushConstants
+@@ -233,7 +380,27 @@ struct PushConstants
  // coordinates, and without a scale everything outside the 1x1 corner of the
  // clip volume is culled. N&B's FMV renderer does exactly that: it hands the
  // pipeline a pixel-space rectangle and disables the viewport.
@@ -379,7 +413,7 @@ index ee3830d..1bd84a1 100644
  
  // A vfetch the vertex declaration does not describe - see the stream table's
  // comment. `index` is whatever register the instruction named, so it arrives as
-@@ -244,8 +377,7 @@ struct PushConstants
+@@ -244,8 +411,7 @@ struct PushConstants
  // a draw that binds fewer streams than the shader fetches would otherwise do.
  float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes)
  {
@@ -389,7 +423,7 @@ index ee3830d..1bd84a1 100644
  
      if (address == 0)
          return 0.0;
-@@ -253,14 +385,167 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,14 +419,166 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -548,10 +582,10 @@ index ee3830d..1bd84a1 100644
 +
  // Per-stage float4 constant file. The recompiler picks the stage by defining
 -// RENUT_STAGE_CONSTANTS to the matching push-constant address.
-+// RENUT_STAGE_CONSTANTS to the matching uniform buffer's array.
- #define cReg(INDEX) \
+-#define cReg(INDEX) \
 -    vk::RawBufferLoad<float4>(RENUT_STAGE_CONSTANTS + min(uint(INDEX), uint(RENUT_SHADER_CONSTANT_COUNT - 1)) * 16, 0x10)
-+    RENUT_STAGE_CONSTANTS[min(uint(INDEX), uint(RENUT_SHADER_CONSTANT_COUNT - 1))]
++// RENUT_STAGE_CONSTANTS to the matching stage's lookup.
++#define cReg(INDEX) RENUT_STAGE_CONSTANTS(uint(INDEX))
  
  #else
 -#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
@@ -561,7 +595,7 @@ index ee3830d..1bd84a1 100644
  #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
  #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
  #endif
-@@ -289,7 +574,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -289,7 +607,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint   g_SwappedBlendWeights             : packoffset(c67.w); \
      uint   g_SwappedPositions                : packoffset(c68.x); \
      uint   g_SintTexcoords                   : packoffset(c68.y); \
@@ -575,7 +609,7 @@ index ee3830d..1bd84a1 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -317,6 +607,197 @@ uint g_SpecConstants();
+@@ -317,6 +640,197 @@ uint g_SpecConstants();
  #ifdef RENUT_RECOMP
  // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
  #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
@@ -773,7 +807,7 @@ index ee3830d..1bd84a1 100644
  #endif
  
  #ifdef RENUT_RECOMP
-@@ -349,7 +830,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -349,7 +863,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
  float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
@@ -788,7 +822,7 @@ index ee3830d..1bd84a1 100644
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -483,6 +970,53 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +1003,53 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -843,7 +877,7 @@ index ee3830d..1bd84a1 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..64dea27 100644
+index c71e7c9..99de266 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -1317,7 +1351,7 @@ index c71e7c9..64dea27 100644
      // shaders that carry a table, so the body always uses raw indices.
      out += "#ifdef __spirv__\n\n";
 -    println("#define RENUT_STAGE_CONSTANTS g_PushConstants.{}ShaderConstants", stageName);
-+    println("#define RENUT_STAGE_CONSTANTS g_{}ShaderConstants", stageName);
++    println("#define RENUT_STAGE_CONSTANTS g_{}ShaderConstant", stageName);
      out += "\n#else\n\n";
  
      println("cbuffer {}ShaderConstants : register(b{}, space4)", stageName, isPixelShader ? 1 : 0);

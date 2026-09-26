@@ -20,7 +20,9 @@
 #include <cmath>
 #include <chrono>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <tuple>
 #include <type_traits>
 #include <memory>
@@ -677,6 +679,10 @@ struct GuestTexture {
   uint64_t content = 0;
   bool failed = false;
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
+  // 2D textures: the guest memory under the base levels and under the mips,
+  // write-watched while `watched` (see GetGuestTexture).
+  std::array<uint32_t, 2> watch_begin{}, watch_end{};
+  bool watched = false;
 };
 
 uint64_t ContentHash(const uint8_t* data, uint32_t span);
@@ -734,6 +740,9 @@ struct Stats {
   // spent waiting for the GPU to hand a frame slot back, and the bytes it
   // copied into the ring - guest vertex and index streams, constant blocks.
   uint64_t cp_cpu_us = 0, slot_wait_us = 0, stream_bytes = 0, constant_bytes = 0;
+  // Streams served from a kept buffer, bytes copied into new kept buffers, and
+  // kept streams the guest wrote over.
+  uint64_t kept_hits = 0, kept_bytes_made = 0, kept_drops = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -755,11 +764,23 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // constants marks that stage's block as needing a look (CommitConstants).
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  // Marks the constant blocks (kConstantChunks per stage, each bound on its
+  // own - see set 4 in shader_common.h) that a write lands in.
   void MarkConstantsWritten(uint32_t first, uint32_t count) {
-    if (first < XE_GPU_REG_SHADER_CONSTANT_256_X) vs_constants_written_ = true;
-    if (first + count > XE_GPU_REG_SHADER_CONSTANT_256_X) ps_constants_written_ = true;
+    constexpr uint32_t kChunkRegisters = kConstantChunkSize / 4;
+    const uint32_t end = first + count;
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+      const uint32_t base = stage ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X;
+      const uint32_t lo = std::max(first, base);
+      const uint32_t hi = std::min(end, base + kConstantChunks * kChunkRegisters);
+      for (uint32_t r = lo; r < hi; r = (r / kChunkRegisters + 1) * kChunkRegisters) {
+        constants_written_[stage][(r - base) / kChunkRegisters] = true;
+      }
+    }
   }
-  bool vs_constants_written_ = true, ps_constants_written_ = true;
+  static constexpr uint32_t kConstantChunks = 4;
+  static constexpr uint32_t kConstantChunkSize = 1024;
+  bool constants_written_[2][kConstantChunks] = {{true, true, true, true}, {true, true, true, true}};
   // A draw left out for a reason no other counter names: counted by reason
   // and shader for the periodic report, and named in a trace.
   bool Drop(const char* reason, const HostShader* vs, const HostShader* ps);
@@ -779,6 +800,39 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint8_t* Pointer(uint64_t offset) { return upload_data_ + offset; }
   uint64_t Address(uint64_t offset) const { return upload_address_ + offset; }
   bool UploadGuest(uint32_t address, uint32_t size, xenos::Endian endian, uint64_t& offset);
+  // A guest vertex or index stream, from a buffer of its own that outlives the
+  // frame while the guest leaves that memory alone, or copied into the ring.
+  //
+  // Nearly all of the game's geometry never changes, and copying and swapping
+  // every stream into the ring every frame was the command thread's largest
+  // single cost after the draw itself (~48 MB a frame in a busy scene). The
+  // guest's pages under a kept stream are write-watched (rexglue's physical
+  // memory callbacks, the mechanism xenia's shared memory uses): the first
+  // write to one drops every stream on it, and a stream dropped often is
+  // treated as dynamic and goes back to the ring each frame, unwatched.
+  bool GuestStream(uint32_t address, uint32_t size, xenos::Endian endian, RenderBuffer*& buffer,
+                   uint64_t& offset);
+  void DrainWatchHits();
+  static std::pair<uint32_t, uint32_t> WatchHitThunk(void* context, uint32_t start, uint32_t length,
+                                                     bool exact_range);
+  struct KeptStream {
+    std::unique_ptr<RenderBuffer> buffer;
+    uint32_t base = 0, size = 0;
+    uint64_t last_used = 0, dropped_frame = 0;
+    uint32_t drops = 0;
+    bool valid = false;
+  };
+  std::unordered_map<uint64_t, KeptStream> kept_streams_;
+  uint64_t kept_bytes_ = 0;
+  // Filled by the guest thread that tripped a watch (inside its fault
+  // handler), drained by this one.
+  std::mutex watch_mutex_;
+  std::vector<std::pair<uint32_t, uint32_t>> watch_hits_;
+  std::atomic<uint32_t> watch_serial_{0};
+  uint32_t watch_seen_ = 0;
+  void* watch_handle_ = nullptr;
+  // Debug: <files>/plume-no-persist sends every stream through the ring again.
+  bool keep_streams_ = true;
   // Memory export (renutMemExport in shader_common.h). A range of guest memory
   // a vertex shader has written lives in a buffer of its own from then on, and
   // later draws that fetch from it read that buffer: guest memory never sees
@@ -1007,8 +1061,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   alignas(16) uint8_t shared_shadow_[RENUT_SHARED_SIZE] = {};
   // Where a draw assembles its shared block before it is compared.
   alignas(16) uint8_t shared_built_[RENUT_SHARED_SIZE] = {};
-  uint64_t vs_constants_offset_ = UINT64_MAX;
-  uint64_t ps_constants_offset_ = UINT64_MAX;
+  // Where each stage's constant blocks were last placed in the ring.
+  uint64_t constant_offsets_[2][kConstantChunks] = {
+      {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX}, {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX}};
   uint64_t shared_offset_ = UINT64_MAX;
   // The addresses last pushed, to leave the push constants alone when the
   // three blocks are the ones already bound.
@@ -1020,7 +1075,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   VkDescriptorSetLayout constants_set_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool constants_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet constants_set_ = VK_NULL_HANDLE;
-  uint32_t bound_constant_offsets_[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+  // Set 4: the vertex blocks, the pixel blocks, then the shared block.
+  static constexpr uint32_t kConstantBindings = 2 * kConstantChunks + 1;
+  uint32_t bound_constant_offsets_[kConstantBindings];
   // What the list has bound, to leave unchanged state alone (StartList resets).
   RenderViewport bound_viewport_;
   RenderRect bound_scissor_;
@@ -1277,6 +1334,7 @@ bool PlumeCommandProcessor::SetupContext() {
     REXLOG_ERROR("Renut: Plume constant buffers unavailable");
     return false;
   }
+  watch_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(WatchHitThunk, this);
 
   {
     auto* vulkan_device = static_cast<VulkanDevice*>(device_);
@@ -1376,6 +1434,12 @@ void PlumeCommandProcessor::ShutdownContext() {
   InvalidateResolvedLookups();
   exports_.clear();
   patch_grids_.clear();
+  if (watch_handle_) {
+    memory_->UnregisterPhysicalMemoryInvalidationCallback(watch_handle_);
+    watch_handle_ = nullptr;
+  }
+  kept_streams_.clear();
+  kept_bytes_ = 0;
   for (auto& retired : retired_buffers_) retired.clear();
   for (auto& buffer : writeback_buffers_) buffer.reset();
   for (auto& list : writebacks_) list.clear();
@@ -1407,8 +1471,8 @@ void PlumeCommandProcessor::ShutdownContext() {
 bool PlumeCommandProcessor::CreateConstantBuffers() {
   VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
   auto* layout = static_cast<VulkanPipelineLayout*>(layout_.get());
-  VkDescriptorSetLayoutBinding bindings[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
+  VkDescriptorSetLayoutBinding bindings[kConstantBindings] = {};
+  for (uint32_t i = 0; i < kConstantBindings; ++i) {
     bindings[i].binding = i;
     bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     bindings[i].descriptorCount = 1;
@@ -1416,7 +1480,7 @@ bool PlumeCommandProcessor::CreateConstantBuffers() {
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
   }
   VkDescriptorSetLayoutCreateInfo set_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  set_info.bindingCount = 3;
+  set_info.bindingCount = kConstantBindings;
   set_info.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(vk_device, &set_info, nullptr, &constants_set_layout_) != VK_SUCCESS) {
     return false;
@@ -1435,7 +1499,7 @@ bool PlumeCommandProcessor::CreateConstantBuffers() {
   vkDestroyPipelineLayout(vk_device, layout->vk, nullptr);
   layout->vk = extended;
 
-  VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3};
+  VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kConstantBindings};
   VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   pool_info.maxSets = 1;
   pool_info.poolSizeCount = 1;
@@ -1447,11 +1511,11 @@ bool PlumeCommandProcessor::CreateConstantBuffers() {
   allocate.pSetLayouts = &constants_set_layout_;
   if (vkAllocateDescriptorSets(vk_device, &allocate, &constants_set_) != VK_SUCCESS) return false;
   const VkBuffer ring = static_cast<VulkanBuffer*>(upload_.get())->vk;
-  const VkDescriptorBufferInfo infos[3] = {{ring, 0, kStageConstantSize},
-                                           {ring, 0, kStageConstantSize},
-                                           {ring, 0, (RENUT_SHARED_SIZE + 15) & ~15u}};
-  VkWriteDescriptorSet writes[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
+  VkDescriptorBufferInfo infos[kConstantBindings];
+  for (uint32_t i = 0; i + 1 < kConstantBindings; ++i) infos[i] = {ring, 0, kConstantChunkSize};
+  infos[kConstantBindings - 1] = {ring, 0, (RENUT_SHARED_SIZE + 15) & ~15u};
+  VkWriteDescriptorSet writes[kConstantBindings] = {};
+  for (uint32_t i = 0; i < kConstantBindings; ++i) {
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[i].dstSet = constants_set_;
     writes[i].dstBinding = i;
@@ -1459,7 +1523,7 @@ bool PlumeCommandProcessor::CreateConstantBuffers() {
     writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     writes[i].pBufferInfo = &infos[i];
   }
-  vkUpdateDescriptorSets(vk_device, 3, writes, 0, nullptr);
+  vkUpdateDescriptorSets(vk_device, kConstantBindings, writes, 0, nullptr);
   return true;
 }
 
@@ -1490,6 +1554,112 @@ bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::
   CopySwapped(Pointer(offset), memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
   stats_.stream_bytes += size;
   uploaded_streams_.emplace(key, offset);
+  return true;
+}
+
+// The guest wrote into watched pages: which pages is all that is known, so
+// every kept stream on them is dropped. Called with the guest's global lock
+// held, from the thread that wrote, so it only records the range. Returning
+// the range itself keeps rexglue from unwatching up to 4 MB around it, which
+// would leave other kept streams there unwatched without a call.
+std::pair<uint32_t, uint32_t> PlumeCommandProcessor::WatchHitThunk(void* context, uint32_t start,
+                                                                   uint32_t length, bool) {
+  auto* self = static_cast<PlumeCommandProcessor*>(context);
+  {
+    std::lock_guard<std::mutex> lock(self->watch_mutex_);
+    self->watch_hits_.emplace_back(start, length);
+  }
+  self->watch_serial_.fetch_add(1, std::memory_order_release);
+  return {start, length};
+}
+
+void PlumeCommandProcessor::DrainWatchHits() {
+  const uint32_t serial = watch_serial_.load(std::memory_order_acquire);
+  if (serial == watch_seen_) return;
+  watch_seen_ = serial;
+  std::vector<std::pair<uint32_t, uint32_t>> hits;
+  {
+    std::lock_guard<std::mutex> lock(watch_mutex_);
+    hits.swap(watch_hits_);
+  }
+  for (auto& [key, texture] : guest_textures_) {
+    if (!texture.watched) continue;
+    for (const auto& [start, length] : hits) {
+      if ((texture.watch_begin[0] < start + length && start < texture.watch_end[0]) ||
+          (texture.watch_begin[1] < start + length && start < texture.watch_end[1])) {
+        texture.watched = false;
+        break;
+      }
+    }
+  }
+  for (auto& [key, kept] : kept_streams_) {
+    if (!kept.valid) continue;
+    for (const auto& [start, length] : hits) {
+      if (kept.base < start + length && start < kept.base + kept.size) {
+        // Earlier draws of this frame, and the frame before, may still read it.
+        retired_buffers_[slot_].push_back(std::move(kept.buffer));
+        kept_bytes_ -= kept.size;
+        kept.valid = false;
+        ++kept.drops;
+        kept.dropped_frame = swaps_;
+        ++stats_.kept_drops;
+        break;
+      }
+    }
+  }
+}
+
+bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::Endian endian,
+                                        RenderBuffer*& buffer, uint64_t& offset) {
+  // Streams are kept up to this much in all; past it they are copied as before.
+  constexpr uint64_t kKeptBudget = 384ull << 20;
+  buffer = upload_.get();
+  if (!keep_streams_ || !address || !size || size > (32u << 20)) {
+    return UploadGuest(address, size, endian, offset);
+  }
+  DrainWatchHits();
+  // Kept by aligned window rather than by the exact stream: every draw of a
+  // mesh names its own stretch of the same index buffer, and one entry per
+  // stretch made tens of thousands of kept buffers, each looked up and each
+  // checked against every write.
+  constexpr uint32_t kWindow = 16u << 10;
+  const uint32_t window_base = address & ~(kWindow - 1);
+  const uint64_t window_end =
+      std::min<uint64_t>((uint64_t(address) + size + kWindow - 1) & ~uint64_t(kWindow - 1), 0x20000000ull);
+  if (window_end <= address + uint64_t(size) - 1 || window_end - window_base > (32u << 20)) {
+    return UploadGuest(address, size, endian, offset);
+  }
+  const uint32_t window_size = uint32_t(window_end - window_base);
+  const uint64_t key = (uint64_t(window_base) << 32) ^ (uint64_t(window_size) << 2) ^ uint64_t(endian);
+  KeptStream& kept = kept_streams_[key];
+  kept.last_used = swaps_;
+  if (kept.valid) {
+    buffer = kept.buffer.get();
+    offset = address - window_base;
+    ++stats_.kept_hits;
+    return true;
+  }
+  // Written over three times: the guest rewrites it, and a watch would only
+  // cost its thread a fault a frame. Tried again after a while.
+  const bool dynamic = kept.drops >= 3 && swaps_ - kept.dropped_frame < 900;
+  if (dynamic || kept_bytes_ + window_size > kKeptBudget) return UploadGuest(address, size, endian, offset);
+  auto made = device_->createBuffer(RenderBufferDesc::UploadBuffer(
+      window_size, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::DEVICE_ADDRESSABLE |
+                RenderBufferFlag::STORAGE));
+  if (!made) return UploadGuest(address, size, endian, offset);
+  // Watch first, copy second: a write that lands during the copy still drops it.
+  memory_->EnablePhysicalMemoryAccessCallbacks(window_base, window_size, true, false);
+  auto* data = static_cast<uint8_t*>(made->map());
+  CopySwapped(data, memory_->TranslatePhysical<const uint8_t*>(window_base), window_size, endian);
+  made->unmap();
+  kept.buffer = std::move(made);
+  kept.base = window_base;
+  kept.size = window_size;
+  kept.valid = true;
+  kept_bytes_ += window_size;
+  stats_.kept_bytes_made += window_size;
+  buffer = kept.buffer.get();
+  offset = address - window_base;
   return true;
 }
 
@@ -1680,7 +1850,7 @@ void PlumeCommandProcessor::RefreshExport(ExportRange& range) {
 bool PlumeCommandProcessor::BindStream(uint32_t address, uint32_t size, xenos::Endian endian,
                                        RenderBuffer*& buffer, uint64_t& offset) {
   buffer = upload_.get();
-  if (exports_.empty()) return UploadGuest(address, size, endian, offset);
+  if (exports_.empty()) return GuestStream(address, size, endian, buffer, offset);
   std::vector<ExportRange*> overlapping;
   for (auto& [key, range] : exports_) {
     if (address >= range.base && uint64_t(address) + size <= uint64_t(range.base) + range.size) {
@@ -1695,7 +1865,7 @@ bool PlumeCommandProcessor::BindStream(uint32_t address, uint32_t size, xenos::E
     }
     if (range.base < address + size && address < range.base + range.size) overlapping.push_back(&range);
   }
-  if (overlapping.empty()) return UploadGuest(address, size, endian, offset);
+  if (overlapping.empty()) return GuestStream(address, size, endian, buffer, offset);
   // A stream that is mostly exported is typically the pool the particle
   // emitters export into piece by piece, drawn whole. Growing a range over it
   // lets every later draw read it straight away instead of piecing it
@@ -1951,6 +2121,14 @@ void PlumeCommandProcessor::EvictIdleTextures() {
     InvalidateResolvedLookups();
     ++evicted;
   }
+  for (auto it = kept_streams_.begin(); it != kept_streams_.end();) {
+    if (swaps_ - it->second.last_used < 600) { ++it; continue; }
+    if (it->second.buffer) {
+      retired_buffers_[slot_].push_back(std::move(it->second.buffer));
+      kept_bytes_ -= it->second.size;
+    }
+    it = kept_streams_.erase(it);
+  }
   if (evicted) {
     REXLOG_INFO("Renut: Plume evicted {} idle textures (free descriptors 2D {} 3D {} cube {})", evicted,
                 free_2d, free_3d, free_cube);
@@ -2010,10 +2188,13 @@ void PlumeCommandProcessor::StartList() {
   upload_used_ = slice_base_;
   uploaded_streams_.clear();
   ++upload_generation_;
-  vs_constants_offset_ = ps_constants_offset_ = shared_offset_ = UINT64_MAX;
+  for (auto& stage : constant_offsets_) {
+    for (uint64_t& offset : stage) offset = UINT64_MAX;
+  }
+  shared_offset_ = UINT64_MAX;
   // A new command list starts with no push constants of its own.
   pushed_constants_[0] = pushed_constants_[1] = pushed_constants_[2] = UINT64_MAX;
-  bound_constant_offsets_[0] = bound_constant_offsets_[1] = bound_constant_offsets_[2] = UINT32_MAX;
+  std::fill(std::begin(bound_constant_offsets_), std::end(bound_constant_offsets_), UINT32_MAX);
   viewport_bound_ = scissor_bound_ = false;
   bound_vertex_buffers_.fill(VertexBinding{});
   bound_index_buffer_ = nullptr;
@@ -2375,12 +2556,41 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   }
   GuestTexture& texture = guest_textures_[key];
   if (texture.failed) return 0;
-  // Checked once per frame; the draws after the first reuse the result.
-  if (texture.texture && texture.checked_frame == swaps_ && texdump_directory_.empty()) {
+  // Checked once per frame; the draws after the first reuse the result. A
+  // texture whose memory is write-watched and was not written since is not
+  // checked at all - hashing every texture in use every frame was a tenth of
+  // this thread - except once every 256 frames, in case a write went around
+  // the watch.
+  DrainWatchHits();
+  const bool unchanged =
+      texture.checked_frame == swaps_ || (texture.watched && ((swaps_ + key) & 255) != 0);
+  if (texture.texture && unchanged && texdump_directory_.empty()) {
+    texture.checked_frame = swaps_;
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
   texture.checked_frame = swaps_;
+  if (keep_streams_ && !texture.watched) {
+    // Watch first, hash second, so that a write landing in between is seen.
+    texture.watch_begin = {UINT32_MAX, UINT32_MAX};
+    texture.watch_end = {0, 0};
+    for (uint32_t i = 0; i < levels; ++i) {
+      const uint32_t which = layouts[i].from_mips ? 1 : 0;
+      texture.watch_begin[which] = std::min(texture.watch_begin[which], fetch_layout->starts[i]);
+      texture.watch_end[which] =
+          std::max(texture.watch_end[which], fetch_layout->starts[i] + layouts[i].extent);
+    }
+    for (uint32_t which = 0; which < 2; ++which) {
+      if (texture.watch_begin[which] >= texture.watch_end[which]) {
+        texture.watch_begin[which] = texture.watch_end[which] = 0;
+        continue;
+      }
+      memory_->EnablePhysicalMemoryAccessCallbacks(texture.watch_begin[which],
+                                                   texture.watch_end[which] - texture.watch_begin[which],
+                                                   true, false);
+    }
+    texture.watched = true;
+  }
   for (uint32_t i = 0; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
   if (!texdump_directory_.empty() && dumped_.insert(key).second) texture.content = ~content;
   if (texture.texture && texture.content == content) {
@@ -2847,6 +3057,42 @@ gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, ui
   }
   shader_lookup_[host_address] = {dword_count, shader.get()};
   return shader.get();
+}
+
+// Debug (RENUT_PIPELINE_STATS in plume-env): what the driver's compiler made of
+// each stage - instructions, registers, preamble and so on - one line per
+// executable, to see what a draw of the guest's shaders costs.
+void LogPipelineStatistics(RenderPipeline& pipeline, const HostShader* vs, const HostShader* ps) {
+  auto* vulkan = static_cast<VulkanGraphicsPipeline*>(&pipeline);
+  VkDevice device = vulkan->device->vk;
+  if (!vkGetPipelineExecutablePropertiesKHR || !vkGetPipelineExecutableStatisticsKHR) return;
+  VkPipelineInfoKHR info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+  info.pipeline = vulkan->vk;
+  uint32_t count = 0;
+  if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, nullptr) != VK_SUCCESS) return;
+  std::vector<VkPipelineExecutablePropertiesKHR> executables(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+  vkGetPipelineExecutablePropertiesKHR(device, &info, &count, executables.data());
+  for (uint32_t i = 0; i < count; ++i) {
+    VkPipelineExecutableInfoKHR executable = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+    executable.pipeline = vulkan->vk;
+    executable.executableIndex = i;
+    uint32_t stat_count = 0;
+    vkGetPipelineExecutableStatisticsKHR(device, &executable, &stat_count, nullptr);
+    std::vector<VkPipelineExecutableStatisticKHR> stats(stat_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+    vkGetPipelineExecutableStatisticsKHR(device, &executable, &stat_count, stats.data());
+    std::string line = fmt::format("Renut: Plume stats vs={:016X} ps={:016X} {}:", vs && vs->entry ? vs->entry->hash : 0,
+                                   ps && ps->entry ? ps->entry->hash : 0, executables[i].name);
+    for (const auto& stat : stats) {
+      switch (stat.format) {
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: line += fmt::format(" [{}]={}", stat.name, stat.value.b32); break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: line += fmt::format(" [{}]={}", stat.name, stat.value.i64); break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: line += fmt::format(" [{}]={}", stat.name, stat.value.u64); break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: line += fmt::format(" [{}]={}", stat.name, stat.value.f64); break;
+        default: break;
+      }
+    }
+    REXLOG_INFO("{}", line);
+  }
 }
 
 bool PlumeCommandProcessor::Drop(const char* reason, const HostShader* vs, const HostShader* ps) {
@@ -3571,10 +3817,18 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   uint64_t generation;
   do {
     generation = upload_generation_;
-    if (!CommitConstants(vs_shadow_, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X],
-                         kStageConstantSize, vs_constants_offset_, &vs_constants_written_) ||
-        !CommitConstants(ps_shadow_, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X],
-                         kStageConstantSize, ps_constants_offset_, &ps_constants_written_) ||
+    bool placed = true;
+    for (uint32_t stage = 0; stage < 2 && placed; ++stage) {
+      uint8_t* shadow = stage ? ps_shadow_ : vs_shadow_;
+      const auto* file = reinterpret_cast<const uint8_t*>(
+          &regs.values[stage ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X]);
+      for (uint32_t chunk = 0; chunk < kConstantChunks && placed; ++chunk) {
+        placed = CommitConstants(shadow + chunk * kConstantChunkSize, file + chunk * kConstantChunkSize,
+                                 kConstantChunkSize, constant_offsets_[stage][chunk],
+                                 &constants_written_[stage][chunk]);
+      }
+    }
+    if (!placed ||
         !CommitConstants(shared_shadow_, shared_built_, RENUT_SHARED_SIZE, shared_offset_)) {
       return Drop("constants upload", vs, ps);
     }
@@ -3744,6 +3998,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                        std::chrono::steady_clock::now() - pipeline_start)
                                        .count());
     ++stats_.pipelines;
+    if (pipeline && getenv("RENUT_PIPELINE_STATS")) LogPipelineStatistics(*pipeline, vs, ps);
     if (!pipeline) {
       REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
                   vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
@@ -3759,6 +4014,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   bool indexed = index_buffer_info && index_buffer_info->guest_base;
   RenderFormat index_format = RenderFormat::R16_UINT;
   uint64_t index_offset = 0;
+  RenderBuffer* index_buffer = upload_.get();
   uint32_t index_bytes = 0;
   const PatchGrid* patch_grid = nullptr;
   if (patch_list) {
@@ -3785,9 +4041,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
     index_format = is32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT;
     const uint32_t size = index_count * (is32 ? 4 : 2);
-    if (!UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)) {
-      return Drop("index upload", vs, ps);
-    }
+    // A quad list's indices are read back here to be split into triangles,
+    // so they stay in the ring.
+    const bool uploaded =
+        quad_list ? UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)
+                  : GuestStream(index_buffer_info->guest_base, size, index_buffer_info->endianness,
+                                index_buffer, index_offset);
+    if (!uploaded) return Drop("index upload", vs, ps);
     index_bytes = size;
   }
   if (quad_list) {
@@ -3811,6 +4071,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     indexed = true;
     index_format = RenderFormat::R32_UINT;
+    index_buffer = upload_.get();
     index_offset = offset;
     index_bytes = quads * 6 * 4;
     vertex_count = quads * 6;
@@ -3833,18 +4094,23 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     bound_interface_key_ = interface_key;
     ++stats_.pipeline_binds;
   }
-  const uint64_t push[3] = {Address(vs_constants_offset_), Address(ps_constants_offset_),
+  const uint64_t push[3] = {Address(constant_offsets_[0][0]), Address(constant_offsets_[1][0]),
                             Address(shared_offset_)};
   if (std::memcmp(push, pushed_constants_, sizeof(push)) != 0) {
     list_->setGraphicsPushConstants(0, push, 0, sizeof(push));
     std::memcpy(pushed_constants_, push, sizeof(push));
   }
-  const uint32_t constant_offsets[3] = {uint32_t(vs_constants_offset_), uint32_t(ps_constants_offset_),
-                                        uint32_t(shared_offset_)};
+  uint32_t constant_offsets[kConstantBindings];
+  for (uint32_t stage = 0; stage < 2; ++stage) {
+    for (uint32_t chunk = 0; chunk < kConstantChunks; ++chunk) {
+      constant_offsets[stage * kConstantChunks + chunk] = uint32_t(constant_offsets_[stage][chunk]);
+    }
+  }
+  constant_offsets[kConstantBindings - 1] = uint32_t(shared_offset_);
   if (std::memcmp(constant_offsets, bound_constant_offsets_, sizeof(constant_offsets)) != 0) {
     vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(list_)->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            static_cast<VulkanPipelineLayout*>(layout_.get())->vk, 4, 1, &constants_set_, 3,
-                            constant_offsets);
+                            static_cast<VulkanPipelineLayout*>(layout_.get())->vk, 4, 1, &constants_set_,
+                            kConstantBindings, constant_offsets);
     std::memcpy(bound_constant_offsets_, constant_offsets, sizeof(constant_offsets));
   }
   // Dynamic state, vertex and index buffers are only set when they change:
@@ -3883,7 +4149,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
-  if (trace_) {
+  if (trace_ && index_buffer == upload_.get()) {
     uint32_t lo = UINT32_MAX, hi = 0;
     for (uint32_t i = 0; i < vertex_count; ++i) {
       uint32_t v = !indexed ? i
@@ -3943,7 +4209,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     // The ring is bound whole and each draw starts at its own indices, which
     // Allocate aligns to 256 bytes - one binding for every draw of the list.
     const uint32_t index_size = index_format == RenderFormat::R32_UINT ? 4 : 2;
-    BindIndexBuffer(upload_.get(), index_format);
+    BindIndexBuffer(index_buffer, index_format);
     list_->drawIndexedInstanced(draw_count, 1, uint32_t(index_offset / index_size), base_vertex, 0);
   } else if (patch_list) {
     BindIndexBuffer(patch_grid->indices.get(), RenderFormat::R32_UINT);
@@ -4467,6 +4733,18 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       fetch_layouts_.clear();
     }
     skip_mask_ = mask;
+    const bool keep_streams = access((root + "/plume-no-persist").c_str(), F_OK) != 0;
+    if (keep_streams != keep_streams_) {
+      REXLOG_INFO("Renut: Plume kept streams {}", keep_streams ? "on" : "off");
+      if (!keep_streams) {
+        for (auto& [key, kept] : kept_streams_) {
+          if (kept.buffer) retired_buffers_[slot_].push_back(std::move(kept.buffer));
+        }
+        kept_streams_.clear();
+        kept_bytes_ = 0;
+      }
+    }
+    keep_streams_ = keep_streams;
     const bool writeback = access((root + "/plume-writeback").c_str(), F_OK) == 0;
     if (writeback != writeback_) {
       REXLOG_INFO("Renut: Plume export writeback {}", writeback ? "on" : "off");
@@ -4563,7 +4841,7 @@ void PlumeCommandProcessor::Report() {
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
       "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={} "
       "const_reused={} export(draws={} ranges={}/{} reads={} merges={} refreshes={} barriers={}) "
-      "cp_cpu_ms={} slot_wait_ms={} stream_mb={} constant_mb={}",
+      "cp_cpu_ms={} slot_wait_ms={} stream_mb={} constant_mb={} kept(hits={} new_mb={} drops={} total_mb={} streams={})",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes, stats_.barriers,
       stats_.pipeline_binds, stats_.vertices, stats_.gs_draws, stats_.patch_draws, stats_.patch_vertices,
@@ -4580,7 +4858,8 @@ void PlumeCommandProcessor::Report() {
       stats_.constants_reused, stats_.export_draws, exports_.size(), stats_.export_ranges,
       stats_.export_reads, stats_.export_merges, stats_.export_refreshes, stats_.export_barriers,
       stats_.cp_cpu_us / 1000, stats_.slot_wait_us / 1000, stats_.stream_bytes >> 20,
-      stats_.constant_bytes >> 20);
+      stats_.constant_bytes >> 20, stats_.kept_hits, stats_.kept_bytes_made >> 20, stats_.kept_drops,
+      kept_bytes_ >> 20, kept_streams_.size());
   // Keep what the driver compiled this interval, so the next run of this scene
   // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
   // shuts the process down cleanly, so waiting for the device's own save would

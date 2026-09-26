@@ -31,10 +31,19 @@ index 9dcfedf..093ece3 100644
          case RenderFormat::R32_UINT:
          case RenderFormat::R32_SINT:
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..124ed8c 100644
+index f1dd503..b975937 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -249,6 +249,10 @@ namespace plume {
+@@ -87,6 +87,8 @@ namespace plume {
+         VK_KHR_PRESENT_ID_EXTENSION_NAME,
+         VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
+         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
++        // Per-stage compiler statistics, for reNut's RENUT_PIPELINE_STATS.
++        VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME,
+         // Vulkan spec requires this to be enabled if supported by the driver.
+         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+     };
+@@ -249,6 +251,10 @@ namespace plume {
              return VK_FORMAT_BC7_UNORM_BLOCK;
          case RenderFormat::BC7_UNORM_SRGB:
              return VK_FORMAT_BC7_SRGB_BLOCK;
@@ -45,3 +54,30 @@ index f1dd503..124ed8c 100644
          default:
              assert(false && "Unknown format.");
              return VK_FORMAT_UNDEFINED;
+@@ -1648,6 +1654,12 @@ namespace plume {
+         pipelineInfo.pDynamicState = &dynamicState;
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.renderPass = renderPass;
++        // reNut: the driver keeps each stage's compiler statistics for
++        // vkGetPipelineExecutableStatisticsKHR while RENUT_PIPELINE_STATS is set.
++        static const bool captureStatistics = getenv("RENUT_PIPELINE_STATS") != nullptr;
++        if (captureStatistics) {
++            pipelineInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
++        }
+ 
+         VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+@@ -3883,6 +3895,13 @@ namespace plume {
+             featuresChain = &portabilityFeatures;
+         }
+ 
++        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executableFeatures = {};
++        if (supportedOptionalExtensions.find(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) != supportedOptionalExtensions.end()) {
++            executableFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
++            executableFeatures.pNext = featuresChain;
++            featuresChain = &executableFeatures;
++        }
++
+         VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
+         VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
+         const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());

@@ -65,3 +65,42 @@ base (estado + desenho) ~9 ms, VS ~14 ms, PS ~11 ms a 719 MHz.
 `IssueDraw` 13% · cópia de streams (`CopySwapped` + `UploadGuest`) 14%,
 ~48 MB/quadro · constantes (`memmove` + `memcmp`) 14%, ~42 MB/quadro · XXH3 do
 conteúdo de texturas 11% · parsing de pacotes ~8%.
+
+## Segunda parte: CPU e estatísticas do compilador
+
+Área pesada (~8.800 desenhos, 719 MHz), thread de gravação:
+
+| passo | CPU/quadro | o que mudou |
+| --- | --- | --- |
+| antes | ~47 ms (5,4 µs/desenho) | 48 MB de streams + 42 MB de constantes por quadro |
+| streams guardados com write-watch | ~44 ms | streams 48 → 0,8 MB, mas 30 mil entradas |
+| janelas de 16 KB | — | 30 mil → ~3,9 mil entradas, varredura de escritas some |
+| cache de pipelines em thread de fundo | ~38 ms | a thread gravava 360 MB a cada relatório com pipeline novo (`write` 15%) |
+| constantes em blocos de 1 KB | ~37 ms (4,1 µs/desenho) | constantes 42 → 22,5 MB/quadro |
+
+- **Streams guardados** (`GuestStream`): vértices e índices ficam num buffer próprio
+  por janela alinhada de 16 KB enquanto o guest não escreve nas páginas (callback
+  de invalidação do rexglue, como o shared memory do xenia). Três escritas → a
+  janela vira dinâmica por 900 quadros e volta ao ring. `files/plume-no-persist`
+  desliga. O callback devolve a faixa exata: `(0, UINT32_MAX)` faria o rexglue
+  desproteger até 4 MB em volta e streams vizinhos perderiam a vigilância.
+- **Texturas 2D**: vigiadas do mesmo jeito; só re-hasheadas se escritas (e a cada
+  256 quadros por segurança).
+- **Constantes**: cada estágio em 4 UBOs de 64 float4 (bindings 0-3 VS, 4-7 PS,
+  8 compartilhado); `MarkConstantsWritten` marca o bloco.
+
+A GPU segue o limite nas áreas pesadas (~56 ms, ~6,3 µs/desenho).
+
+### Estatísticas do compilador (`RENUT_PIPELINE_STATS=1` no plume-env)
+
+Uma linha `Plume stats` por estágio de cada pipeline criado. 1.132 pipelines:
+
+| estágio | instruções (mediana / p90) | registradores | espera SY estimada |
+| --- | --- | --- | --- |
+| FS | 1.118 / 1.170 (~244 NOPs) | 8 | 100 / 185 |
+| VS | 705 / 1.535 | 12 | 447 / 2.314 |
+
+**Todo pixel shader tem ~1.100 instruções, quase fixo** - é código comum gerado
+pelo recompilador, não do jogo. Próximo alvo da GPU: ver no HLSL/SPIR-V o que
+todo PS carrega (as 26 entradas, param-gen, remaps, helpers de textura) e cortar.
+Log completo em `out/stats-2026-09-26.log`.
