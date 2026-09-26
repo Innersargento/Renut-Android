@@ -142,7 +142,7 @@ static void validateFibers() {
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activity, jstring directory,
     jobject surface,jstring hooks,jstring driverDirectory,jstring driverLibrary,jstring renderer,jboolean launch,
-    jboolean oneUiFix,jstring tuDebug) {
+    jboolean oneUiFix,jstring tuDebug,jstring ir3Debug) {
   const char* chars = env->GetStringUTFChars(directory, nullptr);
   if (!chars) return nullptr;
   std::filesystem::path root(chars);
@@ -208,6 +208,15 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
           note("Ambiente: "+line);
           plume_env+=line+"\n";
         }
+      }
+      // The launcher's IR3_SHADER_DEBUG choice, unless plume-env set one. It
+      // joins the text the pipeline cache is named after: ir3 reads it when it
+      // compiles, and a cache written without it would hand back binaries
+      // compiled without it.
+      if(const auto ir3=javaString(env,ir3Debug);!ir3.empty()&&!getenv("IR3_SHADER_DEBUG")){
+        setenv("IR3_SHADER_DEBUG",ir3.c_str(),1);
+        note("IR3_SHADER_DEBUG: "+ir3);
+        plume_env+="IR3_SHADER_DEBUG="+ir3+"\n";
       }
       renutConfigureXenosDriver(javaString(env,hooks),javaString(env,driverDirectory),javaString(env,driverLibrary),oneUiFix,
                                 javaString(env,tuDebug));

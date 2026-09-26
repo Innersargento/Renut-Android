@@ -19,7 +19,8 @@ public final class MainActivity extends Activity {
     private static final int ISO=10, XEX=11, DRIVER=12, EXPORT=13;
     private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
     private static final String[] TU_DEBUG={"","perf","sysmem","gmem"};
-    private TextView status, library, driver, renderer, fpsCounter, oneUiFix, tuDebug;
+    private static final String[] IR3_DEBUG={"","nopreamble","noearlypreamble","nouboopt","nodescprefetch"};
+    private TextView status, library, driver, renderer, fpsCounter, oneUiFix, tuDebug, ir3Debug;
     private ProgressBar progress;
     private Button cancel;
     private volatile Thread worker;
@@ -52,7 +53,8 @@ public final class MainActivity extends Activity {
             i.putExtra("renderer",getPreferences(0).getString("renderer","xenos"));
             i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
             i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));
-            i.putExtra("tuDebug",getPreferences(0).getString("tuDebug",""));startActivity(i);
+            i.putExtra("tuDebug",getPreferences(0).getString("tuDebug",""));
+            i.putExtra("ir3Debug",getPreferences(0).getString("ir3Debug",""));startActivity(i);
         });
         button(game,"Validar runtime ARM64",()->startActivity(new Intent(this,RuntimeActivity.class)));
         button(game,"Testar runtime com Plume",()->{
@@ -90,6 +92,12 @@ public final class MainActivity extends Activity {
             getPreferences(0).edit().putString("tuDebug",TU_DEBUG[next]).apply(); refresh();
         });
         graphics.addView(text("Depuração do Turnip. \"perf\" registra no logcat por que cada render pass foi para GMEM ou sysmem; \"sysmem\" e \"gmem\" forçam um dos modos. Só para medição. Não tem efeito no driver do sistema.",13,muted));
+        ir3Debug=text("",16,ink); graphics.addView(ir3Debug);
+        button(graphics,"Alternar IR3_SHADER_DEBUG",()->{
+            int next=(Arrays.asList(IR3_DEBUG).indexOf(getPreferences(0).getString("ir3Debug",""))+1)%IR3_DEBUG.length;
+            getPreferences(0).edit().putString("ir3Debug",IR3_DEBUG[next]).apply(); refresh();
+        });
+        graphics.addView(text("Opções do compilador de shaders do Turnip. \"nopreamble\" é o mais rápido, mas faz placas penduradas piscarem entre dois tons; \"noearlypreamble\", \"nouboopt\" e \"nodescprefetch\" servem para medir. Cada opção tem seu próprio cache de shaders, então a primeira execução com ela compila tudo de novo. Um IR3_SHADER_DEBUG em plume-env tem prioridade. Não tem efeito no driver do sistema.",13,muted));
         button(graphics,"Testar Plume no aparelho",()->{
             Intent intent=new Intent(this,ProbeActivity.class);
             intent.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
@@ -146,6 +154,8 @@ public final class MainActivity extends Activity {
         oneUiFix.setText(getPreferences(0).getBoolean("oneui",true)?"One UI fix: ativado":"One UI fix: desativado");
         String debug=getPreferences(0).getString("tuDebug","");
         tuDebug.setText("TU_DEBUG: "+(debug.isEmpty()?"desativado":debug));
+        String ir3=getPreferences(0).getString("ir3Debug","");
+        ir3Debug.setText("IR3_SHADER_DEBUG: "+(ir3.isEmpty()?"desativado":ir3));
         File diagnostic=new File(getFilesDir(),"probe-report.txt");
         try{if(diagnostic.lastModified()>reportReadAt){report=new String(Files.readAllBytes(diagnostic.toPath()),java.nio.charset.StandardCharsets.UTF_8);reportReadAt=diagnostic.lastModified();if(worker==null)status.setText(report);}}catch(IOException ignored){}
         File runtimeReport=new File(getFilesDir(),"runtime-report.txt");
