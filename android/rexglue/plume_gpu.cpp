@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -58,6 +59,7 @@ using rex::graphics::Register;
 using namespace rex::graphics;
 
 #include "shaders/point_list.geom.inc"
+#include "shaders/debug_point.frag.inc"
 #include "shaders/rect_list.geom.inc"
 
 // Where microcode without a recompiled shader is saved (SetPlumeMissDumpDirectory).
@@ -696,6 +698,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
                  uint32_t frontbuffer_height) override;
   gfx::Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                           const uint32_t* host_address, uint32_t dword_count) override;
+  // A draw left out for a reason no other counter names: counted by reason
+  // and shader for the periodic report, and named in a trace.
+  bool Drop(const char* reason, const HostShader* vs, const HostShader* ps);
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
@@ -824,6 +829,14 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Debug: <files>/plume-skip-shader holds a shader hash (hex); draws with
   // that vertex or pixel shader are dropped.
   uint64_t skip_shader_ = 0;
+  // Debug: <files>/plume-debug-shader holds a shader hash (hex); draws with
+  // that vertex or pixel shader lose depth testing, blending, alpha test and
+  // culling, to show where they land and what colour they come out.
+  uint64_t debug_shader_ = 0;
+  // "<hash> <mode>": 1 drops the depth test, 2 blending, 4 alpha test and
+  // culling (7 when left out); 8 draws a point list's sprite coordinate.
+  uint32_t debug_mode_ = 7;
+  std::map<std::tuple<std::string, uint64_t, uint64_t, bool>, uint64_t> drops_;
   // Debug: <files>/plume-snap holds "<hex address> <n>": the n-th resolve of
   // the frame into that address is copied aside and presented instead of the
   // front buffer, to see an intermediate pass on screen.
@@ -860,6 +873,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unique_ptr<RenderTextureView> white_cube_view_;
   std::unique_ptr<RenderShader> rect_list_gs_;
   std::unique_ptr<RenderShader> point_list_gs_;
+  std::unique_ptr<RenderShader> debug_point_fs_;  // plume-debug-shader mode 8
 
   // Keyed by guest base. Never overlapping: a new range swallows the ones it touches.
   std::map<uint32_t, ExportRange> exports_;
@@ -1111,6 +1125,8 @@ bool PlumeCommandProcessor::SetupContext() {
                                         RenderShaderFormat::SPIRV);
   point_list_gs_ = device_->createShader(k_point_list_geom, sizeof(k_point_list_geom), "main",
                                          RenderShaderFormat::SPIRV);
+  debug_point_fs_ = device_->createShader(k_debug_point_frag, sizeof(k_debug_point_frag), "main",
+                                          RenderShaderFormat::SPIRV);
 
   upload_used_ = 0;
   uint64_t white = Allocate(4 * 6, 256);
@@ -2328,6 +2344,15 @@ gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, ui
   return shader.get();
 }
 
+bool PlumeCommandProcessor::Drop(const char* reason, const HostShader* vs, const HostShader* ps) {
+  const uint64_t vs_hash = vs && vs->entry ? vs->entry->hash : 0;
+  const uint64_t ps_hash = ps && ps->entry ? ps->entry->hash : 0;
+  const bool exports = vs && vs->entry && (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT);
+  ++drops_[{reason, vs_hash, ps_hash, exports}];
+  Trace("dropped ({}) vs={:016X} ps={:016X}{}", reason, vs_hash, ps_hash, exports ? " memexport" : "");
+  return true;
+}
+
 bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool) {
   const gfx::RegisterFile& regs = *register_file_;
@@ -2451,7 +2476,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // Render targets.
   const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
   const uint32_t pitch = surface.surface_pitch;
-  if (!pitch) return true;
+  if (!pitch) return Drop("no pitch", vs, ps);
   const auto window_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   const uint32_t height = std::clamp<uint32_t>(window_br.br_y, 16, 4096);
   max_draw_height_ = std::max(max_draw_height_, height);
@@ -2484,7 +2509,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     depth = GetTarget(depth_info.depth_base, uint32_t(depth_info.depth_format), true, pitch, height);
   }
-  if (!color_count && !depth) return true;
+  if (!color_count && !depth) return Drop("no color or depth", vs, ps);
   // GetTarget may have recreated a texture that an earlier slot also uses.
   for (uint32_t i = 0; i < color_count; ++i) {
     Transition(colors[i]->texture.get(), colors[i]->layout, RenderTextureLayout::COLOR_WRITE);
@@ -2656,7 +2681,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // without MSAA; like a single-sample A2C, keep the fragments at or above
   // half coverage.
   const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(skip_mask_ & 4096);
-  const bool alpha_test = ps && (alpha_test_enabled || alpha_to_mask);
+  bool alpha_test = ps && (alpha_test_enabled || alpha_to_mask);
   float alpha_ref = alpha_test_enabled ? regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF) : 0.5f;
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 12, &alpha_ref, 4);
 
@@ -2862,6 +2887,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                           regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 3));
     }
     Trace("{}", line);
+    if (vs->entry->hash == debug_shader_ || vs->entry->hash == arm_target_) {
+      // Every constant for the shader under study, to run it by hand.
+      for (uint32_t i = 8; i < 256; ++i) {
+        float c[4];
+        for (uint32_t j = 0; j < 4; ++j) c[j] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + j);
+        if (c[0] || c[1] || c[2] || c[3]) Trace("  vsc{}=({},{},{},{})", i, c[0], c[1], c[2], c[3]);
+      }
+      Trace("  bools {:08X} {:08X}", regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+            regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 1]);
+    }
     for (const auto& [k, entry] : patch_list ? vs->domain_live_fetches : vs->live_fetches) {
       float scale;
       std::memcpy(&scale, &entry[3], 4);
@@ -2968,7 +3003,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         !CommitConstants(ps_shadow_, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X],
                          kStageConstantSize, ps_constants_offset_) ||
         !CommitConstants(shared_shadow_, shared_built_, RENUT_SHARED_SIZE, shared_offset_)) {
-      return true;
+      return Drop("constants upload", vs, ps);
     }
   } while (generation != upload_generation_);
 
@@ -2984,20 +3019,29 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     Trace("  zviewport scale={} offset={}", regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
           regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET));
   }
-  if (scissor_rect.right <= scissor_rect.left || scissor_rect.bottom <= scissor_rect.top) return true;
+  if (scissor_rect.right <= scissor_rect.left || scissor_rect.bottom <= scissor_rect.top) {
+    return Drop("empty scissor", vs, ps);
+  }
 
   // Pipeline.
   const auto raster = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
   const bool polygonal = draw_util::IsPrimitivePolygonal(false, prim_type);
   RenderCullMode cull = RenderCullMode::NONE;
   if (polygonal && !(skip_mask_ & 131072)) {
-    if (raster.cull_front && raster.cull_back) return true;
+    if (raster.cull_front && raster.cull_back) return Drop("culls both faces", vs, ps);
     if (raster.cull_front) cull = RenderCullMode::FRONT;
     else if (raster.cull_back) cull = RenderCullMode::BACK;
   }
   const RenderFrontFace front_face = raster.face ? RenderFrontFace::CLOCKWISE
                                                 : RenderFrontFace::COUNTER_CLOCKWISE;
-  const bool depth_enabled = depth && depth_control.z_enable && !(skip_mask_ & 1024);
+  const bool debug_draw =
+      debug_shader_ && (vs->entry->hash == debug_shader_ || (ps && ps->entry->hash == debug_shader_));
+  if (debug_draw && (debug_mode_ & 4)) {
+    cull = RenderCullMode::NONE;
+    alpha_test = false;
+  }
+  const bool depth_enabled =
+      depth && depth_control.z_enable && !(skip_mask_ & 1024) && !(debug_draw && (debug_mode_ & 1));
   const bool depth_write = depth_enabled && depth_control.z_write_enable;
   RenderBlendDesc blends[4];
   for (uint32_t i = 0; i < color_count; ++i) {
@@ -3016,6 +3060,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                        b.srcBlendAlpha == RenderBlend::ONE && b.dstBlendAlpha == RenderBlend::ZERO &&
                        b.blendOpAlpha == RenderBlendOperation::ADD);
     b.renderTargetWriteMask = uint8_t((color_mask >> (4 * i)) & 0xF);
+    if (debug_draw && (debug_mode_ & 2)) {
+      b.blendEnabled = false;
+      b.renderTargetWriteMask = 0xF;
+    }
   }
   const uint32_t spec = (alpha_test ? SPEC_CONSTANT_ALPHA_TEST : 0) |
                         (r11g11b10_normals ? SPEC_CONSTANT_R11G11B10_NORMAL : 0);
@@ -3045,6 +3093,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   HashCombine(key, depth_write);
   HashCombine(key, depth_control.zfunc);
   HashCombine(key, spec);
+  // Mode 8 swaps a point list's pixel shader for the sprite-coordinate view.
+  const bool debug_point = debug_draw && (debug_mode_ & 8) && point_list && color_count;
+  HashCombine(key, debug_point);
   for (const auto& e : input_elements) {
     HashCombine(key, e.location);
     HashCombine(key, e.format);
@@ -3062,7 +3113,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.vertexShader =
         patch_list ? vs->domain_compiled->module.get() : vs->compiled->module.get();
     desc.geometryShader = rect_list ? rect_list_gs_.get() : point_list ? point_list_gs_.get() : nullptr;
-    desc.pixelShader = ps ? ps->compiled->module.get() : nullptr;
+    desc.pixelShader = debug_point ? debug_point_fs_.get() : ps ? ps->compiled->module.get() : nullptr;
     desc.primitiveTopology = topology;
     desc.cullMode = cull;
     desc.frontFace = front_face;
@@ -3127,7 +3178,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     patch_domain_bytes = vertex_count * 4 * uint32_t(sizeof(float));
     patch_domain_offset = Allocate(patch_domain_bytes, 256);
-    if (patch_domain_offset == UINT64_MAX) return true;
+    if (patch_domain_offset == UINT64_MAX) return Drop("upload full", vs, ps);
     auto* out = reinterpret_cast<float*>(Pointer(patch_domain_offset));
     const float step = 1.0f / float(level);
     auto corner = [&](uint32_t patch, uint32_t row, uint32_t col) {
@@ -3179,7 +3230,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     index_format = is32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT;
     const uint32_t size = index_count * (is32 ? 4 : 2);
     if (!UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)) {
-      return true;
+      return Drop("index upload", vs, ps);
     }
     index_bytes = size;
   }
@@ -3187,7 +3238,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     // Two triangles per quad, as 32-bit indices.
     const uint32_t quads = index_count / 4;
     uint64_t offset = Allocate(uint64_t(quads) * 6 * 4, 256);
-    if (offset == UINT64_MAX) return true;
+    if (offset == UINT64_MAX) return Drop("upload full", vs, ps);
     auto* out = reinterpret_cast<uint32_t*>(Pointer(offset));
     for (uint32_t q = 0; q < quads; ++q) {
       uint32_t v[4];
@@ -3777,13 +3828,17 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       --arm_left_;
     }
   }
-  if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
+  if (!miss_dump_directory_.empty() && !trace_) {
+    // Every frame: a request made when something looks wrong has to catch the
+    // frame that shows it.
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
-    const std::string request = root + "/plume-trace-request";
-    if (!trace_ && std::remove(request.c_str()) == 0) {
+    if (std::remove((root + "/plume-trace-request").c_str()) == 0) {
       trace_ = std::fopen((root + "/plume-trace.txt").c_str(), "w");
       trace_dump_name_ = "exportdump";
     }
+  }
+  if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
+    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
     texdump_directory_.clear();
     if (std::remove((root + "/plume-texdump-request").c_str()) == 0) {
       texdump_directory_ = root + "/texdump";
@@ -3837,6 +3892,16 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     if (skip_shader != skip_shader_) REXLOG_INFO("Renut: Plume dropping shader {:016X}", skip_shader);
     skip_shader_ = skip_shader;
+    unsigned long long debug_shader = 0;
+    uint32_t debug_mode = 7;
+    if (FILE* file = std::fopen((root + "/plume-debug-shader").c_str(), "r")) {
+      if (std::fscanf(file, "%llx", &debug_shader) != 1) debug_shader = 0;
+      if (std::fscanf(file, "%u", &debug_mode) != 1) debug_mode = 7;
+      std::fclose(file);
+    }
+    debug_mode_ = debug_mode;
+    if (debug_shader != debug_shader_) REXLOG_INFO("Renut: Plume debugging shader {:016X}", debug_shader);
+    debug_shader_ = debug_shader;
   }
   // A range nothing has exported into for a while goes back to guest memory.
   for (auto it = exports_.begin(); it != exports_.end();) {
@@ -3902,6 +3967,24 @@ void PlumeCommandProcessor::Report() {
     REXLOG_INFO("Renut: Plume   missing VS {:016X}: {} draws", hash, count);
   }
   missed_draws_.clear();
+  if (!drops_.empty()) {
+    std::map<std::string, uint64_t> by_reason;
+    std::vector<std::pair<uint64_t, std::tuple<std::string, uint64_t, uint64_t, bool>>> ranked;
+    for (const auto& [key, count] : drops_) {
+      by_reason[std::get<0>(key)] += count;
+      ranked.emplace_back(count, key);
+    }
+    std::string line = "Renut: Plume drops:";
+    for (const auto& [reason, count] : by_reason) line += fmt::format(" [{}] {}", reason, count);
+    REXLOG_INFO("{}", line);
+    std::sort(ranked.rbegin(), ranked.rend());
+    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); ++i) {
+      const auto& [count, key] = ranked[i];
+      REXLOG_INFO("Renut: Plume   drop [{}] vs={:016X} ps={:016X}{}: {}", std::get<0>(key), std::get<1>(key),
+                  std::get<2>(key), std::get<3>(key) ? " memexport" : "", count);
+    }
+    drops_.clear();
+  }
   reported_guest_swaps_ = renut_guest_swap_count();
   stats_ = {};
 }

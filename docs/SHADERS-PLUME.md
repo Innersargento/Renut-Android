@@ -282,7 +282,7 @@ e o remap força o `w`. A UV é `16_16_FLOAT` no segundo dword, lida por `vfetch
 
 ## Ferramentas de depuração do Plume (arquivos em `files/`)
 
-- `plume-trace-request`: trace do próximo quadro (verificado a cada 30 quadros).
+- `plume-trace-request`: trace do próximo quadro (verificado a cada quadro).
 - `plume-trace-arm`: trace armado. Vazio, aprende os pares VS/PS de 150 quadros e depois
   grava os 3 quadros seguintes a um par novo. Com um hash (hex), dispara só com esse
   shader. Até 6 rajadas, em `plume-trace-arm-<rajada>-<quadro>.txt` e
@@ -292,3 +292,38 @@ e o remap força o `w`. A UV é `16_16_FLOAT` no segundo dword, lida por `vfetch
   (`live<k>`).
 - `plume-skip-shader`: descarta os desenhos com esse hash (VS ou PS).
 - `plume-writeback`: religa a cópia de volta do memory export.
+
+## Efeitos translúcidos sumidos: duas falhas do recompilador (25/09/2026)
+
+Fumaça, faíscas, o brilho das notas, o raio da chave e os halos de luz não apareciam.
+O brilho da nota (`5DFD59A19552C1F0`/`D6B4E8659C9D8E72`) serviu de caso de estudo: com
+`plume-debug-shader` ele era desenhado no lugar e no tamanho certos, mas nenhum pixel
+passava o alpha test. A textura (atlas com alfa) e a coordenada do sprite estavam certas;
+o alfa da cor, calculado no VS pela idade da partícula, saía zero.
+
+1. **Metades vetorial e escalar em paralelo.** Uma instrução ALU do Xenos tem uma
+   operação vetorial e uma escalar que leem as fontes antes de qualquer escrita. O
+   recompilador gravava o resultado vetorial primeiro, e a escalar lia o registrador já
+   alterado: `r3.w = c197.z - r3.z; ps = r3.w - r3.z;` dava "idade − nascimento" no lugar
+   de "fim − nascimento" (a duração da vida). Agora o resultado vetorial espera num
+   temporário (`vectorResult`) até a parte escalar ser gerada.
+2. **Coordenadas em texels (`tx_coord_denorm`).** O `tfetch` pode receber a coordenada em
+   texels; as partículas suaves leem assim a profundidade resolvida na posição do pixel.
+   O recompilador ignorava o bit e amostrava como fração. Agora divide pelo tamanho da
+   textura nas buscas 1D e 2D (73 shaders).
+
+Os dois estão em `tools/shaders/renut-xenosrecomp.patch`; 4.886 contêineres, 0 falhas no
+`spirv-val`. Confirmado no aparelho: os efeitos voltaram, sem artefatos novos.
+
+## Mais ferramentas de depuração
+
+- `plume-debug-shader`: `<hash> [modo]`. Nos desenhos com esse VS ou PS, o modo 1 tira o
+  teste de profundidade, 2 o blend, 4 o alpha test e o cull (padrão 7), e 8 troca o PS de
+  uma lista de pontos por `shaders/debug_point.frag` (coordenada do sprite em vermelho e
+  verde, azul onde o primeiro interpolador não é zero). O trace desse shader traz todas as
+  constantes do VS (`vsc<n>`) e os booleanos.
+- O log a cada 300 quadros lista os desenhos descartados por motivo e por shader
+  (`Plume drops`). Os ~650 por quadro de `3D0794ADDBF5A4F3`/`60E8DEF931549772`, sem cor nem
+  profundidade, são as consultas de visibilidade do jogo.
+- `tools/bug-watch.sh <sessão>`: um print no celular vira um trace do quadro seguinte em
+  `out/bugs/<sessão>/`; prints do reNut de PC (Win+PrtSc) vão para `pc/` na mesma sessão.

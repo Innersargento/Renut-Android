@@ -715,7 +715,7 @@ index ee3830d..c23d67a 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..952bde3 100644
+index c71e7c9..8d3de66 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -791,11 +791,7 @@ index c71e7c9..952bde3 100644
 +            lastFullFetch = instr;
 +            haveLastFullFetch = true;
 +        }
- 
--        // The fetch constants above 95 are not stream sources at all, and a
--        // negative stream is not one either. Either way there is nothing to
--        // read, and guessing would bind the wrong buffer.
--        if (fetchConstant > 95 || (95 - fetchConstant) >= RENUT_VERTEX_STREAM_COUNT)
++
 +        // D3D rewrites the vfetch at bind time for the vertex buffer actually
 +        // bound, so the stream, format, stride and offset in the microcode as
 +        // registered are not the ones in use. The host decodes the live
@@ -838,7 +834,11 @@ index c71e7c9..952bde3 100644
 +
 +        const VertexFetchInstruction& fetchSource =
 +            (instr.isMiniFetch && haveLastFullFetch) ? lastFullFetch : instr;
-+
+ 
+-        // The fetch constants above 95 are not stream sources at all, and a
+-        // negative stream is not one either. Either way there is nothing to
+-        // read, and guessing would bind the wrong buffer.
+-        if (fetchConstant > 95 || (95 - fetchConstant) >= RENUT_VERTEX_STREAM_COUNT)
 +        const uint32_t fetchConstant =
 +            uint32_t(fetchSource.constIndex) * 3 + uint32_t(fetchSource.constIndexSelect);
 +
@@ -979,7 +979,27 @@ index c71e7c9..952bde3 100644
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
  
-@@ -949,17 +1091,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -567,7 +709,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool /*bi
+         out += dimension;
+ 
+         print("(texture{}DescriptorIndex({}), samplerDescriptorIndex({}), ", heapDimension, slot, slot);
++        // tx_coord_denorm: the coordinates are in texels. N&B's soft particles
++        // read the resolved scene depth at the pixel position this way; taken
++        // as fractions they all read the clamped edge and faded to nothing.
++        const bool denorm = instr.texCoordDenorm &&
++            (instr.dimension == TextureDimension::Texture1D || instr.dimension == TextureDimension::Texture2D);
++        if (denorm)
++            out += "(";
+         printSrcRegister(componentCount);
++        if (denorm)
++        {
++            print(") / float{}(getTexture2DDimensions(g_Texture2DDescriptorHeap[texture2DDescriptorIndex({})]){})",
++                componentCount == 1 ? "" : "2", slot, componentCount == 1 ? ".x" : "");
++        }
+ 
+         switch (instr.dimension)
+         {
+@@ -949,17 +1103,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                      exportRegister = "oPointSizeEdgeKill";
                      break;
  
@@ -1016,7 +1036,36 @@ index c71e7c9..952bde3 100644
  
                  default:
                  {
-@@ -1034,6 +1191,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1024,20 +1193,41 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         vectorWriteMask &= 0b1;
+ #endif
+ 
++    // The vector and scalar halves of an ALU instruction run in parallel: both
++    // read their sources before either writes. Written straight away, a vector
++    // result would reach a scalar operation that reads the same register (N&B's
++    // particle shaders take a lifetime as end - birth in the scalar half while
++    // the vector half overwrites end with the age), so it waits in a temporary.
++    const bool deferVector = vectorWriteMask != 0 && exportRegister.empty() &&
++        instr.scalarOpcode != AluScalarOpcode::RetainPrev;
+     if (vectorWriteMask != 0)
+     {
+         indent();
+-        if (!exportRegister.empty())
++        if (deferVector)
++        {
++            out += "{\n";
++            ++indentation;
++            indent();
++            const uint32_t lanes = uint32_t(__builtin_popcount(vectorWriteMask));
++            if (lanes == 1)
++                out += "float vectorResult";
++            else
++                print("float{} vectorResult", lanes);
++        }
++        else if (!exportRegister.empty())
+         {
+             out += exportRegister;
+             out += '.';
          }
          else
          {
@@ -1026,7 +1075,37 @@ index c71e7c9..952bde3 100644
              print("r{}.", instr.vectorDest);
          }
  
-@@ -1421,6 +1581,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+-        for (size_t i = 0; i < 4; i++)
++        for (size_t i = 0; i < 4 && !deferVector; i++)
+         {
+             if ((vectorWriteMask >> i) & 0x1)
+                 out += SWIZZLES[i];
+@@ -1402,6 +1592,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         }
+     }
+ 
++    if (deferVector)
++    {
++        indent();
++#ifdef RENUT_RECOMP
++        markWritten(uint32_t(instr.vectorDest));
++#endif
++        print("r{}.", instr.vectorDest);
++        for (size_t i = 0; i < 4; i++)
++        {
++            if ((vectorWriteMask >> i) & 0x1)
++                out += SWIZZLES[i];
++        }
++        out += " = vectorResult;\n";
++        --indentation;
++        indent();
++        out += "}\n";
++    }
++
+     uint32_t scalarWriteMask = instr.scalarWriteMask;
+     if (instr.exportData)
+         scalarWriteMask &= ~instr.vectorWriteMask;
+@@ -1421,6 +1629,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -1036,7 +1115,7 @@ index c71e7c9..952bde3 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1492,8 +1655,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1492,8 +1703,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      isPixelShader = (shaderContainer->flags & 0x1) == 0;
  
  #ifdef RENUT_RECOMP
@@ -1059,7 +1138,7 @@ index c71e7c9..952bde3 100644
      println("#define RENUT_STAGE_{}", isPixelShader ? "PIXEL" : "VERTEX");
  #endif
  
-@@ -1603,6 +1779,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1603,6 +1827,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #endif
              println("\tin {3}float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)], interpolation);
          }
@@ -1070,7 +1149,7 @@ index c71e7c9..952bde3 100644
  
          out += "#ifdef __spirv__\n";
          out += "\tin bool iFace : SV_IsFrontFace\n";
-@@ -1661,6 +1841,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1661,6 +1889,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
          #endif
  
@@ -1088,7 +1167,7 @@ index c71e7c9..952bde3 100644
              out += '\t';
  
              bool locatedInput = false;
-@@ -1689,6 +1880,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1689,6 +1928,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
@@ -1107,7 +1186,7 @@ index c71e7c9..952bde3 100644
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1701,6 +1904,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1701,6 +1952,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
@@ -1118,7 +1197,7 @@ index c71e7c9..952bde3 100644
      }
  
      out += ")\n";
-@@ -1815,6 +2022,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1815,6 +2070,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
@@ -1128,7 +1207,7 @@ index c71e7c9..952bde3 100644
  
          out += "\n";
      }
-@@ -1826,8 +2036,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1826,8 +2084,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
@@ -1143,7 +1222,7 @@ index c71e7c9..952bde3 100644
 +            #else
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
 +            #endif
-             }
++            }
 +        #ifdef RENUT_RECOMP
 +            // r0.xyz is the domain location in zyx order and r1.x the patch
 +            // index, the way the Xenos hands them to a patch-indexed triangle
@@ -1155,7 +1234,7 @@ index c71e7c9..952bde3 100644
 +            else if (isDomainShader && i == 1)
 +            {
 +                out += "float4(iDomainPatch.w, 0.0, 0.0, 0.0);\n";
-+            }
+             }
 +            else if (!isPixelShader && i == 0)
 +            {
 +                out += "float4(float(iVertexId), 0.0, 0.0, 0.0);\n";
@@ -1164,7 +1243,7 @@ index c71e7c9..952bde3 100644
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
-@@ -1849,11 +2086,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1849,11 +2134,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #ifdef RENUT_RECOMP
      if (!isPixelShader)
      {
@@ -1185,7 +1264,7 @@ index c71e7c9..952bde3 100644
      }
  #endif
      if (isPixelShader)
-@@ -2463,6 +2704,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2463,6 +2752,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      // Kill vertex: a non-zero .z means the vertex is discarded.
                      // Feeding SV_Position a NaN drops every primitive that uses
                      // it, which is the closest a raster pipeline gets.
@@ -1195,7 +1274,7 @@ index c71e7c9..952bde3 100644
                      indent();
                      out += "if (oPointSizeEdgeKill.z != 0.0)\n";
                      indent();
-@@ -2484,6 +2728,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2484,6 +2776,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                          // multiply-add and changes nothing in the common case.
                          out += "\toPos.xy = oPos.xy * g_ViewportScaleOffset.xy + "
                                 "(g_ViewportScaleOffset.zw + g_HalfPixelOffset) * oPos.w;\n";
@@ -1205,7 +1284,7 @@ index c71e7c9..952bde3 100644
                      #else
                          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                      #endif
-@@ -2553,5 +2800,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2553,5 +2848,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
  #endif
  
