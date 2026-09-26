@@ -23,6 +23,14 @@ seen_pc=$(list_pc)
 echo "Watching (session $SESSION). Take a screenshot on the phone or on the PC."
 while true; do
   now=$(list_phone)
+  # A failed or short listing (adb busy, device reconnecting) must not become
+  # the new baseline: the next good one would then report every old
+  # screenshot in the gallery as new, and trace the game every few seconds.
+  if [ -z "$now" ] || [ "$(comm -13 <(echo "$seen_phone") <(echo "$now") | grep -c .)" -gt 3 ]; then
+    [ -n "$now" ] && seen_phone=$now
+    sleep 1
+    continue
+  fi
   comm -13 <(echo "$seen_phone") <(echo "$now") | while IFS= read -r shot; do
     [ -n "$shot" ] || continue
     dir="$OUT/$(date +%H%M%S)"

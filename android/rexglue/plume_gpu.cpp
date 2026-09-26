@@ -768,6 +768,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool CommitConstants(uint8_t* shadow, const void* source, size_t size, uint64_t& offset);
 
   void BeginFrame();
+  void EvictIdleTextures();
   void StartList();
   void FlushImagesForNextFrame();
   void Flush();
@@ -995,6 +996,28 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     }
     return next_descriptor_ < kMaxTextures2D ? next_descriptor_++ : 0;
   }
+  // Volumes and stacks share the 3D set, cube maps have their own; both are far
+  // smaller than the 2D one and recycled the same way.
+  std::vector<uint32_t> free_3d_descriptors_, free_cube_descriptors_;
+  std::array<std::vector<uint32_t>, kPlumeFramesInFlight> retired_3d_descriptor_slots_;
+  std::array<std::vector<uint32_t>, kPlumeFramesInFlight> retired_cube_descriptor_slots_;
+  uint32_t Allocate3DDescriptor() {
+    if (!free_3d_descriptors_.empty()) {
+      uint32_t index = free_3d_descriptors_.back();
+      free_3d_descriptors_.pop_back();
+      return index;
+    }
+    return next_3d_descriptor_ < kMaxTextures3D ? next_3d_descriptor_++ : 0;
+  }
+  uint32_t AllocateCubeDescriptor() {
+    if (!free_cube_descriptors_.empty()) {
+      uint32_t index = free_cube_descriptors_.back();
+      free_cube_descriptors_.pop_back();
+      return index;
+    }
+    return next_cube_descriptor_ < kMaxTexturesCube ? next_cube_descriptor_++ : 0;
+  }
+  uint64_t last_eviction_ = 0;
   void RetireTexture(std::unique_ptr<RenderTexture>& texture, uint32_t& descriptor) {
     if (texture) retired_slots_[slot_].push_back(std::move(texture));
     if (descriptor) retired_descriptor_slots_[slot_].push_back(descriptor);
@@ -1567,6 +1590,64 @@ void PlumeCommandProcessor::ReadTimestamps(uint32_t slot) {
 // Moves to the next frame in flight and opens its command list. Waiting here,
 // rather than after the submission that ended the last frame, is what lets the
 // GPU run a frame while this one is recorded.
+// Nothing in these caches was ever freed. Every trip between levels added the
+// new level's textures on top of the old ones until the 4096 2D descriptors ran
+// out (about four trips): from then on every new texture sampled the white one
+// in slot 0 and the picture collapsed to white. The 16 cube descriptors ran
+// out long before that. Whatever has not been sampled for a while goes; it is
+// decoded again if it comes back, and a resolve is only dropped when it has
+// been neither written nor read.
+void PlumeCommandProcessor::EvictIdleTextures() {
+  const uint32_t free_2d = kMaxTextures2D - next_descriptor_ + uint32_t(free_descriptors_.size());
+  const uint32_t free_3d = kMaxTextures3D - next_3d_descriptor_ + uint32_t(free_3d_descriptors_.size());
+  const uint32_t free_cube = kMaxTexturesCube - next_cube_descriptor_ + uint32_t(free_cube_descriptors_.size());
+  // About a minute at the game's frame rate, a few seconds when a set runs low.
+  auto idle_for = [&](bool short_of) { return short_of ? uint64_t(60) : uint64_t(900); };
+  auto idle = [&](uint64_t frame, uint64_t limit) { return frame == ~0ull || swaps_ - frame >= limit; };
+  uint32_t evicted = 0;
+
+  const uint64_t limit_2d = idle_for(free_2d < 512);
+  for (auto it = guest_textures_.begin(); it != guest_textures_.end();) {
+    if (!idle(it->second.checked_frame, limit_2d)) { ++it; continue; }
+    RetireTexture(it->second.texture, it->second.descriptor);
+    it = guest_textures_.erase(it);
+    ++evicted;
+  }
+  const uint64_t limit_3d = idle_for(free_3d < 16);
+  for (auto* map : {&guest_stacks_, &guest_volumes_}) {
+    for (auto it = map->begin(); it != map->end();) {
+      if (!idle(it->second.checked_frame, limit_3d)) { ++it; continue; }
+      if (it->second.texture) retired_slots_[slot_].push_back(std::move(it->second.texture));
+      if (it->second.descriptor) retired_3d_descriptor_slots_[slot_].push_back(it->second.descriptor);
+      it = map->erase(it);
+      ++evicted;
+    }
+  }
+  const uint64_t limit_cube = idle_for(free_cube < 4);
+  for (auto it = guest_cubes_.begin(); it != guest_cubes_.end();) {
+    if (!idle(it->second.checked_frame, limit_cube)) { ++it; continue; }
+    if (it->second.view) retired_views_[slot_].push_back(std::move(it->second.view));
+    if (it->second.texture) retired_slots_[slot_].push_back(std::move(it->second.texture));
+    if (it->second.descriptor) retired_cube_descriptor_slots_[slot_].push_back(it->second.descriptor);
+    it = guest_cubes_.erase(it);
+    ++evicted;
+  }
+  const uint64_t limit_resolved = free_2d < 512 ? 120 : 1800;
+  for (auto it = resolved_.begin(); it != resolved_.end();) {
+    Resolved& r = it->second;
+    if (!idle(r.written_frame, limit_resolved) || !idle(r.checked_frame, limit_resolved)) { ++it; continue; }
+    RetireSwizzled(r);
+    RetireTexture(r.texture, r.descriptor);
+    RetireTexture(r.fitted, r.fitted_descriptor);
+    it = resolved_.erase(it);
+    ++evicted;
+  }
+  if (evicted) {
+    REXLOG_INFO("Renut: Plume evicted {} idle textures (free descriptors 2D {} 3D {} cube {})", evicted,
+                free_2d, free_3d, free_cube);
+  }
+}
+
 void PlumeCommandProcessor::BeginFrame() {
   slot_ = (slot_ + 1) % kPlumeFramesInFlight;
   // The slot's command list, ring slice and retired resources are all still in
@@ -1581,10 +1662,24 @@ void PlumeCommandProcessor::BeginFrame() {
     free_descriptors_.push_back(index);
   }
   retired_descriptor_slots_[slot_].clear();
+  for (uint32_t index : retired_3d_descriptor_slots_[slot_]) {
+    set_3d_->setTexture(index, white_3d_.get(), RenderTextureLayout::SHADER_READ);
+    free_3d_descriptors_.push_back(index);
+  }
+  retired_3d_descriptor_slots_[slot_].clear();
+  for (uint32_t index : retired_cube_descriptor_slots_[slot_]) {
+    set_cube_->setTexture(index, white_cube_.get(), RenderTextureLayout::SHADER_READ, white_cube_view_.get());
+    free_cube_descriptors_.push_back(index);
+  }
+  retired_cube_descriptor_slots_[slot_].clear();
   retired_framebuffer_slots_[slot_].clear();
   retired_slots_[slot_].clear();
   retired_views_[slot_].clear();
   retired_buffers_[slot_].clear();
+  if (swaps_ - last_eviction_ >= 30) {
+    last_eviction_ = swaps_;
+    EvictIdleTextures();
+  }
   StartList();
   // Only here, never from Flush: a mid-frame flush keeps recording into the
   // same range, and resetting it would drop what the first submission wrote.
@@ -2000,7 +2095,12 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   }
   texture.content = content;
   if (!texture.descriptor) texture.descriptor = AllocateTextureDescriptor();
-  if (!texture.descriptor) return 0;
+  if (!texture.descriptor) {
+    // Out of descriptors: try again next frame, once eviction has freed some,
+    // rather than keep this texture white for as long as it stays in use.
+    texture.content = ~content;
+    return 0;
+  }
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
   uint32_t w = width, h = height;
   for (uint32_t level = 0; level < levels; ++level) {
@@ -2180,8 +2280,8 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
   }
   const uint32_t width = layouts[0].width, height = layouts[0].height;
   if (!texture.descriptor) {
-    if (next_3d_descriptor_ >= kMaxTextures3D) return 0;
-    texture.descriptor = next_3d_descriptor_++;
+    texture.descriptor = Allocate3DDescriptor();
+    if (!texture.descriptor) return 0;
   }
   if (!texture.texture || texture.width != width || texture.height != height ||
       texture.depth != depth || texture.levels != levels) {
@@ -2258,8 +2358,8 @@ uint32_t PlumeCommandProcessor::GetGuestVolumeTexture(const xenos::xe_gpu_textur
     return 0;
   }
   if (!texture.descriptor) {
-    if (next_3d_descriptor_ >= kMaxTextures3D) return 0;
-    texture.descriptor = next_3d_descriptor_++;
+    texture.descriptor = Allocate3DDescriptor();
+    if (!texture.descriptor) return 0;
   }
   if (!texture.texture || texture.width != width || texture.height != height || texture.depth != depth) {
     if (texture.texture) retired_slots_[slot_].push_back(std::move(texture.texture));
@@ -2334,8 +2434,8 @@ uint32_t PlumeCommandProcessor::GetGuestCubeTexture(const xenos::xe_gpu_texture_
     for (uint32_t face = 0; face < 6; ++face) DumpTexture(fetch, faces[face], width, height, "cube");
   }
   if (!texture.descriptor) {
-    if (next_cube_descriptor_ >= kMaxTexturesCube) return 0;
-    texture.descriptor = next_cube_descriptor_++;
+    texture.descriptor = AllocateCubeDescriptor();
+    if (!texture.descriptor) return 0;
   }
   if (!texture.texture) {
     texture.texture = device_->createTexture(RenderTextureDesc::Texture(
@@ -3991,8 +4091,14 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     debug_shader_ = debug_shader;
   }
   // A range nothing has exported into for a while goes back to guest memory.
+  // Emitters export every frame they are alive, so a couple of seconds is
+  // plenty. At 600 frames a range outlived the level that exported into it:
+  // the next level reused the memory for ordinary meshes, and every block it
+  // wrote with the bytes the range's snapshot already held kept the old
+  // level's exported vertices - triangles across the screen after a few
+  // trips between Showdown Town and Nutty Acres.
   for (auto it = exports_.begin(); it != exports_.end();) {
-    if (it->second.exported_frame + 600 < swaps_) {
+    if (it->second.exported_frame + 30 < swaps_) {
       retired_buffers_[slot_].push_back(std::move(it->second.buffer));
       it = exports_.erase(it);
     } else {
