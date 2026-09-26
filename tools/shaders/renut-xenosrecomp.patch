@@ -715,7 +715,7 @@ index ee3830d..c23d67a 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..80442e0 100644
+index c71e7c9..f229fb5 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -791,11 +791,7 @@ index c71e7c9..80442e0 100644
 +            lastFullFetch = instr;
 +            haveLastFullFetch = true;
 +        }
- 
--        // The fetch constants above 95 are not stream sources at all, and a
--        // negative stream is not one either. Either way there is nothing to
--        // read, and guessing would bind the wrong buffer.
--        if (fetchConstant > 95 || (95 - fetchConstant) >= RENUT_VERTEX_STREAM_COUNT)
++
 +        // D3D rewrites the vfetch at bind time for the vertex buffer actually
 +        // bound, so the stream, format, stride and offset in the microcode as
 +        // registered are not the ones in use. The host decodes the live
@@ -838,7 +834,11 @@ index c71e7c9..80442e0 100644
 +
 +        const VertexFetchInstruction& fetchSource =
 +            (instr.isMiniFetch && haveLastFullFetch) ? lastFullFetch : instr;
-+
+ 
+-        // The fetch constants above 95 are not stream sources at all, and a
+-        // negative stream is not one either. Either way there is nothing to
+-        // read, and guessing would bind the wrong buffer.
+-        if (fetchConstant > 95 || (95 - fetchConstant) >= RENUT_VERTEX_STREAM_COUNT)
 +        const uint32_t fetchConstant =
 +            uint32_t(fetchSource.constIndex) * 3 + uint32_t(fetchSource.constIndexSelect);
 +
@@ -1036,7 +1036,22 @@ index c71e7c9..80442e0 100644
  
                  default:
                  {
-@@ -1024,20 +1193,41 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -987,7 +1156,14 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     if (instr.vectorOpcode >= AluVectorOpcode::SetpEqPush && instr.vectorOpcode <= AluVectorOpcode::SetpGePush)
+     {
+         indent();
++#ifdef RENUT_RECOMP
++        // The predicate tests the sources' w, whatever the destination mask
++        // (see the result below for x). Taking the component the mask selects
++        // tested the wrong lanes for any destination but .w.
++        print("p0 = ({}).w == 0.0 && ({}).w ", op(VECTOR_0, true), op(VECTOR_1, true));
++#else
+         print("p0 = {} == 0.0 && {} ", op(VECTOR_0), op(VECTOR_1));
++#endif
+ 
+         switch (instr.vectorOpcode)
+         {
+@@ -1024,20 +1200,41 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          vectorWriteMask &= 0b1;
  #endif
  
@@ -1080,7 +1095,31 @@ index c71e7c9..80442e0 100644
          {
              if ((vectorWriteMask >> i) & 0x1)
                  out += SWIZZLES[i];
-@@ -1402,6 +1592,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1142,8 +1339,23 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         case AluVectorOpcode::SetpNePush:
+         case AluVectorOpcode::SetpGtPush:
+         case AluVectorOpcode::SetpGePush:
++#ifdef RENUT_RECOMP
++        {
++            // Xenos: the result has its own test, on x - dest = (src0.x == 0 &&
++            // src1.x <cmp> 0) ? 0 : src0.x + 1 - while p0 tests w. Reusing p0
++            // and adding 1 to the masked lane broke the counters N&B's lit
++            // shaders pick their shadow cascade with: building shadows cut
++            // off just past the player at night.
++            const char* compare = instr.vectorOpcode == AluVectorOpcode::SetpEqPush ? "==" :
++                                  instr.vectorOpcode == AluVectorOpcode::SetpNePush ? "!=" :
++                                  instr.vectorOpcode == AluVectorOpcode::SetpGtPush ? ">" : ">=";
++            print("(({0}).x == 0.0 && ({1}).x {2} 0.0) ? 0.0 : ({0}).x + 1.0", op(VECTOR_0, true), op(VECTOR_1, true), compare);
++            break;
++        }
++#else
+             print("p0 ? 0.0 : {} + 1.0", op(VECTOR_0));
+             break;
++#endif
+ 
+         case AluVectorOpcode::KillEq:
+             print("any({} == {})", op(VECTOR_0, true), op(VECTOR_1, true));
+@@ -1402,6 +1614,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
      }
  
@@ -1105,7 +1144,7 @@ index c71e7c9..80442e0 100644
      uint32_t scalarWriteMask = instr.scalarWriteMask;
      if (instr.exportData)
          scalarWriteMask &= ~instr.vectorWriteMask;
-@@ -1421,6 +1629,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1421,6 +1651,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -1115,7 +1154,7 @@ index c71e7c9..80442e0 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1492,8 +1703,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1492,8 +1725,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      isPixelShader = (shaderContainer->flags & 0x1) == 0;
  
  #ifdef RENUT_RECOMP
@@ -1138,7 +1177,7 @@ index c71e7c9..80442e0 100644
      println("#define RENUT_STAGE_{}", isPixelShader ? "PIXEL" : "VERTEX");
  #endif
  
-@@ -1603,6 +1827,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1603,6 +1849,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #endif
              println("\tin {3}float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)], interpolation);
          }
@@ -1149,7 +1188,7 @@ index c71e7c9..80442e0 100644
  
          out += "#ifdef __spirv__\n";
          out += "\tin bool iFace : SV_IsFrontFace\n";
-@@ -1661,6 +1889,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1661,6 +1911,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
          #endif
  
@@ -1167,7 +1206,7 @@ index c71e7c9..80442e0 100644
              out += '\t';
  
              bool locatedInput = false;
-@@ -1689,6 +1928,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1689,6 +1950,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
@@ -1186,7 +1225,7 @@ index c71e7c9..80442e0 100644
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1701,6 +1952,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1701,6 +1974,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
@@ -1197,7 +1236,7 @@ index c71e7c9..80442e0 100644
      }
  
      out += ")\n";
-@@ -1792,14 +2047,29 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1792,14 +2069,29 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          if (isPixelShader)
          {
              value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
@@ -1227,7 +1266,7 @@ index c71e7c9..80442e0 100644
          }
      }
  
-@@ -1815,6 +2085,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1815,6 +2107,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
@@ -1237,7 +1276,7 @@ index c71e7c9..80442e0 100644
  
          out += "\n";
      }
-@@ -1826,8 +2099,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1826,8 +2121,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
@@ -1260,7 +1299,7 @@ index c71e7c9..80442e0 100644
 +            else if (isDomainShader && i == 0)
 +            {
 +                out += "float4(iDomainPatch.z, iDomainPatch.y, iDomainPatch.x, 0.0);\n";
-+            }
+             }
 +            else if (isDomainShader && i == 1)
 +            {
 +                out += "float4(iDomainPatch.w, 0.0, 0.0, 0.0);\n";
@@ -1268,12 +1307,12 @@ index c71e7c9..80442e0 100644
 +            else if (!isPixelShader && i == 0)
 +            {
 +                out += "float4(float(iVertexId), 0.0, 0.0, 0.0);\n";
-             }
++            }
 +        #endif
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
-@@ -1849,11 +2149,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1849,11 +2171,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #ifdef RENUT_RECOMP
      if (!isPixelShader)
      {
@@ -1294,7 +1333,7 @@ index c71e7c9..80442e0 100644
      }
  #endif
      if (isPixelShader)
-@@ -2463,6 +2767,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2463,6 +2789,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      // Kill vertex: a non-zero .z means the vertex is discarded.
                      // Feeding SV_Position a NaN drops every primitive that uses
                      // it, which is the closest a raster pipeline gets.
@@ -1304,7 +1343,7 @@ index c71e7c9..80442e0 100644
                      indent();
                      out += "if (oPointSizeEdgeKill.z != 0.0)\n";
                      indent();
-@@ -2484,6 +2791,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2484,6 +2813,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                          // multiply-add and changes nothing in the common case.
                          out += "\toPos.xy = oPos.xy * g_ViewportScaleOffset.xy + "
                                 "(g_ViewportScaleOffset.zw + g_HalfPixelOffset) * oPos.w;\n";
@@ -1314,7 +1353,7 @@ index c71e7c9..80442e0 100644
                      #else
                          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                      #endif
-@@ -2553,5 +2863,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2553,5 +2885,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
  #endif
  

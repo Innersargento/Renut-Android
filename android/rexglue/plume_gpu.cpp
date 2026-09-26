@@ -850,6 +850,10 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // culling (7 when left out); 8 draws a point list's sprite coordinate; 16
   // and 32 whiten textures (see the shared block).
   uint32_t debug_mode_ = 7;
+  // Debug: <files>/plume-white-slots holds a hex mask of 2D fetch slots that
+  // every draw samples as white - e.g. 8000 whitens slot 15 (a shadow map reads
+  // as fully lit), to see which texture a lighting artifact comes from.
+  uint32_t white_slots_ = 0;
   std::map<std::tuple<std::string, uint64_t, uint64_t, bool>, uint64_t> drops_;
   // Debug: <files>/plume-snap holds "<hex address> <n>": the n-th resolve of
   // the frame into that address is copied aside and presented instead of the
@@ -2829,6 +2833,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     if (debug_mode_ & 32) texture_descriptor[0] = 0;
   }
+  for (uint32_t mask = white_slots_; mask; mask &= mask - 1) texture_descriptor[__builtin_ctz(mask)] = 0;
   std::memcpy(sh + RENUT_SHARED_TEXTURE2D_OFFSET, texture_descriptor, sizeof(texture_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURE3D_OFFSET, stack_descriptor, sizeof(stack_descriptor));
@@ -4087,6 +4092,13 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       std::fclose(file);
     }
     debug_mode_ = debug_mode;
+    unsigned int white_slots = 0;
+    if (FILE* file = std::fopen((root + "/plume-white-slots").c_str(), "r")) {
+      if (std::fscanf(file, "%x", &white_slots) != 1) white_slots = 0;
+      std::fclose(file);
+    }
+    if (white_slots != white_slots_) REXLOG_INFO("Renut: Plume white slots {:08X}", white_slots);
+    white_slots_ = white_slots;
     if (debug_shader != debug_shader_) REXLOG_INFO("Renut: Plume debugging shader {:016X}", debug_shader);
     debug_shader_ = debug_shader;
   }
