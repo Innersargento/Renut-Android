@@ -153,10 +153,27 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..e15872e 100644
+index ee3830d..7170006 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -73,9 +73,70 @@
+@@ -54,12 +54,11 @@
+ #define RENUT_SHARED_TEXTURECUBE_OFFSET  (RENUT_TEXTURE_SLOT_COUNT * 8)                      //  256 .. 383
+ #define RENUT_SHARED_SAMPLER_OFFSET      (RENUT_TEXTURE_SLOT_COUNT * 12)                     //  384 .. 511
+ #define RENUT_SHARED_BOOLEANS_OFFSET     (RENUT_TEXTURE_SLOT_COUNT * 16)                     //  512 .. 543
+-#define RENUT_SHARED_LOOP_OFFSET         (RENUT_SHARED_BOOLEANS_OFFSET + RENUT_BOOL_REGISTER_COUNT / 8)   //  544 .. 1055
+-#define RENUT_SHARED_MISC_OFFSET         (RENUT_SHARED_LOOP_OFFSET + RENUT_LOOP_CONSTANT_COUNT * 16)      // 1056 ..
++#define RENUT_SHARED_MISC_OFFSET         (RENUT_SHARED_BOOLEANS_OFFSET + RENUT_BOOL_REGISTER_COUNT / 8)   //  544 ..
+ // Misc runs to +40, then 8 bytes of padding so the float4 at +48 lands on a
+-// 16-byte boundary (1056 + 48 = 1104), which is what a float4 RawBufferLoad
+-// wants. Bytes 40..47 are unused.
+-#define RENUT_SHARED_VIEWPORT_OFFSET     (RENUT_SHARED_MISC_OFFSET + 48)                     // 1104
++// 16-byte boundary (544 + 48 = 592), which is what a float4 load wants.
++// Bytes 40..47 are unused.
++#define RENUT_SHARED_VIEWPORT_OFFSET     (RENUT_SHARED_MISC_OFFSET + 48)                     //  592
+ 
+ // Device addresses of the sixteen bound vertex streams, eight bytes each.
+ //
+@@ -73,9 +72,81 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -173,16 +190,23 @@ index ee3830d..e15872e 100644
 +
 +#define RENUT_VERTEX_STREAM_COUNT 17
 +#define RENUT_DIRECT_FETCH_STREAM 16
-+#define RENUT_SHARED_STREAMS_OFFSET      (RENUT_SHARED_MISC_OFFSET + 64)                     // 1120 .. 1263
++#define RENUT_SHARED_STREAMS_OFFSET      (RENUT_SHARED_MISC_OFFSET + 64)                     //  608 .. 751
 +// Per-draw vertex input flags that did not fit in the misc block.
-+#define RENUT_SHARED_INPUTS_OFFSET       (RENUT_SHARED_STREAMS_OFFSET + 18 * 8)              // 1264 .. 1279
++#define RENUT_SHARED_INPUTS_OFFSET       (RENUT_SHARED_STREAMS_OFFSET + 18 * 8)              //  752 .. 767
++// Everything above changes from one draw to the next - the textures, the
++// booleans, the streams - and everything below hardly ever does, so the two
++// halves are separate uniform buffers (bindings 8 and 9 of set 4): a draw
++// uploads the 768 bytes of the first instead of the whole block.
++#define RENUT_SHARED_HOT_SIZE            (RENUT_SHARED_INPUTS_OFFSET + 16)                   //  768
++// The loop constants, int4 each (count, start, step).
++#define RENUT_SHARED_LOOP_OFFSET         RENUT_SHARED_HOT_SIZE                               //  768 .. 1279
 +// Live vertex fetches (see vfetchLive): uint4 per fetch - stream | format << 8
 +// | flags << 16, stride bytes, offset bytes, exp scale as float bits.
 +#define RENUT_LIVE_FETCH_COUNT           32
 +#define RENUT_LIVE_FETCH_LOCATION        0xFE
 +// A live fetch's second word carries its stride in the low 16 bits and, in
 +// bits 16..27, the component remap of RENUT_SHARED_REMAP_OFFSET for it.
-+#define RENUT_SHARED_FETCH_OFFSET        (RENUT_SHARED_INPUTS_OFFSET + 16)                   // 1280 .. 1791
++#define RENUT_SHARED_FETCH_OFFSET        (RENUT_SHARED_LOOP_OFFSET + RENUT_LOOP_CONSTANT_COUNT * 16)  // 1280 .. 1791
 +// Point sprites. A float4 in guest pixels - PA_SU_POINT_SIZE's width and
 +// height, the diameter used when the vertex shader writes none, then
 +// PA_SU_POINT_MINMAX's min and max, which clamp the one it writes - and a
@@ -203,6 +227,10 @@ index ee3830d..e15872e 100644
 +// what the live one does - see ShaderInputElement::dstSwizzle.
 +#define RENUT_INPUT_REMAP_COUNT          32
 +#define RENUT_INPUT_REMAP_IDENTITY       0x688u
++// ...and handed to the shaders as specialization constants, id 16 + location,
++// for the locations the vertex shaders can have (0..23). See g_SpecInputRemap0.
++#define RENUT_SPEC_INPUT_REMAP_BASE      16
++#define RENUT_SPEC_INPUT_REMAP_LOCATIONS 24
 +#define RENUT_SHARED_REMAP_OFFSET        (RENUT_SHARED_EXPORT_OFFSET + RENUT_EXPORT_RANGE_COUNT * 16)  // 1952 .. 2079
 +// User clip planes: PA_CL_UCP_0..5 in the guest's clip space, then the mask
 +// of enabled ones (PA_CL_CLIP_CNTL.ucp_ena, zero under clip_disable). A vertex
@@ -230,7 +258,7 @@ index ee3830d..e15872e 100644
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -119,6 +180,11 @@
+@@ -119,6 +190,11 @@
      X(TexCoord,     9, 21) \
      X(TexCoord,    10, 22)
  
@@ -242,7 +270,7 @@ index ee3830d..e15872e 100644
  #ifdef __cplusplus
  #include <cstdint>
  
-@@ -136,7 +202,7 @@
+@@ -136,7 +212,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -251,7 +279,7 @@ index ee3830d..e15872e 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +218,20 @@ struct ShaderInputElement
+@@ -152,6 +228,20 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -272,7 +300,7 @@ index ee3830d..e15872e 100644
  };
  #endif
  
-@@ -203,27 +283,94 @@ struct PushConstants
+@@ -203,27 +293,152 @@ struct PushConstants
  
  #ifdef RENUT_RECOMP
  
@@ -302,7 +330,11 @@ index ee3830d..e15872e 100644
 +[[vk::binding(7, 4)]] cbuffer RenutPixelConstants3 { float4 g_PixelConstants3[RENUT_CONSTANT_CHUNK_SIZE]; };
 +[[vk::binding(8, 4)]] cbuffer RenutSharedConstants
 +{
-+    uint4 g_SharedWords[RENUT_SHARED_SIZE / 16];
++    uint4 g_SharedWords[RENUT_SHARED_HOT_SIZE / 16];
++};
++[[vk::binding(9, 4)]] cbuffer RenutSharedColdConstants
++{
++    uint4 g_SharedColdWords[(RENUT_SHARED_SIZE - RENUT_SHARED_HOT_SIZE) / 16];
 +};
 +
 +// A constant index known when the shader is compiled folds to one block and
@@ -333,10 +365,16 @@ index ee3830d..e15872e 100644
 +}
 +
 +// The shared block by byte offset, in the RENUT_SHARED_* layout above.
-+#define renutSharedU(OFFSET)   (g_SharedWords[(OFFSET) >> 4][((OFFSET) >> 2) & 3])
++// Either half by the offset in the whole layout. An offset known when the
++// shader compiles picks its half there; both indices are clamped so that one
++// that is not stays inside both arrays whichever the select throws away.
++#define renutSharedU4(OFFSET)  ((OFFSET) < RENUT_SHARED_HOT_SIZE \
++    ? g_SharedWords[min(uint(OFFSET) >> 4, RENUT_SHARED_HOT_SIZE / 16 - 1)] \
++    : g_SharedColdWords[min((uint(OFFSET) - RENUT_SHARED_HOT_SIZE) >> 4, \
++                            (RENUT_SHARED_SIZE - RENUT_SHARED_HOT_SIZE) / 16 - 1)])
++#define renutSharedU(OFFSET)   (renutSharedU4(OFFSET)[((OFFSET) >> 2) & 3])
 +#define renutSharedF(OFFSET)   asfloat(renutSharedU(OFFSET))
 +#define renutSharedF2(OFFSET)  float2(renutSharedF(OFFSET), renutSharedF((OFFSET) + 4))
-+#define renutSharedU4(OFFSET)  (g_SharedWords[(OFFSET) >> 4])
 +#define renutSharedF4(OFFSET)  asfloat(renutSharedU4(OFFSET))
 +#define renutSharedU64(OFFSET) (uint64_t(renutSharedU(OFFSET)) | (uint64_t(renutSharedU((OFFSET) + 4)) << 32))
 +
@@ -369,22 +407,70 @@ index ee3830d..e15872e 100644
 +#define g_Booleans(i)         renutSharedU(RENUT_SHARED_BOOLEANS_OFFSET + (i) * 4)
 +#define g_LoopConstant(i)     asint(renutSharedU4(RENUT_SHARED_LOOP_OFFSET + (i) * 16))
 +
-+#define g_SwappedTexcoords    renutSharedU(RENUT_SHARED_MISC_OFFSET + 0)
 +#define g_HalfPixelOffset     renutSharedF2(RENUT_SHARED_MISC_OFFSET + 4)
 +#define g_AlphaThreshold      renutSharedF(RENUT_SHARED_MISC_OFFSET + 12)
-+#define g_SwappedNormals      renutSharedU(RENUT_SHARED_MISC_OFFSET + 16)
-+#define g_SwappedBinormals    renutSharedU(RENUT_SHARED_MISC_OFFSET + 20)
-+#define g_SwappedTangents     renutSharedU(RENUT_SHARED_MISC_OFFSET + 24)
-+#define g_SwappedBlendWeights renutSharedU(RENUT_SHARED_MISC_OFFSET + 28)
-+#define g_SwappedPositions    renutSharedU(RENUT_SHARED_MISC_OFFSET + 32)
-+#define g_SintTexcoords       renutSharedU(RENUT_SHARED_MISC_OFFSET + 36)
-+#define g_SwappedBlendIndices renutSharedU(RENUT_SHARED_MISC_OFFSET + 40)
-+#define g_PackedInputs        renutSharedU(RENUT_SHARED_MISC_OFFSET + 44)
-+#define g_IntInputs           renutSharedU(RENUT_SHARED_INPUTS_OFFSET + 0)
++
++// How the host bound each vertex input, and which user clip planes are on, as
++// specialization constants. Every one of them follows from the pipeline's own
++// vertex input layout (or, for the clip mask, a register that changes a few
++// times a frame), so the host keys its pipelines on them anyway - and fixed at
++// pipeline creation the driver folds each test away. Read from the shared
++// block instead they were uniform, and Turnip computed all of them in the
++// shader's preamble, which runs once per draw before any of its waves start:
++// a vertex shader's median preamble was 414 instructions. The shared block
++// keeps their old offsets unused so that its layout does not move.
++[[vk::constant_id(1)]] const uint g_SpecPackedInputs = 0;
++[[vk::constant_id(2)]] const uint g_SpecIntInputs = 0;
++[[vk::constant_id(3)]] const uint g_SpecUserClipMask = 0;
++[[vk::constant_id(4)]] const uint g_SpecSwappedTexcoords = 0;
++[[vk::constant_id(5)]] const uint g_SpecSwappedNormals = 0;
++[[vk::constant_id(6)]] const uint g_SpecSwappedBinormals = 0;
++[[vk::constant_id(7)]] const uint g_SpecSwappedTangents = 0;
++[[vk::constant_id(8)]] const uint g_SpecSwappedBlendWeights = 0;
++[[vk::constant_id(9)]] const uint g_SpecSwappedPositions = 0;
++[[vk::constant_id(10)]] const uint g_SpecSwappedBlendIndices = 0;
++[[vk::constant_id(11)]] const uint g_SpecSintTexcoords = 0;
++// The input remap of each vertex input location, 16 + location (see
++// RENUT_SHARED_REMAP_OFFSET for the encoding). Locations stop at 23.
++[[vk::constant_id(16)]] const uint g_SpecInputRemap0 = 0;
++[[vk::constant_id(17)]] const uint g_SpecInputRemap1 = 0;
++[[vk::constant_id(18)]] const uint g_SpecInputRemap2 = 0;
++[[vk::constant_id(19)]] const uint g_SpecInputRemap3 = 0;
++[[vk::constant_id(20)]] const uint g_SpecInputRemap4 = 0;
++[[vk::constant_id(21)]] const uint g_SpecInputRemap5 = 0;
++[[vk::constant_id(22)]] const uint g_SpecInputRemap6 = 0;
++[[vk::constant_id(23)]] const uint g_SpecInputRemap7 = 0;
++[[vk::constant_id(24)]] const uint g_SpecInputRemap8 = 0;
++[[vk::constant_id(25)]] const uint g_SpecInputRemap9 = 0;
++[[vk::constant_id(26)]] const uint g_SpecInputRemap10 = 0;
++[[vk::constant_id(27)]] const uint g_SpecInputRemap11 = 0;
++[[vk::constant_id(28)]] const uint g_SpecInputRemap12 = 0;
++[[vk::constant_id(29)]] const uint g_SpecInputRemap13 = 0;
++[[vk::constant_id(30)]] const uint g_SpecInputRemap14 = 0;
++[[vk::constant_id(31)]] const uint g_SpecInputRemap15 = 0;
++[[vk::constant_id(32)]] const uint g_SpecInputRemap16 = 0;
++[[vk::constant_id(33)]] const uint g_SpecInputRemap17 = 0;
++[[vk::constant_id(34)]] const uint g_SpecInputRemap18 = 0;
++[[vk::constant_id(35)]] const uint g_SpecInputRemap19 = 0;
++[[vk::constant_id(36)]] const uint g_SpecInputRemap20 = 0;
++[[vk::constant_id(37)]] const uint g_SpecInputRemap21 = 0;
++[[vk::constant_id(38)]] const uint g_SpecInputRemap22 = 0;
++[[vk::constant_id(39)]] const uint g_SpecInputRemap23 = 0;
++
++#define g_SwappedTexcoords    g_SpecSwappedTexcoords
++#define g_SwappedNormals      g_SpecSwappedNormals
++#define g_SwappedBinormals    g_SpecSwappedBinormals
++#define g_SwappedTangents     g_SpecSwappedTangents
++#define g_SwappedBlendWeights g_SpecSwappedBlendWeights
++#define g_SwappedPositions    g_SpecSwappedPositions
++#define g_SintTexcoords       g_SpecSintTexcoords
++#define g_SwappedBlendIndices g_SpecSwappedBlendIndices
++#define g_PackedInputs        g_SpecPackedInputs
++#define g_IntInputs           g_SpecIntInputs
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -233,7 +380,27 @@ struct PushConstants
+@@ -233,7 +448,27 @@ struct PushConstants
  // coordinates, and without a scale everything outside the 1x1 corner of the
  // clip volume is culled. N&B's FMV renderer does exactly that: it hands the
  // pipeline a pixel-space rectangle and disables the viewport.
@@ -400,7 +486,7 @@ index ee3830d..e15872e 100644
 +// draw with no plane enabled gets a distance that clips nothing.
 +float renutUserClipDistance(float4 position)
 +{
-+    uint mask = renutSharedU(RENUT_SHARED_UCP_MASK_OFFSET);
++    uint mask = g_SpecUserClipMask;
 +    float distance = 3.0e38;
 +    [unroll] for (uint i = 0; i < RENUT_USER_CLIP_PLANE_COUNT; ++i)
 +    {
@@ -413,7 +499,7 @@ index ee3830d..e15872e 100644
  
  // A vfetch the vertex declaration does not describe - see the stream table's
  // comment. `index` is whatever register the instruction named, so it arrives as
-@@ -244,8 +411,7 @@ struct PushConstants
+@@ -244,8 +479,7 @@ struct PushConstants
  // a draw that binds fewer streams than the shader fetches would otherwise do.
  float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes)
  {
@@ -423,7 +509,7 @@ index ee3830d..e15872e 100644
  
      if (address == 0)
          return 0.0;
-@@ -253,14 +419,166 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,14 +487,166 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -595,21 +681,41 @@ index ee3830d..e15872e 100644
  #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
  #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
  #endif
-@@ -289,7 +607,12 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
-     uint   g_SwappedBlendWeights             : packoffset(c67.w); \
-     uint   g_SwappedPositions                : packoffset(c68.x); \
-     uint   g_SintTexcoords                   : packoffset(c68.y); \
+@@ -279,17 +665,22 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+     uint4  g_TextureCubeDescriptorIndices[8] : packoffset(c16); \
+     uint4  g_SamplerDescriptorIndices[8]     : packoffset(c24); \
+     uint4  g_BooleansArr[2]                  : packoffset(c32); \
+-    int4   g_LoopConstants[32]               : packoffset(c34); \
+-    uint   g_SwappedTexcoords                : packoffset(c66.x); \
+-    float2 g_HalfPixelOffset                 : packoffset(c66.y); \
+-    float  g_AlphaThreshold                  : packoffset(c66.w); \
+-    uint   g_SwappedNormals                  : packoffset(c67.x); \
+-    uint   g_SwappedBinormals                : packoffset(c67.y); \
+-    uint   g_SwappedTangents                 : packoffset(c67.z); \
+-    uint   g_SwappedBlendWeights             : packoffset(c67.w); \
+-    uint   g_SwappedPositions                : packoffset(c68.x); \
+-    uint   g_SintTexcoords                   : packoffset(c68.y); \
 -    float4 g_ViewportScaleOffset             : packoffset(c69);
-+    uint   g_SwappedBlendIndices             : packoffset(c68.z); \
-+    uint   g_PackedInputs                    : packoffset(c68.w); \
-+    float4 g_ViewportScaleOffset             : packoffset(c69); \
-+    uint   g_IntInputs                       : packoffset(c78.x); \
++    int4   g_LoopConstants[32]               : packoffset(c48); \
++    uint   g_SwappedTexcoords                : packoffset(c34.x); \
++    float2 g_HalfPixelOffset                 : packoffset(c34.y); \
++    float  g_AlphaThreshold                  : packoffset(c34.w); \
++    uint   g_SwappedNormals                  : packoffset(c35.x); \
++    uint   g_SwappedBinormals                : packoffset(c35.y); \
++    uint   g_SwappedTangents                 : packoffset(c35.z); \
++    uint   g_SwappedBlendWeights             : packoffset(c35.w); \
++    uint   g_SwappedPositions                : packoffset(c36.x); \
++    uint   g_SintTexcoords                   : packoffset(c36.y); \
++    uint   g_SwappedBlendIndices             : packoffset(c36.z); \
++    uint   g_PackedInputs                    : packoffset(c36.w); \
++    float4 g_ViewportScaleOffset             : packoffset(c37); \
++    uint   g_IntInputs                       : packoffset(c47.x); \
 +    float4 g_PointSize                       : packoffset(c112); \
 +    float2 g_PointScreenToNdc                : packoffset(c113);
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -317,6 +640,197 @@ uint g_SpecConstants();
+@@ -317,6 +708,197 @@ uint g_SpecConstants();
  #ifdef RENUT_RECOMP
  // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
  #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
@@ -807,7 +913,7 @@ index ee3830d..e15872e 100644
  #endif
  
  #ifdef RENUT_RECOMP
-@@ -349,7 +863,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -349,7 +931,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
  float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
@@ -822,7 +928,7 @@ index ee3830d..e15872e 100644
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -483,6 +1003,53 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +1071,83 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -843,8 +949,38 @@ index ee3830d..e15872e 100644
 +}
 +
 +#ifdef __spirv__
-+#define g_InputRemap(LOCATION) \
-+    ((LOCATION) < RENUT_INPUT_REMAP_COUNT ? renutSharedU(RENUT_SHARED_REMAP_OFFSET + (LOCATION) * 4) : 0u)
++uint renutInputRemap(uint location)
++{
++    switch (location)
++    {
++    case 0: return g_SpecInputRemap0;
++    case 1: return g_SpecInputRemap1;
++    case 2: return g_SpecInputRemap2;
++    case 3: return g_SpecInputRemap3;
++    case 4: return g_SpecInputRemap4;
++    case 5: return g_SpecInputRemap5;
++    case 6: return g_SpecInputRemap6;
++    case 7: return g_SpecInputRemap7;
++    case 8: return g_SpecInputRemap8;
++    case 9: return g_SpecInputRemap9;
++    case 10: return g_SpecInputRemap10;
++    case 11: return g_SpecInputRemap11;
++    case 12: return g_SpecInputRemap12;
++    case 13: return g_SpecInputRemap13;
++    case 14: return g_SpecInputRemap14;
++    case 15: return g_SpecInputRemap15;
++    case 16: return g_SpecInputRemap16;
++    case 17: return g_SpecInputRemap17;
++    case 18: return g_SpecInputRemap18;
++    case 19: return g_SpecInputRemap19;
++    case 20: return g_SpecInputRemap20;
++    case 21: return g_SpecInputRemap21;
++    case 22: return g_SpecInputRemap22;
++    case 23: return g_SpecInputRemap23;
++    default: return 0u;
++    }
++}
++#define g_InputRemap(LOCATION) renutInputRemap(LOCATION)
 +#else
 +#define g_InputRemap(LOCATION) 0u
 +#endif

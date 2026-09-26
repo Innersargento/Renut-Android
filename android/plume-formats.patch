@@ -31,7 +31,7 @@ index 9dcfedf..093ece3 100644
          case RenderFormat::R32_UINT:
          case RenderFormat::R32_SINT:
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..b975937 100644
+index f1dd503..88fb60c 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -87,6 +87,8 @@ namespace plume {
@@ -54,7 +54,19 @@ index f1dd503..b975937 100644
          default:
              assert(false && "Unknown format.");
              return VK_FORMAT_UNDEFINED;
-@@ -1648,6 +1654,12 @@ namespace plume {
+@@ -930,7 +936,10 @@ namespace plume {
+         info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+         info.pNext = nullptr;
+         info.buffer = vk;
+-        return vkGetBufferDeviceAddress(device->vk, &info);
++        if (deviceAddress == 0) {
++            deviceAddress = vkGetBufferDeviceAddress(device->vk, &info);
++        }
++        return deviceAddress;
+     }
+ 
+     // VulkanBufferFormattedView
+@@ -1648,6 +1657,17 @@ namespace plume {
          pipelineInfo.pDynamicState = &dynamicState;
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.renderPass = renderPass;
@@ -64,10 +76,15 @@ index f1dd503..b975937 100644
 +        if (captureStatistics) {
 +            pipelineInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 +        }
++        // And its internal representations (NIR, ir3 assembly) under RENUT_PIPELINE_IR.
++        static const bool captureInternals = getenv("RENUT_PIPELINE_IR") != nullptr;
++        if (captureInternals) {
++            pipelineInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
++        }
  
          VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
          if (res != VK_SUCCESS) {
-@@ -3883,6 +3895,13 @@ namespace plume {
+@@ -3883,6 +3903,13 @@ namespace plume {
              featuresChain = &portabilityFeatures;
          }
  
@@ -81,3 +98,16 @@ index f1dd503..b975937 100644
          VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
          VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
          const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 0a1edbe..e05da0f 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -56,6 +56,8 @@ namespace plume {
+         VmaAllocationInfo allocationInfo = {};
+         RenderBufferDesc desc;
+         RenderBarrierStages barrierStages = RenderBarrierStage::NONE;
++        // reNut: a buffer's device address never changes; asked once, not per draw.
++        mutable uint64_t deviceAddress = 0;
+ 
+         VulkanBuffer() = default;
+         VulkanBuffer(VulkanDevice *device, VulkanPool *pool, const RenderBufferDesc &desc);
