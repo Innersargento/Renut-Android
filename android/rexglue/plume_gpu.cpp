@@ -3461,7 +3461,18 @@ bool PlumeCommandProcessor::IssueCopy() {
   const uint32_t original = copying_depth ? info.depth_original_base : info.color_original_base;
   // Source rectangle in pixels: whole tiles from the render target's base,
   // plus the offset within the first tile.
-  const uint32_t tile_width = edram.format_is_64bpp ? 40 : 80;
+  // A tile is 80x16 samples. Targets here hold one texel per pixel whatever
+  // the guest's sample count, so a 4x tile is 40 pixels wide and a 2x or 4x
+  // one 8 tall. Counting samples as pixels found the dialogue portraits (96x96
+  // at 4x, pitch 120) and the blueprint (256x256 at 4x, pitch 280) in the
+  // twice-as-wide 1x target sharing their EDRAM base: no portrait, and a
+  // quarter of the vehicle.
+  auto tile_size = [](const draw_util::ResolveEdramInfo& e, uint32_t& tw, uint32_t& th) {
+    tw = (e.format_is_64bpp ? 40 : 80) >> (e.msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0);
+    th = 16 >> (e.msaa_samples >= xenos::MsaaSamples::k2X ? 1 : 0);
+  };
+  uint32_t tile_width, tile_height;
+  tile_size(edram, tile_width, tile_height);
   // EDRAM bases are shared between targets of different pitches (both shadow
   // maps use depth base 0), so prefer the one the resolve's pitch names.
   Target* source = FindTarget(original, edram.format, copying_depth,
@@ -3469,7 +3480,7 @@ bool PlumeCommandProcessor::IssueCopy() {
   const uint32_t tiles = edram.base_tiles - original;
   const uint32_t pitch_tiles = std::max(1u, uint32_t(edram.pitch_tiles));
   const uint32_t x = (tiles % pitch_tiles) * tile_width + info.coordinate_info.edram_offset_x_div_8 * 8;
-  const uint32_t y = (tiles / pitch_tiles) * 16 + info.coordinate_info.edram_offset_y_div_8 * 8;
+  const uint32_t y = (tiles / pitch_tiles) * tile_height + info.coordinate_info.edram_offset_y_div_8 * 8;
   // plume-skip bit 134217728 drops every clear, these and Direct3D's. The
   // picture is wrong; it measures what the clear-only passes cost.
   const bool skip_clears = skip_mask_ & 134217728;
@@ -3585,8 +3596,10 @@ bool PlumeCommandProcessor::IssueCopy() {
     ++stats_.clears;
   }
   if (info.IsClearingDepth() && !skip_clears) {
+    uint32_t depth_tile_width, depth_tile_height;
+    tile_size(info.depth_edram_info, depth_tile_width, depth_tile_height);
     Target* depth = FindTarget(info.depth_original_base, info.depth_edram_info.format, true,
-                               std::max(1u, uint32_t(info.depth_edram_info.pitch_tiles)) * 80);
+                               std::max(1u, uint32_t(info.depth_edram_info.pitch_tiles)) * depth_tile_width);
     if (depth) {
       Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
       std::array<Target*, 4> none{};
