@@ -24,9 +24,9 @@ void renutConfigureXenosDriver(const std::string& hooks,const std::string& direc
   // GPU. Never overwrites a value the session already set, so it stays
   // overridable from outside.
   if(one_ui_fix)setenv("FD_DEV_FEATURES","enable_tp_ubwc_flag_hint=1",0);
-  // Turnip's debug flags, read at the same point. "perf" logs to logcat why
-  // each render pass went to GMEM or sysmem; "sysmem" / "gmem" force one mode.
-  if(!tu_debug.empty())setenv("TU_DEBUG",tu_debug.c_str(),0);
+  // The selection in the app takes precedence over inherited debug flags.
+  // An empty value explicitly disables the flags for this runtime process.
+  setenv("TU_DEBUG",tu_debug.c_str(),1);
   // adrenotools concatenates directory + library name, so it needs the slash.
   std::string driver_dir=directory;
   if(!driver_dir.empty()&&driver_dir.back()!='/')driver_dir+='/';

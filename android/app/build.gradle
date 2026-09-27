@@ -1,4 +1,8 @@
-plugins { id 'com.android.application' }
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
 
 android {
     namespace 'org.renut.android'
@@ -20,7 +24,17 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+    kotlinOptions { jvmTarget = '17' }
+    buildFeatures { compose true }
     sourceSets.main.java.srcDir '../../external/rexglue-android/thirdparty/sdl3/android-project/app/src/main/java'
     packaging { jniLibs { useLegacyPackaging true } }
     buildTypes { release { minifyEnabled false } }
+}
+
+dependencies {
+    implementation 'androidx.activity:activity-compose:1.10.1'
+    implementation 'androidx.compose.ui:ui:1.9.0'
+    implementation 'androidx.compose.foundation:foundation:1.9.0'
+    implementation 'androidx.compose.material3:material3:1.3.2'
+    implementation 'androidx.compose.material:material-icons-extended:1.7.8'
 }

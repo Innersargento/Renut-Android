@@ -7,7 +7,7 @@ import android.widget.*;
 import java.io.File;
 
 /** A fresh process selects one Vulkan loader; exiting discards all driver state. */
-public final class ProbeActivity extends Activity implements SurfaceHolder.Callback {
+public final class ProbeActivity extends androidx.activity.ComponentActivity implements SurfaceHolder.Callback {
     static { System.loadLibrary("renut_probe"); }
     private static native String nativeRun(Surface surface,String hooks,String directory,String library);
     private static native void nativeStop();
@@ -25,8 +25,11 @@ public final class ProbeActivity extends Activity implements SurfaceHolder.Callb
         results=new ScrollView(this);results.addView(status);box.addView(results);
         surface=new SurfaceView(this);surface.getHolder().addCallback(this);box.addView(surface,new LinearLayout.LayoutParams(-1,0,1));
         Button close=new Button(this);close.setText("Voltar à biblioteca");close.setOnClickListener(v->finish());box.addView(close);
-        setContentView(box);
+        ComposeScreens.showProbe(this);
     }
+    public String uiStatus(){return status.getText().toString();}
+    public boolean uiFinished(){return !started||render!=null&&!render.isAlive()&&status.getText().toString().length()>0;}
+    public void attachComposeSurface(SurfaceView view){surface=view;surface.getHolder().addCallback(this);}
     @Override public void surfaceCreated(SurfaceHolder holder){
         if(started)return;started=true;
         render=new Thread(()->{

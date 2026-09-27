@@ -13,7 +13,7 @@ import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
 
 /** Isolates the Vulkan loader and the guest runtime for each validation session. */
-public final class RuntimeActivity extends Activity implements SurfaceHolder.Callback {
+public final class RuntimeActivity extends androidx.activity.ComponentActivity implements SurfaceHolder.Callback {
     private TextView status;
     private SurfaceView surface;
     private GamepadOverlay overlay;
@@ -133,9 +133,12 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
         body.addView(results,new LinearLayout.LayoutParams(-1,graphics?-2:0,graphics?0:1));
         if(graphics){surface=new SurfaceView(this);surface.getHolder().addCallback(this);body.addView(surface,new LinearLayout.LayoutParams(-1,0,1));}
         Button close=new Button(this);close.setText("Voltar");close.setOnClickListener(v->finish());body.addView(close);
-        setContentView(body);
+        ComposeScreens.showRuntime(this);
         if(!graphics)startValidation(null);
     }
+    public boolean uiGraphics(){return graphics;}
+    public String uiStatus(){return status.getText().toString();}
+    public void attachComposeSurface(SurfaceView view){surface=view;surface.getHolder().addCallback(this);}
     private void setupController(){
         if(controller!=null)return;
         InputDevice device=ExternalController.findSelected(this);

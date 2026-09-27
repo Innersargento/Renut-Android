@@ -15,12 +15,11 @@ import java.nio.file.Files;
 import java.util.*;
 import java.util.zip.*;
 
-public final class MainActivity extends Activity {
-    private static final int ISO=10, XEX=11, DRIVER=12, EXPORT=13;
+public final class MainActivity extends androidx.activity.ComponentActivity {
+    private static final int ISO=10, XEX=11, DRIVER=12, EXPORT=13, SAVE_IMPORT=14, SAVE_EXPORT=15;
     private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
-    private static final String[] TU_DEBUG={"","perf","sysmem","gmem"};
-    private static final String[] IR3_DEBUG={"","nopreamble","noearlypreamble","nouboopt","nodescprefetch"};
-    private TextView status, library, driver, renderer, fpsCounter, oneUiFix, sceneMsaa, tuDebug, ir3Debug;
+    private TextView status, library, driver, renderer, fpsCounter, oneUiFix, sceneMsaa, tuDebug, ir3Debug, savesSummary;
+    private LinearLayout savesList;
     private ProgressBar progress;
     private Button cancel;
     private volatile Thread worker;
@@ -28,14 +27,32 @@ public final class MainActivity extends Activity {
     private String report="Nenhum teste gráfico executado.";
     private long reportReadAt;
     private final ArrayList<Button> actions=new ArrayList<>();
+    private final Map<String,Runnable> uiActions=new LinkedHashMap<>();
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         getWindow().setStatusBarColor(Color.rgb(12,23,28));
         getWindow().setNavigationBarColor(Color.rgb(12,23,28));
-        ScrollView scroll=new ScrollView(this);
+        LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(Color.rgb(12,23,28));setContentView(root);
+        FrameLayout pages=new FrameLayout(this);root.addView(pages,new LinearLayout.LayoutParams(-1,0,1));
+        ScrollView savesPage=new ScrollView(this);pages.addView(savesPage);
+        LinearLayout savesBody=new LinearLayout(this);savesBody.setOrientation(LinearLayout.VERTICAL);savesBody.setPadding(dp(24),dp(28),dp(24),dp(28));savesBody.setBackgroundColor(Color.rgb(12,23,28));savesPage.addView(savesBody);
+        savesBody.addView(text("RENUT  /  SAVES",13,Color.rgb(103,223,174)));
+        TextView savesTitle=text("Seus saves",34,ink);savesTitle.setTypeface(null,Typeface.BOLD);savesBody.addView(savesTitle);
+        LinearLayout saveCard=card(savesBody,"ARQUIVOS DO JOGO");
+        savesSummary=text("Procurando saves…",15,ink);saveCard.addView(savesSummary);
+        savesList=new LinearLayout(this);savesList.setOrientation(LinearLayout.VERTICAL);saveCard.addView(savesList);
+        button(saveCard,"Exportar saves (.zip)",()->{
+            Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("application/zip").addCategory(Intent.CATEGORY_OPENABLE);
+            i.putExtra(Intent.EXTRA_TITLE,"renut-saves.zip");startActivityForResult(i,SAVE_EXPORT);
+        });
+        button(saveCard,"Importar saves (.zip)",()->{
+            Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("application/zip").addCategory(Intent.CATEGORY_OPENABLE);
+            startActivityForResult(i,SAVE_IMPORT);
+        });
+        ScrollView scroll=new ScrollView(this);pages.addView(scroll);scroll.setVisibility(View.GONE);
         LinearLayout body=new LinearLayout(this); body.setOrientation(LinearLayout.VERTICAL); body.setPadding(dp(24),dp(28),dp(24),dp(28));
-        body.setBackgroundColor(Color.rgb(12,23,28)); scroll.addView(body); setContentView(scroll);
+        body.setBackgroundColor(Color.rgb(12,23,28)); scroll.addView(body);
         body.setOnApplyWindowInsetsListener((v,insets)->{
             v.setPadding(dp(24),dp(28)+insets.getSystemWindowInsetTop(),dp(24),dp(28)+insets.getSystemWindowInsetBottom()); return insets;
         });
@@ -102,17 +119,9 @@ public final class MainActivity extends Activity {
         });
         graphics.addView(text("Pede ao Turnip a dica de flag UBWC do processador de texturas (FD_DEV_FEATURES). Sem ela, amostrar uma imagem comprimida que a GPU acabou de escrever devolve dado velho: a tela pisca preta e os quadros saem em blocos. Não tem efeito no driver do sistema.",13,muted));
         tuDebug=text("",16,ink); graphics.addView(tuDebug);
-        button(graphics,"Alternar TU_DEBUG",()->{
-            int next=(Arrays.asList(TU_DEBUG).indexOf(getPreferences(0).getString("tuDebug",""))+1)%TU_DEBUG.length;
-            getPreferences(0).edit().putString("tuDebug",TU_DEBUG[next]).apply(); refresh();
-        });
         graphics.addView(text("Depuração do Turnip. \"perf\" registra no logcat por que cada render pass foi para GMEM ou sysmem; \"sysmem\" e \"gmem\" forçam um dos modos. Só para medição. Não tem efeito no driver do sistema.",13,muted));
         ir3Debug=text("",16,ink); graphics.addView(ir3Debug);
-        button(graphics,"Alternar IR3_SHADER_DEBUG",()->{
-            int next=(Arrays.asList(IR3_DEBUG).indexOf(getPreferences(0).getString("ir3Debug",""))+1)%IR3_DEBUG.length;
-            getPreferences(0).edit().putString("ir3Debug",IR3_DEBUG[next]).apply(); refresh();
-        });
-        graphics.addView(text("Opções do compilador de shaders do Turnip. \"nopreamble\" é o mais rápido, mas faz placas penduradas piscarem entre dois tons; \"noearlypreamble\", \"nouboopt\" e \"nodescprefetch\" servem para medir. Cada opção tem seu próprio cache de shaders, então a primeira execução com ela compila tudo de novo. Um IR3_SHADER_DEBUG em plume-env tem prioridade. Não tem efeito no driver do sistema.",13,muted));
+        graphics.addView(text("Opções do compilador de shaders do Turnip. \"nopreamble\" é o mais rápido, mas faz placas penduradas piscarem entre dois tons; \"noearlypreamble\", \"nouboopt\" e \"nodescprefetch\" servem para medir. Cada combinação tem seu próprio cache de shaders. Não tem efeito no driver do sistema.",13,muted));
         button(graphics,"Testar Plume no aparelho",()->{
             Intent intent=new Intent(this,ProbeActivity.class);
             intent.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
@@ -129,7 +138,14 @@ public final class MainActivity extends Activity {
             Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain").addCategory(Intent.CATEGORY_OPENABLE);
             i.putExtra(Intent.EXTRA_TITLE,"renut-diagnostico.txt");startActivityForResult(i,EXPORT);
         });
+        LinearLayout nav=new LinearLayout(this);nav.setPadding(dp(16),dp(8),dp(16),dp(8));root.addView(nav);
+        Button savesTab=new Button(this);savesTab.setText("▣  Saves");savesTab.setAllCaps(false);
+        Button settingsTab=new Button(this);settingsTab.setText("⚙  Configurações");settingsTab.setAllCaps(false);
+        nav.addView(savesTab,new LinearLayout.LayoutParams(0,dp(52),1));nav.addView(settingsTab,new LinearLayout.LayoutParams(0,dp(52),1));
+        savesTab.setOnClickListener(v->{savesPage.setVisibility(View.VISIBLE);scroll.setVisibility(View.GONE);refreshSaves();});
+        settingsTab.setOnClickListener(v->{savesPage.setVisibility(View.GONE);scroll.setVisibility(View.VISIBLE);});
         refresh();
+        ComposeScreens.showMain(this);
     }
     private int dp(int n){return (int)(getResources().getDisplayMetrics().density*n);}
     private TextView text(String value,int size,int color){TextView t=new TextView(this);t.setText(value);t.setTextSize(size);t.setTextColor(color);t.setPadding(0,dp(7),0,dp(9));return t;}
@@ -142,8 +158,44 @@ public final class MainActivity extends Activity {
     private void button(LinearLayout box,String name,Runnable action){
         Button b=new Button(this);b.setText(name);b.setAllCaps(false);b.setTextColor(ink);
         b.setOnClickListener(v->action.run());box.addView(b,new LinearLayout.LayoutParams(-1,dp(54)));actions.add(b);
+        uiActions.put(name,action);
     }
+    public void uiAction(String name){Runnable action=uiActions.get(name);if(action!=null&&worker==null)action.run();}
+    public boolean uiBusy(){return worker!=null;}
+    public boolean uiCanCancel(){return worker!=null&&cancel.getVisibility()==View.VISIBLE;}
+    public void uiCancelImport(){Thread t=worker;if(t!=null&&uiCanCancel())t.interrupt();}
+    public String uiLibrary(){return library.getText().toString();}
+    public String uiStatus(){return status.getText().toString();}
+    public String uiDriver(){return driver.getText().toString();}
+    public String uiRenderer(){return renderer.getText().toString();}
+    public String uiFps(){return fpsCounter.getText().toString();}
+    public String uiMsaa(){return sceneMsaa.getText().toString();}
+    public String uiOneUi(){return oneUiFix.getText().toString();}
+    public String uiTu(){return tuDebug.getText().toString();}
+    public String uiIr3(){return ir3Debug.getText().toString();}
+    public boolean uiShowControls(){return getPreferences(0).getBoolean("showControls",true);}
+    public void uiSetShowControls(boolean value){getPreferences(0).edit().putBoolean("showControls",value).apply();}
+    public boolean uiFpsEnabled(){return getPreferences(0).getBoolean("fps",false);}
+    public void uiSetFps(boolean value){getPreferences(0).edit().putBoolean("fps",value).apply();refresh();}
+    public boolean uiMsaaEnabled(){return getPreferences(0).getBoolean("sceneMsaa",false);}
+    public void uiSetMsaa(boolean value){getPreferences(0).edit().putBoolean("sceneMsaa",value).apply();refresh();}
+    public boolean uiOneUiEnabled(){return getPreferences(0).getBoolean("oneui",true);}
+    public void uiSetOneUi(boolean value){getPreferences(0).edit().putBoolean("oneui",value).apply();refresh();}
+    public String uiTuMode(){return getPreferences(0).getString("tuDebug","");}
+    public void uiSetTuMode(String value){getPreferences(0).edit().putString("tuDebug",value).apply();refresh();}
+    public String uiIr3Mode(){return getPreferences(0).getString("ir3Debug","");}
+    public void uiSetIr3Mode(String value){getPreferences(0).edit().putString("ir3Debug",value).apply();refresh();}
+    public java.util.List<String> uiSaves()throws IOException{return SaveArchive.list(new File(getFilesDir(),"runtime-user"));}
     private void pick(int code){startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE),code);}
+    private void refreshSaves(){
+        if(savesList==null)return;
+        savesList.removeAllViews();
+        try{
+            java.util.List<String> entries=SaveArchive.list(new File(getFilesDir(),"runtime-user"));
+            savesSummary.setText(entries.isEmpty()?"Nenhum save encontrado neste aparelho.":entries.size()+" arquivo(s) de save encontrado(s).");
+            for(String name:entries)savesList.addView(text(name,13,muted));
+        }catch(IOException e){savesSummary.setText("Não foi possível ler os saves: "+e.getMessage());}
+    }
     private void clearShaderCache(){
         File root=getFilesDir();
         try{
@@ -152,7 +204,7 @@ public final class MainActivity extends Activity {
             status.setText(removed?"Cache de shaders apagado. Será recriado na próxima execução.":"Nenhum cache de shaders salvo para apagar.");
         }catch(IOException e){status.setText("Não foi possível apagar o cache de shaders: "+e.getMessage());}
     }
-    @Override protected void onResume(){super.onResume();refresh();}
+    @Override protected void onResume(){super.onResume();refresh();refreshSaves();}
     private void refresh(){
         if(library==null)return;
         File active=new File(getFilesDir(),"active-game.txt");
@@ -181,6 +233,17 @@ public final class MainActivity extends Activity {
         super.onActivityResult(request,result,data);
         if(result!=RESULT_OK||data==null||data.getData()==null)return;
         Uri uri=data.getData();
+        if(request==SAVE_EXPORT||request==SAVE_IMPORT){
+            if(worker!=null)return;
+            final boolean importing=request==SAVE_IMPORT;
+            if(importing){
+                new AlertDialog.Builder(this).setTitle("Importar saves?")
+                    .setMessage("Arquivos com o mesmo caminho serão substituídos. Feche o jogo antes de continuar.")
+                    .setNegativeButton("Cancelar",null)
+                    .setPositiveButton("Importar",(dialog,which)->transferSaves(uri,true)).show();
+            }else transferSaves(uri,false);
+            return;
+        }
         if(request==EXPORT){
             try(OutputStream out=getContentResolver().openOutputStream(uri)){
                 if(out==null)throw new IOException("Destino indisponível.");
@@ -234,6 +297,27 @@ public final class MainActivity extends Activity {
                 runOnUiThread(()->{worker=null;cancel.setVisibility(View.GONE);progress.setVisibility(View.GONE);for(Button b:actions)b.setEnabled(true);refresh();});
             }
         },"renut-import");worker.start();
+    }
+    private void transferSaves(Uri uri,boolean importing){
+        for(Button b:actions)b.setEnabled(false);
+        worker=new Thread(()->{
+            try{
+                File saveRoot=new File(getFilesDir(),"runtime-user");
+                if(importing){
+                    try(InputStream in=getContentResolver().openInputStream(uri)){
+                        if(in==null)throw new IOException("Arquivo indisponível.");
+                        SaveArchive.importZip(saveRoot,in);
+                    }
+                }else{
+                    try(OutputStream out=getContentResolver().openOutputStream(uri)){
+                        if(out==null)throw new IOException("Destino indisponível.");
+                        SaveArchive.exportZip(saveRoot,out);
+                    }
+                }
+                runOnUiThread(()->Toast.makeText(this,importing?"Saves importados.":"Saves exportados.",Toast.LENGTH_LONG).show());
+            }catch(Exception e){runOnUiThread(()->new AlertDialog.Builder(this).setTitle("Falha nos saves").setMessage(e.getMessage()).setPositiveButton("OK",null).show());}
+            finally{runOnUiThread(()->{worker=null;for(Button b:actions)b.setEnabled(true);refreshSaves();});}
+        },"renut-saves");worker.start();
     }
     private void copy(Uri source,File target,long limit)throws IOException{
         try(InputStream in=getContentResolver().openInputStream(source);OutputStream out=new FileOutputStream(target)){

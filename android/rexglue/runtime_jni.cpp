@@ -221,15 +221,12 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
           plume_env+=line+"\n";
         }
       }
-      // The launcher's IR3_SHADER_DEBUG choice, unless plume-env set one. It
-      // joins the text the pipeline cache is named after: ir3 reads it when it
-      // compiles, and a cache written without it would hand back binaries
-      // compiled without it.
-      if(const auto ir3=javaString(env,ir3Debug);!ir3.empty()&&!getenv("IR3_SHADER_DEBUG")){
-        setenv("IR3_SHADER_DEBUG",ir3.c_str(),1);
-        note("IR3_SHADER_DEBUG: "+ir3);
-        plume_env+="IR3_SHADER_DEBUG="+ir3+"\n";
-      }
+      // The app selection, including an empty selection, takes precedence.
+      // Include it in the pipeline cache key because IR3 changes shader code.
+      const auto ir3=javaString(env,ir3Debug);
+      setenv("IR3_SHADER_DEBUG",ir3.c_str(),1);
+      note("IR3_SHADER_DEBUG: "+(ir3.empty()?std::string("desativado"):ir3));
+      plume_env+="IR3_SHADER_DEBUG="+ir3+"\n";
       renutConfigureXenosDriver(javaString(env,hooks),javaString(env,driverDirectory),javaString(env,driverLibrary),oneUiFix,
                                 javaString(env,tuDebug));
       note("Driver solicitado: "+(javaString(env,driverLibrary).empty()?std::string("sistema"):javaString(env,driverLibrary)));
