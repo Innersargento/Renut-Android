@@ -85,6 +85,30 @@ REX_EXTERN(sub_8222A990) {
   __imp__sub_8222A990(ctx, base);
 }
 
+// Scene view job @ 0x823B18C8 (r3 the job; +40 its scene, +80 its band). The
+// game renders a view's objects as three jobs: one per MSAA band, each drawing
+// the objects that fall inside its band with a projection stretched to that
+// band, and one for the whole screen with the objects that span both. The
+// band jobs' command buffers are predicated to their bands. With the scene in
+// one pass nothing predicates them away, so an object in the lower half is
+// drawn over the whole screen with the lower band's projection: vehicles'
+// wheels and the crane's claws hang in the air, stretched. The scene's +44
+// turns the split on; cleared, the band jobs end their buffers empty and the
+// whole-screen job draws every object - the game's own path without bands.
+extern "C" void __imp__sub_823B18C8(PPCContext& __restrict, uint8_t*);
+REX_EXTERN(sub_823B18C8) {
+  if (!REXCVAR_GET(renut_scene_msaa)) {
+    const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r3.u32 + 40));
+    auto* split = reinterpret_cast<uint32_t*>(base + scene + 44);
+    if (scene && *split == __builtin_bswap32(1)) {
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true)) REXLOG_INFO("Renut: scene {:08X} objects no longer split by band", scene);
+      *split = 0;
+    }
+  }
+  __imp__sub_823B18C8(ctx, base);
+}
+
 extern "C" void __imp__meLoadMovie(PPCContext& __restrict, uint8_t*);
 REX_EXTERN(meLoadMovie) {
   REXLOG_INFO("Renut movie request: {}", GuestString(base, ctx.r3.u32, 160));

@@ -978,6 +978,13 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // One-frame trace: touching <files>/plume-trace-request records the next
   // frame's draws and resolves into <files>/plume-trace.txt.
   FILE* trace_ = nullptr;
+  // The guest bytes each traced draw's streams held when it was drawn, checked
+  // again at the swap: a stream the CPU rewrote after the draw was read early.
+  struct TracedStream {
+    uint32_t draw, stream, address;
+    std::vector<uint8_t> bytes;
+  };
+  std::vector<TracedStream> traced_streams_;
   // Pixel shaders whose shadow-cascade constants this trace already holds.
   std::unordered_set<uint64_t> traced_cascade_ps_;
   uint64_t trace_ps_ = 0;
@@ -3552,11 +3559,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   if (trace_) {
-    std::string line = fmt::format("draw #{} vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X}",
+    std::string line = fmt::format("draw #{} vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X} bm={:X}",
                                    draw_index,
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
                                    index_count, uint32_t(edram_mode), pitch, height,
-                                   regs[XE_GPU_REG_RB_COLORCONTROL]);
+                                   regs[XE_GPU_REG_RB_COLORCONTROL], bin_mask_);
     for (uint32_t i = 0; i < color_count; ++i) {
       reg::RB_COLOR_INFO info;
       info.value = regs[kColorInfo[i]];
@@ -3727,6 +3734,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     uint64_t offset;
     RenderBuffer* buffer;
     Trace("  stream{} {:08X}+{:X} e{}", stream, fetch.address << 2, fetch.size << 2, uint32_t(fetch.endian));
+    if (trace_ && fetch.size && (fetch.size << 2) <= (1u << 20)) {
+      const auto* guest = memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2);
+      traced_streams_.push_back({frame_draw_ - 1, stream, uint32_t(fetch.address << 2),
+                                 std::vector<uint8_t>(guest, guest + (fetch.size << 2))});
+    }
     if (BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset)) {
       streams[stream] = buffer == upload_.get() ? Address(offset) : buffer->getDeviceAddress() + offset;
       slot_offsets[stream] = offset;
@@ -4940,6 +4952,21 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             r.width, r.height, uint32_t(r.format), r.guest_pitch, r.guest_height, r.guest_bpp,
             r.generation, r.written_frame);
     }
+    for (const TracedStream& t : traced_streams_) {
+      const auto* now = memory_->TranslatePhysical<const uint8_t*>(t.address);
+      uint32_t changed = 0, first = UINT32_MAX;
+      for (uint32_t i = 0; i < t.bytes.size(); i += 4) {
+        if (std::memcmp(now + i, t.bytes.data() + i, 4)) {
+          ++changed;
+          first = std::min(first, i);
+        }
+      }
+      if (changed) {
+        Trace("  stale draw #{} stream{} {:08X}+{:X}: {} of {} dwords changed since, first at +{:X}", t.draw,
+              t.stream, t.address, t.bytes.size(), changed, t.bytes.size() / 4, first);
+      }
+    }
+    traced_streams_.clear();
     std::fclose(trace_);
     trace_ = nullptr;
     traced_cascade_ps_.clear();
