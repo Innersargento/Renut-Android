@@ -153,7 +153,7 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..7170006 100644
+index ee3830d..cbb320d 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
 @@ -54,12 +54,11 @@
@@ -173,7 +173,7 @@ index ee3830d..7170006 100644
  
  // Device addresses of the sixteen bound vertex streams, eight bytes each.
  //
-@@ -73,9 +72,81 @@
+@@ -73,9 +72,83 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -231,6 +231,8 @@ index ee3830d..7170006 100644
 +// for the locations the vertex shaders can have (0..23). See g_SpecInputRemap0.
 +#define RENUT_SPEC_INPUT_REMAP_BASE      16
 +#define RENUT_SPEC_INPUT_REMAP_LOCATIONS 24
++// The boolean registers, a word of 32 each: id RENUT_SPEC_BOOLS_BASE + word.
++#define RENUT_SPEC_BOOLS_BASE            40
 +#define RENUT_SHARED_REMAP_OFFSET        (RENUT_SHARED_EXPORT_OFFSET + RENUT_EXPORT_RANGE_COUNT * 16)  // 1952 .. 2079
 +// User clip planes: PA_CL_UCP_0..5 in the guest's clip space, then the mask
 +// of enabled ones (PA_CL_CLIP_CNTL.ucp_ena, zero under clip_disable). A vertex
@@ -258,7 +260,7 @@ index ee3830d..7170006 100644
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -119,6 +190,11 @@
+@@ -119,6 +192,11 @@
      X(TexCoord,     9, 21) \
      X(TexCoord,    10, 22)
  
@@ -270,7 +272,7 @@ index ee3830d..7170006 100644
  #ifdef __cplusplus
  #include <cstdint>
  
-@@ -136,7 +212,7 @@
+@@ -136,7 +214,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -279,7 +281,7 @@ index ee3830d..7170006 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +228,20 @@ struct ShaderInputElement
+@@ -152,6 +230,20 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -300,7 +302,7 @@ index ee3830d..7170006 100644
  };
  #endif
  
-@@ -203,27 +293,152 @@ struct PushConstants
+@@ -203,27 +295,168 @@ struct PushConstants
  
  #ifdef RENUT_RECOMP
  
@@ -457,6 +459,22 @@ index ee3830d..7170006 100644
 +[[vk::constant_id(38)]] const uint g_SpecInputRemap22 = 0;
 +[[vk::constant_id(39)]] const uint g_SpecInputRemap23 = 0;
 +
++// The boolean registers, as specialization constants too: id
++// RENUT_SPEC_BOOLS_BASE + word, bit n % 32 of word n / 32. The host keys each
++// pipeline on the bits its two shaders test (and leaves the rest zero), so the
++// driver drops the branches a draw does not take. The lit material tests
++// sixteen of them for eight chained point lights and its shadow cascades; read
++// as uniforms, every draw carried all of that code, ~1,100 instructions.
++[[vk::constant_id(40)]] const uint g_SpecBools0 = 0;
++[[vk::constant_id(41)]] const uint g_SpecBools1 = 0;
++[[vk::constant_id(42)]] const uint g_SpecBools2 = 0;
++[[vk::constant_id(43)]] const uint g_SpecBools3 = 0;
++[[vk::constant_id(44)]] const uint g_SpecBools4 = 0;
++[[vk::constant_id(45)]] const uint g_SpecBools5 = 0;
++[[vk::constant_id(46)]] const uint g_SpecBools6 = 0;
++[[vk::constant_id(47)]] const uint g_SpecBools7 = 0;
++#define g_SpecBoolWord(w) ((w) == 0 ? g_SpecBools0 : (w) == 1 ? g_SpecBools1 :                            (w) == 2 ? g_SpecBools2 : (w) == 3 ? g_SpecBools3 :                            (w) == 4 ? g_SpecBools4 : (w) == 5 ? g_SpecBools5 :                            (w) == 6 ? g_SpecBools6 : g_SpecBools7)
++
 +#define g_SwappedTexcoords    g_SpecSwappedTexcoords
 +#define g_SwappedNormals      g_SpecSwappedNormals
 +#define g_SwappedBinormals    g_SpecSwappedBinormals
@@ -470,7 +488,7 @@ index ee3830d..7170006 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -233,7 +448,27 @@ struct PushConstants
+@@ -233,7 +466,27 @@ struct PushConstants
  // coordinates, and without a scale everything outside the 1x1 corner of the
  // clip volume is culled. N&B's FMV renderer does exactly that: it hands the
  // pipeline a pixel-space rectangle and disables the viewport.
@@ -499,7 +517,7 @@ index ee3830d..7170006 100644
  
  // A vfetch the vertex declaration does not describe - see the stream table's
  // comment. `index` is whatever register the instruction named, so it arrives as
-@@ -244,8 +479,7 @@ struct PushConstants
+@@ -244,8 +497,7 @@ struct PushConstants
  // a draw that binds fewer streams than the shader fetches would otherwise do.
  float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes)
  {
@@ -509,7 +527,7 @@ index ee3830d..7170006 100644
  
      if (address == 0)
          return 0.0;
-@@ -253,14 +487,166 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,14 +505,166 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -681,7 +699,7 @@ index ee3830d..7170006 100644
  #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
  #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
  #endif
-@@ -279,17 +665,22 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -279,17 +683,22 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint4  g_TextureCubeDescriptorIndices[8] : packoffset(c16); \
      uint4  g_SamplerDescriptorIndices[8]     : packoffset(c24); \
      uint4  g_BooleansArr[2]                  : packoffset(c32); \
@@ -715,11 +733,16 @@ index ee3830d..7170006 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -317,6 +708,197 @@ uint g_SpecConstants();
+@@ -316,9 +725,204 @@ uint g_SpecConstants();
+ 
  #ifdef RENUT_RECOMP
  // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
++#ifdef __spirv__
++#define BOOL_BIT(n) ((g_SpecBoolWord((n) / 32u) & (1u << ((n) & 31u))) != 0)
++#else
  #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
-+
+ #endif
+ 
 +// The radius in host NDC of the sprite a point becomes. `size` is the diameter
 +// the vertex shader exported in guest pixels, or -1 if it exported none; as on
 +// the hardware, one it did export is clamped to PA_SU_POINT_MINMAX.
@@ -910,10 +933,12 @@ index ee3830d..7170006 100644
 +{
 +}
 +#endif
- #endif
- 
++#endif
++
  #ifdef RENUT_RECOMP
-@@ -349,7 +931,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ // A vertex stage has no implicit derivatives, so every fetch there has to name
+ // its level explicitly. N&B does sample from vertex shaders - 1D ramps and 3D
+@@ -349,7 +953,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
  float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
@@ -928,7 +953,7 @@ index ee3830d..7170006 100644
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -483,6 +1071,83 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +1093,83 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  

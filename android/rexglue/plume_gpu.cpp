@@ -283,6 +283,10 @@ class HostShader : public gfx::Shader {
   // Texture fetch constants this shader reads; ~0 until TextureMask ran.
   uint32_t texture_mask = 0;
   bool texture_mask_decoded = false;
+  // Boolean registers the control flow tests, a bit per register in words of
+  // 32; the pipeline is specialized on these (RENUT_SPEC_BOOLS_BASE).
+  uint32_t bool_mask[8] = {};
+  bool bool_mask_decoded = false;
   CompiledShader* compiled = nullptr;
   // Vertex shaders: the input layout decoded from this variant's vfetches.
   std::vector<LiveElement> elements;
@@ -853,7 +857,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     bool valid = false;
   };
   std::unordered_map<uint64_t, KeptStream> kept_streams_;
-  LookupMemo<KeptStream> kept_memo_;
+  LookupMemo<KeptStream, 13> kept_memo_;
   uint64_t kept_bytes_ = 0;
   // Filled by the guest thread that tripped a watch (inside its fault
   // handler), drained by this one.
@@ -957,7 +961,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // LoadShader's answers this frame, by microcode address: {dwords, shader}.
   std::unordered_map<const uint32_t*, std::pair<uint32_t, HostShader*>> shader_lookup_;
   // In front of shader_lookup_, by address and length; cleared with it.
-  LookupMemo<HostShader> shader_memo_;
+  LookupMemo<HostShader, 12> shader_memo_;
   uint64_t shader_lookup_frame_ = UINT64_MAX;
   std::vector<RenderInputElement> draw_input_elements_;
   std::vector<RenderInputSlot> draw_input_slots_;
@@ -967,7 +971,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Never invalidated: a fetch constant always describes the same layout. The
   // contents behind it are checked separately, once a frame, in GetGuestTexture.
   std::unordered_map<uint64_t, FetchLayout> fetch_layouts_;
-  LookupMemo<FetchLayout> layout_memo_;
+  LookupMemo<FetchLayout, 12> layout_memo_;
   std::unordered_set<uint64_t> missed_pairs_;
   std::string miss_dump_directory_;
   // One-frame trace: touching <files>/plume-trace-request records the next
@@ -992,6 +996,11 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::string trace_dump_name_ = "exportdump";
   // Debug: <files>/plume-skip holds a bit mask of draw kinds to drop (see IssueDraw).
   uint32_t skip_mask_ = 0;
+  // Debug: <files>/plume-bind, per-draw state the draw path leaves as it was
+  // bound, to price each on the GPU (the picture is wrong). 1 constants
+  // descriptor set, 2 push constants, 4 vertex buffers, 8 viewport and scissor,
+  // 16 drops depth-only draws.
+  uint32_t bind_skip_ = 0;
   // What exporting shaders write stays on the GPU: the draws that read it are
   // served from the export buffers. Copying it back to guest memory a few
   // frames late overwrote memory the game had freed and reused (its asserts
@@ -1052,6 +1061,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unique_ptr<RenderDescriptorSet> set_2d_, set_3d_, set_cube_, set_samplers_;
   std::array<std::unique_ptr<RenderSampler>, kMaxSamplers> samplers_;
   std::unordered_map<uint32_t, uint32_t> sampler_indices_;
+  // Nothing is ever erased from sampler_indices_, so its nodes stay put.
+  LookupMemo<uint32_t, 8> sampler_memo_;
   uint32_t next_sampler_ = 0;
   std::unique_ptr<RenderTexture> white_2d_, white_3d_, white_cube_;
   std::unique_ptr<RenderTextureView> white_cube_view_;
@@ -1189,7 +1200,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint64_t, Target> targets_;
   std::unordered_map<uint64_t, std::unique_ptr<RenderFramebuffer>> framebuffers_;
   std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> pipelines_;
-  LookupMemo<std::unique_ptr<RenderPipeline>> pipeline_memo_;
+  LookupMemo<std::unique_ptr<RenderPipeline>, 13> pipeline_memo_;
   // Keyed by guest address and host format: N&B reuses an address within a
   // frame for different things (a 768x768 shadow map, then the bloom chain),
   // and draws recorded earlier must keep the texture they sampled.
@@ -1300,7 +1311,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint64_t resolve_serial_ = 0;
   uint64_t target_serial_ = 0;
   std::unordered_map<uint64_t, GuestTexture> guest_textures_;
-  LookupMemo<GuestTexture> texture_memo_;
+  LookupMemo<GuestTexture, 12> texture_memo_;
   std::unordered_set<uint32_t> unsupported_formats_;
   uint32_t next_descriptor_ = 1;
   std::unordered_map<uint64_t, GuestTexture> guest_cubes_;
@@ -2162,9 +2173,10 @@ void PlumeCommandProcessor::EvictIdleTextures() {
     if (!idle(it->second.checked_frame, limit_2d)) { ++it; continue; }
     RetireTexture(it->second.texture, it->second.descriptor);
     it = guest_textures_.erase(it);
-    texture_memo_.Clear();
     ++evicted;
   }
+  // Once, not per erased entry: the memo is 64 KB.
+  texture_memo_.Clear();
   const uint64_t limit_3d = idle_for(free_3d < 16);
   for (auto* map : {&guest_stacks_, &guest_volumes_}) {
     for (auto it = map->begin(); it != map->end();) {
@@ -2195,6 +2207,7 @@ void PlumeCommandProcessor::EvictIdleTextures() {
     InvalidateResolvedLookups();
     ++evicted;
   }
+  bool kept_erased = false;
   for (auto it = kept_streams_.begin(); it != kept_streams_.end();) {
     if (swaps_ - it->second.last_used < 600) { ++it; continue; }
     if (it->second.buffer) {
@@ -2202,8 +2215,9 @@ void PlumeCommandProcessor::EvictIdleTextures() {
       kept_bytes_ -= it->second.size;
     }
     it = kept_streams_.erase(it);
-    kept_memo_.Clear();
+    kept_erased = true;
   }
+  if (kept_erased) kept_memo_.Clear();
   if (evicted) {
     REXLOG_INFO("Renut: Plume evicted {} idle textures (free descriptors 2D {} 3D {} cube {})", evicted,
                 free_2d, free_3d, free_cube);
@@ -2770,8 +2784,12 @@ uint32_t PlumeCommandProcessor::GetSampler(const xenos::xe_gpu_texture_fetch_t& 
   // The fallback is the old behaviour: linear everywhere, no anisotropy, and
   // every axis wrapped, for comparing a capture against.
   if (skip_mask_ & 524288) return kSamplerDefault;
+  if (const uint32_t* memo = sampler_memo_.Find(key)) return *memo;
   auto found = sampler_indices_.find(key);
-  if (found != sampler_indices_.end()) return found->second;
+  if (found != sampler_indices_.end()) {
+    sampler_memo_.Put(key, &found->second);
+    return found->second;
+  }
   if (next_sampler_ >= kMaxSamplers) return kSamplerDefault;
 
   auto filter = [](xenos::TextureFilter f) {
@@ -3400,6 +3418,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     depth = GetTarget(depth_info.depth_base, uint32_t(depth_info.depth_format), true, pitch, height);
   }
   if (!color_count && !depth) return Drop("no color or depth", vs, ps);
+  // Debug (plume-bind 16): drop depth-only draws - the shadow casters - to
+  // price them.
+  if ((bind_skip_ & 16) && !color_count) return true;
   // GetTarget may have recreated a texture that an earlier slot also uses.
   for (uint32_t i = 0; i < color_count; ++i) {
     Transition(colors[i]->texture.get(), colors[i]->layout, RenderTextureLayout::COLOR_WRITE);
@@ -4047,6 +4068,27 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   for (uint32_t i = 0; i < RENUT_SPEC_INPUT_REMAP_LOCATIONS; ++i) {
     if (input_remap[i]) spec_constants.emplace_back(RENUT_SPEC_INPUT_REMAP_BASE + i, input_remap[i]);
   }
+  // The boolean registers the two shaders branch on, and only those: a
+  // register neither tests stays out of the key, so it cannot multiply the
+  // pipelines of shaders that ignore it.
+  auto bools_of = [](HostShader* shader) -> const uint32_t* {
+    if (!shader) return nullptr;
+    if (!shader->bool_mask_decoded) {
+      rex::string::StringBuffer disassembly;
+      shader->AnalyzeUcode(disassembly);
+      std::memcpy(shader->bool_mask, shader->constant_register_map().bool_bitmap,
+                  sizeof(shader->bool_mask));
+      shader->bool_mask_decoded = true;
+    }
+    return shader->bool_mask;
+  };
+  const uint32_t* vs_bools = bools_of(vs);
+  const uint32_t* ps_bools = bools_of(ps);
+  for (uint32_t word = 0; word < 8; ++word) {
+    const uint32_t tested = vs_bools[word] | (ps_bools ? ps_bools[word] : 0);
+    const uint32_t value = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + word] & tested;
+    if (value) spec_constants.emplace_back(RENUT_SPEC_BOOLS_BASE + word, value);
+  }
   // The pipeline key: the fields laid end to end and hashed once. Hashing
   // each field on its own was a few dozen XXH3 calls a draw.
   KeyBytes key_bytes;
@@ -4259,7 +4301,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   const uint64_t push[3] = {Address(constant_offsets_[0][0]), Address(constant_offsets_[1][0]),
                             Address(shared_offset_)};
-  if (std::memcmp(push, pushed_constants_, sizeof(push)) != 0) {
+  if (std::memcmp(push, pushed_constants_, sizeof(push)) != 0 &&
+      !((bind_skip_ & 2) && pushed_constants_[0] != UINT64_MAX)) {
     list_->setGraphicsPushConstants(0, push, 0, sizeof(push));
     std::memcpy(pushed_constants_, push, sizeof(push));
   }
@@ -4271,7 +4314,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   constant_offsets[kConstantBindings - 2] = uint32_t(shared_offset_);
   constant_offsets[kConstantBindings - 1] = uint32_t(shared_cold_offset_);
-  if (std::memcmp(constant_offsets, bound_constant_offsets_, sizeof(constant_offsets)) != 0) {
+  if (std::memcmp(constant_offsets, bound_constant_offsets_, sizeof(constant_offsets)) != 0 &&
+      !((bind_skip_ & 1) && bound_constant_offsets_[0] != UINT32_MAX)) {
     vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(list_)->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             static_cast<VulkanPipelineLayout*>(layout_.get())->vk, 4, 1, &constants_set_,
                             kConstantBindings, constant_offsets);
@@ -4280,7 +4324,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // Dynamic state, vertex and index buffers are only set when they change:
   // Plume passes each call straight to Vulkan, and Turnip re-emits the state
   // behind every one of them at the next draw.
-  if (!viewport_bound_ || std::memcmp(&viewport, &bound_viewport_, sizeof(viewport)) != 0) {
+  if (!viewport_bound_ || (std::memcmp(&viewport, &bound_viewport_, sizeof(viewport)) != 0 && !(bind_skip_ & 8))) {
     list_->setViewports(&viewport, 1);
     bound_viewport_ = viewport;
     viewport_bound_ = true;
@@ -4288,7 +4332,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // plume-skip bit 8388608 scissors every draw to one pixel: vertex work and
   // binning stay, fragment work goes. What is left is the per-draw cost.
   if (skip_mask_ & 8388608) scissor_rect = RenderRect(0, 0, 1, 1);
-  if (!scissor_bound_ || std::memcmp(&scissor_rect, &bound_scissor_, sizeof(scissor_rect)) != 0) {
+  if (!scissor_bound_ ||
+      (std::memcmp(&scissor_rect, &bound_scissor_, sizeof(scissor_rect)) != 0 && !(bind_skip_ & 8))) {
     list_->setScissors(&scissor_rect, 1);
     bound_scissor_ = scissor_rect;
     scissor_bound_ = true;
@@ -4306,8 +4351,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                     slot_sizes[slot.index]);
     }
     VertexBinding& bound = bound_vertex_buffers_[slot.index];
-    if (bound.buffer != view.buffer.ref || bound.offset != view.buffer.offset) {
-      list_->setVertexBuffers(slot.index, &view, 1, &slot);
+    if ((bound.buffer != view.buffer.ref || bound.offset != view.buffer.offset) &&
+        !((bind_skip_ & 4) && bound.buffer)) {
+      // Straight to Vulkan: Plume's wrapper goes through two thread_local
+      // vectors a call, which was ~4% of this thread at a call or two a draw.
+      if (const auto* vb = static_cast<const VulkanBuffer*>(view.buffer.ref)) {
+        const VkDeviceSize offset = view.buffer.offset;
+        vkCmdBindVertexBuffers(static_cast<VulkanCommandList*>(list_)->vk, slot.index, 1, &vb->vk, &offset);
+      } else {
+        list_->setVertexBuffers(slot.index, &view, 1, &slot);
+      }
       bound.buffer = view.buffer.ref;
       bound.offset = view.buffer.offset;
     }
@@ -4887,6 +4940,13 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
     uint32_t mask = 0;
+    uint32_t bind_skip = 0;
+    if (FILE* file = std::fopen((root + "/plume-bind").c_str(), "r")) {
+      if (std::fscanf(file, "%u", &bind_skip) != 1) bind_skip = 0;
+      std::fclose(file);
+    }
+    if (bind_skip != bind_skip_) REXLOG_INFO("Renut: Plume bind skip {}", bind_skip);
+    bind_skip_ = bind_skip;
     if (FILE* file = std::fopen((root + "/plume-skip").c_str(), "r")) {
       if (std::fscanf(file, "%u", &mask) != 1) mask = 0;
       std::fclose(file);

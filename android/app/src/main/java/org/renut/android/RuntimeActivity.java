@@ -44,6 +44,7 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
                 |View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN|View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
             if(android.os.Build.VERSION.SDK_INT>=28)getWindow().getAttributes().layoutInDisplayCutoutMode=
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().getAttributes().preferredRefreshRate=60f;
             FrameLayout root=new FrameLayout(this);root.setBackgroundColor(Color.BLACK);
             surface=new SurfaceView(this);surface.getHolder().addCallback(this);
             root.addView(surface,new FrameLayout.LayoutParams(-1,-1));
@@ -112,7 +113,14 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
         },"renut-runtime-validation").start();
     }
     private void stop(){cancelled=true;if(loaded)nativeStop();}
-    @Override public void surfaceCreated(SurfaceHolder h){startValidation(h.getSurface());}
+    @Override public void surfaceCreated(SurfaceHolder h){
+        // The game presents at most 30 frames a second; left alone the panel
+        // refreshes at 120 Hz for them. 60 keeps an even cadence below 30 too.
+        if(launch&&android.os.Build.VERSION.SDK_INT>=30){
+            try{h.getSurface().setFrameRate(60f,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(Exception ignored){}
+        }
+        startValidation(h.getSurface());
+    }
     @Override public void surfaceChanged(SurfaceHolder h,int format,int width,int height){}
     @Override public void surfaceDestroyed(SurfaceHolder h){stop();}
     @Override protected void onPause(){stop();super.onPause();finish();}
