@@ -43,7 +43,7 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
     private ScrollView results;
     private boolean started, graphics, launch;
     private volatile boolean loaded, cancelled;
-    private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,String renderer,boolean launch,boolean oneUiFix,String tuDebug,String ir3Debug);
+    private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,String renderer,boolean launch,boolean oneUiFix,boolean sceneMsaa,String tuDebug,String ir3Debug);
     private static native void nativeStop();
     private static native void nativeButton(int button,boolean down);
     private static native void nativeStick(int stick,float x,float y);
@@ -267,6 +267,7 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
                 report=nativeValidate(getFilesDir().getAbsolutePath(),target,getApplicationInfo().nativeLibraryDir,
                     getIntent().getStringExtra("driverDir"),getIntent().getStringExtra("driverLib"),
                     getIntent().getStringExtra("renderer"),launch,getIntent().getBooleanExtra("oneUiFix",true),
+                    getIntent().getBooleanExtra("sceneMsaa",false),
                     getIntent().getStringExtra("tuDebug"),getIntent().getStringExtra("ir3Debug"));
             }catch(Throwable e){
                 report="Falha ao iniciar o runtime: "+e;

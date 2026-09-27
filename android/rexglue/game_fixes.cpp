@@ -15,7 +15,7 @@
 
 void renutPostMovieFrame(const std::string& path, uint32_t serial);
 
-REXCVAR_DEFINE_BOOL(renut_scene_msaa, true, "reNut",
+REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut",
                     "Keep the game's MSAA scene surfaces, which the Xbox 360 renders in two "
                     "or four bands (predicated tiling) with every draw sent once per band. "
                     "Off: one pass, no MSAA - the host never resolved the samples anyway");

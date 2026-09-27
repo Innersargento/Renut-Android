@@ -20,7 +20,7 @@ public final class MainActivity extends Activity {
     private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
     private static final String[] TU_DEBUG={"","perf","sysmem","gmem"};
     private static final String[] IR3_DEBUG={"","nopreamble","noearlypreamble","nouboopt","nodescprefetch"};
-    private TextView status, library, driver, renderer, fpsCounter, oneUiFix, tuDebug, ir3Debug;
+    private TextView status, library, driver, renderer, fpsCounter, oneUiFix, sceneMsaa, tuDebug, ir3Debug;
     private ProgressBar progress;
     private Button cancel;
     private volatile Thread worker;
@@ -62,6 +62,7 @@ public final class MainActivity extends Activity {
             i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
             i.putExtra("showControls",getPreferences(0).getBoolean("showControls",true));
             i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));
+            i.putExtra("sceneMsaa",getPreferences(0).getBoolean("sceneMsaa",false));
             i.putExtra("tuDebug",getPreferences(0).getString("tuDebug",""));
             i.putExtra("ir3Debug",getPreferences(0).getString("ir3Debug",""));startActivity(i);
         });
@@ -90,6 +91,11 @@ public final class MainActivity extends Activity {
         button(graphics,"Ativar/desativar contador de FPS",()->{
             getPreferences(0).edit().putBoolean("fps",!getPreferences(0).getBoolean("fps",false)).apply(); refresh();
         });
+        sceneMsaa=text("",16,ink); graphics.addView(sceneMsaa);
+        button(graphics,"Ativar/desativar MSAA",()->{
+            getPreferences(0).edit().putBoolean("sceneMsaa",!getPreferences(0).getBoolean("sceneMsaa",false)).apply(); refresh();
+        });
+        graphics.addView(text("Com MSAA o jogo divide a cena em faixas e desenha tudo uma vez por faixa, como no Xbox 360. Desativado, desenha em uma passada só: bem mais rápido, e a imagem é a mesma, porque o renderizador nunca resolveu as amostras.",13,muted));
         oneUiFix=text("",16,ink); graphics.addView(oneUiFix);
         button(graphics,"Ativar/desativar One UI fix",()->{
             getPreferences(0).edit().putBoolean("oneui",!getPreferences(0).getBoolean("oneui",true)).apply(); refresh();
@@ -161,6 +167,7 @@ public final class MainActivity extends Activity {
             ?"Renderizador: Plume nativo (em desenvolvimento)":"Renderizador: RexGlue (emulação Xenos)");
         fpsCounter.setText(getPreferences(0).getBoolean("fps",false)?"Contador de FPS: ativado":"Contador de FPS: desativado");
         oneUiFix.setText(getPreferences(0).getBoolean("oneui",true)?"One UI fix: ativado":"One UI fix: desativado");
+        sceneMsaa.setText(getPreferences(0).getBoolean("sceneMsaa",false)?"MSAA: ativado":"MSAA: desativado");
         String debug=getPreferences(0).getString("tuDebug","");
         tuDebug.setText("TU_DEBUG: "+(debug.isEmpty()?"desativado":debug));
         String ir3=getPreferences(0).getString("ir3Debug","");
