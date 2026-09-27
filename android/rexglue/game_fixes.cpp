@@ -2,11 +2,18 @@
 // are weak symbols, so a strong definition here replaces them at link time.
 
 #include <atomic>
+#include <chrono>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
+
+void renutPostMovieFrame(const std::string& path, uint32_t serial);
 
 REXCVAR_DEFINE_BOOL(renut_scene_msaa, true, "reNut",
                     "Keep the game's MSAA scene surfaces, which the Xbox 360 renders in two "
@@ -14,6 +21,27 @@ REXCVAR_DEFINE_BOOL(renut_scene_msaa, true, "reNut",
                     "Off: one pass, no MSAA - the host never resolved the samples anyway");
 
 namespace {
+
+// Movies opened by the game, oldest first, until a renderer takes one. The
+// boot sequence opens the MGS logo and the intro together and plays them in
+// that order; attract and in-game movies open just before they play.
+struct PendingMovie {
+  std::string path;
+  std::chrono::steady_clock::time_point opened;
+};
+std::mutex movie_mutex;
+std::deque<PendingMovie> pending_movies;
+
+void QueueMovie(std::string path, const char* source) {
+  REXLOG_INFO("Renut movie open ({}): {}", source, path);
+  std::lock_guard lock(movie_mutex);
+  pending_movies.push_back({std::move(path), std::chrono::steady_clock::now()});
+}
+
+std::string GuestString(uint8_t* base, uint32_t address, size_t limit) {
+  const char* text = reinterpret_cast<const char*>(base + address);
+  return address ? std::string(text, strnlen(text, limit)) : std::string();
+}
 
 // The game's MSAA mode (0 none, 1 2x, 2 4x), read by the scene surface setup
 // (sub_823ED2A8) and the tile count (sub_8222A990).
@@ -57,19 +85,80 @@ REX_EXTERN(sub_8222A990) {
   __imp__sub_8222A990(ctx, base);
 }
 
+extern "C" void __imp__meLoadMovie(PPCContext& __restrict, uint8_t*);
+REX_EXTERN(meLoadMovie) {
+  REXLOG_INFO("Renut movie request: {}", GuestString(base, ctx.r3.u32, 160));
+  __imp__meLoadMovie(ctx, base);
+}
+
+// Asset path builder. meLoadMovie formats the boot movies' paths through it;
+// other movies take the CCal open below.
+extern "C" void __imp__sub_822BE7F0(PPCContext& __restrict, uint8_t*);
+REX_EXTERN(sub_822BE7F0) {
+  bool movie_call = ctx.lr == 0x822B6A70;
+  uint32_t output = ctx.r3.u32;
+  __imp__sub_822BE7F0(ctx, base);
+  if (movie_call) QueueMovie(GuestString(base, output, 260), "meLoadMovie");
+}
+
+// CCal video open @ 0x82A0BE20, reached from sub_8239D6E8 for attract and
+// in-game movies (r3 manager, r4 path, r5 where the player is stored).
+extern "C" void __imp__sub_82A0BE20(PPCContext& __restrict, uint8_t*);
+REX_EXTERN(sub_82A0BE20) {
+  std::string path = GuestString(base, ctx.r4.u32, 260);
+  __imp__sub_82A0BE20(ctx, base);
+  if (int32_t(ctx.r3.u32) >= 0) QueueMovie(std::move(path), "CCal");
+}
+
 // nut_Render_CCalVideoRenderer @ 0x82A0D9E8
 //
-// Blits a decoded frame of the movie that follows the Rare logo. Video decode
-// produces invalid XMEDIA_VIDEO_FRAMEs (garbage width/height/pitch), so this
-// path never completes a usable frame: on desktop Linux it SIGSEGVs, here the
-// player stops advancing and the last logo frame stays on screen. Skipping the
-// blit lets the movie's audio and timing run so the game boots into 3D; movies
-// show black until the video frame path is fixed. Same fix as
-// etonedemid/reNut_linuxfixes commit 755f620.
+// Blits a decoded frame of the current movie. Video decode produces invalid
+// XMEDIA_VIDEO_FRAMEs (garbage width/height/pitch), so this path never
+// completes a usable frame: on desktop Linux it SIGSEGVs, here the player
+// stops advancing and the last logo frame stays on screen. Skipping the blit
+// lets the movie's audio and timing run so the game boots into 3D; the Android
+// overlay decodes the original ASF/WMV3 file instead. The original workaround
+// came from etonedemid/reNut_linuxfixes commit 755f620.
+//
+// Each movie gets its own renderer (`this`), so a new `this` takes the oldest
+// movie opened. The same address can come back for a later movie: after a
+// pause in the blits, a movie opened since the current one started replaces it.
 REX_EXTERN(sub_82A0D9E8) {
-  static std::atomic<bool> logged{false};
-  if (!logged.exchange(true)) {
-    REXLOG_INFO("Renut: skipping intro movie video blit (sub_82A0D9E8)");
+  using clock = std::chrono::steady_clock;
+  static uint32_t current_this = 0;
+  static uint32_t serial = 0;
+  static std::string current_path;
+  static clock::time_point started, last_blit, last_post;
+  const uint32_t self = ctx.r3.u32;
+  const auto now = clock::now();
+  bool changed = false;
+  {
+    std::lock_guard lock(movie_mutex);
+    // Opened but never played (a skipped movie, say): do not hand it on.
+    while (!pending_movies.empty() && now - pending_movies.front().opened > std::chrono::seconds(60))
+      pending_movies.pop_front();
+    bool resumed_later = self == current_this && now - last_blit > std::chrono::seconds(1) &&
+                         !pending_movies.empty() && pending_movies.front().opened > started;
+    if (self != current_this || resumed_later) {
+      changed = true;
+      current_this = self;
+      started = now;
+      ++serial;
+      current_path.clear();
+      if (!pending_movies.empty()) {
+        current_path = std::move(pending_movies.front().path);
+        pending_movies.pop_front();
+      }
+    }
+  }
+  last_blit = now;
+  if (changed) {
+    REXLOG_INFO("Renut movie #{}: renderer {:08X} shows {}", serial, self,
+                current_path.empty() ? "(unknown)" : current_path);
+  }
+  if (!current_path.empty() && (changed || now - last_post > std::chrono::milliseconds(500))) {
+    last_post = now;
+    renutPostMovieFrame(current_path, serial);
   }
   ctx.r3.u64 = 0;
 }

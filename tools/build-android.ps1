@@ -3,6 +3,8 @@ $ErrorActionPreference = 'Stop'
 $renutRoot = Split-Path $PSScriptRoot -Parent
 if (-not $JavaHome) { throw 'Informe -JavaHome com o caminho de um JDK 17 ou 21.' }
 $env:JAVA_HOME = $JavaHome
+# Returns at once when the video FFmpeg matches tools/build-video-ffmpeg.sh.
+& (Join-Path $PSScriptRoot 'bootstrap-video-ffmpeg.ps1')
 $socketDir = Join-Path $renutRoot 'out/java-tmp'
 New-Item -ItemType Directory -Force $socketDir | Out-Null
 # Windows packaged shells can remap the default Java socket directory.
