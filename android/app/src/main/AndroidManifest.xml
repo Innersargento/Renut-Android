@@ -10,6 +10,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".ControllerSettingsActivity" android:exported="false" />
         <activity android:name=".ProbeActivity" android:process=":gpu" android:exported="false" />
         <activity android:name=".RuntimeActivity" android:process=":runtime" android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />

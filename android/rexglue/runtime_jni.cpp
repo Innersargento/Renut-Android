@@ -45,6 +45,15 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeS
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeTrigger(JNIEnv*,jclass,jint trigger,jfloat value) {
   renut::SetTouchTrigger(trigger,value);
 }
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalButton(JNIEnv*,jclass,jint button,jboolean down) {
+  renut::SetExternalButton(uint16_t(button),down);
+}
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalStick(JNIEnv*,jclass,jint stick,jfloat x,jfloat y) {
+  renut::SetExternalStick(stick,x,y);
+}
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalTrigger(JNIEnv*,jclass,jint trigger,jfloat value) {
+  renut::SetExternalTrigger(trigger,value);
+}
 extern "C" uint64_t renut_guest_swap_count();
 extern "C" JNIEXPORT jlong JNICALL Java_org_renut_android_RuntimeActivity_nativeFrameCount(JNIEnv*,jclass) {
   return jlong(renut_guest_swap_count());

@@ -46,12 +46,21 @@ public final class MainActivity extends Activity {
         library=text("Nenhum arquivo importado",16,ink); game.addView(library);
         button(game,"Importar imagem ISO",()->pick(ISO));
         button(game,"Importar apenas o XEX",()->pick(XEX));
+        CheckBox showControls=new CheckBox(this);
+        showControls.setText("Mostrar controles na tela");
+        showControls.setTextColor(ink);
+        showControls.setChecked(getPreferences(0).getBoolean("showControls",true));
+        showControls.setOnCheckedChangeListener((view,checked)->
+            getPreferences(0).edit().putBoolean("showControls",checked).apply());
+        game.addView(showControls);
+        button(game,"Configurar controle externo",()->startActivity(new Intent(this,ControllerSettingsActivity.class)));
         button(game,"Iniciar Banjo (experimental)",()->{
             Intent i=new Intent(this,RuntimeActivity.class).putExtra("launch",true);
             i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
             i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
             i.putExtra("renderer",getPreferences(0).getString("renderer","xenos"));
             i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
+            i.putExtra("showControls",getPreferences(0).getBoolean("showControls",true));
             i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));
             i.putExtra("tuDebug",getPreferences(0).getString("tuDebug",""));
             i.putExtra("ir3Debug",getPreferences(0).getString("ir3Debug",""));startActivity(i);

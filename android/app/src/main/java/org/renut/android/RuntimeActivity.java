@@ -3,6 +3,7 @@ package org.renut.android;
 import android.app.Activity;
 import android.os.Bundle;
 import android.graphics.Color;
+import android.hardware.input.InputManager;
 import android.view.*;
 import android.widget.*;
 import java.io.File;
@@ -14,6 +15,14 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
     private TextView status;
     private SurfaceView surface;
     private GamepadOverlay overlay;
+    private ExternalController.Player controller;
+    private int controllerDeviceId = -1;
+    private InputManager inputManager;
+    private final InputManager.InputDeviceListener deviceListener = new InputManager.InputDeviceListener() {
+        @Override public void onInputDeviceAdded(int id) { if (launch) setupController(); }
+        @Override public void onInputDeviceChanged(int id) { if (launch && id == controllerDeviceId) { clearController(); setupController(); } }
+        @Override public void onInputDeviceRemoved(int id) { if (id == controllerDeviceId) { clearController(); setupController(); } }
+    };
     private ScrollView results;
     private boolean started, graphics, launch;
     private volatile boolean loaded, cancelled;
@@ -22,6 +31,9 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
     private static native void nativeButton(int button,boolean down);
     private static native void nativeStick(int stick,float x,float y);
     private static native void nativeTrigger(int trigger,float value);
+    private static native void nativeExternalButton(int button,boolean down);
+    private static native void nativeExternalStick(int stick,float x,float y);
+    private static native void nativeExternalTrigger(int trigger,float value);
     private static native long nativeFrameCount();
     private TextView fps;
     public int openContentFd(String uri, String mode) throws java.io.IOException {
@@ -34,11 +46,16 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
         launch=getIntent().getBooleanExtra("launch",false);
         if(launch)setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         graphics=launch||getIntent().getBooleanExtra("graphics",false);
+        if(launch){
+            inputManager=(InputManager)getSystemService(INPUT_SERVICE);
+            inputManager.registerInputDeviceListener(deviceListener,null);
+            setupController();
+        }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         status=new TextView(this);status.setTextColor(Color.rgb(226,237,235));status.setTextSize(16);
         results=new ScrollView(this);results.addView(status);
         if(launch){
-            // Full screen: the game surface with the Xbox 360 controller drawn over it.
+            // Full screen game surface with optional on-screen controls.
             getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                 |View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 |View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN|View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
@@ -48,13 +65,15 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
             FrameLayout root=new FrameLayout(this);root.setBackgroundColor(Color.BLACK);
             surface=new SurfaceView(this);surface.getHolder().addCallback(this);
             root.addView(surface,new FrameLayout.LayoutParams(-1,-1));
-            overlay=new GamepadOverlay(this,new GamepadOverlay.Sink(){
-                @Override public void button(int mask,boolean down){if(loaded)nativeButton(mask,down);}
-                @Override public void stick(int stick,float x,float y){if(loaded)nativeStick(stick,x,y);}
-                @Override public void trigger(int trigger,float value){if(loaded)nativeTrigger(trigger,value);}
-                @Override public void exit(){finish();}
-            });
-            root.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
+            if(getIntent().getBooleanExtra("showControls",true)){
+                overlay=new GamepadOverlay(this,new GamepadOverlay.Sink(){
+                    @Override public void button(int mask,boolean down){if(loaded)nativeButton(mask,down);}
+                    @Override public void stick(int stick,float x,float y){if(loaded)nativeStick(stick,x,y);}
+                    @Override public void trigger(int trigger,float value){if(loaded)nativeTrigger(trigger,value);}
+                    @Override public void exit(){finish();}
+                });
+                root.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
+            }
             if(getIntent().getBooleanExtra("fps",false)){
                 // Frames the game presented (D3DDevice_Swap) per second, sampled every 0.5 s.
                 fps=new TextView(this);fps.setTextColor(Color.rgb(120,255,120));fps.setTextSize(14);
@@ -90,6 +109,29 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
         setContentView(body);
         if(!graphics)startValidation(null);
     }
+    private void setupController(){
+        if(controller!=null)return;
+        InputDevice device=ExternalController.findSelected(this);
+        if(device==null)return;
+        controllerDeviceId=device.getId();
+        controller=new ExternalController.Player(device,ExternalController.load(this,device),new ExternalController.Sink(){
+            @Override public void button(int mask,boolean down){if(loaded)nativeExternalButton(mask,down);}
+            @Override public void stick(int stick,float x,float y){if(loaded)nativeExternalStick(stick,x,y);}
+            @Override public void trigger(int trigger,float value){if(loaded)nativeExternalTrigger(trigger,value);}
+        });
+    }
+    private void clearController(){
+        if(controller!=null)controller.release();
+        controller=null;controllerDeviceId=-1;
+    }
+    @Override public boolean dispatchKeyEvent(KeyEvent event){
+        if(launch){setupController();if(controller!=null&&controller.key(event))return true;}
+        return super.dispatchKeyEvent(event);
+    }
+    @Override public boolean dispatchGenericMotionEvent(MotionEvent event){
+        if(launch){setupController();if(controller!=null&&controller.motion(event))return true;}
+        return super.dispatchGenericMotionEvent(event);
+    }
     private void startValidation(Surface target){
         if(started||cancelled)return;started=true;
         new Thread(()->{
@@ -108,7 +150,7 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
             }
             final String message=report;
             runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
-                if(overlay!=null){overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
+                if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
                 else results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
         },"renut-runtime-validation").start();
     }
@@ -123,6 +165,6 @@ public final class RuntimeActivity extends Activity implements SurfaceHolder.Cal
     }
     @Override public void surfaceChanged(SurfaceHolder h,int format,int width,int height){}
     @Override public void surfaceDestroyed(SurfaceHolder h){stop();}
-    @Override protected void onPause(){stop();super.onPause();finish();}
-    @Override protected void onDestroy(){stop();super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
+    @Override protected void onPause(){clearController();stop();super.onPause();finish();}
+    @Override protected void onDestroy(){if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
 }

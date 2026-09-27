@@ -14,7 +14,7 @@ namespace renut {
 using rex::X_RESULT;
 using rex::X_STATUS;
 
-// State of the on-screen Xbox 360 controller, written by the Java overlay.
+// Merged state of the on-screen and external controllers.
 struct TouchPad {
   uint16_t buttons = 0;
   uint8_t left_trigger = 0, right_trigger = 0;
@@ -22,6 +22,8 @@ struct TouchPad {
 };
 inline std::mutex touch_mutex;
 inline TouchPad touch_pad;
+inline TouchPad overlay_pad;
+inline TouchPad external_pad;
 inline uint32_t touch_packet = 0;
 
 // Keystroke events (XamInputGetKeystroke*), which menus such as the Single
@@ -99,15 +101,29 @@ inline void UpdateTouchKeys() {
 // B, X, Y. The Guide button is reserved by the system.
 constexpr uint16_t kTouchButtonMask = 0xF3FF;
 
-inline void SetTouchButton(uint16_t button, bool down) {
+// Caller holds touch_mutex. External analog input takes priority while moved.
+inline void UpdateMergedPad() {
+  TouchPad next;
+  next.buttons = overlay_pad.buttons | external_pad.buttons;
+  next.left_trigger = std::max(overlay_pad.left_trigger, external_pad.left_trigger);
+  next.right_trigger = std::max(overlay_pad.right_trigger, external_pad.right_trigger);
+  next.lx = external_pad.lx ? external_pad.lx : overlay_pad.lx;
+  next.ly = external_pad.ly ? external_pad.ly : overlay_pad.ly;
+  next.rx = external_pad.rx ? external_pad.rx : overlay_pad.rx;
+  next.ry = external_pad.ry ? external_pad.ry : overlay_pad.ry;
+  if (next.buttons == touch_pad.buttons && next.left_trigger == touch_pad.left_trigger &&
+      next.right_trigger == touch_pad.right_trigger && next.lx == touch_pad.lx &&
+      next.ly == touch_pad.ly && next.rx == touch_pad.rx && next.ry == touch_pad.ry) return;
+  touch_pad = next;
+  ++touch_packet;
+  UpdateTouchKeys();
+}
+
+inline void SetSourceButton(TouchPad& source, uint16_t button, bool down) {
   std::lock_guard lock(touch_mutex);
   button &= kTouchButtonMask;
-  uint16_t next = down ? touch_pad.buttons | button : touch_pad.buttons & ~button;
-  if (next != touch_pad.buttons) {
-    touch_pad.buttons = next;
-    ++touch_packet;
-    UpdateTouchKeys();
-  }
+  source.buttons = down ? source.buttons | button : source.buttons & ~button;
+  UpdateMergedPad();
 }
 
 inline int16_t ToAxis(float value) {
@@ -115,32 +131,31 @@ inline int16_t ToAxis(float value) {
 }
 
 // stick 0 = left, 1 = right; x right-positive, y up-positive, both in [-1, 1].
-inline void SetTouchStick(int stick, float x, float y) {
+inline void SetSourceStick(TouchPad& source, int stick, float x, float y) {
   std::lock_guard lock(touch_mutex);
-  int16_t& ax = stick ? touch_pad.rx : touch_pad.lx;
-  int16_t& ay = stick ? touch_pad.ry : touch_pad.ly;
-  int16_t nx = ToAxis(x), ny = ToAxis(y);
-  if (nx != ax || ny != ay) {
-    ax = nx;
-    ay = ny;
-    ++touch_packet;
-    UpdateTouchKeys();
-  }
+  int16_t& ax = stick ? source.rx : source.lx;
+  int16_t& ay = stick ? source.ry : source.ly;
+  ax = ToAxis(x);
+  ay = ToAxis(y);
+  UpdateMergedPad();
 }
 
 // trigger 0 = left, 1 = right; value in [0, 1].
-inline void SetTouchTrigger(int trigger, float value) {
+inline void SetSourceTrigger(TouchPad& source, int trigger, float value) {
   std::lock_guard lock(touch_mutex);
-  uint8_t& t = trigger ? touch_pad.right_trigger : touch_pad.left_trigger;
-  auto next = uint8_t(std::lround(std::clamp(value, 0.f, 1.f) * 255.f));
-  if (next != t) {
-    t = next;
-    ++touch_packet;
-    UpdateTouchKeys();
-  }
+  uint8_t& t = trigger ? source.right_trigger : source.left_trigger;
+  t = uint8_t(std::lround(std::clamp(value, 0.f, 1.f) * 255.f));
+  UpdateMergedPad();
 }
 
-// On-screen controller exposed to the game as player one's gamepad.
+inline void SetTouchButton(uint16_t button, bool down) { SetSourceButton(overlay_pad, button, down); }
+inline void SetTouchStick(int stick, float x, float y) { SetSourceStick(overlay_pad, stick, x, y); }
+inline void SetTouchTrigger(int trigger, float value) { SetSourceTrigger(overlay_pad, trigger, value); }
+inline void SetExternalButton(uint16_t button, bool down) { SetSourceButton(external_pad, button, down); }
+inline void SetExternalStick(int stick, float x, float y) { SetSourceStick(external_pad, stick, x, y); }
+inline void SetExternalTrigger(int trigger, float value) { SetSourceTrigger(external_pad, trigger, value); }
+
+// Combined controller exposed to the game as player one's gamepad.
 class TouchInput final : public rex::input::InputDriver {
   static constexpr auto id_ = static_cast<rex::input::DeviceId>(0x52454E5554);
 
