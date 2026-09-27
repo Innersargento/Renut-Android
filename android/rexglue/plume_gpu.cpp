@@ -769,6 +769,7 @@ struct Stats {
   // Streams served from a kept buffer, bytes copied into new kept buffers, and
   // kept streams the guest wrote over.
   uint64_t kept_hits = 0, kept_bytes_made = 0, kept_drops = 0, kept_unwatchable = 0;
+  uint64_t band_skipped = 0, band_moved = 0, band_widened = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -996,6 +997,23 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::string trace_dump_name_ = "exportdump";
   // Debug: <files>/plume-skip holds a bit mask of draw kinds to drop (see IssueDraw).
   uint32_t skip_mask_ = 0;
+  // Predicated tiling, done once. The 2x MSAA scene does not fit the 10 MB of
+  // EDRAM, so Direct3D replays it for a lower band with the window offset
+  // moved up by the band's height, and the game draws a few objects per band
+  // itself (window offset 0, a viewport the size of the band). Host targets
+  // have no size limit: the upper band's full-screen draws get the whole
+  // screen, the lower band's replay is dropped, the game's own lower-band
+  // draws move down by the band's height, and the resolves follow. Learned
+  // from a frame that replayed a band, applied from the next one on.
+  // Off by default: the water then reflects up close instead of in the
+  // distance (it reads something per band that the merge does not give back
+  // yet). <files>/plume-merge-bands "1" turns it on: ~30 FPS in Showdown Town.
+  bool merge_bands_ = false;
+  bool merge_frame_ = false;  // merging this frame
+  bool band2_ = false;        // the lower band's replay has begun this frame
+  uint32_t band_color_base_ = UINT32_MAX, band_depth_base_ = UINT32_MAX, band_pitch_ = 0;
+  uint32_t band_h_ = 0, band_full_h_ = 0;
+  uint64_t band_seen_frame_ = 0;
   // Debug: <files>/plume-bind, per-draw state the draw path leaves as it was
   // bound, to price each on the GPU (the picture is wrong). 1 constants
   // descriptor set, 2 push constants, 4 vertex buffers, 8 viewport and scissor,
@@ -2226,6 +2244,8 @@ void PlumeCommandProcessor::EvictIdleTextures() {
 
 void PlumeCommandProcessor::BeginFrame() {
   slot_ = (slot_ + 1) % kPlumeFramesInFlight;
+  merge_frame_ = merge_bands_ && band_h_ && band_full_h_ > band_h_ && swaps_ - band_seen_frame_ <= 2;
+  band2_ = false;
   // The slot's command list, ring slice and retired resources are all still in
   // use until the frame that last held it has finished.
   const auto wait_start = std::chrono::steady_clock::now();
@@ -3293,12 +3313,49 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     return true;
   }
+  // Predicated tiling (see merge_bands_). A negative window offset is the
+  // replay of a lower band: learn its layout, and while merging drop it.
+  const int32_t band_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset;
+  const uint32_t band_surface_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+  const uint32_t band_color = regs.Get<reg::RB_COLOR_INFO>().color_base;
+  if (band_offset < 0 && edram_mode == xenos::EdramMode::kColorDepth && band_surface_pitch) {
+    // The band's own height is the scissor's, not the window scissor's (that
+    // one stays at the upper band's 384 rows).
+    draw_util::Scissor band_scissor;
+    draw_util::GetScissor(regs, band_scissor);
+    const uint32_t below = uint32_t(-band_offset) + band_scissor.offset[1] + band_scissor.extent[1];
+    if (band_color != band_color_base_ || band_surface_pitch != band_pitch_ ||
+        uint32_t(-band_offset) != band_h_) {
+      band_color_base_ = band_color;
+      band_depth_base_ = regs.Get<reg::RB_DEPTH_INFO>().depth_base;
+      band_pitch_ = band_surface_pitch;
+      band_h_ = uint32_t(-band_offset);
+      band_full_h_ = below;
+      REXLOG_INFO("Renut: Plume predicated tiling: bands of {} rows over {} (colour {:X}, depth {:X}, pitch {})",
+                  band_h_, band_full_h_, band_color_base_, band_depth_base_, band_pitch_);
+    }
+    band_full_h_ = std::max(band_full_h_, below);
+    band_seen_frame_ = swaps_;
+  }
+  const bool band_surface =
+      merge_frame_ && band_surface_pitch == band_pitch_ && band_color == band_color_base_;
+  if (band_surface && band_offset < 0 && uint32_t(-band_offset) == band_h_) {
+    band2_ = true;
+    ++stats_.band_skipped;
+    return true;
+  }
+  // Upper band: full-screen draws widen to the whole target. Lower band (after
+  // its replay began): the game's own draws move down by the band's height.
+  const bool band_merge = band_surface && band_offset == 0;
   // Direct3D's Clear draws a rectangle with its own shader, in an EDRAM view
   // of the targets (half the pitch at 64 bpp, all four colour targets, a
   // 4096-row surface) that only aliases the real ones on the hardware. Drawn
   // literally it would clear render targets of its own; clear the real ones.
   if (vs->entry->hash == kD3DClearVertexShader && prim_type == xenos::PrimitiveType::kRectangleList &&
       !(skip_mask_ & 2048)) {
+    // A clear that starts the lower band's replay would wipe what the upper
+    // band now draws for the whole screen.
+    if (merge_frame_ && band_offset < 0 && uint32_t(-band_offset) == band_h_) return true;
     IssueD3DClear(edram_mode);
     return true;
   }
@@ -3386,7 +3443,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   const uint32_t pitch = surface.surface_pitch;
   if (!pitch) return Drop("no pitch", vs, ps);
   const auto window_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
-  const uint32_t height = std::clamp<uint32_t>(window_br.br_y, 16, 4096);
+  const uint32_t height =
+      std::clamp<uint32_t>(std::max<uint32_t>(window_br.br_y, band_merge ? band_full_h_ : 0u), 16, 4096);
   max_draw_height_ = std::max(max_draw_height_, height);
   const uint32_t color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
   static constexpr gfx::Register kColorInfo[4] = {
@@ -3907,6 +3965,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     window_x = float(offset.window_x_offset);
     window_y = float(offset.window_y_offset);
   }
+  if (band_merge && band2_) window_y += float(band_h_);
   const bool keep_pixel_center =
       pixel_center_debug_ == 0 ||
       (pixel_center_debug_ == 1 && edram_mode != xenos::EdramMode::kDepthOnly);
@@ -3936,6 +3995,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     viewport = RenderViewport(0.f, 0.f, float(extent->width), float(extent->height));
   }
   std::memcpy(sh + RENUT_SHARED_VIEWPORT_OFFSET, scale_offset, sizeof(scale_offset));
+  // Merged predicated tiling: pixels below the upper band read their position
+  // relative to the lower band, as they did when it was drawn on its own
+  // (renutFragPos). The upper band's full-screen draws and the game's own
+  // lower-band draws need it; every other draw gets 0.
+  const float band_split =
+      band_merge && (band2_ || std::fabs(viewport.height) >= float(band_full_h_) - 1.f) ? float(band_h_) : 0.f;
+  std::memcpy(sh + RENUT_SHARED_BAND_SPLIT_OFFSET, &band_split, sizeof(band_split));
 
   // User clip planes, in the guest's clip space; the vertex shaders turn the
   // enabled ones into a clip distance (renutUserClipDistance). N&B's
@@ -3997,6 +4063,15 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   RenderRect scissor_rect(int32_t(scissor.offset[0]), int32_t(scissor.offset[1]),
                           int32_t(scissor.offset[0] + scissor.extent[0]),
                           int32_t(scissor.offset[1] + scissor.extent[1]));
+  if (band_merge && band2_) {
+    scissor_rect.top += int32_t(band_h_);
+    scissor_rect.bottom = std::min(scissor_rect.bottom + int32_t(band_h_), int32_t(band_full_h_));
+    ++stats_.band_moved;
+  } else if (band_merge && scissor_rect.bottom == int32_t(band_h_) &&
+             std::fabs(viewport.height) >= float(band_full_h_) - 1.f) {
+    scissor_rect.bottom = int32_t(band_full_h_);
+    ++stats_.band_widened;
+  }
   if (trace_) {
     Trace("  viewport ({}, {}) {}x{} window ({}, {}) scissor ({}, {})-({}, {}) vte={:X}", viewport.x,
           viewport.y, viewport.width, viewport.height, window_x, window_y, scissor_rect.left,
@@ -4478,10 +4553,22 @@ bool PlumeCommandProcessor::IssueCopy() {
   const uint32_t tiles = edram.base_tiles - original;
   const uint32_t pitch_tiles = std::max(1u, uint32_t(edram.pitch_tiles));
   const uint32_t x = (tiles % pitch_tiles) * tile_width + info.coordinate_info.edram_offset_x_div_8 * 8;
-  const uint32_t y = (tiles / pitch_tiles) * tile_height + info.coordinate_info.edram_offset_y_div_8 * 8;
+  uint32_t y = (tiles / pitch_tiles) * tile_height + info.coordinate_info.edram_offset_y_div_8 * 8;
   // plume-skip bit 134217728 drops every clear, these and Direct3D's. The
   // picture is wrong; it measures what the clear-only passes cost.
   const bool skip_clears = skip_mask_ & 134217728;
+  // Predicated tiling done once (merge_bands_): the upper band's resolves copy
+  // the whole screen, which the upper band now draws, but clear only the band;
+  // the lower band's read it from below the upper one.
+  uint32_t copy_height = height;
+  if (merge_frame_ && source && pitch_tiles * tile_width == band_pitch_ &&
+      original == (copying_depth ? band_depth_base_ : band_color_base_)) {
+    if (band2_) {
+      y += band_h_;
+    } else if (y == 0 && height == band_h_) {
+      copy_height = band_full_h_;
+    }
+  }
 
   Trace("resolve {} base={:X} fmt={} src=({},{}) {}x{} found={} -> {:08X} dfmt={} ({},{}) pitch={} h={} clear={}{}",
         copying_depth ? "depth" : "color", original, uint32_t(edram.format), x, y, width, height,
@@ -4492,7 +4579,7 @@ bool PlumeCommandProcessor::IssueCopy() {
         info.IsClearingDepth() ? "d" : "");
   if (source && x < source->width && y < source->height &&
       info.rb_copy_control.copy_command != xenos::CopyCommand::kNull) {
-    const uint32_t w = std::min(width, source->width - x), h = std::min(height, source->height - y);
+    const uint32_t w = std::min(width, source->width - x), h = std::min(copy_height, source->height - y);
     const uint32_t dest_w = std::max(uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32u, w);
     const uint32_t dest_h = std::max(uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) * 32u, h);
     const uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8;
@@ -4947,6 +5034,14 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     if (bind_skip != bind_skip_) REXLOG_INFO("Renut: Plume bind skip {}", bind_skip);
     bind_skip_ = bind_skip;
+    bool merge_bands = false;
+    if (FILE* file = std::fopen((root + "/plume-merge-bands").c_str(), "r")) {
+      int value = 0;
+      if (std::fscanf(file, "%d", &value) == 1) merge_bands = value != 0;
+      std::fclose(file);
+    }
+    if (merge_bands != merge_bands_) REXLOG_INFO("Renut: Plume band merging {}", merge_bands ? "on" : "off");
+    merge_bands_ = merge_bands;
     if (FILE* file = std::fopen((root + "/plume-skip").c_str(), "r")) {
       if (std::fscanf(file, "%u", &mask) != 1) mask = 0;
       std::fclose(file);
@@ -5067,7 +5162,8 @@ void PlumeCommandProcessor::Report() {
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
       "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={} "
       "const_reused={} export(draws={} ranges={}/{} reads={} merges={} refreshes={} barriers={}) "
-      "cp_cpu_ms={} slot_wait_ms={} stream_mb={} constant_mb={} kept(hits={} new_mb={} drops={} unwatchable={} total_mb={} streams={})",
+      "cp_cpu_ms={} slot_wait_ms={} stream_mb={} constant_mb={} kept(hits={} new_mb={} drops={} unwatchable={} total_mb={} streams={}) "
+      "bands(skipped={} moved={} widened={})",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes, stats_.barriers,
       stats_.pipeline_binds, stats_.vertices, stats_.gs_draws, stats_.patch_draws, stats_.patch_vertices,
@@ -5085,7 +5181,8 @@ void PlumeCommandProcessor::Report() {
       stats_.export_reads, stats_.export_merges, stats_.export_refreshes, stats_.export_barriers,
       stats_.cp_cpu_us / 1000, stats_.slot_wait_us / 1000, stats_.stream_bytes >> 20,
       stats_.constant_bytes >> 20, stats_.kept_hits, stats_.kept_bytes_made >> 20, stats_.kept_drops,
-      stats_.kept_unwatchable, kept_bytes_ >> 20, kept_streams_.size());
+      stats_.kept_unwatchable, kept_bytes_ >> 20, kept_streams_.size(), stats_.band_skipped,
+      stats_.band_moved, stats_.band_widened);
   // Keep what the driver compiled this interval, so the next run of this scene
   // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
   // shuts the process down cleanly, so waiting for the device's own save would

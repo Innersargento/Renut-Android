@@ -153,10 +153,10 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..cbb320d 100644
+index ee3830d..68da5a9 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -54,12 +54,11 @@
+@@ -54,12 +54,14 @@
  #define RENUT_SHARED_TEXTURECUBE_OFFSET  (RENUT_TEXTURE_SLOT_COUNT * 8)                      //  256 .. 383
  #define RENUT_SHARED_SAMPLER_OFFSET      (RENUT_TEXTURE_SLOT_COUNT * 12)                     //  384 .. 511
  #define RENUT_SHARED_BOOLEANS_OFFSET     (RENUT_TEXTURE_SLOT_COUNT * 16)                     //  512 .. 543
@@ -169,11 +169,14 @@ index ee3830d..cbb320d 100644
 -#define RENUT_SHARED_VIEWPORT_OFFSET     (RENUT_SHARED_MISC_OFFSET + 48)                     // 1104
 +// 16-byte boundary (544 + 48 = 592), which is what a float4 load wants.
 +// Bytes 40..47 are unused.
++// Predicated tiling done once by the host: the row where the lower band
++// starts, 0 when the draw is not merged (float, in the padding at +40).
++#define RENUT_SHARED_BAND_SPLIT_OFFSET   (RENUT_SHARED_MISC_OFFSET + 40)                     //  584
 +#define RENUT_SHARED_VIEWPORT_OFFSET     (RENUT_SHARED_MISC_OFFSET + 48)                     //  592
  
  // Device addresses of the sixteen bound vertex streams, eight bytes each.
  //
-@@ -73,9 +72,83 @@
+@@ -73,9 +75,83 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -260,7 +263,7 @@ index ee3830d..cbb320d 100644
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -119,6 +192,11 @@
+@@ -119,6 +195,11 @@
      X(TexCoord,     9, 21) \
      X(TexCoord,    10, 22)
  
@@ -272,7 +275,7 @@ index ee3830d..cbb320d 100644
  #ifdef __cplusplus
  #include <cstdint>
  
-@@ -136,7 +214,7 @@
+@@ -136,7 +217,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -281,7 +284,7 @@ index ee3830d..cbb320d 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +230,20 @@ struct ShaderInputElement
+@@ -152,6 +233,20 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -302,7 +305,7 @@ index ee3830d..cbb320d 100644
  };
  #endif
  
-@@ -203,27 +295,168 @@ struct PushConstants
+@@ -203,27 +298,176 @@ struct PushConstants
  
  #ifdef RENUT_RECOMP
  
@@ -378,6 +381,14 @@ index ee3830d..cbb320d 100644
 +#define renutSharedF(OFFSET)   asfloat(renutSharedU(OFFSET))
 +#define renutSharedF2(OFFSET)  float2(renutSharedF(OFFSET), renutSharedF((OFFSET) + 4))
 +#define renutSharedF4(OFFSET)  asfloat(renutSharedU4(OFFSET))
++// The pixel position the shader reads (param gen). The host draws the upper
++// band of the game's predicated tiling over the whole screen and moves the
++// game's own lower-band draws below it; on the console each band starts at
++// row 0, and shaders that turn the position into texture coordinates (water
++// reflections and refraction) expect that. Below the split the position is
++// given back relative to the lower band.
++#define renutFragPos(P) float2((P).x, (P).y - ((renutSharedF(RENUT_SHARED_BAND_SPLIT_OFFSET) > 0.0 && \
++    (P).y >= renutSharedF(RENUT_SHARED_BAND_SPLIT_OFFSET)) ? renutSharedF(RENUT_SHARED_BAND_SPLIT_OFFSET) : 0.0))
 +#define renutSharedU64(OFFSET) (uint64_t(renutSharedU(OFFSET)) | (uint64_t(renutSharedU((OFFSET) + 4)) << 32))
 +
  #define texture2DDescriptorIndex(SLOT) \
@@ -488,7 +499,7 @@ index ee3830d..cbb320d 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -233,7 +466,27 @@ struct PushConstants
+@@ -233,7 +477,27 @@ struct PushConstants
  // coordinates, and without a scale everything outside the 1x1 corner of the
  // clip volume is culled. N&B's FMV renderer does exactly that: it hands the
  // pipeline a pixel-space rectangle and disables the viewport.
@@ -517,7 +528,7 @@ index ee3830d..cbb320d 100644
  
  // A vfetch the vertex declaration does not describe - see the stream table's
  // comment. `index` is whatever register the instruction named, so it arrives as
-@@ -244,8 +497,7 @@ struct PushConstants
+@@ -244,8 +508,7 @@ struct PushConstants
  // a draw that binds fewer streams than the shader fetches would otherwise do.
  float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes)
  {
@@ -527,7 +538,7 @@ index ee3830d..cbb320d 100644
  
      if (address == 0)
          return 0.0;
-@@ -253,14 +505,166 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,14 +516,166 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -699,7 +710,7 @@ index ee3830d..cbb320d 100644
  #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
  #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
  #endif
-@@ -279,17 +683,22 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -279,17 +694,22 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint4  g_TextureCubeDescriptorIndices[8] : packoffset(c16); \
      uint4  g_SamplerDescriptorIndices[8]     : packoffset(c24); \
      uint4  g_BooleansArr[2]                  : packoffset(c32); \
@@ -733,8 +744,14 @@ index ee3830d..cbb320d 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -316,9 +725,204 @@ uint g_SpecConstants();
+@@ -314,11 +734,210 @@ uint g_SpecConstants();
  
+ #endif
+ 
++#ifndef renutFragPos
++#define renutFragPos(P) (P)
++#endif
++
  #ifdef RENUT_RECOMP
  // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
 +#ifdef __spirv__
@@ -938,7 +955,7 @@ index ee3830d..cbb320d 100644
  #ifdef RENUT_RECOMP
  // A vertex stage has no implicit derivatives, so every fetch there has to name
  // its level explicitly. N&B does sample from vertex shaders - 1D ramps and 3D
-@@ -349,7 +953,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -349,7 +968,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
  float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
@@ -953,7 +970,7 @@ index ee3830d..cbb320d 100644
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -483,6 +1093,83 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +1108,83 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -1038,7 +1055,7 @@ index ee3830d..cbb320d 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..99de266 100644
+index c71e7c9..61ff16f 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -1623,16 +1640,17 @@ index c71e7c9..99de266 100644
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
+-                out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
 +            #ifdef RENUT_RECOMP
 +                // The param-gen register. X is the pixel's x with back-facing in
 +                // the sign bit, Y its y with "is a point" in the sign bit, and
 +                // ZW the coordinate inside a point sprite - what the host's
 +                // point expansion hands over in iPointSprite, and zero for
 +                // anything else. A point is never back-facing.
-+                out += "float4((iPos.xy - 0.5) * float2((iPointSprite.x < 0.0) ? 1.0 : (iFace ? 1.0 : -1.0), "
++                out += "float4((renutFragPos(iPos.xy) - 0.5) * float2((iPointSprite.x < 0.0) ? 1.0 : (iFace ? 1.0 : -1.0), "
 +                       "(iPointSprite.x < 0.0) ? -1.0 : 1.0), (iPointSprite.x < 0.0) ? saturate(iPointSprite.zw) : 0.0);\n";
 +            #else
-                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++                out += "float4((renutFragPos(iPos.xy) - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
 +            #endif
 +            }
 +        #ifdef RENUT_RECOMP
