@@ -92,23 +92,6 @@ set(IS_ARM64 ON)
 set(IS_X86_64 OFF)
 include("${CMAKE_CURRENT_BINARY_DIR}/ffmpeg.cmake")
 
-# Direct ASF/WMV3 movie decoder. Keep its fuller FFmpeg build isolated
-# from RexGlue's small WMA/XMA codec library to avoid duplicate symbols.
-set(RENUT_VIDEO_FFMPEG "${RENUT_ROOT}/out/ffmpeg-video/install")
-if(NOT EXISTS "${RENUT_VIDEO_FFMPEG}/lib/libavformat.a")
-    message(FATAL_ERROR "Video FFmpeg missing: run tools/build-video-ffmpeg.sh first")
-endif()
-add_library(renut_video SHARED video_player.cpp)
-target_include_directories(renut_video PRIVATE "${RENUT_VIDEO_FFMPEG}/include")
-target_link_libraries(renut_video PRIVATE
-    "${RENUT_VIDEO_FFMPEG}/lib/libavformat.a"
-    "${RENUT_VIDEO_FFMPEG}/lib/libavcodec.a"
-    "${RENUT_VIDEO_FFMPEG}/lib/libswscale.a"
-    "${RENUT_VIDEO_FFMPEG}/lib/libavutil.a"
-    m log android)
-target_link_options(renut_video PRIVATE "-Wl,--exclude-libs,ALL" "-Wl,-z,max-page-size=16384")
-set_target_properties(renut_video PROPERTIES CXX_VISIBILITY_PRESET hidden)
-
 add_library(renderdoc INTERFACE)
 target_include_directories(renderdoc INTERFACE "${DEPS}/renderdoc")
 include("${CMAKE_CURRENT_SOURCE_DIR}/xenos-dependencies.cmake")

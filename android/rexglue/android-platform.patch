@@ -1808,7 +1808,7 @@ index 697399c..d50e6fa 100644
  }
  
 diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
-index 2b93005..f64cf51 100644
+index 2b93005..1d0277a 100644
 --- a/src/system/mmio_handler.cpp
 +++ b/src/system/mmio_handler.cpp
 @@ -11,7 +11,16 @@
@@ -1901,8 +1901,24 @@ index 2b93005..f64cf51 100644
  bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
    return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
  }
-@@ -416,10 +484,12 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+@@ -406,6 +474,7 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     // clears the watch we just hit).
+     // Do this under the lock so we don't introduce another race condition.
+     auto lock = global_critical_region_.Acquire();
++#if !REX_PLATFORM_LINUX
+     memory::PageAccess cur_access;
+     size_t page_length = memory::page_size();
+     memory::QueryProtect(fault_host_address, page_length, cur_access);
+@@ -414,12 +483,20 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+       // Another thread has cleared this watch. Abort.
+       return true;
      }
++#endif
++    // On Linux and Android QueryProtect parses all of /proc/self/maps on every
++    // write-watch fault; movie frames, which rewrite watched textures, spent
++    // ~50 ms of the render thread in it. Skip it: the access violation
++    // callback checks the heap's own watch and protection state, and restores
++    // a page another thread has already unwatched.
      // The address is not found within any range, so either a write watch or an
      // actual access violation.
 -    if (access_violation_callback_) {

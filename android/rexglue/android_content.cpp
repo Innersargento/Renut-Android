@@ -18,22 +18,6 @@ void renutSetContentActivity(JNIEnv* env, jobject value) {
   activity = value ? env->NewGlobalRef(value) : nullptr;
 }
 
-void renutPostMovieFrame(const std::string& path, uint32_t serial) {
-  std::lock_guard lock(content_mutex);
-  if (!vm || !activity) return;
-  JNIEnv* env = nullptr;
-  bool attached = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_EDETACHED;
-  if (attached && vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
-  jclass cls = env->GetObjectClass(activity);
-  jmethodID callback = cls ? env->GetMethodID(cls, "onMovieFrame", "(Ljava/lang/String;I)V") : nullptr;
-  jstring value = callback ? env->NewStringUTF(path.c_str()) : nullptr;
-  if (callback && value && !env->ExceptionCheck()) env->CallVoidMethod(activity, callback, value, jint(serial));
-  if (env->ExceptionCheck()) env->ExceptionClear();
-  if (value) env->DeleteLocalRef(value);
-  if (cls) env->DeleteLocalRef(cls);
-  if (attached) vm->DetachCurrentThread();
-}
-
 namespace rex::filesystem {
 int OpenAndroidContentFileDescriptor(std::string_view uri, const char* mode) {
   std::lock_guard lock(content_mutex);

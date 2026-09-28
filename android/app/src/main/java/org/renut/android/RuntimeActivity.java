@@ -3,8 +3,6 @@ package org.renut.android;
 import android.app.Activity;
 import android.os.Bundle;
 import android.graphics.Color;
-import android.graphics.Matrix;
-import android.graphics.SurfaceTexture;
 import android.hardware.input.InputManager;
 import android.view.*;
 import android.widget.*;
@@ -20,21 +18,6 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private View gameMenu;
     private boolean controlsVisible;
     private float gameRefreshRate=60f;
-    private TextureView movieView;
-    // Movie overlay state, touched only on the UI thread. Times are System.nanoTime().
-    private Thread movieWorker, lastMovieWorker;
-    private File movieFile;
-    private String missingMoviePath;
-    private long lastMovieFrame, movieStart;
-    private int movieSerial=-1, finishedMovieSerial=-1;
-    private int movieGeneration;
-    private final android.os.Handler movieHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-    private final Runnable movieWatchdog = new Runnable(){@Override public void run(){
-        if(movieSerial<0)return;
-        // The game stopped showing it (skipped or over): do not restart it midway.
-        if(System.nanoTime()-lastMovieFrame>1_800_000_000L){finishedMovieSerial=movieSerial;stopMovie();return;}
-        movieHandler.postDelayed(this,500);
-    }};
     private ExternalController.Player controller;
     private int controllerDeviceId = -1;
     private InputManager inputManager;
@@ -98,16 +81,6 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             FrameLayout root=new FrameLayout(this);root.setBackgroundColor(Color.BLACK);
             surface=new SurfaceView(this);surface.getHolder().addCallback(this);
             root.addView(surface,new FrameLayout.LayoutParams(-1,-1));
-            movieView=new TextureView(this);
-            movieView.setOpaque(true);
-            movieView.setVisibility(View.GONE);
-            movieView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener(){
-                @Override public void onSurfaceTextureAvailable(SurfaceTexture texture,int width,int height){openMovie();}
-                @Override public void onSurfaceTextureSizeChanged(SurfaceTexture texture,int width,int height){}
-                @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture texture){if(movieWorker!=null)movieWorker.interrupt();return true;}
-                @Override public void onSurfaceTextureUpdated(SurfaceTexture texture){}
-            });
-            root.addView(movieView,new FrameLayout.LayoutParams(-1,-1));
             overlay=new GamepadOverlay(this,new GamepadOverlay.Sink(){
                 @Override public void button(int mask,boolean down){if(loaded)nativeButton(mask,down);}
                 @Override public void stick(int stick,float x,float y){if(loaded)nativeStick(stick,x,y);}
@@ -191,103 +164,6 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         if(controller!=null)controller.release();
         controller=null;controllerDeviceId=-1;
     }
-    /** Called on the guest thread by the movie blit hook, at most every 500 ms; serial names one playback. */
-    public void onMovieFrame(String gamePath,int serial){
-        if(!launch||gamePath==null)return;
-        final long now=System.nanoTime();
-        runOnUiThread(()->{
-            lastMovieFrame=now;
-            if(serial==movieSerial||serial==finishedMovieSerial)return;
-            File source=gamePath.equals(missingMoviePath)?null:sourceMovie(gamePath);
-            if(source==null){
-                if(!gamePath.equals(missingMoviePath))android.util.Log.w("renut-video","Vídeo não encontrado nos dados do jogo: "+gamePath);
-                missingMoviePath=gamePath;
-                finishedMovieSerial=serial;
-                return;
-            }
-            stopMovie();
-            movieSerial=serial;
-            movieFile=source;
-            movieStart=now;
-            movieView.setVisibility(View.VISIBLE);
-            if(movieView.isAvailable())openMovie();
-            movieHandler.postDelayed(movieWatchdog,500);
-        });
-    }
-    /** Maps a guest path such as GAME:\\dir\\file onto the imported game data, ignoring case like the guest filesystem. */
-    private File sourceMovie(String guestPath){
-        String relative=guestPath.replace('\\','/');
-        int device=relative.indexOf(':');
-        if(device>=0)relative=relative.substring(device+1);
-        try{
-            File files=getFilesDir().getCanonicalFile();
-            String active=new String(Files.readAllBytes(new File(files,"active-game.txt").toPath()),StandardCharsets.UTF_8).trim();
-            File data=new File(files,active).getCanonicalFile();
-            if(!data.getPath().startsWith(files.getPath()+File.separator))return null;
-            File source=data;
-            for(String part:relative.split("/")){
-                if(part.isEmpty()||part.equals("."))continue;
-                if(part.equals(".."))return null;
-                File next=new File(source,part);
-                if(!next.exists()){
-                    String[] names=source.list();
-                    if(names==null)return null;
-                    next=null;
-                    for(String name:names)if(name.equalsIgnoreCase(part)){next=new File(source,name);break;}
-                    if(next==null)return null;
-                }
-                source=next;
-            }
-            source=source.getCanonicalFile();
-            return source.isFile()&&source.getPath().startsWith(data.getPath()+File.separator)?source:null;
-        }catch(Exception ignored){return null;}
-    }
-    private void openMovie(){
-        if(movieFile==null||movieView==null||!movieView.isAvailable()||movieWorker!=null)return;
-        final int generation=++movieGeneration;
-        final String source=movieFile.getAbsolutePath();
-        final long start=movieStart;
-        final SurfaceTexture texture=movieView.getSurfaceTexture();
-        // A stopped worker may still be connected to this SurfaceTexture, and
-        // a second producer cannot connect until it lets go.
-        final Thread previous=lastMovieWorker;
-        Thread worker=new Thread(()->{
-            String failure=null;
-            try{
-                if(previous!=null)previous.join();
-                if(Thread.currentThread().isInterrupted())return;
-                Surface videoSurface=new Surface(texture);
-                try{failure=NativeMoviePlayer.play(source,videoSurface,Thread.currentThread(),this,start);}
-                finally{videoSurface.release();}
-            }catch(InterruptedException ignored){
-            }catch(RuntimeException exception){failure=String.valueOf(exception);
-            }finally{
-                if(failure!=null)android.util.Log.e("renut-video",source+": "+failure);
-                runOnUiThread(()->{if(generation==movieGeneration&&movieSerial>=0){finishedMovieSerial=movieSerial;stopMovie();}});
-            }
-        },"renut-native-movie");
-        movieWorker=worker;
-        lastMovieWorker=worker;
-        worker.start();
-    }
-    public void onNativeMovieSize(int width,int height){
-        runOnUiThread(()->{
-            if(movieView==null||movieSerial<0)return;
-            float viewRatio=(float)movieView.getWidth()/Math.max(1,movieView.getHeight());
-            float videoRatio=(float)width/Math.max(1,height);
-            Matrix transform=new Matrix();
-            if(viewRatio>videoRatio)transform.setScale(videoRatio/viewRatio,1f,movieView.getWidth()/2f,movieView.getHeight()/2f);
-            else transform.setScale(1f,viewRatio/videoRatio,movieView.getWidth()/2f,movieView.getHeight()/2f);
-            movieView.setTransform(transform);
-        });
-    }
-    private void stopMovie(){
-        movieHandler.removeCallbacks(movieWatchdog);
-        if(movieWorker!=null){movieWorker.interrupt();movieWorker=null;}
-        movieGeneration++;
-        movieFile=null;movieSerial=-1;
-        if(movieView!=null)movieView.setVisibility(View.GONE);
-    }
     @Override public boolean dispatchKeyEvent(KeyEvent event){
         if(launch&&event.getKeyCode()==KeyEvent.KEYCODE_BACK){
             if(event.getAction()==KeyEvent.ACTION_UP)onBackPressed();
@@ -319,7 +195,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 try{Files.write(new File(getFilesDir(),"runtime-report.txt").toPath(),report.getBytes(StandardCharsets.UTF_8));}catch(Exception ignored){}
             }
             final String message=report;
-            runOnUiThread(()->{if(!isFinishing()){stopMovie();status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
+            runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
                 if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
                 else results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
         },"renut-runtime-validation").start();
@@ -335,6 +211,6 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     }
     @Override public void surfaceChanged(SurfaceHolder h,int format,int width,int height){}
     @Override public void surfaceDestroyed(SurfaceHolder h){stop();}
-    @Override protected void onPause(){stopMovie();clearController();stop();super.onPause();finish();}
+    @Override protected void onPause(){clearController();stop();super.onPause();finish();}
     @Override protected void onDestroy(){if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
 }
