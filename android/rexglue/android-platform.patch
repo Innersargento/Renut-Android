@@ -393,6 +393,31 @@ index 7a711a8..bd487c3 100644
  
    // Drain the semaphore of its count.
    auto client_semaphore = client_semaphores_[index].get();
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..6bf8b03 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -22,6 +22,7 @@
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/perf/counter.h>
++#include <rex/platform.h>
+ #include <SDL3/SDL.h>
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+@@ -75,7 +76,11 @@ bool SDLAudioDriver::Initialize() {
+ 
+   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
+   // Handing it a 6ch stream instead would use SDL's own downmix.
+-  if (obtained_spec.channels <= 2) {
++  // Android always takes the fold: SDL opens AAudio with a channel count and
++  // no mask, which AAudio treats as an index mask (0x8000003F), so a stereo
++  // speaker plays channels 0-1 only and drops the centre (dialogue),
++  // LFE and surrounds.
++  if (REX_PLATFORM_ANDROID || obtained_spec.channels <= 2) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+     desired_spec.channels = 2;
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
 index 11b83be..1cba64a 100644
 --- a/src/audio/xma_context.cpp
