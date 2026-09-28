@@ -50,6 +50,8 @@
 #include <filesystem>
 #include <string>
 
+void renutReportShadowEngineProfile();
+
 namespace renut {
 namespace {
 
@@ -1026,6 +1028,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // descriptor set, 2 push constants, 4 vertex buffers, 8 viewport and scissor,
   // 16 drops depth-only draws.
   uint32_t bind_skip_ = 0;
+  bool shadow_native_constants_ = true;
   // What exporting shaders write stays on the GPU: the draws that read it are
   // served from the export buffers. Copying it back to guest memory a few
   // frames late overwrote memory the game had freed and reused (its asserts
@@ -4052,7 +4055,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   do {
     generation = upload_generation_;
     bool placed = true;
-    for (uint32_t stage = 0; stage < 2 && placed; ++stage) {
+    // Depth-only draws have no fragment shader, so its constants can wait
+    // until a color draw actually needs them.
+    for (uint32_t stage = 0; stage < (ps || !shadow_native_constants_ ? 2u : 1u) && placed; ++stage) {
       uint8_t* shadow = stage ? ps_shadow_ : vs_shadow_;
       const auto* file = reinterpret_cast<const uint8_t*>(
           &regs.values[stage ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X]);
@@ -4386,7 +4391,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     bound_interface_key_ = interface_key;
     ++stats_.pipeline_binds;
   }
-  const uint64_t push[3] = {Address(constant_offsets_[0][0]), Address(constant_offsets_[1][0]),
+  // Inactive fragment bindings still need a valid offset. Keep their values
+  // uncommitted so the next draw with a fragment shader uploads them.
+  const bool skip_ps_constants = !ps && shadow_native_constants_;
+  const uint64_t unused_ps_offset = slice_base_;
+  const uint64_t push[3] = {Address(constant_offsets_[0][0]),
+                            Address(skip_ps_constants ? unused_ps_offset : constant_offsets_[1][0]),
                             Address(shared_offset_)};
   if (std::memcmp(push, pushed_constants_, sizeof(push)) != 0 &&
       !((bind_skip_ & 2) && pushed_constants_[0] != UINT64_MAX)) {
@@ -4396,7 +4406,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   uint32_t constant_offsets[kConstantBindings];
   for (uint32_t stage = 0; stage < 2; ++stage) {
     for (uint32_t chunk = 0; chunk < kConstantChunks; ++chunk) {
-      constant_offsets[stage * kConstantChunks + chunk] = uint32_t(constant_offsets_[stage][chunk]);
+      constant_offsets[stage * kConstantChunks + chunk] =
+          uint32_t(stage == 1 && skip_ps_constants ? unused_ps_offset : constant_offsets_[stage][chunk]);
     }
   }
   constant_offsets[kConstantBindings - 2] = uint32_t(shared_offset_);
@@ -5055,6 +5066,16 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
     uint32_t mask = 0;
     uint32_t bind_skip = 0;
+    bool shadow_native_constants = true;
+    if (FILE* file = std::fopen((root + "/plume-shadow-constants").c_str(), "r")) {
+      int value = 1;
+      if (std::fscanf(file, "%d", &value) == 1) shadow_native_constants = value != 0;
+      std::fclose(file);
+    }
+    if (shadow_native_constants != shadow_native_constants_) {
+      REXLOG_INFO("Renut: Plume shadow PS constants {}", shadow_native_constants ? "native skip" : "legacy upload");
+    }
+    shadow_native_constants_ = shadow_native_constants;
     if (FILE* file = std::fopen((root + "/plume-bind").c_str(), "r")) {
       if (std::fscanf(file, "%u", &bind_skip) != 1) bind_skip = 0;
       std::fclose(file);
@@ -5183,6 +5204,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 }
 
 void PlumeCommandProcessor::Report() {
+  renutReportShadowEngineProfile();
   REXLOG_INFO(
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
       "no_target={} resolves={} clears={} passes={} barriers={} pipeline_binds={} vertices={} gs_draws={} patch_draws={} patch_vertices={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
