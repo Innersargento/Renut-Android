@@ -127,6 +127,7 @@ object ComposeScreens {
     val ir3Mode = activity.uiIr3Mode()
     val logLevel = activity.uiRuntimeOption("log_level", "info")
     val shaderAsync = activity.uiRuntimeOption("renut_plume_async_pipelines", "false") == "true"
+    val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Header("RENUT / ANDROID", "Configurações", "Jogo, vídeo, controles e diagnóstico.") }
         item {
@@ -140,6 +141,10 @@ object ComposeScreens {
         item {
             Panel("Display") {
                 ToggleRow("Contador de FPS", fpsEnabled, !busy) { activity.uiSetFps(it) }
+                ToggleRow("Destravar FPS", uncapFps, !busy) {
+                    activity.uiSetRuntimeOption("renut_plume_uncap_fps", it.toString())
+                }
+                Text("Usa o modo de apresentação imediato e a maior frequência da tela na próxima partida. Pode alterar o ritmo de partes do jogo.", color = Muted, fontSize = 12.sp)
                 ToggleRow("MSAA", msaaEnabled, !busy) { activity.uiSetMsaa(it) }
             }
         }

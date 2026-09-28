@@ -13,7 +13,7 @@ import java.util.Set;
 /** Edits only the runtime cvars exposed by the Android settings screen. */
 final class RuntimeOptions {
     private static final Set<String> BOOLEANS = Set.of(
-        "renut_plume_async_pipelines");
+        "renut_plume_async_pipelines", "renut_plume_uncap_fps");
     private static final Set<String> LEVELS = Set.of("trace", "debug", "info", "warn", "error", "critical", "off");
 
     private RuntimeOptions() {}

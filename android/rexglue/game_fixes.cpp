@@ -22,6 +22,8 @@ REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut",
                     "Off: one pass, no MSAA - the host never resolved the samples anyway");
 REXCVAR_DEFINE_BOOL(renut_shadow_engine_profile, false, "reNut",
                     "Count shadow casters submitted by the game's dynamic and cached shadow passes");
+REXCVAR_DEFINE_BOOL(renut_plume_uncap_fps, false, "reNut/Plume",
+                    "Use the game's immediate presentation interval instead of its 30 FPS setting");
 
 namespace {
 
@@ -75,6 +77,19 @@ void ForceSceneSinglePass(uint8_t* base) {
 }
 
 }  // namespace
+
+// The game selects a presentation interval through this routine. Index 0 is
+// its immediate mode; preserve the original routine's device bookkeeping.
+extern "C" void __imp__rex_setParamInterval(PPCContext& __restrict, uint8_t*);
+REX_EXTERN(rex_setParamInterval) {
+  if (REXCVAR_GET(renut_plume_uncap_fps) && ctx.r3.u32 != 0) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+      REXLOG_INFO("Renut: presentation interval {} -> immediate (FPS unlocked)", ctx.r3.u32);
+    ctx.r3.u32 = 0;
+  }
+  __imp__rex_setParamInterval(ctx, base);
+}
 
 // These are the two shadow-map jobs identified in config/renut_hooks.toml. The
 // game still submits every caster normally. This seam lets the native backend

@@ -19,6 +19,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private GamepadOverlay overlay;
     private View gameMenu;
     private boolean controlsVisible;
+    private float gameRefreshRate=60f;
     private TextureView movieView;
     // Movie overlay state, touched only on the UI thread. Times are System.nanoTime().
     private Thread movieWorker, lastMovieWorker;
@@ -63,6 +64,17 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         launch=getIntent().getBooleanExtra("launch",false);
+        if(launch && "true".equals(RuntimeOptions.get(this,"renut_plume_uncap_fps","false"))){
+            Display display=getDisplay();
+            if(display!=null){
+                Display.Mode current=display.getMode();
+                for(Display.Mode mode:display.getSupportedModes()){
+                    if(mode.getPhysicalWidth()==current.getPhysicalWidth() &&
+                       mode.getPhysicalHeight()==current.getPhysicalHeight())
+                        gameRefreshRate=Math.max(gameRefreshRate,mode.getRefreshRate());
+                }
+            }
+        }
         if(launch)setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         graphics=launch||getIntent().getBooleanExtra("graphics",false);
         if(launch){
@@ -80,7 +92,9 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 |View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN|View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
             if(android.os.Build.VERSION.SDK_INT>=28)getWindow().getAttributes().layoutInDisplayCutoutMode=
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-            getWindow().getAttributes().preferredRefreshRate=60f;
+            WindowManager.LayoutParams windowParams=getWindow().getAttributes();
+            windowParams.preferredRefreshRate=gameRefreshRate;
+            getWindow().setAttributes(windowParams);
             FrameLayout root=new FrameLayout(this);root.setBackgroundColor(Color.BLACK);
             surface=new SurfaceView(this);surface.getHolder().addCallback(this);
             root.addView(surface,new FrameLayout.LayoutParams(-1,-1));
@@ -312,10 +326,10 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     }
     private void stop(){cancelled=true;if(loaded)nativeStop();}
     @Override public void surfaceCreated(SurfaceHolder h){
-        // The game presents at most 30 frames a second; left alone the panel
-        // refreshes at 120 Hz for them. 60 keeps an even cadence below 30 too.
+        // Request the selected display rate for the game surface as well as
+        // the window; the default 60 Hz keeps an even cadence for 30 FPS.
         if(launch&&android.os.Build.VERSION.SDK_INT>=30){
-            try{h.getSurface().setFrameRate(60f,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(Exception ignored){}
+            try{h.getSurface().setFrameRate(gameRefreshRate,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(Exception ignored){}
         }
         startValidation(h.getSurface());
     }
