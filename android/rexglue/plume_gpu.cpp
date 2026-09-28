@@ -19,7 +19,9 @@
 #include <array>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -42,6 +44,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
+#include <rex/cvar.h>
 #include <rex/memory.h>
 
 #include <fmt/format.h>
@@ -51,6 +54,13 @@
 #include <string>
 
 void renutReportShadowEngineProfile();
+
+REXCVAR_DEFINE_BOOL(renut_plume_async_pipelines, false, "reNut/Plume",
+                    "Create new Plume graphics pipelines on a worker; non-export draws are skipped until ready.");
+REXCVAR_DEFINE_BOOL(renut_plume_memexport_readback, false, "reNut/Plume",
+                    "Copy shader exports back to guest memory (experimental; may overwrite reused memory).");
+REXCVAR_DEFINE_BOOL(renut_plume_memexport_fast, true, "reNut/Plume",
+                    "Batch Plume memexport readback across frames; off waits for the current frame.");
 
 namespace renut {
 namespace {
@@ -1035,6 +1045,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // fired, then it wrote through garbage pointers or fed the CP garbage), so
   // it is only done, for debugging, while <files>/plume-writeback exists.
   bool writeback_ = false;
+  bool writeback_fast_ = true;
   // Debug: <files>/plume-drawskip holds "<first> <end>": draws of each frame
   // with an index in that range are dropped (to bisect a rendering bug).
   uint32_t drawskip_first_ = 0, drawskip_end_ = 0, frame_draw_ = 0;
@@ -1229,6 +1240,24 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint64_t, std::unique_ptr<RenderFramebuffer>> framebuffers_;
   std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> pipelines_;
   LookupMemo<std::unique_ptr<RenderPipeline>, 13> pipeline_memo_;
+  struct PipelineJob {
+    RenderGraphicsPipelineDesc desc;
+    std::vector<RenderInputElement> elements;
+    std::vector<RenderInputSlot> slots;
+    std::vector<RenderSpecConstant> constants;
+    std::unique_ptr<RenderPipeline> result;
+    std::atomic<bool> done{false};
+    uint64_t duration_us = 0;
+  };
+  std::mutex pipeline_mutex_;
+  std::condition_variable pipeline_ready_;
+  std::deque<std::shared_ptr<PipelineJob>> pipeline_queue_;
+  std::unordered_map<uint64_t, std::shared_ptr<PipelineJob>> pending_pipelines_;
+  std::unordered_set<uint64_t> failed_pipelines_;
+  std::thread pipeline_worker_;
+  bool stop_pipeline_worker_ = false;
+  void StartPipelineWorker();
+  void StopPipelineWorker();
   // Keyed by guest address and host format: N&B reuses an address within a
   // frame for different things (a 768x768 shadow map, then the bloom chain),
   // and draws recorded earlier must keep the texture they sampled.
@@ -1351,6 +1380,44 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   Stats stats_;
   uint64_t swaps_ = 0;
 };
+
+void PlumeCommandProcessor::StartPipelineWorker() {
+  if (pipeline_worker_.joinable()) return;
+  stop_pipeline_worker_ = false;
+  pipeline_worker_ = std::thread([this] {
+    for (;;) {
+      std::shared_ptr<PipelineJob> job;
+      {
+        std::unique_lock lock(pipeline_mutex_);
+        pipeline_ready_.wait(lock, [this] { return stop_pipeline_worker_ || !pipeline_queue_.empty(); });
+        if (stop_pipeline_worker_) return;
+        job = std::move(pipeline_queue_.front());
+        pipeline_queue_.pop_front();
+      }
+      job->desc.inputElements = job->elements.data();
+      job->desc.inputSlots = job->slots.data();
+      job->desc.specConstants = job->constants.data();
+      const auto start = std::chrono::steady_clock::now();
+      try { job->result = device_->createGraphicsPipeline(job->desc); }
+      catch (const std::exception& e) { REXLOG_WARN("Renut: Plume async pipeline failed: {}", e.what()); }
+      job->duration_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start).count());
+      job->done.store(true, std::memory_order_release);
+    }
+  });
+}
+
+void PlumeCommandProcessor::StopPipelineWorker() {
+  if (!pipeline_worker_.joinable()) return;
+  {
+    std::lock_guard lock(pipeline_mutex_);
+    stop_pipeline_worker_ = true;
+    pipeline_queue_.clear();
+  }
+  pipeline_ready_.notify_one();
+  pipeline_worker_.join();
+  pending_pipelines_.clear();
+}
 
 bool PlumeCommandProcessor::SetupContext() {
   if (!CommandProcessor::SetupContext()) return false;
@@ -1495,6 +1562,8 @@ bool PlumeCommandProcessor::SetupContext() {
     set_cube_->setTexture(i, white_cube_.get(), RenderTextureLayout::SHADER_READ,
                           white_cube_view_.get());
   }
+  writeback_ = REXCVAR_GET(renut_plume_memexport_readback);
+  writeback_fast_ = REXCVAR_GET(renut_plume_memexport_fast);
   BeginFrame();
   REXLOG_INFO("Renut: Plume command processor ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);
@@ -1502,6 +1571,7 @@ bool PlumeCommandProcessor::SetupContext() {
 }
 
 void PlumeCommandProcessor::ShutdownContext() {
+  StopPipelineWorker();
   if (list_open_) {
     list_->end();
     list_open_ = false;
@@ -4286,12 +4356,43 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.inputSlotsCount = uint32_t(input_slots.size());
     desc.specConstants = spec_constants.data();
     desc.specConstantsCount = uint32_t(spec_constants.size());
-    const auto pipeline_start = std::chrono::steady_clock::now();
-    pipeline = device_->createGraphicsPipeline(desc);
-    stats_.pipeline_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                       std::chrono::steady_clock::now() - pipeline_start)
-                                       .count());
-    ++stats_.pipelines;
+    // Exporting shaders feed later draws and sometimes the guest CPU. Never
+    // skip those draws merely because their first pipeline is still compiling.
+    if (REXCVAR_GET(renut_plume_async_pipelines) &&
+        !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
+      auto pending = pending_pipelines_.find(key);
+      if (pending != pending_pipelines_.end()) {
+        if (!pending->second->done.load(std::memory_order_acquire))
+          return Drop("pipeline compiling", vs, ps);
+        pipeline = std::move(pending->second->result);
+        stats_.pipeline_us += pending->second->duration_us;
+        ++stats_.pipelines;
+        pending_pipelines_.erase(pending);
+        if (!pipeline) failed_pipelines_.insert(key);
+      } else if (!failed_pipelines_.count(key) && pending_pipelines_.size() < 128) {
+        auto job = std::make_shared<PipelineJob>();
+        job->desc = desc;
+        job->elements = input_elements;
+        job->slots = input_slots;
+        job->constants = spec_constants;
+        StartPipelineWorker();
+        pending_pipelines_.emplace(key, job);
+        {
+          std::lock_guard lock(pipeline_mutex_);
+          pipeline_queue_.push_back(std::move(job));
+        }
+        pipeline_ready_.notify_one();
+        return Drop("pipeline compiling", vs, ps);
+      }
+    }
+    if (!pipeline && !failed_pipelines_.count(key) && !pending_pipelines_.count(key)) {
+      const auto pipeline_start = std::chrono::steady_clock::now();
+      pipeline = device_->createGraphicsPipeline(desc);
+      stats_.pipeline_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - pipeline_start)
+                                         .count());
+      ++stats_.pipelines;
+    }
     if (pipeline && getenv("RENUT_PIPELINE_STATS")) LogPipelineStatistics(*pipeline, vs, ps);
     if (pipeline && getenv("RENUT_PIPELINE_IR")) {
       DumpPipelineInternals(*pipeline, vs, ps, miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')));
@@ -4939,6 +5040,10 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   const auto submit_start = std::chrono::steady_clock::now();
   if (renderer) {
     renderer->SubmitAndPresent(list_, source, frontbuffer_width, frontbuffer_height, slot_);
+    if (writeback_ && !writeback_fast_ && !writebacks_[slot_].empty()) {
+      renderer->WaitForSlot(slot_);
+      ApplyWritebacks(slot_);
+    }
   }
   const auto submit_end = std::chrono::steady_clock::now();
   stats_.submit_us +=
@@ -5114,11 +5219,13 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
     }
     keep_streams_ = keep_streams;
-    const bool writeback = access((root + "/plume-writeback").c_str(), F_OK) == 0;
+    const bool writeback = REXCVAR_GET(renut_plume_memexport_readback) ||
+        access((root + "/plume-writeback").c_str(), F_OK) == 0;
     if (writeback != writeback_) {
       REXLOG_INFO("Renut: Plume export writeback {}", writeback ? "on" : "off");
     }
     writeback_ = writeback;
+    writeback_fast_ = REXCVAR_GET(renut_plume_memexport_fast);
     uint32_t address = 0, ordinal = 0;
     if (FILE* file = std::fopen((root + "/plume-snap").c_str(), "r")) {
       if (std::fscanf(file, "%x %u", &address, &ordinal) != 2) address = ordinal = 0;

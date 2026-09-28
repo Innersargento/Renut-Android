@@ -17,6 +17,8 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private TextView status;
     private SurfaceView surface;
     private GamepadOverlay overlay;
+    private View gameMenu;
+    private boolean controlsVisible;
     private TextureView movieView;
     // Movie overlay state, touched only on the UI thread. Times are System.nanoTime().
     private Thread movieWorker, lastMovieWorker;
@@ -43,7 +45,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private ScrollView results;
     private boolean started, graphics, launch;
     private volatile boolean loaded, cancelled;
-    private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,String renderer,boolean launch,boolean oneUiFix,boolean sceneMsaa,String tuDebug,String ir3Debug);
+    private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,boolean launch,boolean oneUiFix,boolean sceneMsaa,String tuDebug,String ir3Debug);
     private static native void nativeStop();
     private static native void nativeButton(int button,boolean down);
     private static native void nativeStick(int stick,float x,float y);
@@ -92,15 +94,15 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 @Override public void onSurfaceTextureUpdated(SurfaceTexture texture){}
             });
             root.addView(movieView,new FrameLayout.LayoutParams(-1,-1));
-            if(getIntent().getBooleanExtra("showControls",true)){
-                overlay=new GamepadOverlay(this,new GamepadOverlay.Sink(){
-                    @Override public void button(int mask,boolean down){if(loaded)nativeButton(mask,down);}
-                    @Override public void stick(int stick,float x,float y){if(loaded)nativeStick(stick,x,y);}
-                    @Override public void trigger(int trigger,float value){if(loaded)nativeTrigger(trigger,value);}
-                    @Override public void exit(){finish();}
-                });
-                root.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
-            }
+            overlay=new GamepadOverlay(this,new GamepadOverlay.Sink(){
+                @Override public void button(int mask,boolean down){if(loaded)nativeButton(mask,down);}
+                @Override public void stick(int stick,float x,float y){if(loaded)nativeStick(stick,x,y);}
+                @Override public void trigger(int trigger,float value){if(loaded)nativeTrigger(trigger,value);}
+                @Override public void exit(){showGameMenu();}
+            });
+            controlsVisible=getIntent().getBooleanExtra("showControls",true);
+            overlay.setVisibility(controlsVisible?View.VISIBLE:View.GONE);
+            root.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
             if(getIntent().getBooleanExtra("fps",false)){
                 // Frames the game presented (D3DDevice_Swap) per second, sampled every 0.5 s.
                 fps=new TextView(this);fps.setTextColor(Color.rgb(120,255,120));fps.setTextSize(14);
@@ -122,6 +124,9 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             }
             results.setVisibility(View.GONE);results.setBackgroundColor(Color.rgb(12,23,28));
             root.addView(results,new FrameLayout.LayoutParams(-1,-1));
+            gameMenu=ComposeScreens.createGameMenu(this);
+            gameMenu.setVisibility(View.GONE);
+            root.addView(gameMenu,new FrameLayout.LayoutParams(-1,-1));
             setContentView(root);
             return;
         }
@@ -139,6 +144,24 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     public boolean uiGraphics(){return graphics;}
     public String uiStatus(){return status.getText().toString();}
     public void attachComposeSurface(SurfaceView view){surface=view;surface.getHolder().addCallback(this);}
+    public boolean uiGameControlsVisible(){return controlsVisible;}
+    public void uiSetGameControlsVisible(boolean visible){
+        controlsVisible=visible;
+        if(!visible)overlay.cancelTouches();
+        overlay.setVisibility(visible?View.VISIBLE:View.GONE);
+        getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("showControls",visible).apply();
+    }
+    public void uiCloseGameMenu(){gameMenu.setVisibility(View.GONE);}
+    private void showGameMenu(){
+        if(!launch||gameMenu==null||results.getVisibility()==View.VISIBLE)return;
+        overlay.cancelTouches();
+        gameMenu.setVisibility(View.VISIBLE);
+    }
+    @Override public void onBackPressed(){
+        if(launch&&gameMenu!=null&&gameMenu.getVisibility()==View.VISIBLE){gameMenu.setVisibility(View.GONE);return;}
+        if(launch&&results.getVisibility()!=View.VISIBLE){showGameMenu();return;}
+        super.onBackPressed();
+    }
     private void setupController(){
         if(controller!=null)return;
         InputDevice device=ExternalController.findSelected(this);
@@ -252,6 +275,11 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         if(movieView!=null)movieView.setVisibility(View.GONE);
     }
     @Override public boolean dispatchKeyEvent(KeyEvent event){
+        if(launch&&event.getKeyCode()==KeyEvent.KEYCODE_BACK){
+            if(event.getAction()==KeyEvent.ACTION_UP)onBackPressed();
+            return true;
+        }
+        if(launch&&gameMenu!=null&&gameMenu.getVisibility()==View.VISIBLE)return super.dispatchKeyEvent(event);
         if(launch){setupController();if(controller!=null&&controller.key(event))return true;}
         return super.dispatchKeyEvent(event);
     }
@@ -269,7 +297,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 if(cancelled){nativeStop();return;}
                 report=nativeValidate(getFilesDir().getAbsolutePath(),target,getApplicationInfo().nativeLibraryDir,
                     getIntent().getStringExtra("driverDir"),getIntent().getStringExtra("driverLib"),
-                    getIntent().getStringExtra("renderer"),launch,getIntent().getBooleanExtra("oneUiFix",true),
+                    launch,getIntent().getBooleanExtra("oneUiFix",true),
                     getIntent().getBooleanExtra("sceneMsaa",false),
                     getIntent().getStringExtra("tuDebug"),getIntent().getStringExtra("ir3Debug"));
             }catch(Throwable e){

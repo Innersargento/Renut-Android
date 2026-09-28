@@ -244,6 +244,12 @@ final class GamepadOverlay extends View {
         return true;
     }
 
+    void cancelTouches() {
+        for (int i = 0; i < touches.size(); ++i) release(touches.valueAt(i), true);
+        touches.clear();
+        invalidate();
+    }
+
     private Control controlAt(float x, float y, Control exclude) {
         float slop = Math.min(getWidth(), getHeight()) / 40f;
         Control best = null;

@@ -20,9 +20,6 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/system/kernel_state.h>
 
-REXCVAR_DEFINE_STRING(renut_renderer, "xenos", "reNut",
-                      "Renderer: xenos (RexGlue's emulated Xenos GPU) or plume (native "
-                      "renderer driven by the game's Direct3D calls; in development)");
 REXCVAR_DEFINE_BOOL(renut_d3d_dump_shaders, true, "reNut",
                     "Save every shader the game creates or registers (Create*Shader, "
                     "XGRegister*Shader) as a complete container, for offline recompilation");
@@ -46,7 +43,6 @@ constexpr const char* kNames[] = {
 
 std::array<std::atomic<uint64_t>, kFunctionCount> counts;
 std::array<std::atomic<Handler>, kFunctionCount> handlers;
-std::atomic<int> plume_mode{-1};
 // renut_d3d_report_swaps, read once: every intercepted call tests it.
 std::atomic<int32_t> report_every{-1};
 
@@ -224,12 +220,7 @@ inline void Leave(Function function, uint32_t r3, uint32_t r4, PPCContext& ctx, 
 }
 
 bool PlumeActive() {
-  int mode = plume_mode.load(std::memory_order_relaxed);
-  if (mode < 0) {
-    mode = REXCVAR_GET(renut_renderer) == "plume" ? 1 : 0;
-    plume_mode.store(mode, std::memory_order_relaxed);
-  }
-  return mode == 1;
+  return true;
 }
 
 void SetHandler(Function function, Handler handler) {

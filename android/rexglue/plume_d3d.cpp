@@ -1,4 +1,4 @@
-// Direct3D handlers for renut_renderer = "plume".
+// Direct3D handlers for the native Plume renderer.
 //
 // Every call still flows to the game's own Direct3D, which records the PM4 the
 // Plume command processor (plume_gpu.cpp) executes. These only mirror the

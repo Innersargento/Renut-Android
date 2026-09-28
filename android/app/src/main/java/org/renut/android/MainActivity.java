@@ -18,7 +18,7 @@ import java.util.zip.*;
 public final class MainActivity extends androidx.activity.ComponentActivity {
     private static final int ISO=10, XEX=11, DRIVER=12, EXPORT=13, SAVE_IMPORT=14, SAVE_EXPORT=15;
     private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
-    private TextView status, library, driver, renderer, fpsCounter, oneUiFix, sceneMsaa, tuDebug, ir3Debug, savesSummary;
+    private TextView status, library, driver, fpsCounter, oneUiFix, sceneMsaa, tuDebug, ir3Debug, savesSummary;
     private LinearLayout savesList;
     private ProgressBar progress;
     private Button cancel;
@@ -75,7 +75,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             Intent i=new Intent(this,RuntimeActivity.class).putExtra("launch",true);
             i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
             i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
-            i.putExtra("renderer",getPreferences(0).getString("renderer","xenos"));
             i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
             i.putExtra("showControls",getPreferences(0).getBoolean("showControls",true));
             i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));
@@ -93,11 +92,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         driver=text("Driver do sistema",16,ink); graphics.addView(driver);
         button(graphics,"Importar driver Adreno (.zip)",()->pick(DRIVER));
         button(graphics,"Usar driver do sistema",()->{getPreferences(0).edit().remove("driverDir").remove("driverLib").apply(); refresh();});
-        renderer=text("",16,ink); graphics.addView(renderer);
-        button(graphics,"Alternar renderizador",()->{
-            String next="plume".equals(getPreferences(0).getString("renderer","xenos"))?"xenos":"plume";
-            getPreferences(0).edit().putString("renderer",next).apply(); refresh();
-        });
         button(graphics,"Apagar cache de shaders",()->new AlertDialog.Builder(this)
             .setTitle("Apagar cache de shaders?")
             .setMessage("Remove o cache Vulkan salvo pelo Plume. Os shaders serão compilados novamente na próxima execução; seus jogos e saves serão preservados.")
@@ -167,7 +161,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     public String uiLibrary(){return library.getText().toString();}
     public String uiStatus(){return status.getText().toString();}
     public String uiDriver(){return driver.getText().toString();}
-    public String uiRenderer(){return renderer.getText().toString();}
     public String uiFps(){return fpsCounter.getText().toString();}
     public String uiMsaa(){return sceneMsaa.getText().toString();}
     public String uiOneUi(){return oneUiFix.getText().toString();}
@@ -185,6 +178,11 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     public void uiSetTuMode(String value){getPreferences(0).edit().putString("tuDebug",value).apply();refresh();}
     public String uiIr3Mode(){return getPreferences(0).getString("ir3Debug","");}
     public void uiSetIr3Mode(String value){getPreferences(0).edit().putString("ir3Debug",value).apply();refresh();}
+    public String uiRuntimeOption(String key,String fallback){return RuntimeOptions.get(this,key,fallback);}
+    public void uiSetRuntimeOption(String key,String value){
+        try { RuntimeOptions.set(this,key,value); }
+        catch(IOException e){status.setText("Não foi possível salvar renut.toml: "+e.getMessage());}
+    }
     public java.util.List<String> uiSaves()throws IOException{return SaveArchive.list(new File(getFilesDir(),"runtime-user"));}
     private void pick(int code){startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE),code);}
     private void refreshSaves(){
@@ -215,8 +213,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             library.setText("Banjo-Kazooie: Nuts & Bolts\nEuropa · "+(full?"assets presentes":"XEX identificado; importe a ISO para obter os assets")+"\nInicialização experimental disponível");
         }catch(IOException e){library.setText("Nenhum arquivo importado");}
         driver.setText(getPreferences(0).getString("driverLib","Driver do sistema"));
-        renderer.setText("plume".equals(getPreferences(0).getString("renderer","xenos"))
-            ?"Renderizador: Plume nativo (em desenvolvimento)":"Renderizador: RexGlue (emulação Xenos)");
         fpsCounter.setText(getPreferences(0).getBoolean("fps",false)?"Contador de FPS: ativado":"Contador de FPS: desativado");
         oneUiFix.setText(getPreferences(0).getBoolean("oneui",true)?"One UI fix: ativado":"One UI fix: desativado");
         sceneMsaa.setText(getPreferences(0).getBoolean("sceneMsaa",false)?"MSAA: ativado":"MSAA: desativado");

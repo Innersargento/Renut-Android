@@ -21,14 +21,12 @@
 #include "d3d_layer.h"
 #include "plume_renderer.h"
 #include "plume_gpu.h"
-#include <rex/system/gpu_plugin.h>
 #include <rex/ui/presenter.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
 #include "renut_android_init.h"
 using rex::X_STATUS;
 extern const rex::PPCImageInfo PPCImageConfig;
-extern "C" rex::system::IGraphicsSystem* rex_gpu_create(uint32_t, const rex::system::GpuCreateInfo*);
 void renutSetContentActivity(JNIEnv*, jobject);
 void renutConfigureXenosDriver(const std::string&,const std::string&,const std::string&,bool,const std::string&);
 // Own this entry point so the loader cannot resolve SDL's JNI_OnLoad through
@@ -150,7 +148,7 @@ static void validateFibers() {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activity, jstring directory,
-    jobject surface,jstring hooks,jstring driverDirectory,jstring driverLibrary,jstring renderer,jboolean launch,
+    jobject surface,jstring hooks,jstring driverDirectory,jstring driverLibrary,jboolean launch,
     jboolean oneUiFix,jboolean sceneMsaa,jstring tuDebug,jstring ir3Debug) {
   const char* chars = env->GetStringUTFChars(directory, nullptr);
   if (!chars) return nullptr;
@@ -169,14 +167,9 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     bool has_config = std::filesystem::is_regular_file(root / "renut.toml");
     if (has_config) rex::cvar::LoadConfig(root / "renut.toml");
     auto log_level = spdlog::level::from_str(rex::cvar::GetFlagByName("log_level"));
-    if (log_level == spdlog::level::off) log_level = spdlog::level::info;
     rex::InitLogging(log_path.c_str(), log_level);
     if (has_config) note("Configuração: renut.toml aplicado.");
-    // The launcher's renderer choice overrides renut.toml.
-    if (auto choice = javaString(env, renderer); !choice.empty()) {
-      rex::cvar::SetFlagByName("renut_renderer", choice);
-    }
-    note("Renderizador: " + rex::cvar::GetFlagByName("renut_renderer"));
+    note("Renderizador: Plume");
     // So does its MSAA choice.
     rex::cvar::SetFlagByName("renut_scene_msaa", sceneMsaa ? "true" : "false");
     note(std::string("MSAA: ") + (sceneMsaa ? "ativado" : "desativado"));
@@ -239,29 +232,17 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       if(!game_window->Open())throw std::runtime_error("Falha ao abrir a superfície do jogo.");
       renut::d3d::SetShaderDumpDirectory((root / "shader-dump").string());
       renut::d3d::SetRuntimeFilesDirectory(root.string());
-      if(renut::d3d::PlumeActive()){
-        // The emulated Xenos keeps fences, vertical blank and swaps but does not
-        // present: without an app context it creates no presenter, so the
-        // native renderer owns the window.
-        std::string plume_error;
-        if(!renut::PlumeRenderer::Start(window,&plume_error))throw std::runtime_error(plume_error);
-        renut::d3d::RegisterPlumeHandlers();
-        note("Plume nativo: janela assumida; desenhos, resolves e swaps executados pelo Plume com os shaders recompilados.");
-      }else{
-        runtime.set_app_context(game_context.get());
-      }
+      // The emulated Xenos keeps fences, vertical blank and swaps but does not
+      // present: the native Plume renderer owns the window.
+      std::string plume_error;
+      if(!renut::PlumeRenderer::Start(window,&plume_error))throw std::runtime_error(plume_error);
+      renut::d3d::RegisterPlumeHandlers();
+      note("Plume nativo: janela assumida; desenhos, resolves e swaps executados pelo Plume com os shaders recompilados.");
       runtime.set_display_window(game_window.get());
-      if(renut::d3d::PlumeActive()){
-        // Native renderer: the command stream is parsed as before, but draws,
-        // resolves and swaps run on Plume with the recompiled shaders.
-        renut::SetPlumeMissDumpDirectory((root / "plume-miss").string());
-        renut::SetPlumePipelineCachePath((root / (plume_env.empty() ? std::string("plume-pipelines.bin")
-            : "plume-pipelines-" + std::to_string(std::hash<std::string>{}(plume_env)) + ".bin")).string());
-        config.graphics.reset(renut::CreatePlumeGraphicsSystem());
-      }else{
-        rex::system::GpuCreateInfo info{sizeof(rex::system::GpuCreateInfo),"vulkan"};
-        config.graphics.reset(rex_gpu_create(rex::system::kGpuPluginAbiVersion,&info));
-      }
+      renut::SetPlumeMissDumpDirectory((root / "plume-miss").string());
+      renut::SetPlumePipelineCachePath((root / (plume_env.empty() ? std::string("plume-pipelines.bin")
+          : "plume-pipelines-" + std::to_string(std::hash<std::string>{}(plume_env)) + ".bin")).string());
+      config.graphics.reset(renut::CreatePlumeGraphicsSystem());
       if(!config.graphics)throw std::runtime_error("Backend gráfico indisponível.");
       config.audio_factory=REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
       config.input_factory=[](bool tool_mode){

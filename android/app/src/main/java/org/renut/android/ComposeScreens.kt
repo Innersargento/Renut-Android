@@ -2,6 +2,7 @@ package org.renut.android
 
 import android.app.Activity
 import android.view.SurfaceView
+import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -44,6 +45,9 @@ object ComposeScreens {
     }
     @JvmStatic fun showRuntime(activity: RuntimeActivity) {
         activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { RuntimeScreen(activity) } } })
+    }
+    @JvmStatic fun createGameMenu(activity: RuntimeActivity): View = ComposeView(activity).apply {
+        setContent { RenutTheme { GameMenuScreen(activity) } }
     }
 }
 
@@ -111,7 +115,6 @@ object ComposeScreens {
 @Composable private fun SettingsScreen(activity: MainActivity, modifier: Modifier, tick: Int) {
     @Suppress("UNUSED_VARIABLE") val update = tick
     val library = activity.uiLibrary()
-    val renderer = activity.uiRenderer()
     val driver = activity.uiDriver()
     val status = activity.uiStatus()
     val busy = activity.uiBusy()
@@ -122,6 +125,8 @@ object ComposeScreens {
     val oneUiEnabled = activity.uiOneUiEnabled()
     val tuMode = activity.uiTuMode()
     val ir3Mode = activity.uiIr3Mode()
+    val logLevel = activity.uiRuntimeOption("log_level", "info")
+    val shaderAsync = activity.uiRuntimeOption("renut_plume_async_pipelines", "false") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Header("RENUT / ANDROID", "Configurações", "Jogo, vídeo, controles e diagnóstico.") }
         item {
@@ -134,8 +139,6 @@ object ComposeScreens {
         }
         item {
             Panel("Display") {
-                InfoRow("Renderizador", renderer)
-                ActionButton("Alternar renderizador", !busy, outlined = true) { activity.uiAction("Alternar renderizador") }
                 ToggleRow("Contador de FPS", fpsEnabled, !busy) { activity.uiSetFps(it) }
                 ToggleRow("MSAA", msaaEnabled, !busy) { activity.uiSetMsaa(it) }
             }
@@ -155,6 +158,19 @@ object ComposeScreens {
                 MultiModeSelector("TU_DEBUG", tuMode, listOf("perf", "sysmem", "gmem")) { activity.uiSetTuMode(it) }
                 MultiModeSelector("IR3_SHADER_DEBUG", ir3Mode, listOf("nopreamble", "noearlypreamble", "nouboopt", "nodescprefetch")) { activity.uiSetIr3Mode(it) }
                 ActionButton("Apagar cache de shaders", !busy, outlined = true) { activity.uiAction("Apagar cache de shaders") }
+            }
+        }
+        item {
+            Panel("Opções do runtime") {
+                Text("Aplicadas na próxima inicialização do jogo.", color = Muted, fontSize = 13.sp)
+                SingleChoiceSelector("Nível do log", logLevel,
+                    listOf("trace", "debug", "info", "warn", "error", "critical", "off")) {
+                    activity.uiSetRuntimeOption("log_level", it)
+                }
+                ToggleRow("Compilação assíncrona de shaders e pipelines", shaderAsync, !busy) {
+                    activity.uiSetRuntimeOption("renut_plume_async_pipelines", it.toString())
+                }
+                Text("Compila pipelines novos em segundo plano. O primeiro desenho pode faltar até ficar pronto; desenhos de memexport continuam síncronos.", color = Muted, fontSize = 12.sp)
             }
         }
         item {
@@ -230,9 +246,40 @@ object ComposeScreens {
     }
 }
 
+@Composable private fun SingleChoiceSelector(label: String, selected: String, choices: List<String>, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
+            Text("$label: $selected")
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            choices.forEach { choice ->
+                DropdownMenuItem(text = { Text(choice) }, onClick = { expanded = false; onSelect(choice) })
+            }
+        }
+    }
+}
+
 @Composable private fun ActionButton(label: String, enabled: Boolean, outlined: Boolean = false, onClick: () -> Unit) {
     if (outlined) OutlinedButton(onClick, Modifier.fillMaxWidth(), enabled = enabled, shape = RoundedCornerShape(12.dp)) { Text(label) }
     else Button(onClick, Modifier.fillMaxWidth(), enabled = enabled, shape = RoundedCornerShape(12.dp)) { Text(label) }
+}
+
+@Composable private fun GameMenuScreen(activity: RuntimeActivity) {
+    var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
+    Box(Modifier.fillMaxSize().background(Color(0xBF000000)).clickable { }, contentAlignment = Alignment.Center) {
+        Column(Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(20.dp)) {
+            Panel(null) {
+                Header("RENUT / JOGO", "Menu do jogo", "Ajuste os controles ou volte à biblioteca.")
+                ToggleRow("Mostrar controles na tela", controlsVisible, true) {
+                    controlsVisible = it
+                    activity.uiSetGameControlsVisible(it)
+                }
+                ActionButton("Continuar", true) { activity.uiCloseGameMenu() }
+                ActionButton("Sair para o menu principal", true, outlined = true) { activity.finish() }
+            }
+        }
+    }
 }
 
 @Composable private fun ControllerScreen(activity: ControllerSettingsActivity) {
