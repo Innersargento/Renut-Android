@@ -1,0 +1,28 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// Joins a depth resolve's two copies into RG32F texels: x the depth (the
+// D32_SFLOAT aspect, 4 bytes a texel) and y the stencil over 255 (the S8
+// aspect, 1 byte a texel), which is what an 8_8_8_8 fetch of a Xenos k_24_8
+// surface finds in its first channel. N&B's rain ripples keep only the water
+// pixels by that stencil bit.
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Floats { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) writeonly buffer Pairs { vec2 v[]; };
+
+layout(push_constant) uniform Push {
+    Floats depth;
+    Words stencil;
+    Pairs packed;
+    uint count;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+    uint s = (p.stencil.v[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+    p.packed.v[i] = vec2(p.depth.v[i], float(s) / 255.0);
+}

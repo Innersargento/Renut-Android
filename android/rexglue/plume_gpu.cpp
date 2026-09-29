@@ -62,6 +62,11 @@ REXCVAR_DEFINE_BOOL(renut_plume_memexport_readback, false, "reNut/Plume",
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_fast, true, "reNut/Plume",
                     "Batch Plume memexport readback across frames; off waits for the current frame.");
 
+// game_fixes.cpp: how the MSAA-off path treats the scene's band split
+// (<files>/plume-keep-split: 0 clear, 1 leave, 2 whole-screen projection).
+extern std::atomic<int> g_renut_scene_split_mode;
+REXCVAR_DECLARE(bool, renut_scene_msaa);
+
 namespace renut {
 namespace {
 
@@ -75,6 +80,7 @@ using rex::graphics::Register;
 using namespace rex::graphics;
 
 #include "shaders/point_list.geom.inc"
+#include "shaders/depth_stencil_pack.comp.inc"
 #include "shaders/debug_point.frag.inc"
 #include "shaders/debug_trivial.frag.inc"
 #include "shaders/debug_trivial.vert.inc"
@@ -831,15 +837,33 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // A draw left out for a reason no other counter names: counted by reason
   // and shader for the periodic report, and named in a trace.
   bool Drop(const char* reason, const HostShader* vs, const HostShader* ps);
+  // Debug: a frame trace lists the draws the bin check drops, and
+  // <files>/plume-pred-all "1" runs every predicated packet.
+  bool OnPredicatedSkip(uint32_t opcode) override {
+    if (trace_ && (opcode == xenos::PM4_DRAW_INDX || opcode == xenos::PM4_DRAW_INDX_2)) {
+      std::fprintf(trace_, "predicated %s op=%X select=%llX mask=%llX\n", pred_pass_all_ ? "passed" : "skip",
+                   opcode, (unsigned long long)bin_select_, (unsigned long long)bin_mask_);
+    }
+    return pred_pass_all_;
+  }
+  bool pred_pass_all_ = false;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
   // Direct3D's own Clear (see IssueDraw).
   void IssueD3DClear(xenos::EdramMode edram_mode);
-  // Copies a rectangle of a depth target's depth into an R32_FLOAT texture.
+  // Copies a rectangle of a depth target's depth into an R32_FLOAT texture, or
+  // its depth and stencil into an RG32F one.
   bool CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
-                 uint32_t dest_x, uint32_t dest_y);
+                 uint32_t dest_x, uint32_t dest_y, bool with_stencil);
   std::unique_ptr<RenderBuffer> depth_staging_;
+  // The stencil half of a k_24_8_FLOAT resolve (CopyDepth): the S8 aspect,
+  // then depth_stencil_pack.comp joining both into RG32F texels.
+  std::unique_ptr<RenderBuffer> stencil_staging_, packed_staging_;
+  VkShaderModule pack_module_ = VK_NULL_HANDLE;
+  VkPipelineLayout pack_layout_ = VK_NULL_HANDLE;
+  VkPipeline pack_pipeline_ = VK_NULL_HANDLE;
+  bool CreatePackPipeline();
 
  private:
   // Upload ring (one frame; reset after every swap).
@@ -1317,7 +1341,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     }
     r.swizzled.clear();
   }
-  uint32_t SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle);
+  uint32_t SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first);
   std::array<std::vector<std::unique_ptr<RenderFramebuffer>>, kPlumeFramesInFlight>
       retired_framebuffer_slots_;
   static uint64_t ResolvedKey(uint32_t address, RenderFormat format) {
@@ -1612,6 +1636,14 @@ void PlumeCommandProcessor::ShutdownContext() {
   upload_.reset();
   {
     VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+    if (pack_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, pack_pipeline_, nullptr);
+    if (pack_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, pack_layout_, nullptr);
+    if (pack_module_ != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, pack_module_, nullptr);
+    pack_pipeline_ = VK_NULL_HANDLE;
+    pack_layout_ = VK_NULL_HANDLE;
+    pack_module_ = VK_NULL_HANDLE;
+    stencil_staging_.reset();
+    packed_staging_.reset();
     if (constants_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(vk_device, constants_pool_, nullptr);
     if (constants_set_layout_ != VK_NULL_HANDLE) {
       vkDestroyDescriptorSetLayout(vk_device, constants_set_layout_, nullptr);
@@ -2519,16 +2551,20 @@ void PlumeCommandProcessor::MergeResolvedTails(uint32_t address, Resolved& dest)
   }
 }
 
-uint32_t PlumeCommandProcessor::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle) {
+uint32_t PlumeCommandProcessor::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first) {
   RenderTexture* texture = fitted ? r.fitted.get() : r.texture.get();
   if (!texture) return 0;
-  Resolved::SwizzledView& s = r.swizzled[swizzle | (uint32_t(fitted) << 12)];
+  // Only a resolve that kept its stencil (RG32F) reads differently as 8_8_8_8.
+  stencil_first = stencil_first && r.format == RenderFormat::R32G32_FLOAT;
+  Resolved::SwizzledView& s = r.swizzled[swizzle | (uint32_t(fitted) << 12) | (uint32_t(stencil_first) << 13)];
   if (s.texture != texture || !s.view || !s.descriptor) {
     if (s.view) retired_views_[slot_].push_back(std::move(s.view));
     if (s.descriptor) retired_descriptor_slots_[slot_].push_back(s.descriptor);
     // Xenos swizzle lanes: 0..3 pick a channel, every one of them the
-    // depth; 4 is 0, 5 is 1.
-    auto lane = [](uint32_t code) {
+    // depth; 4 is 0, 5 is 1. Fetched as 8_8_8_8, a k_24_8 surface has its
+    // stencil in the first channel (the low byte), kept in G.
+    auto lane = [stencil_first](uint32_t code) {
+      if (code == 0 && stencil_first) return RenderSwizzle::G;
       return code < 4 ? RenderSwizzle::R : code == 5 ? RenderSwizzle::ONE : RenderSwizzle::ZERO;
     };
     RenderTextureViewDesc desc = RenderTextureViewDesc::Texture2D(r.format);
@@ -3605,12 +3641,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       // and blue across the UI.
       const uint32_t swizzle = uint32_t(fetch.swizzle) & 0xFFF;
       const bool depth_view = r.depth;
+      const bool stencil_first = fetch.format == xenos::TextureFormat::k_8_8_8_8;
       if (fw < r.width || fh < r.height) {
         texture_descriptor[slot] = FittedResolved(r, std::min(fw, r.width), std::min(fh, r.height));
-        if (depth_view && texture_descriptor[slot]) texture_descriptor[slot] = SwizzledResolved(r, true, swizzle);
+        if (depth_view && texture_descriptor[slot]) texture_descriptor[slot] = SwizzledResolved(r, true, swizzle, stencil_first);
       } else {
         Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
-        texture_descriptor[slot] = depth_view ? SwizzledResolved(r, false, swizzle) : r.descriptor;
+        texture_descriptor[slot] = depth_view ? SwizzledResolved(r, false, swizzle, stencil_first) : r.descriptor;
       }
     } else if (fetch.dimension == xenos::DataDimension::k2DOrStacked) {
       texture_descriptor[slot] = GetGuestTexture(fetch);
@@ -3671,6 +3708,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           FindResolved(fetch.base_address << 12) ? "/R" : "", uint32_t(fetch.swizzle) & 0xFFF);
     }
     Trace("{}", line);
+    Trace("  depthcontrol={:08X} stencilrefmask={:08X} bf={:08X}", regs[XE_GPU_REG_RB_DEPTHCONTROL],
+          regs[XE_GPU_REG_RB_STENCILREFMASK], regs[XE_GPU_REG_RB_STENCILREFMASK_BF]);
     Trace("  raster mode={:08X} clip={:08X} offset=({},{},{},{}) blend={:08X} constants=({},{},{},{}) alpha={}",
           regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_CL_CLIP_CNTL],
           regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
@@ -4163,6 +4202,24 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
              std::fabs(viewport.height) >= float(band_full_h_) - 1.f) {
     scissor_rect.bottom = int32_t(band_full_h_);
     ++stats_.band_widened;
+  }
+  // Scene MSAA off (game_fixes.cpp, split mode 2): the game still sorts each
+  // view's objects into an upper-band job (bin mask 3), a lower-band job (C)
+  // and a whole-screen one, all drawn in the single pass. An object that
+  // crosses the split is in both band jobs; on the console each copy only
+  // reached its own band. Keep them there, or it is drawn twice: translucent
+  // water doubles and its stencil marks break the ripples tested against them.
+  if (g_renut_scene_split_mode.load(std::memory_order_relaxed) == 2 && !REXCVAR_GET(renut_scene_msaa) &&
+      regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280 && scissor_rect.bottom >= 720) {
+    constexpr int32_t kBandSplit = 384;  // 2x MSAA at 720p: bands of 384 and 336 rows
+    const uint32_t bands = uint32_t(bin_mask_) & 0xF;
+    if (bands == 0x3) {
+      scissor_rect.bottom = std::min(scissor_rect.bottom, kBandSplit);
+      ++stats_.band_widened;
+    } else if (bands == 0xC) {
+      scissor_rect.top = std::max(scissor_rect.top, kBandSplit);
+      ++stats_.band_moved;
+    }
   }
   if (trace_) {
     Trace("  viewport ({}, {}) {}x{} window ({}, {}) scissor ({}, {})-({}, {}) vte={:X}", viewport.x,
@@ -4777,8 +4834,14 @@ bool PlumeCommandProcessor::IssueCopy() {
     const uint32_t dest_bpp = dest_info ? std::max(1u, dest_info->bits_per_pixel / 8) : 4;
     // Depth resolves become R32_FLOAT textures holding the depth, which is what
     // a k_24_8 / k_24_8_FLOAT fetch returns in x (shadow maps, and the scene
-    // depth the depth-of-field and fog passes read).
-    const RenderFormat dest_format = copying_depth ? RenderFormat::R32_FLOAT : source->format;
+    // depth the depth-of-field and fog passes read). The scene's (k_24_8_FLOAT)
+    // also keep the stencil in y: the rain ripples read its water bit through
+    // an 8_8_8_8 fetch of the same memory.
+    const bool with_stencil =
+        copying_depth && uint32_t(info.copy_dest_info.copy_dest_format) ==
+                             uint32_t(xenos::TextureFormat::k_24_8_FLOAT);
+    const RenderFormat dest_format =
+        copying_depth ? (with_stencil ? RenderFormat::R32G32_FLOAT : RenderFormat::R32_FLOAT) : source->format;
     Resolved* inside = FindResolvedContaining(info.copy_dest_base, dest_format, dest_bpp,
                                               dest_w, dest_h, column, row);
     Resolved& dest = inside && inside->width >= column + dx + w && inside->height >= row + dy + h
@@ -4806,7 +4869,7 @@ bool PlumeCommandProcessor::IssueCopy() {
     }
     if (dest.texture && copying_depth) {
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
-      CopyDepth(*source, x, y, w, h, dest.texture.get(), dest_x, dest_y);
+      CopyDepth(*source, x, y, w, h, dest.texture.get(), dest_x, dest_y, with_stencil && dest.format == dest_format);
     } else if (dest.texture) {
       Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
@@ -4883,16 +4946,56 @@ bool PlumeCommandProcessor::IssueCopy() {
   return true;
 }
 
+bool PlumeCommandProcessor::CreatePackPipeline() {
+  if (pack_pipeline_ != VK_NULL_HANDLE) return true;
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  module_info.codeSize = sizeof(k_depth_stencil_pack_comp);
+  module_info.pCode = k_depth_stencil_pack_comp;
+  if (vkCreateShaderModule(vk_device, &module_info, nullptr, &pack_module_) != VK_SUCCESS) return false;
+  VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+  VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout_info.pushConstantRangeCount = 1;
+  layout_info.pPushConstantRanges = &range;
+  if (vkCreatePipelineLayout(vk_device, &layout_info, nullptr, &pack_layout_) != VK_SUCCESS) return false;
+  VkComputePipelineCreateInfo pipeline_info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  pipeline_info.stage.module = pack_module_;
+  pipeline_info.stage.pName = "main";
+  pipeline_info.layout = pack_layout_;
+  if (vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pack_pipeline_) !=
+      VK_SUCCESS) {
+    pack_pipeline_ = VK_NULL_HANDLE;
+    return false;
+  }
+  return true;
+}
+
 bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                                      RenderTexture* dest, uint32_t dest_x, uint32_t dest_y) {
+                                      RenderTexture* dest, uint32_t dest_x, uint32_t dest_y, bool with_stencil) {
   // Vulkan copies a depth aspect only to a buffer, so go through one: depth
   // to buffer (4 bytes per texel for D32_SFLOAT), buffer to the colour image.
+  // With the stencil, the S8 aspect goes to a second buffer and a compute pass
+  // joins the two into RG32F texels (depth_stencil_pack.comp).
   constexpr uint64_t kStagingSize = 4096ull * 2048 * 4;
   if (uint64_t(w) * h * 4 > kStagingSize) return false;
   if (!depth_staging_) {
-    depth_staging_ = device_->createBuffer(RenderBufferDesc::DefaultBuffer(kStagingSize));
+    depth_staging_ = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+        kStagingSize, RenderBufferFlag::STORAGE | RenderBufferFlag::CONSTANT | RenderBufferFlag::DEVICE_ADDRESSABLE));
     if (!depth_staging_) return false;
   }
+  if (with_stencil && !stencil_staging_) {
+    const auto flags = RenderBufferFlag::STORAGE | RenderBufferFlag::CONSTANT | RenderBufferFlag::DEVICE_ADDRESSABLE;
+    stencil_staging_ = device_->createBuffer(RenderBufferDesc::DefaultBuffer(kStagingSize / 4, flags));
+    packed_staging_ = device_->createBuffer(RenderBufferDesc::DefaultBuffer(kStagingSize * 2, flags));
+    if (!stencil_staging_ || !packed_staging_ || !CreatePackPipeline()) {
+      REXLOG_WARN("Renut: Plume cannot keep the stencil of depth resolves");
+      stencil_staging_.reset();
+      packed_staging_.reset();
+    }
+  }
+  with_stencil = with_stencil && packed_staging_ && pack_pipeline_ != VK_NULL_HANDLE;
   // Always a barrier call, which also ends any open render pass before the
   // raw Vulkan commands below.
   list_->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source.texture.get(), RenderTextureLayout::COPY_SOURCE));
@@ -4904,18 +5007,46 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
   if (skip_mask_ & (268435456 | 536870912)) return true;
   VkCommandBuffer cb = static_cast<VulkanCommandList*>(list_)->vk;
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-  barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
   barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
-                       nullptr, 0, nullptr);
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
   VkBufferImageCopy region = {};
   region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
   region.imageSubresource.layerCount = 1;
   region.imageOffset = {int32_t(x), int32_t(y), 0};
   region.imageExtent = {w, h, 1};
-  vkCmdCopyImageToBuffer(cb, static_cast<VulkanTexture*>(source.texture.get())->vk,
-                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+  VkImage image = static_cast<VulkanTexture*>(source.texture.get())->vk;
+  vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          static_cast<VulkanBuffer*>(depth_staging_.get())->vk, 1, &region);
+  if (with_stencil) {
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           static_cast<VulkanBuffer*>(stencil_staging_.get())->vk, 1, &region);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
+                         0, nullptr, 0, nullptr);
+    struct {
+      uint64_t depth, stencil, packed;
+      uint32_t count, pad;
+    } push = {depth_staging_->getDeviceAddress(), stencil_staging_->getDeviceAddress(),
+              packed_staging_->getDeviceAddress(), w * h, 0};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pack_pipeline_);
+    vkCmdPushConstants(cb, pack_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cb, (w * h + 63) / 64, 1, 1);
+    // The compute layout's push constants may disturb the graphics ones.
+    pushed_constants_[0] = pushed_constants_[1] = pushed_constants_[2] = UINT64_MAX;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier,
+                         0, nullptr, 0, nullptr);
+    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest),
+                             RenderTextureCopyLocation::PlacedFootprint(packed_staging_.get(),
+                                                                        RenderFormat::R32G32_FLOAT, w, h, 1, w),
+                             dest_x, dest_y);
+    return true;
+  }
   barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
@@ -5016,6 +5147,8 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
     if (!depth || depth->height < clear_height)
       depth = GetTarget(depth_info.depth_base, uint32_t(depth_info.depth_format), true,
                         depth ? depth->width : pitch, clear_height);
+    Trace("  clear depth={} stencil={} ref={:X} depthcontrol={:08X}", clear_depth, clear_stencil,
+          regs.Get<reg::RB_STENCILREFMASK>().stencilref, regs[XE_GPU_REG_RB_DEPTHCONTROL]);
     Trace("  clear depth base={:X} -> {}", uint32_t(depth_info.depth_base),
           depth ? fmt::format("target {}x{}", depth->width, depth->height) : std::string("none"));
     if (depth) {
@@ -5281,6 +5414,25 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     if (merge_bands != merge_bands_) REXLOG_INFO("Renut: Plume band merging {}", merge_bands ? "on" : "off");
     merge_bands_ = merge_bands;
+    {
+      bool pass_all = false;
+      if (FILE* file = std::fopen((root + "/plume-pred-all").c_str(), "r")) {
+        int value = 0;
+        if (std::fscanf(file, "%d", &value) == 1) pass_all = value != 0;
+        std::fclose(file);
+      }
+      if (pass_all != pred_pass_all_) REXLOG_INFO("Renut: predicated packets {}", pass_all ? "all run" : "bin-checked");
+      pred_pass_all_ = pass_all;
+    }
+    {
+      int split_mode = 2;
+      if (FILE* file = std::fopen((root + "/plume-keep-split").c_str(), "r")) {
+        if (std::fscanf(file, "%d", &split_mode) != 1) split_mode = 2;
+        std::fclose(file);
+      }
+      if (split_mode != g_renut_scene_split_mode.exchange(split_mode))
+        REXLOG_INFO("Renut: scene band split mode {}", split_mode);
+    }
     if (FILE* file = std::fopen((root + "/plume-skip").c_str(), "r")) {
       if (std::fscanf(file, "%u", &mask) != 1) mask = 0;
       std::fclose(file);

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -143,17 +144,33 @@ REX_EXTERN(sub_8222A990) {
 // one pass nothing predicates them away, so an object in the lower half is
 // drawn over the whole screen with the lower band's projection: vehicles'
 // wheels and the crane's claws hang in the air, stretched. The scene's +44
-// turns the split on; cleared, the band jobs end their buffers empty and the
-// whole-screen job draws every object - the game's own path without bands.
+// turns the split on. Clearing it fixed the main view but emptied the water's
+// mirrored pass (2 draws instead of ~105: no reflections), so the split stays
+// and the band jobs get the view's whole-screen matrix (+128) in place of their
+// band's; Plume then keeps each band job's draws inside its band, as the
+// console's predication did (see IssueDraw, bin mask 3 / C).
 extern "C" void __imp__sub_823B18C8(PPCContext& __restrict, uint8_t*);
+// How the MSAA-off path treats the band split (debug: <files>/plume-keep-split,
+// set by Plume): 0 clears the split flag, 1 leaves everything alone, 2 keeps the
+// split but gives the band jobs the whole-screen projection.
+std::atomic<int> g_renut_scene_split_mode{2};
 REX_EXTERN(sub_823B18C8) {
-  if (!REXCVAR_GET(renut_scene_msaa)) {
+  const int mode = g_renut_scene_split_mode.load(std::memory_order_relaxed);
+  if (!REXCVAR_GET(renut_scene_msaa) && mode != 1) {
     const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r3.u32 + 40));
     auto* split = reinterpret_cast<uint32_t*>(base + scene + 44);
     if (scene && *split == __builtin_bswap32(1)) {
+      if (mode == 0) {
+        *split = 0;
+      } else {
+        // The view's matrices: +128 whole screen, +192 upper band, +256 lower.
+        const uint32_t view = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r3.u32 + 52));
+        uint8_t* block = base + scene + (view << 9);
+        std::memcpy(block + 192, block + 128, 64);
+        std::memcpy(block + 256, block + 128, 64);
+      }
       static std::atomic<bool> logged{false};
-      if (!logged.exchange(true)) REXLOG_INFO("Renut: scene {:08X} objects no longer split by band", scene);
-      *split = 0;
+      if (!logged.exchange(true)) REXLOG_INFO("Renut: scene {:08X} band split mode {}", scene, mode);
     }
   }
   __imp__sub_823B18C8(ctx, base);
