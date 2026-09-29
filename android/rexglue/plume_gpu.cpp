@@ -4243,6 +4243,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       b.renderTargetWriteMask = 0xF;
     }
   }
+  // Blend constants (RB_BLEND_RED..ALPHA) are dynamic state, set per draw, in
+  // the pipelines whose factors use them. Plume left them at zero, so the
+  // game's glow draws - wand sparkles, holograms - added no alpha for bloom.
+  bool blend_constants = false;
+  for (uint32_t i = 0; i < color_count; ++i) {
+    const RenderBlendDesc& b = blends[i];
+    auto constant = [](RenderBlend f) { return f == RenderBlend::BLEND_FACTOR || f == RenderBlend::INV_BLEND_FACTOR; };
+    blend_constants |= b.blendEnabled && (constant(b.srcBlend) || constant(b.dstBlend) ||
+                                          constant(b.srcBlendAlpha) || constant(b.dstBlendAlpha));
+  }
   const uint32_t spec = (alpha_test ? SPEC_CONSTANT_ALPHA_TEST : 0) |
                         (r11g11b10_normals ? SPEC_CONSTANT_R11G11B10_NORMAL : 0);
   // Specialization constants (shader_common.h): 0 the flags above, 1 packed
@@ -4380,6 +4390,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.depthWriteEnabled = depth_write;
     desc.depthFunction = depth_enabled ? Compare(depth_control.zfunc) : RenderComparisonFunction::ALWAYS;
     desc.depthTargetFormat = depth ? depth->format : RenderFormat::UNKNOWN;
+    desc.dynamicBlendFactorEnabled = blend_constants;
     desc.stencilEnabled = stencil_enabled;
     if (stencil_enabled) {
       desc.dynamicStencilEnabled = true;
@@ -4532,6 +4543,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     bound_pipeline_ = pipeline.get();
     bound_interface_key_ = interface_key;
     ++stats_.pipeline_binds;
+  }
+  if (blend_constants) {
+    const float factor[4] = {regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
+                             regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
+    list_->setBlendFactor(factor);
   }
   if (stencil_enabled) {
     list_->setStencilState(stencil_ref_mask.stencilref, stencil_ref_mask.stencilmask,

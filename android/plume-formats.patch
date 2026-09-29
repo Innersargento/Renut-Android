@@ -1,18 +1,20 @@
 diff --git a/plume_render_interface.h b/plume_render_interface.h
-index 2048557..367ffdf 100644
+index 2048557..4cf1f47 100644
 --- a/plume_render_interface.h
 +++ b/plume_render_interface.h
-@@ -137,6 +137,8 @@ namespace plume {
+@@ -137,6 +137,10 @@ namespace plume {
          virtual void setScissors(const RenderRect *scissorRects, uint32_t count) = 0;
          virtual void setFramebuffer(const RenderFramebuffer *framebuffer) = 0;
          virtual void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) = 0;
 +        // For pipelines created with dynamicStencilEnabled; both faces.
 +        virtual void setStencilState(uint32_t reference, uint32_t readMask, uint32_t writeMask) {}
++        // For pipelines created with dynamicBlendFactorEnabled: RGBA.
++        virtual void setBlendFactor(const float *blendFactor) {}
          virtual void clearColor(uint32_t attachmentIndex = 0, RenderColor colorValue = RenderColor(), const RenderRect *clearRects = nullptr, uint32_t clearRectsCount = 0) = 0;
          virtual void clearDepthStencil(bool clearDepth = true, bool clearStencil = true, float depthValue = 1.0f, uint32_t stencilValue = 0, const RenderRect *clearRects = nullptr, uint32_t clearRectsCount = 0) = 0;
          virtual void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) = 0;
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
-index 9dcfedf..31f0540 100644
+index 9dcfedf..9ce1c92 100644
 --- a/plume_render_interface_types.h
 +++ b/plume_render_interface_types.h
 @@ -160,6 +160,9 @@ namespace plume {
@@ -43,17 +45,19 @@ index 9dcfedf..31f0540 100644
          case RenderFormat::R32_FLOAT:
          case RenderFormat::R32_UINT:
          case RenderFormat::R32_SINT:
-@@ -1280,6 +1287,8 @@ namespace plume {
+@@ -1280,6 +1287,10 @@ namespace plume {
          float depthBiasClamp = 0.0f;
          float slopeScaledDepthBias = 0.0f;
          bool dynamicDepthBiasEnabled = false;
 +        // Reference and masks come from setStencilState instead of the desc.
 +        bool dynamicStencilEnabled = false;
++        // Blend constants come from setBlendFactor instead of zero.
++        bool dynamicBlendFactorEnabled = false;
          bool depthEnabled = false;
          bool depthWriteEnabled = false;
          bool stencilEnabled = false;
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..fc72a07 100644
+index f1dd503..ad8834c 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -87,6 +87,8 @@ namespace plume {
@@ -88,7 +92,7 @@ index f1dd503..fc72a07 100644
      }
  
      // VulkanBufferFormattedView
-@@ -1617,6 +1626,12 @@ namespace plume {
+@@ -1617,6 +1626,16 @@ namespace plume {
              dynamicStates.emplace_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
          }
  
@@ -98,10 +102,14 @@ index f1dd503..fc72a07 100644
 +            dynamicStates.emplace_back(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
 +        }
 +
++        if (desc.dynamicBlendFactorEnabled) {
++            dynamicStates.emplace_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
++        }
++
          VkPipelineDynamicStateCreateInfo dynamicState = {};
          dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
          dynamicState.pDynamicStates = dynamicStates.data();
-@@ -1648,6 +1663,17 @@ namespace plume {
+@@ -1648,6 +1667,17 @@ namespace plume {
          pipelineInfo.pDynamicState = &dynamicState;
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.renderPass = renderPass;
@@ -119,7 +127,7 @@ index f1dd503..fc72a07 100644
  
          VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
          if (res != VK_SUCCESS) {
-@@ -3112,6 +3138,12 @@ namespace plume {
+@@ -3112,6 +3142,16 @@ namespace plume {
          vkCmdSetDepthBias(vk, depthBias, depthBiasClamp, slopeScaledDepthBias);
      }
  
@@ -129,10 +137,14 @@ index f1dd503..fc72a07 100644
 +        vkCmdSetStencilWriteMask(vk, VK_STENCIL_FACE_FRONT_AND_BACK, writeMask);
 +    }
 +
++    void VulkanCommandList::setBlendFactor(const float *blendFactor) {
++        vkCmdSetBlendConstants(vk, blendFactor);
++    }
++
      static void clearCommonRectVector(uint32_t width, uint32_t height, const RenderRect *clearRects, uint32_t clearRectsCount, std::vector<VkClearRect> &rectVector) {
          rectVector.clear();
  
-@@ -3229,6 +3261,25 @@ namespace plume {
+@@ -3229,6 +3269,25 @@ namespace plume {
              imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
              vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
          }
@@ -158,7 +170,7 @@ index f1dd503..fc72a07 100644
          else {
              VkImageCopy imageCopy = {};
              imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
-@@ -3883,6 +3934,13 @@ namespace plume {
+@@ -3883,6 +3942,13 @@ namespace plume {
              featuresChain = &portabilityFeatures;
          }
  
@@ -173,7 +185,7 @@ index f1dd503..fc72a07 100644
          VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
          const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 0a1edbe..db2ab37 100644
+index 0a1edbe..2eb1d98 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -56,6 +56,8 @@ namespace plume {
@@ -185,11 +197,12 @@ index 0a1edbe..db2ab37 100644
  
          VulkanBuffer() = default;
          VulkanBuffer(VulkanDevice *device, VulkanPool *pool, const RenderBufferDesc &desc);
-@@ -329,6 +331,7 @@ namespace plume {
+@@ -329,6 +331,8 @@ namespace plume {
          void setScissors(const RenderRect *scissorRects, uint32_t count) override;
          void setFramebuffer(const RenderFramebuffer *framebuffer) override;
          void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) override;
 +        void setStencilState(uint32_t reference, uint32_t readMask, uint32_t writeMask) override;
++        void setBlendFactor(const float *blendFactor) override;
          void clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
          void clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
          void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) override;
