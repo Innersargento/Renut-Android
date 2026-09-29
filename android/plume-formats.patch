@@ -1,5 +1,18 @@
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 2048557..367ffdf 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -137,6 +137,8 @@ namespace plume {
+         virtual void setScissors(const RenderRect *scissorRects, uint32_t count) = 0;
+         virtual void setFramebuffer(const RenderFramebuffer *framebuffer) = 0;
+         virtual void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) = 0;
++        // For pipelines created with dynamicStencilEnabled; both faces.
++        virtual void setStencilState(uint32_t reference, uint32_t readMask, uint32_t writeMask) {}
+         virtual void clearColor(uint32_t attachmentIndex = 0, RenderColor colorValue = RenderColor(), const RenderRect *clearRects = nullptr, uint32_t clearRectsCount = 0) = 0;
+         virtual void clearDepthStencil(bool clearDepth = true, bool clearStencil = true, float depthValue = 1.0f, uint32_t stencilValue = 0, const RenderRect *clearRects = nullptr, uint32_t clearRectsCount = 0) = 0;
+         virtual void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) = 0;
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
-index 9dcfedf..093ece3 100644
+index 9dcfedf..31f0540 100644
 --- a/plume_render_interface_types.h
 +++ b/plume_render_interface_types.h
 @@ -160,6 +160,9 @@ namespace plume {
@@ -30,8 +43,17 @@ index 9dcfedf..093ece3 100644
          case RenderFormat::R32_FLOAT:
          case RenderFormat::R32_UINT:
          case RenderFormat::R32_SINT:
+@@ -1280,6 +1287,8 @@ namespace plume {
+         float depthBiasClamp = 0.0f;
+         float slopeScaledDepthBias = 0.0f;
+         bool dynamicDepthBiasEnabled = false;
++        // Reference and masks come from setStencilState instead of the desc.
++        bool dynamicStencilEnabled = false;
+         bool depthEnabled = false;
+         bool depthWriteEnabled = false;
+         bool stencilEnabled = false;
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..88fb60c 100644
+index f1dd503..fc72a07 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -87,6 +87,8 @@ namespace plume {
@@ -66,7 +88,20 @@ index f1dd503..88fb60c 100644
      }
  
      // VulkanBufferFormattedView
-@@ -1648,6 +1657,17 @@ namespace plume {
+@@ -1617,6 +1626,12 @@ namespace plume {
+             dynamicStates.emplace_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+         }
+ 
++        if (desc.stencilEnabled && desc.dynamicStencilEnabled) {
++            dynamicStates.emplace_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
++            dynamicStates.emplace_back(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK);
++            dynamicStates.emplace_back(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
++        }
++
+         VkPipelineDynamicStateCreateInfo dynamicState = {};
+         dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+         dynamicState.pDynamicStates = dynamicStates.data();
+@@ -1648,6 +1663,17 @@ namespace plume {
          pipelineInfo.pDynamicState = &dynamicState;
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.renderPass = renderPass;
@@ -84,7 +119,46 @@ index f1dd503..88fb60c 100644
  
          VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
          if (res != VK_SUCCESS) {
-@@ -3883,6 +3903,13 @@ namespace plume {
+@@ -3112,6 +3138,12 @@ namespace plume {
+         vkCmdSetDepthBias(vk, depthBias, depthBiasClamp, slopeScaledDepthBias);
+     }
+ 
++    void VulkanCommandList::setStencilState(uint32_t reference, uint32_t readMask, uint32_t writeMask) {
++        vkCmdSetStencilReference(vk, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
++        vkCmdSetStencilCompareMask(vk, VK_STENCIL_FACE_FRONT_AND_BACK, readMask);
++        vkCmdSetStencilWriteMask(vk, VK_STENCIL_FACE_FRONT_AND_BACK, writeMask);
++    }
++
+     static void clearCommonRectVector(uint32_t width, uint32_t height, const RenderRect *clearRects, uint32_t clearRectsCount, std::vector<VkClearRect> &rectVector) {
+         rectVector.clear();
+ 
+@@ -3229,6 +3261,25 @@ namespace plume {
+             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
+             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
+         }
++        else if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
++            // Readback: the whole subresource into the buffer's footprint.
++            assert(srcTexture != nullptr);
++            assert(dstBuffer != nullptr);
++
++            const uint32_t blockWidth = RenderFormatBlockWidth(srcTexture->desc.format);
++            VkBufferImageCopy imageCopy = {};
++            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
++            imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
++            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
++            imageCopy.imageSubresource.layerCount = 1;
++            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
++            imageCopy.imageExtent.width = dstLocation.placedFootprint.width;
++            imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
++            imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
++            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
++        }
+         else {
+             VkImageCopy imageCopy = {};
+             imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
+@@ -3883,6 +3934,13 @@ namespace plume {
              featuresChain = &portabilityFeatures;
          }
  
@@ -99,7 +173,7 @@ index f1dd503..88fb60c 100644
          VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
          const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 0a1edbe..e05da0f 100644
+index 0a1edbe..db2ab37 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -56,6 +56,8 @@ namespace plume {
@@ -111,3 +185,11 @@ index 0a1edbe..e05da0f 100644
  
          VulkanBuffer() = default;
          VulkanBuffer(VulkanDevice *device, VulkanPool *pool, const RenderBufferDesc &desc);
+@@ -329,6 +331,7 @@ namespace plume {
+         void setScissors(const RenderRect *scissorRects, uint32_t count) override;
+         void setFramebuffer(const RenderFramebuffer *framebuffer) override;
+         void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) override;
++        void setStencilState(uint32_t reference, uint32_t readMask, uint32_t writeMask) override;
+         void clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
+         void clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
+         void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) override;

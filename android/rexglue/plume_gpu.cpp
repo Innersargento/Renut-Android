@@ -1082,6 +1082,11 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   RenderFormat snap_format_ = RenderFormat::UNKNOWN;
   RenderTextureLayout snap_layout_ = RenderTextureLayout::UNKNOWN;
   bool snap_taken_ = false;
+  // Debug: while <files>/plume-snap-dump exists, the next snapshot is also
+  // read back into <files>/plume-snap.rgba (a text header, then the texels) -
+  // the blit that presents it cannot show the alpha channel.
+  std::unique_ptr<RenderBuffer> snap_dump_;
+  uint32_t snap_dump_row_ = 0;
   // Debug: touching <files>/plume-texdump-request re-decodes every texture
   // the next frame uses and writes each to <files>/texdump/ (raw RGBA).
   std::string texdump_directory_;
@@ -3632,11 +3637,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   if (trace_) {
-    std::string line = fmt::format("draw #{} vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X} bm={:X}",
+    std::string line = fmt::format("draw #{} vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X} cm={:X} bm={:X}",
                                    draw_index,
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
                                    index_count, uint32_t(edram_mode), pitch, height,
-                                   regs[XE_GPU_REG_RB_COLORCONTROL], bin_mask_);
+                                   regs[XE_GPU_REG_RB_COLORCONTROL], color_mask, bin_mask_);
     for (uint32_t i = 0; i < color_count; ++i) {
       reg::RB_COLOR_INFO info;
       info.value = regs[kColorInfo[i]];
@@ -4190,6 +4195,32 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   const bool depth_enabled =
       depth && depth_control.z_enable && !(skip_mask_ & 1024) && !(debug_draw && (debug_mode_ & 1));
   const bool depth_write = depth_enabled && depth_control.z_write_enable;
+  // Stencil: the game marks pixels in the stencil buffer and later draws shade
+  // only where they are marked; without the test those draws covered their
+  // whole volume. Plume takes one reference and one pair of masks for both
+  // faces, so the back face shares the front's.
+  const bool stencil_enabled = depth && depth_control.stencil_enable;
+  const auto stencil_ref_mask = regs.Get<reg::RB_STENCILREFMASK>();
+  auto stencil_face = [](xenos::CompareFunction func, xenos::StencilOp fail, xenos::StencilOp zpass,
+                         xenos::StencilOp zfail) {
+    // RenderStencilOp lists the Xenos operations in order, after UNKNOWN.
+    auto op = [](xenos::StencilOp o) { return RenderStencilOp(uint32_t(o) + 1); };
+    RenderStencilFaceDesc face;
+    face.compareFunction = Compare(func);
+    face.failOp = op(fail);
+    face.passOp = op(zpass);
+    face.depthFailOp = op(zfail);
+    return face;
+  };
+  RenderStencilFaceDesc stencil_front, stencil_back;
+  if (stencil_enabled) {
+    stencil_front = stencil_face(depth_control.stencilfunc, depth_control.stencilfail,
+                                 depth_control.stencilzpass, depth_control.stencilzfail);
+    stencil_back = depth_control.backface_enable
+                       ? stencil_face(depth_control.stencilfunc_bf, depth_control.stencilfail_bf,
+                                      depth_control.stencilzpass_bf, depth_control.stencilzfail_bf)
+                       : stencil_front;
+  }
   RenderBlendDesc blends[4];
   for (uint32_t i = 0; i < color_count; ++i) {
     reg::RB_BLENDCONTROL bc;
@@ -4274,6 +4305,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   key_bytes.Put(uint8_t((depth != nullptr) | (depth_enabled << 1) | (depth_write << 2)));
   key_bytes.Put(depth_control.zfunc);
+  // Only stencil draws add bytes, so the cached pipelines of every other draw
+  // keep their keys. The reference and masks are dynamic: the game changes
+  // them from draw to draw, and keying on them made thousands of pipelines.
+  if (stencil_enabled) key_bytes.Put(uint32_t(depth_control.value & 0xFFFFFF81u));
   for (const RenderSpecConstant& c : spec_constants) {
     key_bytes.Put(c.index);
     key_bytes.Put(c.value);
@@ -4345,6 +4380,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.depthWriteEnabled = depth_write;
     desc.depthFunction = depth_enabled ? Compare(depth_control.zfunc) : RenderComparisonFunction::ALWAYS;
     desc.depthTargetFormat = depth ? depth->format : RenderFormat::UNKNOWN;
+    desc.stencilEnabled = stencil_enabled;
+    if (stencil_enabled) {
+      desc.dynamicStencilEnabled = true;
+      desc.stencilFrontFace = stencil_front;
+      desc.stencilBackFace = stencil_back;
+    }
     desc.renderTargetCount = color_count;
     for (uint32_t i = 0; i < color_count; ++i) {
       desc.renderTargetFormat[i] = colors[i]->format;
@@ -4491,6 +4532,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     bound_pipeline_ = pipeline.get();
     bound_interface_key_ = interface_key;
     ++stats_.pipeline_binds;
+  }
+  if (stencil_enabled) {
+    list_->setStencilState(stencil_ref_mask.stencilref, stencil_ref_mask.stencilmask,
+                           stencil_ref_mask.stencilwritemask);
   }
   // Inactive fragment bindings still need a valid offset. Keep their values
   // uncommitted so the next draw with a fragment shader uploads them.
@@ -5003,11 +5048,23 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     frontbuffer_width = std::min(frontbuffer_width, r.width);
     frontbuffer_height = std::min(frontbuffer_height, r.height);
   }
+  bool snap_dump = false;
   if (snap_taken_ && snap_) {
     Transition(snap_.get(), snap_layout_, RenderTextureLayout::COPY_SOURCE);
     source = snap_.get();
     frontbuffer_width = std::min(frontbuffer_width, snap_width_);
     frontbuffer_height = std::min(frontbuffer_height, snap_height_);
+    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    if (!miss_dump_directory_.empty() && access((root + "/plume-snap-dump").c_str(), F_OK) == 0) {
+      snap_dump_row_ = (snap_width_ + 63) & ~63u;
+      snap_dump_ = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(snap_dump_row_) * snap_height_ * 4));
+      if (snap_dump_) {
+        list_->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(snap_dump_.get(), snap_format_, snap_width_,
+                                                                            snap_height_, 1, snap_dump_row_),
+                                 RenderTextureCopyLocation::Subresource(snap_.get()));
+        snap_dump = true;
+      }
+    }
   }
   snap_taken_ = false;
   snap_seen_ = 0;
@@ -5053,6 +5110,19 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         std::chrono::duration_cast<std::chrono::microseconds>(submit_end - frame_start_).count());
   }
   frame_start_ = submit_end;
+  if (snap_dump && renderer) {
+    renderer->WaitForAllSlots();
+    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    if (FILE* file = std::fopen((root + "/plume-snap.rgba").c_str(), "wb")) {
+      std::fprintf(file, "%u %u %u %u\n", snap_width_, snap_height_, snap_dump_row_, uint32_t(snap_format_));
+      std::fwrite(snap_dump_->map(), 4, size_t(snap_dump_row_) * snap_height_, file);
+      snap_dump_->unmap();
+      std::fclose(file);
+    }
+    std::remove((root + "/plume-snap-dump").c_str());
+    snap_dump_.reset();
+    REXLOG_INFO("Renut: Plume snapshot written ({}x{}, format {})", snap_width_, snap_height_, uint32_t(snap_format_));
+  }
   const uint64_t cpu_now = ThreadCpuMicroseconds();
   if (cpu_at_swap_) stats_.cp_cpu_us += cpu_now - cpu_at_swap_;
   cpu_at_swap_ = cpu_now;
