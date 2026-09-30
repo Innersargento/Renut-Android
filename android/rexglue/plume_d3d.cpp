@@ -46,6 +46,8 @@ constexpr uint32_t kMaxSleepMicroseconds = 20000;
 // inside it never pays for a sleep.
 constexpr uint32_t kSpinBeforeSleep = 256;
 
+std::atomic<bool> in_background{false};
+constexpr uint32_t kBackgroundSleepMicroseconds = 20000;
 std::mutex files_mutex;
 std::string files_directory;
 std::atomic<uint32_t> blocker_sleep_us{kDefaultSleepMicroseconds};
@@ -126,7 +128,8 @@ bool ClearF(PPCContext& ctx, uint8_t* base) {
 bool BlockerCheck(PPCContext& ctx, uint8_t* base) {
   // One game thread drives this loop; thread_local keeps a second one honest.
   static thread_local uint32_t idle_checks = 0;
-  const uint32_t sleep_us = BlockerSleepMicroseconds();
+  const uint32_t sleep_us = in_background.load(std::memory_order_relaxed)
+      ? kBackgroundSleepMicroseconds : BlockerSleepMicroseconds();
   if (!sleep_us) {
     idle_checks = 0;
     return false;
@@ -156,6 +159,8 @@ bool BlockerCheck(PPCContext& ctx, uint8_t* base) {
 }
 
 }  // namespace
+
+void SetBackground(bool background) { in_background.store(background, std::memory_order_relaxed); }
 
 void SetRuntimeFilesDirectory(std::string directory) {
   std::lock_guard lock(files_mutex);

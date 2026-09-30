@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -52,6 +53,17 @@ struct PlumeRenderer::State {
   std::array<Slot, kPlumeFramesInFlight> slots;
   std::vector<std::unique_ptr<RenderCommandSemaphore>> release;
   RenderFormat format = RenderFormat::UNKNOWN;
+  // Background: the frame loop parks while `paused`. `swap_mutex` covers every use
+  // of the swapchain, so AttachWindow can replace it between two presents.
+  std::mutex swap_mutex;
+  std::mutex pause_mutex;
+  std::condition_variable pause_cv;
+  bool paused = false;
+  bool stopping = false;
+  void WaitWhilePaused() {
+    std::unique_lock lock(pause_mutex);
+    pause_cv.wait(lock, [this] { return !paused || stopping; });
+  }
   std::mutex color_mutex;
   std::array<float, 4> clear_color{0.f, 0.f, 0.f, 1.f};
   std::atomic<uint64_t> frames{0};
@@ -223,6 +235,8 @@ void PlumeRenderer::SetClearColor(float r, float g, float b, float a) {
 
 void PlumeRenderer::Present() {
   auto& s = *state_;
+  std::lock_guard swap_lock(s.swap_mutex);
+  if (!s.swap) return;
   std::array<float, 4> color;
   {
     std::lock_guard lock(s.color_mutex);
@@ -279,11 +293,14 @@ void PlumeRenderer::WaitForAllSlots() {
 void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* source,
                                      uint32_t width, uint32_t height, uint32_t slot_index) {
   auto& s = *state_;
+  // In the background the loop stops here, holding the finished frame.
+  s.WaitWhilePaused();
+  std::lock_guard swap_lock(s.swap_mutex);
   auto& slot = s.slots[slot_index % kPlumeFramesInFlight];
   // The caller waits before it reuses a slot, so this one is free by now.
   WaitForSlot(slot_index);
   uint32_t index = 0;
-  bool acquired = s.swap->acquireTexture(slot.acquire.get(), &index);
+  bool acquired = s.swap && s.swap->acquireTexture(slot.acquire.get(), &index);
   if (!acquired) {
     // Still run the frame: the guest's fences and resolved textures depend on it.
     if (frame) {
@@ -291,7 +308,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
       s.queue->executeCommandLists(&list, 1, nullptr, 0, nullptr, 0, slot.fence.get());
       slot.pending = true;
     }
-    s.swap->resize();
+    if (s.swap) s.swap->resize();
     return;
   }
   auto* target = s.swap->getTexture(index);
@@ -338,6 +355,52 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
   if (s.frames.fetch_add(1) == 0) {
     REXLOG_INFO("Renut: Plume presented its first frame");
   }
+}
+
+void PlumeRenderer::PauseForBackground() {
+  std::lock_guard lock(state_->pause_mutex);
+  state_->paused = true;
+}
+
+void PlumeRenderer::ReleaseForShutdown() {
+  {
+    std::lock_guard lock(state_->pause_mutex);
+    state_->stopping = true;
+  }
+  state_->pause_cv.notify_all();
+}
+
+bool PlumeRenderer::AttachWindow(ANativeWindow* window) {
+  auto& s = *state_;
+  if (!window) return false;
+  // Waits for a present that was already under way when the surface died.
+  std::lock_guard swap_lock(s.swap_mutex);
+  try {
+    ANativeWindow_acquire(window);
+    // Everything queued before the pause has to finish before the old swapchain
+    // goes: it may still hold images the presentation engine is showing.
+    WaitForAllSlots();
+    vkDeviceWaitIdle(static_cast<VulkanDevice*>(s.device.get())->vk);
+    s.release.clear();
+    s.swap.reset();
+    if (s.window) ANativeWindow_release(s.window);
+    s.window = window;
+    s.swap = s.queue->createSwapChain(RenderSwapChainDesc(window, s.format, 3));
+    Require(s.swap && s.swap->resize() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
+    for (uint32_t i = 0; i < s.swap->getTextureCount(); ++i) {
+      s.release.push_back(s.device->createCommandSemaphore());
+    }
+    REXLOG_INFO("Renut: Plume swapchain recreated ({}x{})", s.swap->getWidth(), s.swap->getHeight());
+  } catch (const std::exception& e) {
+    REXLOG_ERROR("Renut: {}", e.what());
+    return false;
+  }
+  {
+    std::lock_guard lock(s.pause_mutex);
+    s.paused = false;
+  }
+  s.pause_cv.notify_all();
+  return true;
 }
 
 std::string PlumeRenderer::report() const {

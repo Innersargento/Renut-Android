@@ -21,6 +21,7 @@
 #include "d3d_layer.h"
 #include "plume_renderer.h"
 #include "plume_gpu.h"
+#include <rex/chrono/clock.h>
 #include <rex/ui/presenter.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
@@ -33,7 +34,43 @@ void renutConfigureXenosDriver(const std::string&,const std::string&,const std::
 // our transitive dependencies. SDL is explicitly loaded/initialized by Java.
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) { return JNI_VERSION_1_6; }
 static std::atomic<bool> render_stopped{false};
-extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeStop(JNIEnv*,jclass) {render_stopped=true;}
+// The window the game loop pumps, reachable from the UI thread for surface changes.
+static std::mutex game_window_mutex;
+static renut::GameWindow* live_game_window = nullptr;
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeStop(JNIEnv*,jclass) {
+  render_stopped=true;
+  // A game paused in the background is parked in the renderer: wake it to shut down.
+  if(auto* plume=renut::PlumeRenderer::Get())plume->ReleaseForShutdown();
+}
+// The app left the screen: its surface is gone. The game keeps its state and
+// stops at its next present, and its clock crawls so that coming back is not a
+// jump of minutes for the physics.
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeBackground(JNIEnv*,jclass) {
+  renut::d3d::SetBackground(true);
+  if(auto* plume=renut::PlumeRenderer::Get())plume->PauseForBackground();
+  rex::chrono::Clock::set_guest_time_scalar(0.02);
+  {
+    std::lock_guard<std::mutex> lock(game_window_mutex);
+    if(live_game_window)live_game_window->SetWindow(nullptr);
+  }
+}
+// A new surface: swapchain replaced, the game runs again.
+extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nativeForeground(JNIEnv* env,jclass,jobject surface) {
+  auto* window=surface?ANativeWindow_fromSurface(env,surface):nullptr;
+  if(!window)return JNI_FALSE;
+  {
+    std::lock_guard<std::mutex> lock(game_window_mutex);
+    if(live_game_window)live_game_window->SetWindow(window);
+  }
+  bool attached=false;
+  if(auto* plume=renut::PlumeRenderer::Get())attached=plume->AttachWindow(window);
+  ANativeWindow_release(window);
+  if(attached){
+    rex::chrono::Clock::set_guest_time_scalar(1.0);
+    renut::d3d::SetBackground(false);
+  }
+  return attached?JNI_TRUE:JNI_FALSE;
+}
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeButton(JNIEnv*,jclass,jint button,jboolean down) {
   renut::SetTouchButton(uint16_t(button),down);
 }
@@ -230,6 +267,10 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       game_context=std::make_unique<renut::GameContext>();
       game_window=std::make_unique<renut::GameWindow>(*game_context,window);
       if(!game_window->Open())throw std::runtime_error("Falha ao abrir a superfície do jogo.");
+      {
+        std::lock_guard<std::mutex> lock(game_window_mutex);
+        live_game_window=game_window.get();
+      }
       renut::d3d::SetShaderDumpDirectory((root / "shader-dump").string());
       renut::d3d::SetRuntimeFilesDirectory(root.string());
       // The emulated Xenos keeps fences, vertical blank and swaps but does not
@@ -297,6 +338,10 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
       }
       note("Encerrando a sessão do jogo.");
+      {
+        std::lock_guard<std::mutex> lock(game_window_mutex);
+        live_game_window=nullptr;
+      }
       runtime.kernel_state()->TerminateTitle();
       game_window->SetPresenter(nullptr);
       game_context->ExecutePendingFunctionsFromUIThread();

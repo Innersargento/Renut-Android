@@ -59,6 +59,18 @@ class PlumeRenderer {
   // Waits for every slot. For teardown and the ring's overflow path.
   void WaitForAllSlots();
 
+  // Background support. The Android surface goes away when the app leaves the
+  // screen, but the game must stay alive to come back to.
+  //
+  // PauseForBackground stops the frame loop at its next present (the command
+  // thread parks there, so the game stalls behind its own fences) and never
+  // touches the dead swapchain again. AttachWindow, once a new surface exists,
+  // replaces the swapchain and lets the loop run. ReleaseForShutdown wakes a
+  // parked thread so the runtime can stop while paused.
+  void PauseForBackground();
+  bool AttachWindow(ANativeWindow* window);
+  void ReleaseForShutdown();
+
   ~PlumeRenderer();
 
  private:

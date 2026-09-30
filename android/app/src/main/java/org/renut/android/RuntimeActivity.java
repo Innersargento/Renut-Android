@@ -31,6 +31,8 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private volatile boolean loaded, cancelled;
     private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,boolean launch,boolean oneUiFix,boolean sceneMsaa,String tuDebug,String ir3Debug);
     private static native void nativeStop();
+    private static native void nativeBackground();
+    private static native boolean nativeForeground(Surface surface);
     private static native void nativeButton(int button,boolean down);
     private static native void nativeStick(int stick,float x,float y);
     private static native void nativeTrigger(int trigger,float value);
@@ -66,6 +68,13 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             setupController();
         }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if(launch){
+            // The notification is how the user gets back to a game left in the background;
+            // without the permission (Android 13+) the game still stays alive, just unlisted.
+            if(android.os.Build.VERSION.SDK_INT>=33&&checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)!=android.content.pm.PackageManager.PERMISSION_GRANTED)
+                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS},7);
+            KeepAliveService.start(this);
+        }
         status=new TextView(this);status.setTextColor(Color.rgb(226,237,235));status.setTextSize(16);
         results=new ScrollView(this);results.addView(status);
         if(launch){
@@ -200,6 +209,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 else results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
         },"renut-runtime-validation").start();
     }
+    private volatile boolean inBackground;
     private void stop(){cancelled=true;if(loaded)nativeStop();}
     @Override public void surfaceCreated(SurfaceHolder h){
         // Request the selected display rate for the game surface as well as
@@ -207,10 +217,22 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         if(launch&&android.os.Build.VERSION.SDK_INT>=30){
             try{h.getSurface().setFrameRate(gameRefreshRate,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(Exception ignored){}
         }
+        if(launch&&started&&loaded&&inBackground){
+            // Back on screen with a new surface: the game was kept alive, give it the window.
+            if(nativeForeground(h.getSurface()))inBackground=false;
+            return;
+        }
         startValidation(h.getSurface());
     }
     @Override public void surfaceChanged(SurfaceHolder h,int format,int width,int height){}
-    @Override public void surfaceDestroyed(SurfaceHolder h){stop();}
-    @Override protected void onPause(){clearController();stop();super.onPause();finish();}
-    @Override protected void onDestroy(){if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
+    @Override public void surfaceDestroyed(SurfaceHolder h){
+        // The game is kept, paused, while the app is away (see KeepAliveService). Only the
+        // diagnostic screens, which own no game state, stop with their surface.
+        if(launch&&started&&loaded&&!isFinishing()){inBackground=true;nativeBackground();}
+        else{stop();if(launch&&!isFinishing())finish();}  // not loaded yet: nothing to keep
+    }
+    // Leaving the screen no longer ends the game; only closing it does (onDestroy).
+    @Override protected void onPause(){clearController();super.onPause();if(!launch){stop();finish();}}
+    @Override protected void onResume(){super.onResume();if(launch)setupController();}
+    @Override protected void onDestroy(){if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
 }

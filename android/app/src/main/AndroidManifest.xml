@@ -1,5 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00402000" android:required="false" />
     <application android:label="reNut" android:theme="@android:style/Theme.Material.NoActionBar"
         android:icon="@drawable/ic_renut" android:dataExtractionRules="@xml/data_extraction_rules"
@@ -14,5 +17,10 @@
         <activity android:name=".ProbeActivity" android:process=":gpu" android:exported="false" />
         <activity android:name=".RuntimeActivity" android:process=":runtime" android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
+        <!-- In the game's process: keeps it alive while the app is in the background. -->
+        <service android:name=".KeepAliveService" android:process=":runtime" android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="game_session" />
+        </service>
     </application>
 </manifest>
