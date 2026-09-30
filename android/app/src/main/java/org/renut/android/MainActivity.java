@@ -70,18 +70,15 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         showControls.setOnCheckedChangeListener((view,checked)->
             getPreferences(0).edit().putBoolean("showControls",checked).apply());
         game.addView(showControls);
+        CheckBox autoStart=new CheckBox(this);
+        autoStart.setText("Iniciar direto no jogo");
+        autoStart.setTextColor(ink);
+        autoStart.setChecked(getPreferences(0).getBoolean("autoStart",false));
+        autoStart.setOnCheckedChangeListener((view,checked)->
+            getPreferences(0).edit().putBoolean("autoStart",checked).apply());
+        game.addView(autoStart);
         button(game,"Configurar controle externo",()->startActivity(new Intent(this,ControllerSettingsActivity.class)));
-        button(game,"Iniciar Banjo (experimental)",()->{
-            Intent i=new Intent(this,RuntimeActivity.class).putExtra("launch",true);
-            i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
-            i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
-            i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
-            i.putExtra("showControls",getPreferences(0).getBoolean("showControls",true));
-            i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));
-            i.putExtra("sceneMsaa",getPreferences(0).getBoolean("sceneMsaa",false));
-            i.putExtra("tuDebug",getPreferences(0).getString("tuDebug",""));
-            i.putExtra("ir3Debug",getPreferences(0).getString("ir3Debug",""));startActivity(i);
-        });
+        button(game,"Iniciar Banjo (experimental)",()->startGame());
         button(game,"Validar runtime ARM64",()->startActivity(new Intent(this,RuntimeActivity.class)));
         button(game,"Testar runtime com Plume",()->{
             Intent i=new Intent(this,RuntimeActivity.class).putExtra("graphics",true);
@@ -140,6 +137,28 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         settingsTab.setOnClickListener(v->{savesPage.setVisibility(View.GONE);scroll.setVisibility(View.VISIBLE);});
         refresh();
         ComposeScreens.showMain(this);
+        // Only on a fresh launch of the launcher: leaving the game (back, or "Sair para o
+        // menu principal") resumes this activity instead of creating it, so the launcher
+        // stays reachable to turn the option off.
+        if(state==null&&!getIntent().getBooleanExtra("noAutoStart",false)&&uiAutoStart()&&hasGame())startGame();
+    }
+    private boolean hasGame(){
+        try{
+            String name=new String(Files.readAllBytes(new File(getFilesDir(),"active-game.txt").toPath()),java.nio.charset.StandardCharsets.UTF_8).trim();
+            return !name.isEmpty()&&new File(getFilesDir(),name).isDirectory();
+        }catch(IOException e){return false;}
+    }
+    private void startGame(){
+        Intent i=new Intent(this,RuntimeActivity.class).putExtra("launch",true);
+        i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
+        i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
+        i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
+        i.putExtra("showControls",getPreferences(0).getBoolean("showControls",true));
+        i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));
+        i.putExtra("sceneMsaa",getPreferences(0).getBoolean("sceneMsaa",false));
+        i.putExtra("tuDebug",getPreferences(0).getString("tuDebug",""));
+        i.putExtra("ir3Debug",getPreferences(0).getString("ir3Debug",""));
+        startActivity(i);
     }
     private int dp(int n){return (int)(getResources().getDisplayMetrics().density*n);}
     private TextView text(String value,int size,int color){TextView t=new TextView(this);t.setText(value);t.setTextSize(size);t.setTextColor(color);t.setPadding(0,dp(7),0,dp(9));return t;}
@@ -166,6 +185,8 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     public String uiOneUi(){return oneUiFix.getText().toString();}
     public String uiTu(){return tuDebug.getText().toString();}
     public String uiIr3(){return ir3Debug.getText().toString();}
+    public boolean uiAutoStart(){return getPreferences(0).getBoolean("autoStart",false);}
+    public void uiSetAutoStart(boolean value){getPreferences(0).edit().putBoolean("autoStart",value).apply();}
     public boolean uiShowControls(){return getPreferences(0).getBoolean("showControls",true);}
     public void uiSetShowControls(boolean value){getPreferences(0).edit().putBoolean("showControls",value).apply();}
     public boolean uiFpsEnabled(){return getPreferences(0).getBoolean("fps",false);}

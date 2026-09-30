@@ -122,6 +122,7 @@ object ComposeScreens {
     val fpsEnabled = activity.uiFpsEnabled()
     val msaaEnabled = activity.uiMsaaEnabled()
     val controlsEnabled = activity.uiShowControls()
+    val autoStartEnabled = activity.uiAutoStart()
     val oneUiEnabled = activity.uiOneUiEnabled()
     val tuMode = activity.uiTuMode()
     val ir3Mode = activity.uiIr3Mode()
@@ -134,6 +135,8 @@ object ComposeScreens {
             Panel("Seu jogo") {
                 Text(library, color = Text)
                 ActionButton("Iniciar Banjo (experimental)", !busy) { activity.uiAction("Iniciar Banjo (experimental)") }
+                ToggleRow("Iniciar direto no jogo", autoStartEnabled, !busy) { activity.uiSetAutoStart(it) }
+                Text("Ao abrir o app, o jogo começa sem passar por esta tela. Para voltar aqui, saia do jogo pelo menu.", color = Muted, fontSize = 12.sp)
                 ActionButton("Importar imagem ISO", !busy, outlined = true) { activity.uiAction("Importar imagem ISO") }
                 ActionButton("Importar apenas o XEX", !busy, outlined = true) { activity.uiAction("Importar apenas o XEX") }
             }
