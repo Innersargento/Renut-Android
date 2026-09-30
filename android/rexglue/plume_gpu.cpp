@@ -847,6 +847,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     return pred_pass_all_;
   }
   bool pred_pass_all_ = false;
+  bool band_fragpos_ = false;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
@@ -3679,6 +3680,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
                                    index_count, uint32_t(edram_mode), pitch, height,
                                    regs[XE_GPU_REG_RB_COLORCONTROL], color_mask, bin_mask_);
+    if (packet_predicated_) line += " pred";
     for (uint32_t i = 0; i < color_count; ++i) {
       reg::RB_COLOR_INFO info;
       info.value = regs[kColorInfo[i]];
@@ -4123,13 +4125,30 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (viewport.width <= 0.f) {
     viewport = RenderViewport(0.f, 0.f, float(extent->width), float(extent->height));
   }
+  // Debug, split mode 5 (game_fixes.cpp): the band a predicated packet belongs
+  // to, for the scissor below. Only predicated packets count - the mask stays
+  // set between them. Off by default: with one tile the game predicates nearly
+  // everything to mask 3, which then means the whole screen (the particles
+  // lost their lower half to this scissor).
+  const bool band_split_scene = g_renut_scene_split_mode.load(std::memory_order_relaxed) == 5 &&
+                                !REXCVAR_GET(renut_scene_msaa) &&
+                                regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280;
+  const uint32_t draw_bands = band_split_scene && packet_predicated_ ? uint32_t(bin_mask_) & 0xF : 0;
+  constexpr float kBandSplit = 384.f;  // 2x MSAA at 720p: bands of 384 and 336 rows
   std::memcpy(sh + RENUT_SHARED_VIEWPORT_OFFSET, scale_offset, sizeof(scale_offset));
   // Merged predicated tiling: pixels below the upper band read their position
   // relative to the lower band, as they did when it was drawn on its own
   // (renutFragPos). The upper band's full-screen draws and the game's own
   // lower-band draws need it; every other draw gets 0.
-  const float band_split =
+  float band_split =
       band_merge && (band2_ || std::fabs(viewport.height) >= float(band_full_h_) - 1.f) ? float(band_h_) : 0.f;
+  // Debug (<files>/plume-band-fragpos "1"): with scene MSAA off, pixels below
+  // row 384 of the scene read their position relative to the lower band, as
+  // the console's lower-band replay gave them.
+  if (band_fragpos_ && !REXCVAR_GET(renut_scene_msaa) && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280 &&
+      std::fabs(viewport.height) >= 700.f) {
+    band_split = 384.f;
+  }
   std::memcpy(sh + RENUT_SHARED_BAND_SPLIT_OFFSET, &band_split, sizeof(band_split));
 
   // User clip planes, in the guest's clip space; the vertex shaders turn the
@@ -4203,22 +4222,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     scissor_rect.bottom = int32_t(band_full_h_);
     ++stats_.band_widened;
   }
-  // Scene MSAA off (game_fixes.cpp, split mode 2): the game still sorts each
-  // view's objects into an upper-band job (bin mask 3), a lower-band job (C)
-  // and a whole-screen one, all drawn in the single pass. An object that
-  // crosses the split is in both band jobs; on the console each copy only
-  // reached its own band. Keep them there, or it is drawn twice: translucent
-  // water doubles and its stencil marks break the ripples tested against them.
-  if (g_renut_scene_split_mode.load(std::memory_order_relaxed) == 2 && !REXCVAR_GET(renut_scene_msaa) &&
-      regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280 && scissor_rect.bottom >= 720) {
-    constexpr int32_t kBandSplit = 384;  // 2x MSAA at 720p: bands of 384 and 336 rows
-    const uint32_t bands = uint32_t(bin_mask_) & 0xF;
-    if (bands == 0x3) {
-      scissor_rect.bottom = std::min(scissor_rect.bottom, kBandSplit);
+  // Split mode 5 only (see draw_bands): keep a band-predicated packet inside
+  // its band.
+  if (scissor_rect.bottom >= 720) {
+    if (draw_bands == 0x3) {
+      scissor_rect.bottom = std::min(scissor_rect.bottom, int32_t(kBandSplit));
       ++stats_.band_widened;
-    } else if (bands == 0xC) {
-      scissor_rect.top = std::max(scissor_rect.top, kBandSplit);
-      ++stats_.band_moved;
+    } else if (draw_bands == 0xC) {
+      scissor_rect.top = std::max(scissor_rect.top, int32_t(kBandSplit));
     }
   }
   if (trace_) {
@@ -5423,6 +5434,14 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
       if (pass_all != pred_pass_all_) REXLOG_INFO("Renut: predicated packets {}", pass_all ? "all run" : "bin-checked");
       pred_pass_all_ = pass_all;
+      bool fragpos = false;
+      if (FILE* file = std::fopen((root + "/plume-band-fragpos").c_str(), "r")) {
+        int value = 0;
+        if (std::fscanf(file, "%d", &value) == 1) fragpos = value != 0;
+        std::fclose(file);
+      }
+      if (fragpos != band_fragpos_) REXLOG_INFO("Renut: band-relative pixel positions {}", fragpos ? "on" : "off");
+      band_fragpos_ = fragpos;
     }
     {
       int split_mode = 2;

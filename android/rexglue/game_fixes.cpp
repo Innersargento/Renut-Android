@@ -147,16 +147,18 @@ REX_EXTERN(sub_8222A990) {
 // turns the split on. Clearing it fixed the main view but emptied the water's
 // mirrored pass (2 draws instead of ~105: no reflections), so the split stays
 // and the band jobs get the view's whole-screen matrix (+128) in place of their
-// band's; Plume then keeps each band job's draws inside its band, as the
-// console's predication did (see IssueDraw, bin mask 3 / C).
+// band's. Keeping the band matrices and giving each band its own viewport
+// instead broke the whole picture: not every predicated packet uses a band
+// projection.
 extern "C" void __imp__sub_823B18C8(PPCContext& __restrict, uint8_t*);
 // How the MSAA-off path treats the band split (debug: <files>/plume-keep-split,
-// set by Plume): 0 clears the split flag, 1 leaves everything alone, 2 keeps the
-// split but gives the band jobs the whole-screen projection.
+// set by Plume): 0 clears the split flag, 1 leaves everything alone, 2 gives the
+// band jobs the whole-screen projection, 5 is 2 plus a scissor to each band
+// (wrong: with one tile the game predicates almost everything to mask 3).
 std::atomic<int> g_renut_scene_split_mode{2};
 REX_EXTERN(sub_823B18C8) {
   const int mode = g_renut_scene_split_mode.load(std::memory_order_relaxed);
-  if (!REXCVAR_GET(renut_scene_msaa) && mode != 1) {
+  if (!REXCVAR_GET(renut_scene_msaa) && (mode == 0 || mode == 2 || mode == 5)) {
     const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r3.u32 + 40));
     auto* split = reinterpret_cast<uint32_t*>(base + scene + 44);
     if (scene && *split == __builtin_bswap32(1)) {
