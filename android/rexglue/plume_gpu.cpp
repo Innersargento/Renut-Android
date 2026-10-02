@@ -10,6 +10,7 @@
 #include "shader_cache.h"
 #include "xenos_ucode_key.h"
 #include "smolv.h"
+#include "spirv_fetch_spec.h"
 
 #include <sys/stat.h>
 #include <time.h>
@@ -57,6 +58,15 @@ void renutReportShadowEngineProfile();
 
 REXCVAR_DEFINE_BOOL(renut_plume_async_pipelines, false, "reNut/Plume",
                     "Create new Plume graphics pipelines on a worker; non-export draws are skipped until ready.");
+REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 1, "reNut/Plume",
+                     "Record draws in windows grouped by pipeline: 0 off, 1 depth-only draws (the shadow "
+                     "maps), 2 also opaque colour draws that test and write depth (reordering them is "
+                     "exact except for depth ties)")
+    .range(0, 2);
+REXCVAR_DEFINE_INT32(renut_plume_fetch_spec, 1, "reNut/Plume",
+                     "Give each vertex shader's live vertex fetch table to the driver as specialization "
+                     "constants, so that the format switches of its fetch sites fold away: 0 off, 1 on")
+    .range(0, 1);
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_readback, false, "reNut/Plume",
                     "Copy shader exports back to guest memory (experimental; may overwrite reused memory).");
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_fast, true, "reNut/Plume",
@@ -272,9 +282,16 @@ std::vector<std::pair<uint32_t, bool>> ReflectInputs(const std::vector<uint32_t>
 // One recompiled shader, shared by every bound variant of it.
 struct CompiledShader {
   std::unique_ptr<RenderShader> module;
+  // The same module with its live vertex fetch table read from specialization
+  // constants instead of the uniform block (spirv_fetch_spec.h). Only vertex
+  // and domain shaders with live fetches have one.
+  std::unique_ptr<RenderShader> fetch_spec_module;
   std::vector<std::pair<uint32_t, bool>> inputs;  // vertex shaders only
   bool failed = false;
 };
+
+// Specialization constant ids 64 + slot * 4 + word hold the live fetch table.
+constexpr uint32_t kFetchSpecBase = 64;
 
 // A vertex element as the bound microcode fetches it.
 struct LiveElement {
@@ -350,7 +367,7 @@ class ShaderStore {
     return Find(ucode_hash, loose_hash, RENUT_DOMAIN_SHADER_HASH_TAG);
   }
 
-  CompiledShader* Build(RenderDevice* device, const ShaderCacheEntry* entry, bool vertex) {
+  CompiledShader* Build(RenderDevice* device, const ShaderCacheEntry* entry, bool vertex, bool fetch_spec = false) {
     CompiledShader& compiled = compiled_[entry];
     if (compiled.module || compiled.failed) return compiled.failed ? nullptr : &compiled;
     const uint8_t* data = g_spirvCache + entry->spirvOffset;
@@ -366,6 +383,17 @@ class ShaderStore {
       return nullptr;
     }
     if (vertex) compiled.inputs = ReflectInputs(spirv);
+    if (fetch_spec) {
+      // The table starts after the loop constants in the cold block (set 4,
+      // binding 9), whose first entry sits right after the hot block.
+      std::vector<uint32_t> specialized = renut::SpecializeFetchTable(
+          spirv, 4, 9, (RENUT_SHARED_FETCH_OFFSET - RENUT_SHARED_HOT_SIZE) / 16, RENUT_LIVE_FETCH_COUNT,
+          kFetchSpecBase);
+      if (!specialized.empty()) {
+        compiled.fetch_spec_module =
+            device->createShader(specialized.data(), specialized.size() * 4, "main", RenderShaderFormat::SPIRV);
+      }
+    }
     return &compiled;
   }
 
@@ -788,6 +816,9 @@ struct Stats {
   // kept streams the guest wrote over.
   uint64_t kept_hits = 0, kept_bytes_made = 0, kept_drops = 0, kept_unwatchable = 0;
   uint64_t band_skipped = 0, band_moved = 0, band_widened = 0;
+  // Draws that waited in a window, the windows, and the pipeline changes
+  // those windows had in game order against the order they were recorded in.
+  uint64_t deferred_draws = 0, defer_windows = 0, defer_binds_before = 0, defer_binds_after = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -1213,7 +1244,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     if (bound_index_buffer_ == buffer && bound_index_format_ == format) return;
     // Vulkan binds an index buffer by offset alone; the size is not used.
     RenderIndexBufferView view(RenderBufferReference(buffer, 0), 0, format);
-    list_->setIndexBuffer(&view);
+    L()->setIndexBuffer(&view);
     bound_index_buffer_ = buffer;
     bound_index_format_ = format;
   }
@@ -1252,6 +1283,40 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void WriteTimestamp();
   void ReadTimestamps(uint32_t slot);
 
+  // Where the GPU's time goes, per (vertex, pixel) shader pair. Debug only:
+  // <files>/plume-pairprof holds "<mode> <frames>" and is consumed when read.
+  // The next `frames` frames get two timestamps around every draw - from before
+  // its state changes to after the draw call - and the sums per pair are
+  // written to <files>/plume-pairprof.txt once the last of them has been read
+  // back. Mode 1 stamps the top of the pipe, which reads the command
+  // processor's clock without waiting for the GPU: when the GPU is the
+  // bottleneck the processor stalls on whichever draw cannot be taken in, so
+  // the spans add up to throughput cost with the draws still overlapping. Mode
+  // 2 stamps the bottom, which drains the pipe at both ends and so measures each
+  // draw alone, latency included. The per-pass timestamps above are separate.
+  static constexpr uint32_t kPairQueries = 32768;  // per slot: two per draw
+  VkQueryPool pair_pool_ = VK_NULL_HANDLE;
+  struct PairMark {
+    uint64_t vs = 0, ps = 0;
+    uint32_t count = 0;
+    uint8_t colors = 0, depth = 0, kind = 0, switched = 0;
+  };
+  std::array<std::vector<PairMark>, kPlumeFramesInFlight> pair_marks_;
+  std::array<uint32_t, kPlumeFramesInFlight> pair_count_{};
+  std::array<bool, kPlumeFramesInFlight> pair_pending_{};
+  struct PairTotal {
+    uint64_t ns = 0, draws = 0, vertices = 0, switches = 0;
+    uint8_t colors = 0, depth = 0;
+  };
+  std::map<std::pair<uint64_t, uint64_t>, PairTotal> pair_totals_;
+  uint32_t pairprof_mode_ = 0, pairprof_frames_left_ = 0;
+  bool pair_capture_ = false;
+  uint32_t pair_used_ = 0, pair_frames_ = 0;
+  uint64_t pair_span_ns_ = 0, pair_gap_ns_ = 0, pair_frame_ns_ = 0;
+  void PairStamp();
+  void ReadPairTimestamps(uint32_t slot);
+  void WritePairReport();
+
   std::array<std::unique_ptr<RenderCommandList>, kPlumeFramesInFlight> lists_;
   RenderCommandList* list_ = nullptr;
   uint32_t slot_ = kPlumeFramesInFlight - 1;
@@ -1265,6 +1330,62 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   const RenderPipeline* bound_pipeline_ = nullptr;
   uint64_t bound_interface_key_ = 0;
   bool state_bound_ = false;
+
+  // Deferred draws. IssueDraw gathers what the Vulkan calls of a draw need into
+  // a packet. A draw that cannot change the picture when it is reordered
+  // against its neighbours waits in a window, and the window is recorded
+  // grouped by pipeline when it closes, so that the GPU swaps programs once per
+  // group instead of once per draw. Everything else that records into the list
+  // goes through L(), which closes the window first, so the command stream
+  // differs from the immediate one only inside a window and nothing is ever
+  // recorded after a barrier, copy or clear it used to precede.
+  struct DeferredSlot {
+    RenderInputSlot slot;
+    RenderVertexBufferView view;
+  };
+  struct DrawPacket {
+    enum class Kind : uint8_t { kNone, kIndexed, kPatch, kPlain };
+    RenderFramebuffer* framebuffer = nullptr;
+    uint32_t pass_colors = 0;
+    bool pass_depth = false;
+    RenderPipeline* pipeline = nullptr;
+    uint64_t interface_key = 0;
+    bool blend_constants = false;
+    bool stencil = false;
+    float blend_factor[4] = {};
+    uint32_t stencil_ref = 0, stencil_mask = 0, stencil_write_mask = 0;
+    uint64_t push[3] = {};
+    uint32_t constant_offsets[kConstantBindings] = {};
+    RenderViewport viewport;
+    RenderRect scissor;
+    uint32_t first_slot = 0, slot_count = 0;
+    Kind kind = Kind::kNone;
+    RenderBuffer* index_buffer = nullptr;
+    RenderFormat index_format = RenderFormat::R16_UINT;
+    uint32_t count = 0, first = 0;
+    int32_t base_vertex = 0;
+    // Only for the pair profile.
+    uint64_t vs_hash = 0, ps_hash = 0;
+  };
+  bool PairBegin(const DrawPacket& pk);
+  static constexpr size_t kMaxDeferred = 384;
+  std::vector<DrawPacket> deferred_, flushing_;
+  std::vector<DeferredSlot> deferred_slots_, flushing_slots_, draw_slots_;
+  std::vector<uint32_t> defer_order_, defer_group_start_;
+  std::unordered_map<const RenderPipeline*, uint32_t> defer_groups_;
+  uint64_t deferred_signature_ = 0;
+  uint32_t defer_mode_ = 1;
+  // files/plume-fetchspec (or the cvar): 1 hands the live fetch table to the
+  // driver as specialization constants. Part of the pipeline key, so a change
+  // builds the pipelines of the shaders it touches afresh.
+  uint32_t fetch_spec_mode_ = 1;
+  void FlushDeferred();
+  void EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count);
+  // The command list, after recording any draws that are waiting.
+  RenderCommandList* L() {
+    if (!deferred_.empty()) FlushDeferred();
+    return list_;
+  }
 
   std::unordered_map<uint64_t, Target> targets_;
   std::unordered_map<uint64_t, std::unique_ptr<RenderFramebuffer>> framebuffers_;
@@ -1524,9 +1645,16 @@ bool PlumeCommandProcessor::SetupContext() {
       timestamp_pool_ = VK_NULL_HANDLE;
       REXLOG_WARN("Renut: Plume timestamp queries unavailable; no per-pass GPU time");
     }
+    info.queryCount = kPairQueries * kPlumeFramesInFlight;
+    if (timestamp_pool_ == VK_NULL_HANDLE ||
+        vkCreateQueryPool(vulkan_device->vk, &info, nullptr, &pair_pool_) != VK_SUCCESS) {
+      pair_pool_ = VK_NULL_HANDLE;
+    }
   }
   for (auto& list : lists_) list = queue_->createCommandList();
   list_ = lists_[0].get();
+  defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
+  fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
   fence_ = device_->createCommandFence();
 
   // Fallback textures: opaque white, for every slot without a texture yet.
@@ -1558,8 +1686,8 @@ bool PlumeCommandProcessor::SetupContext() {
   std::memset(Pointer(zero_offset_), 0, 64);
   // Everything after these belongs to a frame's slice.
   slice_origin_ = (upload_used_ + 255) & ~255ull;
-  list_->begin();
-  list_->barriers(RenderBarrierStage::COPY,
+  L()->begin();
+  L()->barriers(RenderBarrierStage::COPY,
                   std::array{RenderTextureBarrier(white_2d_.get(), RenderTextureLayout::COPY_DEST),
                              RenderTextureBarrier(white_3d_.get(), RenderTextureLayout::COPY_DEST),
                              RenderTextureBarrier(white_cube_.get(), RenderTextureLayout::COPY_DEST)}
@@ -1567,18 +1695,18 @@ bool PlumeCommandProcessor::SetupContext() {
                   3);
   auto footprint = RenderTextureCopyLocation::PlacedFootprint(upload_.get(), RenderFormat::R8G8B8A8_UNORM,
                                                               1, 1, 1, 64, white);
-  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_2d_.get()), footprint);
-  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_3d_.get()), footprint);
+  L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_2d_.get()), footprint);
+  L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_3d_.get()), footprint);
   for (uint32_t face = 0; face < 6; ++face) {
-    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_cube_.get(), 0, face), footprint);
+    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_cube_.get(), 0, face), footprint);
   }
-  list_->barriers(RenderBarrierStage::GRAPHICS,
+  L()->barriers(RenderBarrierStage::GRAPHICS,
                   std::array{RenderTextureBarrier(white_2d_.get(), RenderTextureLayout::SHADER_READ),
                              RenderTextureBarrier(white_3d_.get(), RenderTextureLayout::SHADER_READ),
                              RenderTextureBarrier(white_cube_.get(), RenderTextureLayout::SHADER_READ)}
                       .data(),
                   3);
-  list_->end();
+  L()->end();
   const RenderCommandList* lists = list_;
   queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
   queue_->waitForCommandFence(fence_.get());
@@ -1603,7 +1731,7 @@ bool PlumeCommandProcessor::SetupContext() {
 void PlumeCommandProcessor::ShutdownContext() {
   StopPipelineWorker();
   if (list_open_) {
-    list_->end();
+    L()->end();
     list_open_ = false;
   }
   // Frames may still be running; nothing below may be freed under them.
@@ -1632,6 +1760,10 @@ void PlumeCommandProcessor::ShutdownContext() {
   if (timestamp_pool_ != VK_NULL_HANDLE) {
     vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_, nullptr);
     timestamp_pool_ = VK_NULL_HANDLE;
+  }
+  if (pair_pool_ != VK_NULL_HANDLE) {
+    vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, pair_pool_, nullptr);
+    pair_pool_ = VK_NULL_HANDLE;
   }
   if (upload_) upload_->unmap();
   upload_.reset();
@@ -1881,7 +2013,7 @@ bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::
 // that follow, and earlier fetches before later stores. It has to end the
 // render pass; the pass reopens on the same framebuffer at the next draw.
 void PlumeCommandProcessor::ExportBarrier() {
-  auto* vulkan = static_cast<VulkanCommandList*>(list_);
+  auto* vulkan = static_cast<VulkanCommandList*>(L());
   vulkan->endActiveRenderPass();
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1938,14 +2070,14 @@ PlumeCommandProcessor::ExportRange* PlumeCommandProcessor::GetExport(uint32_t ba
   bool pending = false;
   for (uint32_t key : merged) pending |= exports_[key].written;
   if (pending) ExportBarrier();
-  list_->copyBufferRegion(RenderBufferReference(fresh.buffer.get(), 0),
+  L()->copyBufferRegion(RenderBufferReference(fresh.buffer.get(), 0),
                           RenderBufferReference(upload_.get(), offset), fresh.size);
   if (!merged.empty()) {
     // The guest's bytes first, then what the GPU wrote over them.
     ExportBarrier();
     for (uint32_t key : merged) {
       ExportRange& old = exports_[key];
-      list_->copyBufferRegion(RenderBufferReference(fresh.buffer.get(), old.base - lo),
+      L()->copyBufferRegion(RenderBufferReference(fresh.buffer.get(), old.base - lo),
                               RenderBufferReference(old.buffer.get(), 0), old.size);
       retired_buffers_[slot_].push_back(std::move(old.buffer));
       exports_.erase(key);
@@ -1985,7 +2117,7 @@ void PlumeCommandProcessor::RecordWritebacks() {
   uint64_t at = 0;
   for (const auto& [key, range] : exports_) {
     if (range.exported_frame != swaps_) continue;
-    list_->copyBufferRegion(RenderBufferReference(writeback_buffers_[slot_].get(), at),
+    L()->copyBufferRegion(RenderBufferReference(writeback_buffers_[slot_].get(), at),
                             RenderBufferReference(range.buffer.get(), 0), range.size);
     list.push_back({range.base, range.size, at, range.buffer.get()});
     at += range.size;
@@ -2048,7 +2180,7 @@ void PlumeCommandProcessor::RefreshExport(ExportRange& range) {
     const uint64_t offset = Allocate(end - at, 256);
     if (offset == UINT64_MAX) break;
     CopySwapped(Pointer(offset), memory + at, end - at, range.endian);
-    list_->copyBufferRegion(RenderBufferReference(range.buffer.get(), at),
+    L()->copyBufferRegion(RenderBufferReference(range.buffer.get(), at),
                             RenderBufferReference(upload_.get(), offset), end - at);
     std::memcpy(range.snapshot.data() + at, memory + at, end - at);
     at = end;
@@ -2120,7 +2252,7 @@ bool PlumeCommandProcessor::BindStream(uint32_t address, uint32_t size, xenos::E
   for (ExportRange* range : overlapping) {
     const uint32_t lo = std::max(address, range->base);
     const uint32_t hi = std::min(address + size, range->base + range->size);
-    list_->copyBufferRegion(RenderBufferReference(upload_.get(), offset + (lo - address)),
+    L()->copyBufferRegion(RenderBufferReference(upload_.get(), offset + (lo - address)),
                             RenderBufferReference(range->buffer.get(), lo - range->base), hi - lo);
   }
   ExportBarrier();
@@ -2244,7 +2376,7 @@ void PlumeCommandProcessor::WriteTimestamp() {
       timestamps_used_ >= kMaxTimestamps) {
     return;
   }
-  vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(list_)->vk,
+  vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(L())->vk,
                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
                       slot_ * kMaxTimestamps + timestamps_used_);
   ++timestamps_used_;
@@ -2283,6 +2415,147 @@ void PlumeCommandProcessor::ReadTimestamps(uint32_t slot) {
     total.passes += 1;
     total.draws += draws;
   }
+}
+
+// A profiled draw's entry and its first timestamp. False when the frame has no
+// room for another pair, in which case the draw simply goes unmeasured.
+bool PlumeCommandProcessor::PairBegin(const DrawPacket& pk) {
+  if (pair_used_ + 2 > kPairQueries) return false;
+  PairMark mark;
+  mark.vs = pk.vs_hash;
+  mark.ps = pk.ps_hash;
+  mark.count = pk.count;
+  mark.colors = uint8_t(pk.pass_colors);
+  mark.depth = pk.pass_depth ? 1 : 0;
+  mark.kind = uint8_t(pk.kind);
+  mark.switched = bound_pipeline_ != pk.pipeline ? 1 : 0;
+  pair_marks_[slot_].push_back(mark);
+  PairStamp();
+  return true;
+}
+
+void PlumeCommandProcessor::PairStamp() {
+  vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(list_)->vk,
+                      pairprof_mode_ == 2 ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                                          : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                      pair_pool_, slot_ * kPairQueries + pair_used_);
+  ++pair_used_;
+}
+
+// Folds a captured frame into the per-pair sums, and writes the report once the
+// last frame of the capture has been read.
+void PlumeCommandProcessor::ReadPairTimestamps(uint32_t slot) {
+  if (!pair_pending_[slot]) return;
+  pair_pending_[slot] = false;
+  const uint32_t count = pair_count_[slot];
+  pair_count_[slot] = 0;
+  const auto& marks = pair_marks_[slot];
+  if (pair_pool_ != VK_NULL_HANDLE && count >= 2 && marks.size() * 2 == count) {
+    std::vector<uint64_t> ticks(count);
+    if (vkGetQueryPoolResults(static_cast<VulkanDevice*>(device_)->vk, pair_pool_, slot * kPairQueries, count,
+                              count * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+      auto ns = [&](uint64_t from, uint64_t to) {
+        return to > from ? uint64_t(double(to - from) * timestamp_ns_) : uint64_t(0);
+      };
+      for (size_t i = 0; i < marks.size(); ++i) {
+        const PairMark& m = marks[i];
+        const uint64_t span = ns(ticks[2 * i], ticks[2 * i + 1]);
+        PairTotal& total = pair_totals_[{m.vs, m.ps}];
+        total.ns += span;
+        ++total.draws;
+        total.vertices += m.count;
+        total.switches += m.switched;
+        total.colors = m.colors;
+        total.depth = m.depth;
+        pair_span_ns_ += span;
+        if (i + 1 < marks.size()) pair_gap_ns_ += ns(ticks[2 * i + 1], ticks[2 * i + 2]);
+      }
+      pair_frame_ns_ += ns(ticks[0], ticks[count - 1]);
+      ++pair_frames_;
+    }
+  }
+  if (pairprof_frames_left_ == 0 && std::none_of(pair_pending_.begin(), pair_pending_.end(), [](bool p) { return p; })) {
+    WritePairReport();
+  }
+}
+
+void PlumeCommandProcessor::WritePairReport() {
+  const uint32_t frames = pair_frames_;
+  const uint32_t mode = pairprof_mode_;
+  const uint64_t span_ns = pair_span_ns_, gap_ns = pair_gap_ns_, frame_ns = pair_frame_ns_;
+  std::map<std::pair<uint64_t, uint64_t>, PairTotal> totals;
+  totals.swap(pair_totals_);
+  pair_frames_ = 0;
+  pair_span_ns_ = pair_gap_ns_ = pair_frame_ns_ = 0;
+  if (!frames || miss_dump_directory_.empty()) return;
+  const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+
+  struct Row {
+    uint64_t vs, ps;
+    PairTotal total;
+  };
+  std::vector<Row> rows;
+  PairTotal depth_only, colour;
+  for (const auto& [key, total] : totals) {
+    rows.push_back({key.first, key.second, total});
+    PairTotal& into = total.colors ? colour : depth_only;
+    into.ns += total.ns;
+    into.draws += total.draws;
+    into.switches += total.switches;
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.total.ns > b.total.ns; });
+  const double per = 1.0 / double(frames);
+  const double all = span_ns ? double(span_ns) : 1.0;
+  auto us = [&](uint64_t ns) { return double(ns) / 1000.0 * per; };
+  auto pct = [&](uint64_t ns) { return 100.0 * double(ns) / all; };
+
+  std::string out;
+  out += fmt::format("# plume-pairprof mode {} ({}), {} frames, {} pairs, timestamp period {:.2f} ns\n", mode,
+                     mode == 2 ? "bottom of pipe: each draw alone" : "top of pipe: command processor clock",
+                     frames, rows.size(), timestamp_ns_);
+  uint64_t draws = depth_only.draws + colour.draws;
+  out += fmt::format("# per frame: {:.0f} draws, spans {:.0f} us, between draws {:.0f} us, first stamp to last {:.0f} us\n",
+                     double(draws) * per, us(span_ns), us(gap_ns), us(frame_ns));
+  out += fmt::format("# depth-only: {:.0f} draws {:.0f} us ({:.1f}%, {:.0f}% switch pipeline) | colour: {:.0f} draws {:.0f} us ({:.1f}%, {:.0f}% switch)\n",
+                     double(depth_only.draws) * per, us(depth_only.ns), pct(depth_only.ns),
+                     depth_only.draws ? 100.0 * double(depth_only.switches) / double(depth_only.draws) : 0.0,
+                     double(colour.draws) * per, us(colour.ns), pct(colour.ns),
+                     colour.draws ? 100.0 * double(colour.switches) / double(colour.draws) : 0.0);
+  out += "# rank    pct   us/frame  draws/frame  avg_us  avg_verts  switch%  c d  vs               ps\n";
+  const size_t shown = std::min<size_t>(rows.size(), 150);
+  for (size_t i = 0; i < shown; ++i) {
+    const Row& r = rows[i];
+    const PairTotal& t = r.total;
+    out += fmt::format("{:5d} {:6.2f} {:10.1f} {:11.2f} {:7.2f} {:10.0f} {:7.0f}  {} {}  {:016X} {:016X}\n", i + 1,
+                       pct(t.ns), us(t.ns), double(t.draws) * per, double(t.ns) / 1000.0 / double(t.draws),
+                       double(t.vertices) / double(t.draws), 100.0 * double(t.switches) / double(t.draws),
+                       t.colors, t.depth, r.vs, r.ps);
+  }
+  for (int side = 0; side < 2; ++side) {
+    std::map<uint64_t, PairTotal> by;
+    for (const Row& r : rows) {
+      PairTotal& into = by[side == 0 ? r.vs : r.ps];
+      into.ns += r.total.ns;
+      into.draws += r.total.draws;
+      into.vertices += r.total.vertices;
+      into.switches += r.total.switches;
+    }
+    std::vector<std::pair<uint64_t, PairTotal>> ranked(by.begin(), by.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    out += fmt::format("# by {} shader ({} of them)\n", side == 0 ? "vertex" : "pixel", ranked.size());
+    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 40); ++i) {
+      const PairTotal& t = ranked[i].second;
+      out += fmt::format("{:5d} {:6.2f} {:10.1f} {:11.2f} {:7.2f}  {:016X}\n", i + 1, pct(t.ns), us(t.ns),
+                         double(t.draws) * per, double(t.ns) / 1000.0 / double(t.draws), ranked[i].first);
+    }
+  }
+  if (FILE* file = std::fopen((root + "/plume-pairprof.txt").c_str(), "w")) {
+    std::fwrite(out.data(), 1, out.size(), file);
+    std::fclose(file);
+  }
+  REXLOG_INFO("Renut: Plume pair profile written: {} frames, {} pairs, {:.0f} draws a frame", frames, rows.size(),
+              double(draws) * per);
 }
 
 // Moves to the next frame in flight and opens its command list. Waiting here,
@@ -2372,6 +2645,7 @@ void PlumeCommandProcessor::BeginFrame() {
                                       std::chrono::steady_clock::now() - wait_start)
                                       .count());
   ReadTimestamps(slot_);
+  ReadPairTimestamps(slot_);
   ApplyWritebacks(slot_);
   list_ = lists_[slot_].get();
   slice_base_ = slice_origin_ + uint64_t(slot_) * kUploadSize;
@@ -2404,9 +2678,18 @@ void PlumeCommandProcessor::BeginFrame() {
   pass_marks_[slot_].clear();
   timestamps_used_ = 0;
   if (timestamp_pool_ != VK_NULL_HANDLE) {
-    vkCmdResetQueryPool(static_cast<VulkanCommandList*>(list_)->vk, timestamp_pool_,
+    vkCmdResetQueryPool(static_cast<VulkanCommandList*>(L())->vk, timestamp_pool_,
                         slot_ * kMaxTimestamps, kMaxTimestamps);
     WriteTimestamp();
+  }
+  pair_capture_ = false;
+  pair_used_ = 0;
+  pair_marks_[slot_].clear();
+  if (pair_pool_ != VK_NULL_HANDLE && pairprof_frames_left_ > 0) {
+    vkCmdResetQueryPool(static_cast<VulkanCommandList*>(L())->vk, pair_pool_, slot_ * kPairQueries,
+                        kPairQueries);
+    pair_capture_ = true;
+    --pairprof_frames_left_;
   }
 }
 
@@ -2427,7 +2710,7 @@ void PlumeCommandProcessor::StartList() {
   bound_vertex_buffers_.fill(VertexBinding{});
   bound_index_buffer_ = nullptr;
   bound_index_format_ = RenderFormat::UNKNOWN;
-  list_->begin();
+  L()->begin();
   list_open_ = true;
   bound_framebuffer_ = nullptr;
   bound_pipeline_ = nullptr;
@@ -2441,7 +2724,7 @@ void PlumeCommandProcessor::StartList() {
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
   barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-  vkCmdPipelineBarrier(static_cast<VulkanCommandList*>(list_)->vk,
+  vkCmdPipelineBarrier(static_cast<VulkanCommandList*>(L())->vk,
                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
                        &barrier, 0, nullptr, 0, nullptr);
 }
@@ -2449,8 +2732,9 @@ void PlumeCommandProcessor::StartList() {
 // Runs what was recorded so far and waits, to make room in the upload ring.
 // A full drain: the slice cannot be rewritten while any frame still reads it.
 void PlumeCommandProcessor::Flush() {
+  FlushDeferred();
   if (!list_open_) return;
-  list_->end();
+  L()->end();
   list_open_ = false;
   if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForAllSlots();
   const RenderCommandList* lists = list_;
@@ -2466,7 +2750,7 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
                                 layout == RenderTextureLayout::COPY_DEST)
                                    ? RenderBarrierStage::COPY
                                    : RenderBarrierStage::GRAPHICS;
-  list_->barriers(stages, RenderTextureBarrier(texture, layout));
+  L()->barriers(stages, RenderTextureBarrier(texture, layout));
   ++stats_.barriers;
   current = layout;
   // A barrier ends the render pass, so every layout change made while one is
@@ -2541,7 +2825,7 @@ void PlumeCommandProcessor::MergeResolvedTails(uint32_t address, Resolved& dest)
     Transition(tail.texture.get(), tail.layout, RenderTextureLayout::COPY_SOURCE);
     Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
     RenderBox box(0, 0, int32_t(tail.width), int32_t(tail.height), 0, 1);
-    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
+    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
         RenderTextureCopyLocation::Subresource(tail.texture.get()), 0, y, 0, &box);
     dest.generation += tail.generation;
     RetireSwizzled(tail);
@@ -2597,7 +2881,7 @@ uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint
     Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
     Transition(r.fitted.get(), r.fitted_layout, RenderTextureLayout::COPY_DEST);
     RenderBox box(0, 0, int32_t(width), int32_t(height), 0, 1);
-    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(r.fitted.get()),
+    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(r.fitted.get()),
                              RenderTextureCopyLocation::Subresource(r.texture.get()), 0, 0, 0, &box);
     r.fitted_generation = r.generation;
   }
@@ -2669,17 +2953,17 @@ RenderFramebuffer* PlumeCommandProcessor::GetFramebuffer(const std::array<Target
 
 void PlumeCommandProcessor::SetFramebuffer(RenderFramebuffer* framebuffer) {
   if (!state_bound_) {
-    list_->setGraphicsPipelineLayout(layout_.get());
-    list_->setGraphicsDescriptorSet(set_2d_.get(), 0);
-    list_->setGraphicsDescriptorSet(set_3d_.get(), 1);
-    list_->setGraphicsDescriptorSet(set_cube_.get(), 2);
-    list_->setGraphicsDescriptorSet(set_samplers_.get(), 3);
+    L()->setGraphicsPipelineLayout(layout_.get());
+    L()->setGraphicsDescriptorSet(set_2d_.get(), 0);
+    L()->setGraphicsDescriptorSet(set_3d_.get(), 1);
+    L()->setGraphicsDescriptorSet(set_cube_.get(), 2);
+    L()->setGraphicsDescriptorSet(set_samplers_.get(), 3);
     state_bound_ = true;
   }
   if (bound_framebuffer_ != framebuffer) {
     // setFramebuffer ends the pass that was open, and the next one starts at
     // the first draw, so the mark lands between the two.
-    list_->setFramebuffer(framebuffer);
+    L()->setFramebuffer(framebuffer);
     bound_framebuffer_ = framebuffer;
     ++stats_.passes;
     PassMark mark;
@@ -2882,7 +3166,7 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     const uint64_t staging = Allocate(uint64_t(w) * h * 4, 512);
     if (staging == UINT64_MAX) return 0;
     std::memcpy(Pointer(staging), rgba.data(), size_t(w) * h * 4);
-    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
+    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
                              RenderTextureCopyLocation::PlacedFootprint(
                                  upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, w, staging));
   }
@@ -3081,7 +3365,7 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
     const uint64_t staging = Allocate(uint64_t(w) * h * depth * 4, 512);
     if (staging == UINT64_MAX) return 0;
     std::memcpy(Pointer(staging), all[i].data(), all[i].size() * 4);
-    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), i),
+    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), i),
                              RenderTextureCopyLocation::PlacedFootprint(
                                  upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, depth, w,
                                  staging));
@@ -3158,7 +3442,7 @@ uint32_t PlumeCommandProcessor::GetGuestVolumeTexture(const xenos::xe_gpu_textur
   const uint64_t staging = Allocate(uint64_t(rgba.size()) * 4, 512);
   if (staging == UINT64_MAX) return 0;
   std::memcpy(Pointer(staging), rgba.data(), rgba.size() * 4);
-  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0),
+  L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0),
                            RenderTextureCopyLocation::PlacedFootprint(
                                upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, depth, width,
                                staging));
@@ -3233,7 +3517,7 @@ uint32_t PlumeCommandProcessor::GetGuestCubeTexture(const xenos::xe_gpu_texture_
     const uint64_t staging = Allocate(uint64_t(width) * height * 4, 512);
     if (staging == UINT64_MAX) return 0;
     std::memcpy(Pointer(staging), faces[face].data(), size_t(width) * height * 4);
-    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0, face),
+    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0, face),
                              RenderTextureCopyLocation::PlacedFootprint(
                                  upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, 1, width,
                                  staging));
@@ -3488,7 +3772,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     return true;
   }
   if (!color_pass) ps = nullptr;
-  if (!vs->compiled) vs->compiled = store_->Build(device_, vs->entry, true);
+  if (!vs->compiled) vs->compiled = store_->Build(device_, vs->entry, true, true);
   if (ps && !ps->compiled) ps->compiled = store_->Build(device_, ps->entry, false);
   if (!vs->compiled || (ps && !ps->compiled)) {
     ++stats_.bad_shader;
@@ -3533,7 +3817,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         vs->domain_decoded = true;
         vs->domain_entry = store_->FindDomain(vs->ucode_key, vs->loose_key);
         if (vs->domain_entry) {
-          vs->domain_compiled = store_->Build(device_, vs->domain_entry, false);
+          vs->domain_compiled = store_->Build(device_, vs->domain_entry, false, true);
           std::vector<LiveElement> unused;
           DecodeLiveElements(*vs, vs->domain_entry, unused, vs->domain_live_fetches);
         }
@@ -4360,6 +4644,19 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     const uint32_t value = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + word] & tested;
     if (value) spec_constants.emplace_back(RENUT_SPEC_BOOLS_BASE + word, value);
   }
+  // The live vertex fetch table, if the shader's module has a form that reads
+  // it from specialization constants (spirv_fetch_spec.h): what the table holds
+  // comes from the shader's own vfetch instructions, so it is the same on every
+  // draw that uses this shader and adds no pipelines of its own.
+  CompiledShader* vertex_compiled = patch_list ? vs->domain_compiled : vs->compiled;
+  const bool fetch_spec = fetch_spec_mode_ && vertex_compiled && vertex_compiled->fetch_spec_module;
+  if (fetch_spec) {
+    for (const auto& [slot, entry] : patch_list ? vs->domain_live_fetches : vs->live_fetches) {
+      for (uint32_t word = 0; word < 4; ++word) {
+        if (entry[word]) spec_constants.emplace_back(kFetchSpecBase + slot * 4 + word, entry[word]);
+      }
+    }
+  }
   // The pipeline key: the fields laid end to end and hashed once. Hashing
   // each field on its own was a few dozen XXH3 calls a draw.
   KeyBytes key_bytes;
@@ -4391,6 +4688,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     key_bytes.Put(c.index);
     key_bytes.Put(c.value);
   }
+  key_bytes.Put(uint8_t(fetch_spec));
   // Mode 8 swaps a point list's pixel shader for the sprite-coordinate view.
   const bool debug_point = debug_draw && (debug_mode_ & 8) && point_list && color_count;
   // Geometry-shader and patch draws keep their own: their stages expect the
@@ -4442,9 +4740,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (!pipeline) {
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = layout_.get();
-    desc.vertexShader = trivial_vs   ? debug_trivial_vs_.get()
-                        : patch_list ? vs->domain_compiled->module.get()
-                                     : vs->compiled->module.get();
+    desc.vertexShader = trivial_vs  ? debug_trivial_vs_.get()
+                        : fetch_spec ? vertex_compiled->fetch_spec_module.get()
+                                     : vertex_compiled->module.get();
     desc.geometryShader = rect_list ? rect_list_gs_.get() : point_list ? point_list_gs_.get() : nullptr;
     desc.pixelShader = debug_point  ? debug_point_fs_.get()
                        : trivial_fs ? debug_trivial_fs_.get()
@@ -4595,104 +4893,74 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     vertex_count = quads * 6;
   }
 
-  // Record.
+  // Record. What the Vulkan calls need goes into a packet first. A draw that
+  // cannot change the picture when it is reordered joins a window and is
+  // recorded, grouped by pipeline, when the window closes; any other draw
+  // closes the window and is recorded at once. Nothing from here on reads the
+  // register file for the draw's sake, so it can wait.
   RenderFramebuffer* framebuffer = GetFramebuffer(colors, color_count, depth);
   if (!framebuffer) {
     ++stats_.no_target;
     return true;
   }
-  SetFramebuffer(framebuffer);
-  // plume-skip bit 262144 keeps the bound pipeline whenever it can stand in
-  // for the draw's own (same attachments and vertex input): the picture is
-  // wrong, and what the GPU saves is the price of switching programs.
-  const bool keep_pipeline = (skip_mask_ & 262144) && bound_pipeline_ && interface_key == bound_interface_key_;
-  if (bound_pipeline_ != pipeline.get() && !keep_pipeline) {
-    list_->setPipeline(pipeline.get());
-    bound_pipeline_ = pipeline.get();
-    bound_interface_key_ = interface_key;
-    ++stats_.pipeline_binds;
-  }
+  DrawPacket pk;
+  pk.framebuffer = framebuffer;
+  pk.pass_colors = color_count_of_pass_;
+  pk.pass_depth = depth_of_pass_;
+  pk.pipeline = pipeline.get();
+  pk.interface_key = interface_key;
+  pk.vs_hash = vs->entry->hash;
+  pk.ps_hash = ps ? ps->entry->hash : 0;
   if (blend_constants) {
-    const float factor[4] = {regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
-                             regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
-    list_->setBlendFactor(factor);
+    pk.blend_constants = true;
+    pk.blend_factor[0] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED);
+    pk.blend_factor[1] = regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN);
+    pk.blend_factor[2] = regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE);
+    pk.blend_factor[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
   }
   if (stencil_enabled) {
-    list_->setStencilState(stencil_ref_mask.stencilref, stencil_ref_mask.stencilmask,
-                           stencil_ref_mask.stencilwritemask);
+    pk.stencil = true;
+    pk.stencil_ref = stencil_ref_mask.stencilref;
+    pk.stencil_mask = stencil_ref_mask.stencilmask;
+    pk.stencil_write_mask = stencil_ref_mask.stencilwritemask;
   }
   // Inactive fragment bindings still need a valid offset. Keep their values
   // uncommitted so the next draw with a fragment shader uploads them.
   const bool skip_ps_constants = !ps && shadow_native_constants_;
   const uint64_t unused_ps_offset = slice_base_;
-  const uint64_t push[3] = {Address(constant_offsets_[0][0]),
-                            Address(skip_ps_constants ? unused_ps_offset : constant_offsets_[1][0]),
-                            Address(shared_offset_)};
-  if (std::memcmp(push, pushed_constants_, sizeof(push)) != 0 &&
-      !((bind_skip_ & 2) && pushed_constants_[0] != UINT64_MAX)) {
-    list_->setGraphicsPushConstants(0, push, 0, sizeof(push));
-    std::memcpy(pushed_constants_, push, sizeof(push));
-  }
-  uint32_t constant_offsets[kConstantBindings];
+  pk.push[0] = Address(constant_offsets_[0][0]);
+  pk.push[1] = Address(skip_ps_constants ? unused_ps_offset : constant_offsets_[1][0]);
+  pk.push[2] = Address(shared_offset_);
   for (uint32_t stage = 0; stage < 2; ++stage) {
     for (uint32_t chunk = 0; chunk < kConstantChunks; ++chunk) {
-      constant_offsets[stage * kConstantChunks + chunk] =
+      pk.constant_offsets[stage * kConstantChunks + chunk] =
           uint32_t(stage == 1 && skip_ps_constants ? unused_ps_offset : constant_offsets_[stage][chunk]);
     }
   }
-  constant_offsets[kConstantBindings - 2] = uint32_t(shared_offset_);
-  constant_offsets[kConstantBindings - 1] = uint32_t(shared_cold_offset_);
-  if (std::memcmp(constant_offsets, bound_constant_offsets_, sizeof(constant_offsets)) != 0 &&
-      !((bind_skip_ & 1) && bound_constant_offsets_[0] != UINT32_MAX)) {
-    vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(list_)->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            static_cast<VulkanPipelineLayout*>(layout_.get())->vk, 4, 1, &constants_set_,
-                            kConstantBindings, constant_offsets);
-    std::memcpy(bound_constant_offsets_, constant_offsets, sizeof(constant_offsets));
-  }
-  // Dynamic state, vertex and index buffers are only set when they change:
-  // Plume passes each call straight to Vulkan, and Turnip re-emits the state
-  // behind every one of them at the next draw.
-  if (!viewport_bound_ || (std::memcmp(&viewport, &bound_viewport_, sizeof(viewport)) != 0 && !(bind_skip_ & 8))) {
-    list_->setViewports(&viewport, 1);
-    bound_viewport_ = viewport;
-    viewport_bound_ = true;
-  }
+  pk.constant_offsets[kConstantBindings - 2] = uint32_t(shared_offset_);
+  pk.constant_offsets[kConstantBindings - 1] = uint32_t(shared_cold_offset_);
+  pk.viewport = viewport;
   // plume-skip bit 8388608 scissors every draw to one pixel: vertex work and
   // binning stay, fragment work goes. What is left is the per-draw cost.
   if (skip_mask_ & 8388608) scissor_rect = RenderRect(0, 0, 1, 1);
-  if (!scissor_bound_ ||
-      (std::memcmp(&scissor_rect, &bound_scissor_, sizeof(scissor_rect)) != 0 && !(bind_skip_ & 8))) {
-    list_->setScissors(&scissor_rect, 1);
-    bound_scissor_ = scissor_rect;
-    scissor_bound_ = true;
-  }
+  pk.scissor = scissor_rect;
+  draw_slots_.clear();
   for (const auto& slot : input_slots) {
-    RenderVertexBufferView view;
+    DeferredSlot entry;
+    entry.slot = slot;
     if (patch_list) {
-      view = RenderVertexBufferView(RenderBufferReference(patch_grid->points.get(), 0),
-                                    patch_grid->patches * patch_grid->points_per_patch * 4 *
-                                        uint32_t(sizeof(float)));
+      entry.view = RenderVertexBufferView(RenderBufferReference(patch_grid->points.get(), 0),
+                                          patch_grid->patches * patch_grid->points_per_patch * 4 *
+                                              uint32_t(sizeof(float)));
     } else if (slot.index == kZeroBinding) {
-      view = RenderVertexBufferView(RenderBufferReference(upload_.get(), zero_offset_), 64);
+      entry.view = RenderVertexBufferView(RenderBufferReference(upload_.get(), zero_offset_), 64);
     } else {
-      view = RenderVertexBufferView(RenderBufferReference(slot_buffers[slot.index], slot_offsets[slot.index]),
-                                    slot_sizes[slot.index]);
+      entry.view = RenderVertexBufferView(RenderBufferReference(slot_buffers[slot.index], slot_offsets[slot.index]),
+                                          slot_sizes[slot.index]);
     }
-    VertexBinding& bound = bound_vertex_buffers_[slot.index];
-    if ((bound.buffer != view.buffer.ref || bound.offset != view.buffer.offset) &&
-        !((bind_skip_ & 4) && bound.buffer)) {
-      // Straight to Vulkan: Plume's wrapper goes through two thread_local
-      // vectors a call, which was ~4% of this thread at a call or two a draw.
-      if (const auto* vb = static_cast<const VulkanBuffer*>(view.buffer.ref)) {
-        const VkDeviceSize offset = view.buffer.offset;
-        vkCmdBindVertexBuffers(static_cast<VulkanCommandList*>(list_)->vk, slot.index, 1, &vb->vk, &offset);
-      } else {
-        list_->setVertexBuffers(slot.index, &view, 1, &slot);
-      }
-      bound.buffer = view.buffer.ref;
-      bound.offset = view.buffer.offset;
-    }
+    draw_slots_.push_back(entry);
   }
+  pk.slot_count = uint32_t(draw_slots_.size());
   const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
   if (trace_ && index_buffer == upload_.get()) {
     uint32_t lo = UINT32_MAX, hi = 0;
@@ -4750,24 +5018,219 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // per-draw state and setup stay, the vertex work goes.
   const uint32_t draw_count = (skip_mask_ & 2147483648u) ? std::min(vertex_count, 3u) : vertex_count;
   if (skip_mask_ & 1073741824) {
+    pk.kind = DrawPacket::Kind::kNone;
   } else if (indexed) {
     // The ring is bound whole and each draw starts at its own indices, which
     // Allocate aligns to 256 bytes - one binding for every draw of the list.
     const uint32_t index_size = index_format == RenderFormat::R32_UINT ? 4 : 2;
-    BindIndexBuffer(index_buffer, index_format);
-    list_->drawIndexedInstanced(draw_count, 1, uint32_t(index_offset / index_size), base_vertex, 0);
+    pk.kind = DrawPacket::Kind::kIndexed;
+    pk.index_buffer = index_buffer;
+    pk.index_format = index_format;
+    pk.count = draw_count;
+    pk.first = uint32_t(index_offset / index_size);
+    pk.base_vertex = base_vertex;
   } else if (patch_list) {
-    BindIndexBuffer(patch_grid->indices.get(), RenderFormat::R32_UINT);
-    list_->drawIndexedInstanced(draw_count, 1, 0, 0, 0);
+    pk.kind = DrawPacket::Kind::kPatch;
+    pk.index_buffer = patch_grid->indices.get();
+    pk.index_format = RenderFormat::R32_UINT;
+    pk.count = draw_count;
   } else {
-    list_->drawInstanced(draw_count, 1, uint32_t(std::max(base_vertex, 0)), 0);
+    pk.kind = DrawPacket::Kind::kPlain;
+    pk.count = draw_count;
+    pk.first = uint32_t(std::max(base_vertex, 0));
   }
-  ++stats_.drawn;
-  if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
+
+  // Which draws may wait. Two opaque draws that test and write depth in a
+  // strict direction leave the nearer fragment at every pixel whichever one is
+  // recorded first - only an exact depth tie could differ - provided they share
+  // what a passing fragment writes: the attachments, the colour mask and the
+  // depth and stencil state. Stencil reorders only when it never reads and
+  // writes on depth pass alone, since then the surviving value is the nearest
+  // surface's either way. Depth-only draws (the shadow maps) are exactly
+  // independent; with mode 2 opaque colour draws join them. Draws that
+  // export to memory, patches, merged bands and every debug switch stay in
+  // order.
+  bool defer = false;
+  uint64_t window_signature = 0;
+  if (defer_mode_ && !trace_ && !skip_mask_ && !bind_skip_ && !trivial_mode_ && !debug_draw && !patch_list &&
+      !merge_frame_ && !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && depth_write) {
+    const xenos::CompareFunction zf = depth_control.zfunc;
+    const bool strict = zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual ||
+                        zf == xenos::CompareFunction::kGreater || zf == xenos::CompareFunction::kGreaterEqual;
+    auto stencil_free = [](xenos::CompareFunction func, xenos::StencilOp fail, xenos::StencilOp zpass,
+                           xenos::StencilOp zfail) {
+      return func == xenos::CompareFunction::kAlways && fail == xenos::StencilOp::kKeep &&
+             zfail == xenos::StencilOp::kKeep &&
+             (zpass == xenos::StencilOp::kKeep || zpass == xenos::StencilOp::kZero ||
+              zpass == xenos::StencilOp::kReplace);
+    };
+    const bool stencil_ok =
+        !stencil_enabled ||
+        (stencil_free(depth_control.stencilfunc, depth_control.stencilfail, depth_control.stencilzpass,
+                      depth_control.stencilzfail) &&
+         (!depth_control.backface_enable ||
+          stencil_free(depth_control.stencilfunc_bf, depth_control.stencilfail_bf,
+                       depth_control.stencilzpass_bf, depth_control.stencilzfail_bf)));
+    bool opaque = true;
+    for (uint32_t i = 0; i < color_count; ++i) opaque = opaque && !blends[i].blendEnabled;
+    // A colour draw with a depth bias is a decal over geometry at the same depth,
+    // which is exactly where order decides: it stays in order. Shadow maps use
+    // a bias too, and do not care.
+    const bool biased = raster.poly_offset_front_enable || raster.poly_offset_back_enable;
+    defer = strict && stencil_ok && (!color_pass || (defer_mode_ >= 2 && opaque && !biased));
+    if (defer) {
+      HashCombine(window_signature, framebuffer);
+      HashCombine(window_signature, color_mask);
+      HashCombine(window_signature, uint32_t(depth_control.value));
+      HashCombine(window_signature, stencil_enabled ? uint32_t(stencil_ref_mask.stencilwritemask) : 0u);
+      HashCombine(window_signature, uint32_t(edram_mode));
+    }
+  }
+  if (defer) {
+    if (!deferred_.empty() && deferred_signature_ != window_signature) FlushDeferred();
+    deferred_signature_ = window_signature;
+    pk.first_slot = uint32_t(deferred_slots_.size());
+    deferred_slots_.insert(deferred_slots_.end(), draw_slots_.begin(), draw_slots_.end());
+    deferred_.push_back(pk);
+    ++stats_.deferred_draws;
+    if (deferred_.size() >= kMaxDeferred) FlushDeferred();
+    return true;
+  }
+  FlushDeferred();
+  EmitDraw(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
   return true;
 }
 
+// Records one packet: the pass, the pipeline and every piece of per-draw state
+// that differs from what the list already has bound, then the draw itself.
+void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
+  const bool pair_stamped = pair_capture_ && PairBegin(pk);
+  color_count_of_pass_ = pk.pass_colors;
+  depth_of_pass_ = pk.pass_depth;
+  SetFramebuffer(pk.framebuffer);
+  // plume-skip bit 262144 keeps the bound pipeline whenever it can stand in
+  // for the draw's own (same attachments and vertex input): the picture is
+  // wrong, and what the GPU saves is the price of switching programs.
+  const bool keep_pipeline = (skip_mask_ & 262144) && bound_pipeline_ && pk.interface_key == bound_interface_key_;
+  if (bound_pipeline_ != pk.pipeline && !keep_pipeline) {
+    L()->setPipeline(pk.pipeline);
+    bound_pipeline_ = pk.pipeline;
+    bound_interface_key_ = pk.interface_key;
+    ++stats_.pipeline_binds;
+  }
+  if (pk.blend_constants) L()->setBlendFactor(pk.blend_factor);
+  if (pk.stencil) L()->setStencilState(pk.stencil_ref, pk.stencil_mask, pk.stencil_write_mask);
+  if (std::memcmp(pk.push, pushed_constants_, sizeof(pk.push)) != 0 &&
+      !((bind_skip_ & 2) && pushed_constants_[0] != UINT64_MAX)) {
+    L()->setGraphicsPushConstants(0, pk.push, 0, sizeof(pk.push));
+    std::memcpy(pushed_constants_, pk.push, sizeof(pk.push));
+  }
+  if (std::memcmp(pk.constant_offsets, bound_constant_offsets_, sizeof(pk.constant_offsets)) != 0 &&
+      !((bind_skip_ & 1) && bound_constant_offsets_[0] != UINT32_MAX)) {
+    vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(L())->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            static_cast<VulkanPipelineLayout*>(layout_.get())->vk, 4, 1, &constants_set_,
+                            kConstantBindings, pk.constant_offsets);
+    std::memcpy(bound_constant_offsets_, pk.constant_offsets, sizeof(pk.constant_offsets));
+  }
+  // Dynamic state, vertex and index buffers are only set when they change:
+  // Plume passes each call straight to Vulkan, and Turnip re-emits the state
+  // behind every one of them at the next draw.
+  if (!viewport_bound_ ||
+      (std::memcmp(&pk.viewport, &bound_viewport_, sizeof(pk.viewport)) != 0 && !(bind_skip_ & 8))) {
+    L()->setViewports(&pk.viewport, 1);
+    bound_viewport_ = pk.viewport;
+    viewport_bound_ = true;
+  }
+  if (!scissor_bound_ ||
+      (std::memcmp(&pk.scissor, &bound_scissor_, sizeof(pk.scissor)) != 0 && !(bind_skip_ & 8))) {
+    L()->setScissors(&pk.scissor, 1);
+    bound_scissor_ = pk.scissor;
+    scissor_bound_ = true;
+  }
+  for (uint32_t i = 0; i < slot_count; ++i) {
+    const RenderInputSlot& slot = slots[i].slot;
+    const RenderVertexBufferView& view = slots[i].view;
+    VertexBinding& bound = bound_vertex_buffers_[slot.index];
+    if ((bound.buffer != view.buffer.ref || bound.offset != view.buffer.offset) &&
+        !((bind_skip_ & 4) && bound.buffer)) {
+      // Straight to Vulkan: Plume's wrapper goes through two thread_local
+      // vectors a call, which was ~4% of this thread at a call or two a draw.
+      if (const auto* vb = static_cast<const VulkanBuffer*>(view.buffer.ref)) {
+        const VkDeviceSize offset = view.buffer.offset;
+        vkCmdBindVertexBuffers(static_cast<VulkanCommandList*>(L())->vk, slot.index, 1, &vb->vk, &offset);
+      } else {
+        L()->setVertexBuffers(slot.index, &view, 1, &slot);
+      }
+      bound.buffer = view.buffer.ref;
+      bound.offset = view.buffer.offset;
+    }
+  }
+  switch (pk.kind) {
+    case DrawPacket::Kind::kNone: break;
+    case DrawPacket::Kind::kIndexed:
+      BindIndexBuffer(pk.index_buffer, pk.index_format);
+      L()->drawIndexedInstanced(pk.count, 1, pk.first, pk.base_vertex, 0);
+      break;
+    case DrawPacket::Kind::kPatch:
+      BindIndexBuffer(pk.index_buffer, pk.index_format);
+      L()->drawIndexedInstanced(pk.count, 1, 0, 0, 0);
+      break;
+    case DrawPacket::Kind::kPlain: L()->drawInstanced(pk.count, 1, pk.first, 0); break;
+  }
+  if (pair_stamped) PairStamp();
+  ++stats_.drawn;
+  if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
+}
+
+// Records the draws that are waiting, grouped by pipeline. The groups keep the
+// order in which each pipeline first appeared and the draws keep their order
+// inside a group, so a window whose draws share one pipeline is untouched.
+void PlumeCommandProcessor::FlushDeferred() {
+  if (deferred_.empty()) return;
+  // Taken out first: recording goes through L(), which must find nothing waiting.
+  flushing_.swap(deferred_);
+  flushing_slots_.swap(deferred_slots_);
+  deferred_.clear();
+  deferred_slots_.clear();
+  const size_t n = flushing_.size();
+  defer_order_.resize(n);
+  defer_groups_.clear();
+  defer_group_start_.clear();
+  uint32_t before = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const DrawPacket& pk = flushing_[i];
+    if (i == 0 || pk.pipeline != flushing_[i - 1].pipeline) ++before;
+    auto [it, fresh] = defer_groups_.try_emplace(pk.pipeline, uint32_t(defer_group_start_.size()));
+    if (fresh) defer_group_start_.push_back(0);
+    ++defer_group_start_[it->second];
+  }
+  // Counts to start positions, then each draw to its place.
+  uint32_t at = 0;
+  for (uint32_t& entry : defer_group_start_) {
+    const uint32_t count = entry;
+    entry = at;
+    at += count;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    defer_order_[defer_group_start_[defer_groups_[flushing_[i].pipeline]]++] = uint32_t(i);
+  }
+  uint32_t after = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (i == 0 || flushing_[defer_order_[i]].pipeline != flushing_[defer_order_[i - 1]].pipeline) ++after;
+  }
+  ++stats_.defer_windows;
+  stats_.defer_binds_before += before;
+  stats_.defer_binds_after += after;
+  for (size_t i = 0; i < n; ++i) {
+    const DrawPacket& pk = flushing_[defer_order_[i]];
+    EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
+  }
+  flushing_.clear();
+  flushing_slots_.clear();
+}
+
 bool PlumeCommandProcessor::IssueCopy() {
+  FlushDeferred();
   const gfx::RegisterFile& regs = *register_file_;
   draw_util::ResolveInfo info;
   if (!draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, info)) return true;
@@ -4888,7 +5351,7 @@ bool PlumeCommandProcessor::IssueCopy() {
       // but drops the copies themselves, colour and depth (see CopyDepth).
       if (!(skip_mask_ & 268435456)) {
         RenderBox box(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h), 0, 1);
-        list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
+        L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
                                  RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
                                  dest_y, 0, &box);
       }
@@ -4906,7 +5369,7 @@ bool PlumeCommandProcessor::IssueCopy() {
         if (snap_) {
           Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_SOURCE);
           Transition(snap_.get(), snap_layout_, RenderTextureLayout::COPY_DEST);
-          list_->copyTexture(snap_.get(), dest.texture.get());
+          L()->copyTexture(snap_.get(), dest.texture.get());
           snap_taken_ = true;
         }
       }
@@ -4937,7 +5400,7 @@ bool PlumeCommandProcessor::IssueCopy() {
       color = RenderColor(half(info.rb_color_clear >> 16), half(info.rb_color_clear & 0xFFFF),
                           half(info.rb_color_clear_lo >> 16), half(info.rb_color_clear_lo & 0xFFFF));
     }
-    list_->clearColor(0, color, &rect, 1);
+    L()->clearColor(0, color, &rect, 1);
     ++stats_.clears;
   }
   if (info.IsClearingDepth() && !skip_clears) {
@@ -4950,7 +5413,7 @@ bool PlumeCommandProcessor::IssueCopy() {
       std::array<Target*, 4> none{};
       SetFramebuffer(GetFramebuffer(none, 0, depth));
       const uint32_t d = info.rb_depth_clear;
-      list_->clearDepthStencil(true, true, float(d >> 8) / float(0xFFFFFF), d & 0xFF, &rect, 1);
+      L()->clearDepthStencil(true, true, float(d >> 8) / float(0xFFFFFF), d & 0xFF, &rect, 1);
       ++stats_.clears;
     }
   }
@@ -5009,14 +5472,14 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
   with_stencil = with_stencil && packed_staging_ && pack_pipeline_ != VK_NULL_HANDLE;
   // Always a barrier call, which also ends any open render pass before the
   // raw Vulkan commands below.
-  list_->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source.texture.get(), RenderTextureLayout::COPY_SOURCE));
+  L()->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source.texture.get(), RenderTextureLayout::COPY_SOURCE));
   ++stats_.barriers;
   source.layout = RenderTextureLayout::COPY_SOURCE;
   bound_framebuffer_ = nullptr;
   // plume-skip bit 536870912 keeps that barrier and drops the round trip
   // through the staging buffer, to price it; 268435456 drops every copy.
   if (skip_mask_ & (268435456 | 536870912)) return true;
-  VkCommandBuffer cb = static_cast<VulkanCommandList*>(list_)->vk;
+  VkCommandBuffer cb = static_cast<VulkanCommandList*>(L())->vk;
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
   barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -5052,7 +5515,7 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier,
                          0, nullptr, 0, nullptr);
-    list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest),
+    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest),
                              RenderTextureCopyLocation::PlacedFootprint(packed_staging_.get(),
                                                                         RenderFormat::R32G32_FLOAT, w, h, 1, w),
                              dest_x, dest_y);
@@ -5062,7 +5525,7 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
   barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
                        nullptr, 0, nullptr);
-  list_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest),
+  L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest),
                            RenderTextureCopyLocation::PlacedFootprint(depth_staging_.get(),
                                                                       RenderFormat::R32_FLOAT, w, h, 1, w),
                            dest_x, dest_y);
@@ -5070,6 +5533,7 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
 }
 
 void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
+  FlushDeferred();
   const gfx::RegisterFile& regs = *register_file_;
   // The rectangle's first vertex: float3 position (z is the clear depth) and
   // float4 colour, 28 bytes, through vertex fetch constant 0.
@@ -5143,7 +5607,7 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
       std::array<Target*, 4> colors{target};
       SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
       const RenderRect rect(0, 0, int32_t(target->width), int32_t(target->height));
-      list_->clearColor(0, RenderColor(v[3], v[4], v[5], v[6]), &rect, 1);
+      L()->clearColor(0, RenderColor(v[3], v[4], v[5], v[6]), &rect, 1);
     }
   }
   const auto depth_control = draw_util::GetNormalizedDepthControl(regs);
@@ -5167,7 +5631,7 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
       std::array<Target*, 4> none{};
       SetFramebuffer(GetFramebuffer(none, 0, depth));
       const RenderRect rect(0, 0, int32_t(depth->width), int32_t(depth->height));
-      list_->clearDepthStencil(clear_depth, clear_stencil, std::clamp(v[2], 0.f, 1.f),
+      L()->clearDepthStencil(clear_depth, clear_stencil, std::clamp(v[2], 0.f, 1.f),
                                regs.Get<reg::RB_STENCILREFMASK>().stencilref, &rect, 1);
     }
   }
@@ -5196,6 +5660,7 @@ void PlumeCommandProcessor::FlushImagesForNextFrame() {
 void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
+  FlushDeferred();
   // Before anything is picked for presenting: the one that is moves on to
   // COPY_SOURCE below, which is a transition of its own.
   FlushImagesForNextFrame();
@@ -5219,7 +5684,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       snap_dump_row_ = (snap_width_ + 63) & ~63u;
       snap_dump_ = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(snap_dump_row_) * snap_height_ * 4));
       if (snap_dump_) {
-        list_->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(snap_dump_.get(), snap_format_, snap_width_,
+        L()->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(snap_dump_.get(), snap_format_, snap_width_,
                                                                             snap_height_, 1, snap_dump_row_),
                                  RenderTextureCopyLocation::Subresource(snap_.get()));
         snap_dump = true;
@@ -5241,7 +5706,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       ExportBarrier();
       uint64_t at = 0;
       for (const auto& [key, range] : exports_) {
-        list_->copyBufferRegion(RenderBufferReference(export_dump.get(), at),
+        L()->copyBufferRegion(RenderBufferReference(export_dump.get(), at),
                                 RenderBufferReference(range.buffer.get(), 0), range.size);
         export_dump_at.emplace_back(at, &range);
         at += range.size;
@@ -5252,7 +5717,10 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // FlushImagesForNextFrame already closed any open pass with its barriers.
   WriteTimestamp();
   timestamp_count_[slot_] = timestamps_used_;
-  list_->end();
+  pair_count_[slot_] = pair_used_;
+  pair_pending_[slot_] = pair_capture_;
+  pair_capture_ = false;
+  L()->end();
   list_open_ = false;
   const auto submit_start = std::chrono::steady_clock::now();
   if (renderer) {
@@ -5417,6 +5885,46 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     if (bind_skip != bind_skip_) REXLOG_INFO("Renut: Plume bind skip {}", bind_skip);
     bind_skip_ = bind_skip;
+    {
+      int defer = std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2);
+      if (FILE* file = std::fopen((root + "/plume-defer").c_str(), "r")) {
+        int value = defer;
+        if (std::fscanf(file, "%d", &value) == 1) defer = std::clamp(value, 0, 2);
+        std::fclose(file);
+      }
+      if (uint32_t(defer) != defer_mode_) {
+        REXLOG_INFO("Renut: Plume deferred draws mode {} (0 off, 1 depth-only, 2 opaque colour too)", defer);
+      }
+      defer_mode_ = uint32_t(defer);
+    }
+    {
+      int fetch_spec = std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1);
+      if (FILE* file = std::fopen((root + "/plume-fetchspec").c_str(), "r")) {
+        int value = fetch_spec;
+        if (std::fscanf(file, "%d", &value) == 1) fetch_spec = std::clamp(value, 0, 1);
+        std::fclose(file);
+      }
+      if (uint32_t(fetch_spec) != fetch_spec_mode_) {
+        REXLOG_INFO("Renut: Plume live fetch table as specialization constants {}", fetch_spec ? "on" : "off");
+      }
+      fetch_spec_mode_ = uint32_t(fetch_spec);
+    }
+    // Arms a per-pair GPU profile of the next few frames (see PairBegin). The
+    // file is removed as it is read, so one write is one capture.
+    if (FILE* file = std::fopen((root + "/plume-pairprof").c_str(), "r")) {
+      int mode = 1, frames = 3;
+      const int read = std::fscanf(file, "%d %d", &mode, &frames);
+      std::fclose(file);
+      std::remove((root + "/plume-pairprof").c_str());
+      if (read >= 1 && mode >= 1 && pair_pool_ != VK_NULL_HANDLE && pairprof_frames_left_ == 0) {
+        pairprof_mode_ = uint32_t(std::min(mode, 2));
+        pairprof_frames_left_ = uint32_t(std::clamp(read >= 2 ? frames : 3, 1, 16));
+        pair_totals_.clear();
+        pair_frames_ = 0;
+        pair_span_ns_ = pair_gap_ns_ = pair_frame_ns_ = 0;
+        REXLOG_INFO("Renut: Plume pair profile: mode {}, {} frames", pairprof_mode_, pairprof_frames_left_);
+      }
+    }
     bool merge_bands = false;
     if (FILE* file = std::fopen((root + "/plume-merge-bands").c_str(), "r")) {
       int value = 0;
@@ -5596,6 +6104,11 @@ void PlumeCommandProcessor::Report() {
       stats_.constant_bytes >> 20, stats_.kept_hits, stats_.kept_bytes_made >> 20, stats_.kept_drops,
       stats_.kept_unwatchable, kept_bytes_ >> 20, kept_streams_.size(), stats_.band_skipped,
       stats_.band_moved, stats_.band_widened);
+  if (stats_.defer_windows) {
+    REXLOG_INFO("Renut: Plume deferred draws (mode {}): {} draws in {} windows, pipeline changes {} -> {}",
+                defer_mode_, stats_.deferred_draws, stats_.defer_windows, stats_.defer_binds_before,
+                stats_.defer_binds_after);
+  }
   // Keep what the driver compiled this interval, so the next run of this scene
   // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
   // shuts the process down cleanly, so waiting for the device's own save would
