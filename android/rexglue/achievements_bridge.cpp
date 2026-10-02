@@ -66,6 +66,14 @@ void notifyJava(uint32_t id) {
   }
 }
 
+void writeImage(const std::filesystem::path& path, const rex::system::util::XdbfBlock& image) {
+  std::error_code ec;
+  if (!image) return;
+  if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) == image.size) return;
+  std::ofstream(path, std::ios::binary | std::ios::trunc)
+      .write(reinterpret_cast<const char*>(image.buffer), std::streamsize(image.size));
+}
+
 void writeCatalog(rex::Runtime& runtime, const std::filesystem::path& directory) {
   auto* kernel = runtime.kernel_state();
   const auto achievements = kernel->loaded_achievements();
@@ -90,13 +98,11 @@ void writeCatalog(rex::Runtime& runtime, const std::filesystem::path& directory)
     appendJsonString(json, info.unachieved_description);
     json += '}';
     if (!database.is_valid()) continue;
-    const auto icon = database.GetEntry(rex::system::util::XdbfSection::kImage, info.image_id);
-    if (!icon) continue;
-    const auto path = directory / "icons" / fmt::format("{}.png", info.image_id);
-    if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) == icon.size) continue;
-    std::ofstream(path, std::ios::binary | std::ios::trunc)
-        .write(reinterpret_cast<const char*>(icon.buffer), std::streamsize(icon.size));
+    writeImage(directory / "icons" / fmt::format("{}.png", info.image_id),
+               database.GetEntry(rex::system::util::XdbfSection::kImage, info.image_id));
   }
+  // The game's own cover, for the launcher's play screen.
+  if (database.is_valid()) writeImage(directory / "title.png", database.icon());
   json += "]}";
   const auto temporary = directory / "catalog.json.tmp";
   {

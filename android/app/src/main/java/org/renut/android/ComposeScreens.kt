@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -24,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.asImageBitmap
@@ -85,16 +87,19 @@ object ComposeScreens {
         bottomBar = {
             NavigationBar(containerColor = Surface) {
                 NavigationBarItem(selected = page == 0, onClick = { page = 0 },
+                    icon = { Icon(Icons.Default.PlayArrow, null) }, label = { Text("Jogar") })
+                NavigationBarItem(selected = page == 1, onClick = { page = 1 },
                     icon = { Icon(Icons.Default.Folder, null) }, label = { Text("Saves") })
                 NavigationBarItem(selected = page == 2, onClick = { page = 2 },
                     icon = { Icon(Icons.Default.EmojiEvents, null) }, label = { Text("Conquistas") })
-                NavigationBarItem(selected = page == 1, onClick = { page = 1 },
+                NavigationBarItem(selected = page == 3, onClick = { page = 3 },
                     icon = { Icon(Icons.Default.Settings, null) }, label = { Text("Configurações") })
             }
         }
     ) { padding ->
         when (page) {
-            0 -> SaveScreen(activity, Modifier.padding(padding), tick)
+            0 -> PlayScreen(activity, Modifier.padding(padding), tick) { page = 2 }
+            1 -> SaveScreen(activity, Modifier.padding(padding), tick)
             2 -> AchievementsScreen(activity, Modifier.padding(padding), tick)
             else -> SettingsScreen(activity, Modifier.padding(padding), tick)
         }
@@ -125,6 +130,94 @@ object ComposeScreens {
                 ActionButton("Exportar saves (.zip)", !activity.uiBusy()) { activity.uiAction("Exportar saves (.zip)") }
                 ActionButton("Importar saves (.zip)", !activity.uiBusy(), outlined = true) { activity.uiAction("Importar saves (.zip)") }
                 Text("A importação pede confirmação antes de substituir arquivos existentes.", color = Muted, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable private fun PlayScreen(activity: MainActivity, modifier: Modifier, tick: Int, openAchievements: () -> Unit) {
+    @Suppress("UNUSED_VARIABLE") val update = tick
+    val state = activity.uiGameState()
+    val busy = activity.uiBusy()
+    val autoStart = activity.uiAutoStart()
+    val stamp = Achievements.stamp(activity.filesDir)
+    val progress by produceState<Achievements.Snapshot?>(null, stamp) {
+        value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
+    }
+    // Read from the game on its first launch; until then the card shows a placeholder.
+    val cover = remember(stamp) {
+        runCatching { BitmapFactory.decodeFile(java.io.File(activity.filesDir, "achievements/title.png").path)?.asImageBitmap() }.getOrNull()
+    }
+    LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item { Header("RENUT / JOGAR", "Pronto para jogar?", "Sua aventura continua de onde você parou.") }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = Color.Transparent), shape = RoundedCornerShape(24.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    Modifier.background(Brush.linearGradient(listOf(Color(0xFF4B301F), Color(0xFF241A14), Surface))).padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(18.dp)
+                ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(84.dp).clip(RoundedCornerShape(18.dp)).background(Color(0x33FF9B45)), contentAlignment = Alignment.Center) {
+                            if (cover != null) Image(cover, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            else Icon(Icons.Default.PlayArrow, null, tint = Accent, modifier = Modifier.size(40.dp))
+                        }
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Banjo-Kazooie", color = Text, fontWeight = FontWeight.Bold, fontSize = 24.sp)
+                            Text("Nuts & Bolts", color = Accent, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
+                            Text(when (state) {
+                                2 -> "Edição europeia · jogo completo"
+                                1 -> "Edição europeia · só o XEX importado"
+                                else -> "Nenhum arquivo importado"
+                            }, color = Muted, fontSize = 13.sp)
+                        }
+                    }
+                    Button(
+                        onClick = { activity.uiStartGame() }, enabled = state == 2 && !busy,
+                        modifier = Modifier.fillMaxWidth().height(60.dp), shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(28.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Jogar", fontWeight = FontWeight.Bold, fontSize = 19.sp)
+                    }
+                    if (state != 2) Text(
+                        if (state == 1) "Importe a imagem ISO completa para ter os arquivos que o jogo precisa."
+                        else "Importe a imagem ISO do jogo abaixo para começar.",
+                        color = Muted, fontSize = 13.sp)
+                    else Text("Experimental: o desempenho e a compatibilidade ainda estão em desenvolvimento.", color = Muted, fontSize = 12.sp)
+                }
+            }
+        }
+        progress?.let { data ->
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier.fillMaxWidth().clickable { openAchievements() }) {
+                    Row(Modifier.padding(18.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.EmojiEvents, null, tint = Accent, modifier = Modifier.size(32.dp))
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("${data.unlocked.size} de ${data.count()} conquistas", color = Text, fontWeight = FontWeight.SemiBold)
+                            LinearProgressIndicator(
+                                progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
+                                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                                color = Accent, trackColor = Color(0xFF3A3B3D))
+                        }
+                        Text("${data.earnedGamerscore} G", color = Accent, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+        item {
+            Panel("Ao abrir o app") {
+                ToggleRow("Iniciar direto no jogo", autoStart, !busy) { activity.uiSetAutoStart(it) }
+                Text("O jogo começa sem passar por esta tela. Para voltar aqui, saia do jogo pelo menu.", color = Muted, fontSize = 12.sp)
+            }
+        }
+        item {
+            Panel("Arquivos do jogo") {
+                ActionButton("Importar imagem ISO", !busy, outlined = true) { activity.uiAction("Importar imagem ISO") }
+                ActionButton("Importar apenas o XEX", !busy, outlined = true) { activity.uiAction("Importar apenas o XEX") }
+                if (busy) Text(activity.uiStatus(), color = Muted, fontSize = 13.sp, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                if (activity.uiCanCancel()) ActionButton("Cancelar importação", true, outlined = true) { activity.uiCancelImport() }
+                Text("A importação da ISO precisa de espaço livre para a imagem e os arquivos extraídos.", color = Muted, fontSize = 12.sp)
             }
         }
     }
@@ -194,7 +287,6 @@ object ComposeScreens {
 
 @Composable private fun SettingsScreen(activity: MainActivity, modifier: Modifier, tick: Int) {
     @Suppress("UNUSED_VARIABLE") val update = tick
-    val library = activity.uiLibrary()
     val driver = activity.uiDriver()
     val status = activity.uiStatus()
     val busy = activity.uiBusy()
@@ -202,7 +294,6 @@ object ComposeScreens {
     val fpsEnabled = activity.uiFpsEnabled()
     val msaaEnabled = activity.uiMsaaEnabled()
     val controlsEnabled = activity.uiShowControls()
-    val autoStartEnabled = activity.uiAutoStart()
     val oneUiEnabled = activity.uiOneUiEnabled()
     val tuMode = activity.uiTuMode()
     val ir3Mode = activity.uiIr3Mode()
@@ -211,16 +302,6 @@ object ComposeScreens {
     val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Header("RENUT / ANDROID", "Configurações", "Jogo, vídeo, controles e diagnóstico.") }
-        item {
-            Panel("Seu jogo") {
-                Text(library, color = Text)
-                ActionButton("Iniciar Banjo (experimental)", !busy) { activity.uiAction("Iniciar Banjo (experimental)") }
-                ToggleRow("Iniciar direto no jogo", autoStartEnabled, !busy) { activity.uiSetAutoStart(it) }
-                Text("Ao abrir o app, o jogo começa sem passar por esta tela. Para voltar aqui, saia do jogo pelo menu.", color = Muted, fontSize = 12.sp)
-                ActionButton("Importar imagem ISO", !busy, outlined = true) { activity.uiAction("Importar imagem ISO") }
-                ActionButton("Importar apenas o XEX", !busy, outlined = true) { activity.uiAction("Importar apenas o XEX") }
-            }
-        }
         item {
             Panel("Display") {
                 ToggleRow("Contador de FPS", fpsEnabled, !busy) { activity.uiSetFps(it) }

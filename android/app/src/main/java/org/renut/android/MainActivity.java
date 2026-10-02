@@ -148,6 +148,15 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             return !name.isEmpty()&&new File(getFilesDir(),name).isDirectory();
         }catch(IOException e){return false;}
     }
+    /** 0: nothing imported, 1: only the XEX, 2: the full disc, so the game can start. */
+    public int uiGameState(){
+        if(!hasGame())return 0;
+        try{
+            String name=new String(Files.readAllBytes(new File(getFilesDir(),"active-game.txt").toPath()),java.nio.charset.StandardCharsets.UTF_8).trim();
+            return new File(new File(getFilesDir(),name),"Bundle").isDirectory()?2:1;
+        }catch(IOException e){return 0;}
+    }
+    public void uiStartGame(){if(worker==null)startGame();}
     private void startGame(){
         Intent i=new Intent(this,RuntimeActivity.class).putExtra("launch",true);
         i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
