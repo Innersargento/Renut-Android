@@ -124,7 +124,23 @@ target_link_libraries(renut_guest PRIVATE rexruntime)
 # The recompiled game is the hot path: a profile of the boot stall put ~90% of
 # CPU inside two guest functions, so this target's level matters most.
 target_compile_options(renut_guest PRIVATE -O2 -g0 -Wno-unused-variable -Wno-unused-label)
-target_precompile_headers(renut_guest PRIVATE "${RENUT_ROOT}/generated/android/renut_android_pch.h")
+# The vector tables behind every lvx/stvx byte swap, copied verbatim out of the
+# SDK as read-only data (renut_simd_fast.h explains why). Taken from the header
+# rather than retyped, so an SDK update cannot leave a stale copy behind.
+file(READ "${REXGLUE_ROOT}/include/rex/ppc/intrinsics.h" RENUT_PPC_INTRINSICS)
+set(RENUT_VECTOR_TABLES "")
+foreach(table VectorMaskL VectorMaskR VectorShiftTableL VectorShiftTableR)
+    if(NOT RENUT_PPC_INTRINSICS MATCHES "inline uint8_t ${table}\\[\\] = \\{([^}]*)\\};")
+        message(FATAL_ERROR "rex/ppc/intrinsics.h no longer defines ${table} the way renut_simd_fast.h expects")
+    endif()
+    string(APPEND RENUT_VECTOR_TABLES "alignas(16) static const uint8_t renut_${table}[] = {${CMAKE_MATCH_1}};\n")
+endforeach()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/renut_vector_tables.inc" "${RENUT_VECTOR_TABLES}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${REXGLUE_ROOT}/include/rex/ppc/intrinsics.h")
+target_include_directories(renut_guest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+# The generated header, then the AArch64 forms of the SSE intrinsics the game
+# uses (clang scalarizes SIMDe's vector compares under -ffp-model=strict).
+target_precompile_headers(renut_guest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/renut_guest_pch.h")
 # Native Plume renderer: the offline-recompiled shaders (generated/shaders, from
 # tools/shaders/recompile_shaders.sh) are compiled in; their smol-v blob is
 # embedded with .incbin.
@@ -139,3 +155,11 @@ target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/androi
     "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/smolv")
 target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume adrenotools
     xxHash::xxhash android log dl)
+# Every call between recompiled guest functions, and to the __savegprlr/
+# __restgprlr helpers that each prologue and epilogue calls, went through a PLT
+# stub: they are weak, default-visibility functions of a shared library, so the
+# linker has to assume another library may preempt them. 23.8 thousand stubs,
+# up to three indirect jumps per guest call. Nothing outside this library takes
+# their place (the strong overrides in game_fixes.cpp are settled at link time),
+# so bind them locally and the calls become plain branches.
+target_link_options(renut_runtime PRIVATE -Wl,-Bsymbolic-functions)
