@@ -41,6 +41,19 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native void nativeExternalTrigger(int trigger,float value);
     private static native long nativeFrameCount();
     private TextView fps;
+    private AchievementToast achievementToast;
+    // The one game screen that is open: the native side reports unlocks through a static method.
+    private static volatile java.lang.ref.WeakReference<RuntimeActivity> current;
+    /** Called from the guest thread that wrote the achievement, once it is saved. */
+    public static void onAchievementUnlocked(int id){
+        RuntimeActivity activity=current==null?null:current.get();
+        if(activity==null)return;
+        activity.runOnUiThread(()->{
+            if(activity.isFinishing()||activity.achievementToast==null)return;
+            Achievements.Item item=Achievements.find(activity.getFilesDir(),id);
+            if(item!=null)activity.achievementToast.push(item);
+        });
+    }
     public int openContentFd(String uri, String mode) throws java.io.IOException {
         android.os.ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(android.net.Uri.parse(uri),mode);
         if(descriptor==null)throw new java.io.IOException("Arquivo indisponível.");
@@ -123,6 +136,9 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             gameMenu=ComposeScreens.createGameMenu(this);
             gameMenu.setVisibility(View.GONE);
             root.addView(gameMenu,new FrameLayout.LayoutParams(-1,-1));
+            achievementToast=new AchievementToast(this);
+            root.addView(achievementToast,AchievementToast.params(this));
+            current=new java.lang.ref.WeakReference<>(this);
             setContentView(root);
             return;
         }

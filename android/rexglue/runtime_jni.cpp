@@ -29,6 +29,10 @@
 using rex::X_STATUS;
 extern const rex::PPCImageInfo PPCImageConfig;
 void renutSetContentActivity(JNIEnv*, jobject);
+namespace renut {
+void AchievementsStart(JNIEnv*, jobject, rex::Runtime&, const std::filesystem::path&);
+void AchievementsStop(rex::Runtime&);
+}
 void renutConfigureXenosDriver(const std::string&,const std::string&,const std::string&,bool,const std::string&);
 // Own this entry point so the loader cannot resolve SDL's JNI_OnLoad through
 // our transitive dependencies. SDL is explicitly loaded/initialized by Java.
@@ -313,6 +317,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     status = runtime.LoadXexImage("game:\\default.xex");
     if (status != X_STATUS_SUCCESS) throw std::runtime_error(fmt::format("Carregamento XEX falhou: {:08X}", status));
     note("XEX carregado na memória do runtime.");
+    renut::AchievementsStart(env,activity,runtime,root);
     // Actual recompiled leaf: copies the byte at r3+61 to r4 and returns zero.
     // Scratch storage isolates the test from the loaded game image and saves.
     alignas(32) uint8_t scratch[128]{};
@@ -347,6 +352,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       game_context->ExecutePendingFunctionsFromUIThread();
     }
     if(graphics){validateSwap(runtime,*graphics);note(graphics->report());}
+    renut::AchievementsStop(runtime);
     runtime.Shutdown();
     if(auto* plume=renut::PlumeRenderer::Get()){note(plume->report());renut::PlumeRenderer::Stop();}
     note(launch?"Sessão experimental encerrada; consulte o log para verificar a renderização.":surface?"Ponte VdSwap → Plume validada com framebuffer de teste. As cenas e os shaders do jogo ainda não são renderizados.":

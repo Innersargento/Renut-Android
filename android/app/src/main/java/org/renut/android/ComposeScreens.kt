@@ -1,9 +1,11 @@
 package org.renut.android
 
 import android.app.Activity
+import android.graphics.BitmapFactory
 import android.view.SurfaceView
 import android.view.View
 import androidx.activity.ComponentActivity
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -12,20 +14,31 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import java.text.DateFormat
+import java.util.Date
 
 private val Background = Color(0xFF101113)
 private val Surface = Color(0xFF1C1E21)
@@ -73,13 +86,18 @@ object ComposeScreens {
             NavigationBar(containerColor = Surface) {
                 NavigationBarItem(selected = page == 0, onClick = { page = 0 },
                     icon = { Icon(Icons.Default.Folder, null) }, label = { Text("Saves") })
+                NavigationBarItem(selected = page == 2, onClick = { page = 2 },
+                    icon = { Icon(Icons.Default.EmojiEvents, null) }, label = { Text("Conquistas") })
                 NavigationBarItem(selected = page == 1, onClick = { page = 1 },
                     icon = { Icon(Icons.Default.Settings, null) }, label = { Text("Configurações") })
             }
         }
     ) { padding ->
-        if (page == 0) SaveScreen(activity, Modifier.padding(padding), tick)
-        else SettingsScreen(activity, Modifier.padding(padding), tick)
+        when (page) {
+            0 -> SaveScreen(activity, Modifier.padding(padding), tick)
+            2 -> AchievementsScreen(activity, Modifier.padding(padding), tick)
+            else -> SettingsScreen(activity, Modifier.padding(padding), tick)
+        }
     }
 }
 
@@ -108,6 +126,68 @@ object ComposeScreens {
                 ActionButton("Importar saves (.zip)", !activity.uiBusy(), outlined = true) { activity.uiAction("Importar saves (.zip)") }
                 Text("A importação pede confirmação antes de substituir arquivos existentes.", color = Muted, fontSize = 12.sp)
             }
+        }
+    }
+}
+
+@Composable private fun AchievementsScreen(activity: MainActivity, modifier: Modifier, tick: Int) {
+    // The runtime rewrites these files while the game runs; reload only when they change.
+    @Suppress("UNUSED_VARIABLE") val update = tick
+    val stamp = Achievements.stamp(activity.filesDir)
+    val loaded = remember { mutableStateOf(false) }
+    val snapshot by produceState<Achievements.Snapshot?>(null, stamp) {
+        value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
+        loaded.value = true
+    }
+    val data = snapshot
+    LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item { Header("CONQUISTAS", "Suas conquistas", "As conquistas desbloqueadas no jogo, neste aparelho.") }
+        if (data == null) {
+            if (loaded.value) item {
+                Panel("Ainda sem lista") {
+                    Text("A lista de conquistas é lida do seu jogo na primeira vez em que ele inicia. Abra o jogo uma vez e volte aqui.", color = Muted, fontSize = 14.sp)
+                }
+            }
+        } else {
+            item {
+                Panel("Progresso") {
+                    Text("${data.unlocked.size} de ${data.count()} desbloqueadas", color = Text, fontWeight = FontWeight.SemiBold)
+                    LinearProgressIndicator(
+                        progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
+                        modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                        color = Accent, trackColor = Color(0xFF3A3B3D))
+                    Text("${data.earnedGamerscore} de ${data.gamerscore} G", color = Muted, fontSize = 13.sp)
+                }
+            }
+            if (data.unlocked.isNotEmpty()) {
+                item { SectionTitle("Desbloqueadas") }
+                items(data.unlocked, key = { it.id }) { AchievementRow(it) }
+            }
+            if (data.locked.isNotEmpty()) {
+                item { SectionTitle("Bloqueadas") }
+                items(data.locked, key = { it.id }) { AchievementRow(it) }
+            }
+        }
+    }
+}
+
+@Composable private fun AchievementRow(item: Achievements.Item) {
+    val unlocked = item.unlocked()
+    val icon = remember(item.icon) { item.icon?.let { runCatching { BitmapFactory.decodeFile(it.path)?.asImageBitmap() }.getOrNull() } }
+    val gray = remember { ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(0f) }) }
+    Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(14.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(56.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFF34363A)).alpha(if (unlocked) 1f else 0.45f)) {
+                if (icon != null) Image(icon, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, colorFilter = if (unlocked) null else gray)
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(item.label, color = if (unlocked) Text else Muted, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text(item.shownDescription(), color = Muted, fontSize = 13.sp)
+                if (unlocked) Text(
+                    "Desbloqueada em " + DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(item.unlockedAt)),
+                    color = Accent, fontSize = 12.sp)
+            }
+            if (item.gamerscore > 0) Text("${item.gamerscore} G", color = if (unlocked) Accent else Muted, fontWeight = FontWeight.Bold, fontSize = 14.sp)
         }
     }
 }
