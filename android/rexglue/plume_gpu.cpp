@@ -10,6 +10,7 @@
 #include "shader_cache.h"
 #include "xenos_ucode_key.h"
 #include "smolv.h"
+#include "spirv_depth_only.h"
 #include "spirv_fetch_spec.h"
 
 #include <sys/stat.h>
@@ -66,6 +67,10 @@ REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 1, "reNut/Plume",
 REXCVAR_DEFINE_INT32(renut_plume_fetch_spec, 1, "reNut/Plume",
                      "Give each vertex shader's live vertex fetch table to the driver as specialization "
                      "constants, so that the format switches of its fetch sites fold away: 0 off, 1 on")
+    .range(0, 1);
+REXCVAR_DEFINE_INT32(renut_plume_depth_strip, 1, "reNut/Plume",
+                     "Draw depth-only draws (no fragment shader: the shadow maps) with a vertex shader "
+                     "that has lost its interpolant outputs, which nothing reads: 0 off, 1 on")
     .range(0, 1);
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_readback, false, "reNut/Plume",
                     "Copy shader exports back to guest memory (experimental; may overwrite reused memory).");
@@ -286,6 +291,10 @@ struct CompiledShader {
   // constants instead of the uniform block (spirv_fetch_spec.h). Only vertex
   // and domain shaders with live fetches have one.
   std::unique_ptr<RenderShader> fetch_spec_module;
+  // The vertex shader's two forms again without its interpolant outputs
+  // (spirv_depth_only.h), for draws that have no fragment shader.
+  std::unique_ptr<RenderShader> depth_module;
+  std::unique_ptr<RenderShader> depth_fetch_spec_module;
   std::vector<std::pair<uint32_t, bool>> inputs;  // vertex shaders only
   bool failed = false;
 };
@@ -383,15 +392,30 @@ class ShaderStore {
       return nullptr;
     }
     if (vertex) compiled.inputs = ReflectInputs(spirv);
+    std::vector<uint32_t> specialized;
     if (fetch_spec) {
       // The table starts after the loop constants in the cold block (set 4,
       // binding 9), whose first entry sits right after the hot block.
-      std::vector<uint32_t> specialized = renut::SpecializeFetchTable(
+      specialized = renut::SpecializeFetchTable(
           spirv, 4, 9, (RENUT_SHARED_FETCH_OFFSET - RENUT_SHARED_HOT_SIZE) / 16, RENUT_LIVE_FETCH_COUNT,
           kFetchSpecBase);
       if (!specialized.empty()) {
         compiled.fetch_spec_module =
             device->createShader(specialized.data(), specialized.size() * 4, "main", RenderShaderFormat::SPIRV);
+      }
+    }
+    if (vertex) {
+      std::vector<uint32_t> stripped = renut::StripVertexOutputs(spirv);
+      if (!stripped.empty()) {
+        compiled.depth_module =
+            device->createShader(stripped.data(), stripped.size() * 4, "main", RenderShaderFormat::SPIRV);
+        if (!specialized.empty()) {
+          std::vector<uint32_t> both = renut::StripVertexOutputs(specialized);
+          if (!both.empty()) {
+            compiled.depth_fetch_spec_module =
+                device->createShader(both.data(), both.size() * 4, "main", RenderShaderFormat::SPIRV);
+          }
+        }
       }
     }
     return &compiled;
@@ -819,6 +843,7 @@ struct Stats {
   // Draws that waited in a window, the windows, and the pipeline changes
   // those windows had in game order against the order they were recorded in.
   uint64_t deferred_draws = 0, defer_windows = 0, defer_binds_before = 0, defer_binds_after = 0;
+  uint64_t shadow_culled = 0;  // plume-shadowmin
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -1379,6 +1404,16 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // driver as specialization constants. Part of the pipeline key, so a change
   // builds the pipelines of the shaders it touches afresh.
   uint32_t fetch_spec_mode_ = 1;
+  // files/plume-depthstrip (or the cvar): 1 draws the draws that have no
+  // fragment shader with the vertex shader's output-less form. Part of the
+  // pipeline key.
+  uint32_t depth_strip_mode_ = 1;
+  // files/plume-patchlevel: percent of the guest's tessellation level the water
+  // grid uses (100 = as the game sets it).
+  uint32_t patch_level_percent_ = 100;
+  // files/plume-shadowmin: shadow casters (depth-only draws into a shadow map)
+  // with fewer indices than this are dropped; 0 keeps them all.
+  uint32_t shadow_min_indices_ = 0;
   void FlushDeferred();
   void EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count);
   // The command list, after recording any draws that are waiting.
@@ -1655,6 +1690,7 @@ bool PlumeCommandProcessor::SetupContext() {
   list_ = lists_[0].get();
   defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
   fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
+  depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
   fence_ = device_->createCommandFence();
 
   // Fallback textures: opaque white, for every slot without a texture yet.
@@ -3885,6 +3921,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // Debug (plume-bind 16): drop depth-only draws - the shadow casters - to
   // price them.
   if ((bind_skip_ & 16) && !color_count) return true;
+  // files/plume-shadowmin: a shadow caster with fewer indices than this casts
+  // no shadow. Only depth-only draws that write depth into a target that is not
+  // the screen's: a stencil mark, a memory export or the scene's own depth is
+  // never dropped. Off (0) by default.
+  if (shadow_min_indices_ && !color_count && index_count < shadow_min_indices_ && pitch != 1280 &&
+      depth_control.z_write_enable && !depth_control.stencil_enable &&
+      !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
+    ++stats_.shadow_culled;
+    return true;
+  }
   // GetTarget may have recreated a texture that an earlier slot also uses.
   for (uint32_t i = 0; i < color_count; ++i) {
     Transition(colors[i]->texture.get(), colors[i]->layout, RenderTextureLayout::COLOR_WRITE);
@@ -4688,13 +4734,23 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     key_bytes.Put(c.index);
     key_bytes.Put(c.value);
   }
-  key_bytes.Put(uint8_t(fetch_spec));
   // Mode 8 swaps a point list's pixel shader for the sprite-coordinate view.
   const bool debug_point = debug_draw && (debug_mode_ & 8) && point_list && color_count;
   // Geometry-shader and patch draws keep their own: their stages expect the
   // guest's outputs.
   const bool plain_draw = !rect_list && !point_list && !patch_list;
-  const bool trivial_vs = (trivial_mode_ & 1) && plain_draw;
+  // A draw with no fragment shader reads none of the vertex shader's outputs
+  // but its position, so it can have the form that does not write them
+  // (spirv_depth_only.h).
+  RenderShader* depth_module = nullptr;
+  if (depth_strip_mode_ && !ps && plain_draw && vertex_compiled) {
+    depth_module = fetch_spec ? vertex_compiled->depth_fetch_spec_module.get() : vertex_compiled->depth_module.get();
+  }
+  const bool depth_strip = depth_module != nullptr;
+  key_bytes.Put(uint8_t(fetch_spec | (depth_strip << 1)));
+  // Debug (plume-trivial bit 4): a trivial vertex shader for depth-only draws
+  // alone, to price what those draws cost without their vertex work.
+  const bool trivial_vs = ((trivial_mode_ & 1) || ((trivial_mode_ & 4) && !ps)) && plain_draw;
   const bool trivial_fs = ps && (trivial_vs || ((trivial_mode_ & 2) && plain_draw));
   key_bytes.Put(uint8_t(debug_point | (trivial_vs << 1) | (trivial_fs << 2)));
   for (const auto& e : input_elements) {
@@ -4740,9 +4796,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (!pipeline) {
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = layout_.get();
-    desc.vertexShader = trivial_vs  ? debug_trivial_vs_.get()
-                        : fetch_spec ? vertex_compiled->fetch_spec_module.get()
-                                     : vertex_compiled->module.get();
+    desc.vertexShader = trivial_vs   ? debug_trivial_vs_.get()
+                        : depth_strip ? depth_module
+                        : fetch_spec  ? vertex_compiled->fetch_spec_module.get()
+                                      : vertex_compiled->module.get();
     desc.geometryShader = rect_list ? rect_list_gs_.get() : point_list ? point_list_gs_.get() : nullptr;
     desc.pixelShader = debug_point  ? debug_point_fs_.get()
                        : trivial_fs ? debug_trivial_fs_.get()
@@ -4842,8 +4899,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     // the ceiling the guest set for this draw.
     const uint32_t patches = index_count / (quad_patch ? 4 : 3);
     const float wanted = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
-    const uint32_t level =
-        std::clamp(uint32_t(wanted > 1.0f ? wanted : 1.0f), 1u, kMaxPatchLevel);
+    uint32_t level = std::clamp(uint32_t(wanted > 1.0f ? wanted : 1.0f), 1u, kMaxPatchLevel);
+    // files/plume-patchlevel: a share of the guest's level, in percent. The
+    // grid has level^2 cells, so half the level is a quarter of the vertices.
+    if (patch_level_percent_ < 100) level = std::max(1u, level * patch_level_percent_ / 100);
     indexed = false;
     if (!patches) {
       ++stats_.skipped_prim;
@@ -5909,6 +5968,37 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
       fetch_spec_mode_ = uint32_t(fetch_spec);
     }
+    {
+      int depth_strip = std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1);
+      if (FILE* file = std::fopen((root + "/plume-depthstrip").c_str(), "r")) {
+        int value = depth_strip;
+        if (std::fscanf(file, "%d", &value) == 1) depth_strip = std::clamp(value, 0, 1);
+        std::fclose(file);
+      }
+      if (uint32_t(depth_strip) != depth_strip_mode_) {
+        REXLOG_INFO("Renut: Plume depth-only draws without vertex outputs {}", depth_strip ? "on" : "off");
+      }
+      depth_strip_mode_ = uint32_t(depth_strip);
+    }
+    {
+      unsigned int percent = 100;
+      if (FILE* file = std::fopen((root + "/plume-patchlevel").c_str(), "r")) {
+        if (std::fscanf(file, "%u", &percent) != 1) percent = 100;
+        std::fclose(file);
+      }
+      percent = std::clamp(percent, 10u, 100u);
+      if (percent != patch_level_percent_) REXLOG_INFO("Renut: Plume water tessellation at {}%", percent);
+      patch_level_percent_ = percent;
+    }
+    {
+      unsigned int minimum = 0;
+      if (FILE* file = std::fopen((root + "/plume-shadowmin").c_str(), "r")) {
+        if (std::fscanf(file, "%u", &minimum) != 1) minimum = 0;
+        std::fclose(file);
+      }
+      if (minimum != shadow_min_indices_) REXLOG_INFO("Renut: Plume shadow casters under {} indices dropped", minimum);
+      shadow_min_indices_ = minimum;
+    }
     // Arms a per-pair GPU profile of the next few frames (see PairBegin). The
     // file is removed as it is read, so one write is one capture.
     if (FILE* file = std::fopen((root + "/plume-pairprof").c_str(), "r")) {
@@ -6108,6 +6198,10 @@ void PlumeCommandProcessor::Report() {
     REXLOG_INFO("Renut: Plume deferred draws (mode {}): {} draws in {} windows, pipeline changes {} -> {}",
                 defer_mode_, stats_.deferred_draws, stats_.defer_windows, stats_.defer_binds_before,
                 stats_.defer_binds_after);
+  }
+  if (shadow_min_indices_) {
+    REXLOG_INFO("Renut: Plume shadow casters under {} indices dropped: {}", shadow_min_indices_,
+                stats_.shadow_culled);
   }
   // Keep what the driver compiled this interval, so the next run of this scene
   // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
