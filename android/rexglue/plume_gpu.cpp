@@ -72,6 +72,11 @@ REXCVAR_DEFINE_INT32(renut_plume_depth_strip, 1, "reNut/Plume",
                      "Draw depth-only draws (no fragment shader: the shadow maps) with a vertex shader "
                      "that has lost its interpolant outputs, which nothing reads: 0 off, 1 on")
     .range(0, 1);
+REXCVAR_DEFINE_INT32(renut_plume_rel_constants, 2, "reNut/Plume",
+                     "How a vertex shader's relative constant reads (a0, aL: skinning matrices) are served: "
+                     "0 by the file's four blocks, 1 by the whole file as one block, 2 by that block "
+                     "declared too large for the driver to promote into the constant file")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_readback, false, "reNut/Plume",
                     "Copy shader exports back to guest memory (experimental; may overwrite reused memory).");
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_fast, true, "reNut/Plume",
@@ -1251,9 +1256,29 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   VkDescriptorPool constants_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet constants_set_ = VK_NULL_HANDLE;
   // Set 4: the vertex blocks, the pixel blocks, then the shared block's two
-  // halves.
-  static constexpr uint32_t kConstantBindings = 2 * kConstantChunks + 2;
+  // halves, then twice the vertex file as one block (g_VertexShaderConstantRel:
+  // bindings 10 and 11 read the same bytes, 11 declared far larger).
+  static constexpr uint32_t kSharedHotBinding = 2 * kConstantChunks;
+  static constexpr uint32_t kSharedColdBinding = kSharedHotBinding + 1;
+  static constexpr uint32_t kRelBinding = kSharedColdBinding + 1;
+  static constexpr uint32_t kConstantBindings = kRelBinding + 2;
   uint32_t bound_constant_offsets_[kConstantBindings];
+  // files/plume-relconst (or the cvar): how a vertex shader's relative constant
+  // reads (a0, aL) are served - 0 by the four blocks, 1 by the whole file as one
+  // block, 2 by the same block declared too large for the driver to promote
+  // into the constant file. Part of the pipeline key through spec constant 12.
+  // Default 2: measured on identical frames (tools/quick-ab.py --interleave) mode
+  // 1 costs +8% on the 108 vertex shaders that read by a0/aL, mode 2 -27%, and a
+  // frame costs 22% fewer GPU cycles in the heavy plaza (tools/quick-fps.py).
+  uint32_t rel_constants_mode_ = 0;
+  // Modes 11 and 12 alternate between mode 0 and mode 1 or 2 from one draw of a
+  // shader to the next, and mark the alternate's vertex shader hash in the pair
+  // profile (bit 60 and 61 xored in), so a single capture holds both variants
+  // of the same draws: tools/quick-ab.py --interleave.
+  uint32_t rel_toggle_[256] = {};
+  // Where the whole vertex file was last placed in the ring, and what it held.
+  uint64_t vs_all_offset_ = UINT64_MAX;
+  alignas(16) uint8_t vs_all_shadow_[4096] = {};
   // What the list has bound, to leave unchanged state alone (StartList resets).
   RenderViewport bound_viewport_;
   RenderRect bound_scissor_;
@@ -1691,6 +1716,7 @@ bool PlumeCommandProcessor::SetupContext() {
   defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
   fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
   depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
+  rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
   fence_ = device_->createCommandFence();
 
   // Fallback textures: opaque white, for every slot without a texture yet.
@@ -1873,9 +1899,12 @@ bool PlumeCommandProcessor::CreateConstantBuffers() {
   const VkBuffer ring = static_cast<VulkanBuffer*>(upload_.get())->vk;
   VkDescriptorBufferInfo infos[kConstantBindings];
   static_assert(RENUT_SHARED_HOT_SIZE % 16 == 0 && RENUT_SHARED_SIZE % 16 == 0);
-  for (uint32_t i = 0; i + 2 < kConstantBindings; ++i) infos[i] = {ring, 0, kConstantChunkSize};
-  infos[kConstantBindings - 2] = {ring, 0, RENUT_SHARED_HOT_SIZE};
-  infos[kConstantBindings - 1] = {ring, 0, RENUT_SHARED_SIZE - RENUT_SHARED_HOT_SIZE};
+  for (uint32_t i = 0; i < kSharedHotBinding; ++i) infos[i] = {ring, 0, kConstantChunkSize};
+  infos[kSharedHotBinding] = {ring, 0, RENUT_SHARED_HOT_SIZE};
+  infos[kSharedColdBinding] = {ring, 0, RENUT_SHARED_SIZE - RENUT_SHARED_HOT_SIZE};
+  // The whole vertex file, through both of its declarations.
+  infos[kRelBinding] = {ring, 0, kStageConstantSize};
+  infos[kRelBinding + 1] = {ring, 0, kStageConstantSize};
   VkWriteDescriptorSet writes[kConstantBindings] = {};
   for (uint32_t i = 0; i < kConstantBindings; ++i) {
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2580,7 +2609,7 @@ void PlumeCommandProcessor::WritePairReport() {
     std::vector<std::pair<uint64_t, PairTotal>> ranked(by.begin(), by.end());
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
     out += fmt::format("# by {} shader ({} of them)\n", side == 0 ? "vertex" : "pixel", ranked.size());
-    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 40); ++i) {
+    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 100); ++i) {
       const PairTotal& t = ranked[i].second;
       out += fmt::format("{:5d} {:6.2f} {:10.1f} {:11.2f} {:7.2f}  {:016X}\n", i + 1, pct(t.ns), us(t.ns),
                          double(t.draws) * per, double(t.ns) / 1000.0 / double(t.draws), ranked[i].first);
@@ -2739,6 +2768,7 @@ void PlumeCommandProcessor::StartList() {
   }
   shared_offset_ = UINT64_MAX;
   shared_cold_offset_ = UINT64_MAX;
+  vs_all_offset_ = UINT64_MAX;
   // A new command list starts with no push constants of its own.
   pushed_constants_[0] = pushed_constants_[1] = pushed_constants_[2] = UINT64_MAX;
   std::fill(std::begin(bound_constant_offsets_), std::end(bound_constant_offsets_), UINT32_MAX);
@@ -4514,6 +4544,17 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // The shared block is complete; place all three where the shaders will read
   // them. A block that overflows the ring flushes it, which drops the two
   // placed before it, so the generation says whether to lay them down again.
+  // A vertex shader that reads constants by a0/aL (skinning) gets the whole
+  // file placed as one block too, when rel_constants_mode_ asks for it. Patch
+  // draws run the shader's domain variant, which has its own entry: they keep
+  // the four blocks.
+  uint32_t rel_variant = 0;
+  if (rel_constants_mode_ && !patch_list && (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_REL_CONSTANTS)) {
+    rel_variant = rel_constants_mode_ < 10
+                      ? rel_constants_mode_
+                      : ((rel_toggle_[vs->entry->hash & 255]++ & 1) ? rel_constants_mode_ - 10 : 0);
+  }
+  const bool rel_active = rel_variant != 0;
   uint64_t generation;
   do {
     generation = upload_generation_;
@@ -4529,6 +4570,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                  kConstantChunkSize, constant_offsets_[stage][chunk],
                                  &constants_written_[stage][chunk]);
       }
+    }
+    if (placed && rel_active) {
+      placed = CommitConstants(vs_all_shadow_,
+                               reinterpret_cast<const uint8_t*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]),
+                               kStageConstantSize, vs_all_offset_, nullptr);
     }
     if (!placed ||
         !CommitConstants(shared_shadow_, shared_built_, RENUT_SHARED_HOT_SIZE, shared_offset_) ||
@@ -4703,6 +4749,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       }
     }
   }
+  if (rel_active) spec_constants.emplace_back(RENUT_SPEC_REL_CONSTANTS, rel_variant);
   // The pipeline key: the fields laid end to end and hashed once. Hashing
   // each field on its own was a few dozen XXH3 calls a draw.
   KeyBytes key_bytes;
@@ -4968,7 +5015,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   pk.pass_depth = depth_of_pass_;
   pk.pipeline = pipeline.get();
   pk.interface_key = interface_key;
-  pk.vs_hash = vs->entry->hash;
+  pk.vs_hash = vs->entry->hash ^ (uint64_t(rel_constants_mode_ >= 10 ? rel_variant : 0) << 60);
   pk.ps_hash = ps ? ps->entry->hash : 0;
   if (blend_constants) {
     pk.blend_constants = true;
@@ -4996,8 +5043,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           uint32_t(stage == 1 && skip_ps_constants ? unused_ps_offset : constant_offsets_[stage][chunk]);
     }
   }
-  pk.constant_offsets[kConstantBindings - 2] = uint32_t(shared_offset_);
-  pk.constant_offsets[kConstantBindings - 1] = uint32_t(shared_cold_offset_);
+  pk.constant_offsets[kSharedHotBinding] = uint32_t(shared_offset_);
+  pk.constant_offsets[kSharedColdBinding] = uint32_t(shared_cold_offset_);
+  // Draws that read no constant by a0/aL keep whatever whole-file block was
+  // placed last (any valid offset will do, nothing reads it), so they do not
+  // rebind the set.
+  pk.constant_offsets[kRelBinding] = pk.constant_offsets[kRelBinding + 1] =
+      uint32_t(vs_all_offset_ != UINT64_MAX ? vs_all_offset_ : unused_ps_offset);
   pk.viewport = viewport;
   // plume-skip bit 8388608 scissors every draw to one pixel: vertex work and
   // binning stay, fragment work goes. What is left is the per-draw cost.
@@ -5967,6 +6019,19 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         REXLOG_INFO("Renut: Plume live fetch table as specialization constants {}", fetch_spec ? "on" : "off");
       }
       fetch_spec_mode_ = uint32_t(fetch_spec);
+    }
+    {
+      int rel = std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2);
+      if (FILE* file = std::fopen((root + "/plume-relconst").c_str(), "r")) {
+        int value = rel;
+        if (std::fscanf(file, "%d", &value) == 1) rel = (value >= 0 && value <= 2) || value == 11 || value == 12 ? value : 0;
+        std::fclose(file);
+      }
+      if (uint32_t(rel) != rel_constants_mode_) {
+        REXLOG_INFO("Renut: Plume relative vertex constants mode {} (0 four blocks, 1 one block, 2 one block loaded, "
+                    "11/12 alternate 0 with 1/2 per draw)", rel);
+      }
+      rel_constants_mode_ = uint32_t(rel);
     }
     {
       int depth_strip = std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1);

@@ -153,7 +153,7 @@ index 39f6e81..60c0524 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index ee3830d..68da5a9 100644
+index ee3830d..23bdc18 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
 @@ -54,12 +54,14 @@
@@ -176,7 +176,7 @@ index ee3830d..68da5a9 100644
  
  // Device addresses of the sixteen bound vertex streams, eight bytes each.
  //
-@@ -73,9 +75,83 @@
+@@ -73,9 +75,88 @@
  // Sixteen because that is how many streams SetStreamSource can bind: it writes
  // vertex fetch constant 95 - StreamNumber, and a shader names fetch constant
  // constIndex * 3 + constIndexSelect, so the two meet in this table.
@@ -250,6 +250,11 @@ index ee3830d..68da5a9 100644
 +// constant. Bits 8..15 and 16..23 then hold the first and last float constant
 +// the export addresses are built from.
 +#define RENUT_SHADER_FLAG_MEMEXPORT      (1u << 31)
++// Set when a vertex shader reads the float constants by a0 or aL: the host then
++// places the whole file as one block for g_SpecRelConstants (spec id 12, the
++// mode 0..2 of g_VertexShaderConstantRel). Not a specialization constant.
++#define RENUT_SHADER_FLAG_REL_CONSTANTS  (1u << 30)
++#define RENUT_SPEC_REL_CONSTANTS         12
 +#define RENUT_SHADER_EXPORT_FIRST(mask)  (((mask) >> 8) & 0xFF)
 +#define RENUT_SHADER_EXPORT_LAST(mask)   (((mask) >> 16) & 0xFF)
 +
@@ -263,7 +268,7 @@ index ee3830d..68da5a9 100644
  
  // SPIR-V vertex input locations, shared with the host input-layout builder. A
  // semantic missing here gets no location from the emitter, and the recompiler
-@@ -119,6 +195,11 @@
+@@ -119,6 +200,11 @@
      X(TexCoord,     9, 21) \
      X(TexCoord,    10, 22)
  
@@ -275,7 +280,7 @@ index ee3830d..68da5a9 100644
  #ifdef __cplusplus
  #include <cstdint>
  
-@@ -136,7 +217,7 @@
+@@ -136,7 +222,7 @@
  // declaration in hand builds its input layout out of this instead.
  //
  // `format` is the six-bit Xenos vertex fetch format. `isSigned` and
@@ -284,7 +289,7 @@ index ee3830d..68da5a9 100644
  // bits and are what tell an 8_8_8_8 apart as UNORM, SNORM or UINT.
  struct ShaderInputElement
  {
-@@ -152,6 +233,20 @@ struct ShaderInputElement
+@@ -152,6 +238,20 @@ struct ShaderInputElement
      uint8_t isSigned;
      uint8_t isNormalized;
      uint8_t padding;
@@ -305,7 +310,7 @@ index ee3830d..68da5a9 100644
  };
  #endif
  
-@@ -203,27 +298,176 @@ struct PushConstants
+@@ -203,27 +303,199 @@ struct PushConstants
  
  #ifdef RENUT_RECOMP
  
@@ -356,6 +361,28 @@ index ee3830d..68da5a9 100644
 +    default: return g_VertexConstants3[i];
 +    }
 +}
++// Relative reads of the vertex file (a0, aL: a skinned mesh's bone matrices)
++// can land in any of the four blocks, so Turnip promotes all four whole into the
++// constant file on every draw and the shader picks one with a select per read.
++// With g_SpecRelConstants set the host also binds the whole file as one block
++// (binding 10, 256 float4s, at the offset it placed the draw's blocks) and a
++// relative read is a single read of it. Mode 2 reads the same bytes through
++// binding 11, declared far larger than the file so that the driver cannot
++// promote it into the constant file and loads each read instead. The indices
++// are clamped to the file in every mode, so the extra range is never read.
++#define RENUT_REL_LARGE_COUNT 4096
++[[vk::binding(10, 4)]] cbuffer RenutVertexConstantsAll { float4 g_VertexConstantsAll[RENUT_SHADER_CONSTANT_COUNT]; };
++[[vk::binding(11, 4)]] cbuffer RenutVertexConstantsAllLarge { float4 g_VertexConstantsAllLarge[RENUT_REL_LARGE_COUNT]; };
++[[vk::constant_id(12)]] const uint g_SpecRelConstants = 0;
++float4 g_VertexShaderConstantRel(uint index)
++{
++    index = min(index, uint(RENUT_SHADER_CONSTANT_COUNT - 1));
++    if (g_SpecRelConstants == 1)
++        return g_VertexConstantsAll[index];
++    if (g_SpecRelConstants == 2)
++        return g_VertexConstantsAllLarge[index];
++    return g_VertexShaderConstant(index);
++}
 +float4 g_PixelShaderConstant(uint index)
 +{
 +    index = min(index, uint(RENUT_SHADER_CONSTANT_COUNT - 1));
@@ -368,6 +395,7 @@ index ee3830d..68da5a9 100644
 +    default: return g_PixelConstants3[i];
 +    }
 +}
++float4 g_PixelShaderConstantRel(uint index) { return g_PixelShaderConstant(index); }
 +
 +// The shared block by byte offset, in the RENUT_SHARED_* layout above.
 +// Either half by the offset in the whole layout. An offset known when the
@@ -499,7 +527,7 @@ index ee3830d..68da5a9 100644
  
  // xy scale, zw offset, applied to the vertex position on its way to SV_Position.
  //
-@@ -233,7 +477,27 @@ struct PushConstants
+@@ -233,7 +505,27 @@ struct PushConstants
  // coordinates, and without a scale everything outside the 1x1 corner of the
  // clip volume is culled. N&B's FMV renderer does exactly that: it hands the
  // pipeline a pixel-space rectangle and disables the viewport.
@@ -528,7 +556,7 @@ index ee3830d..68da5a9 100644
  
  // A vfetch the vertex declaration does not describe - see the stream table's
  // comment. `index` is whatever register the instruction named, so it arrives as
-@@ -244,8 +508,7 @@ struct PushConstants
+@@ -244,8 +536,7 @@ struct PushConstants
  // a draw that binds fewer streams than the shader fetches would otherwise do.
  float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes)
  {
@@ -538,7 +566,7 @@ index ee3830d..68da5a9 100644
  
      if (address == 0)
          return 0.0;
-@@ -253,14 +516,166 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -253,14 +544,168 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      return vk::RawBufferLoad<float4>(address + uint(index) * strideBytes + offsetBytes, 0x10);
  }
  
@@ -701,6 +729,8 @@ index ee3830d..68da5a9 100644
 -    vk::RawBufferLoad<float4>(RENUT_STAGE_CONSTANTS + min(uint(INDEX), uint(RENUT_SHADER_CONSTANT_COUNT - 1)) * 16, 0x10)
 +// RENUT_STAGE_CONSTANTS to the matching stage's lookup.
 +#define cReg(INDEX) RENUT_STAGE_CONSTANTS(uint(INDEX))
++// A relative read (a0, aL): see g_VertexShaderConstantRel.
++#define cRegRel(INDEX) RENUT_STAGE_REL_CONSTANTS(uint(INDEX))
  
  #else
 -#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
@@ -710,7 +740,7 @@ index ee3830d..68da5a9 100644
  #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
  #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
  #endif
-@@ -279,17 +694,22 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+@@ -279,17 +724,22 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
      uint4  g_TextureCubeDescriptorIndices[8] : packoffset(c16); \
      uint4  g_SamplerDescriptorIndices[8]     : packoffset(c24); \
      uint4  g_BooleansArr[2]                  : packoffset(c32); \
@@ -744,7 +774,15 @@ index ee3830d..68da5a9 100644
  
  #define texture2DDescriptorIndex(SLOT)   (g_Texture2DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
  #define texture3DDescriptorIndex(SLOT)   (g_Texture3DDescriptorIndices[(SLOT) / 4][(SLOT) % 4])
-@@ -314,11 +734,210 @@ uint g_SpecConstants();
+@@ -301,6 +751,7 @@ float4 vfetchStream(uint stream, float index, uint strideBytes, uint offsetBytes
+ 
+ // The recompiler declares g_ShaderConstants in the per-stage cbuffer.
+ #define cReg(INDEX) g_ShaderConstants[min(uint(INDEX), uint(RENUT_SHADER_CONSTANT_COUNT - 1))]
++#define cRegRel(INDEX) cReg(INDEX)
+ 
+ #else
+ #define DEFINE_SHARED_CONSTANTS() \
+@@ -314,11 +765,210 @@ uint g_SpecConstants();
  
  #endif
  
@@ -955,7 +993,7 @@ index ee3830d..68da5a9 100644
  #ifdef RENUT_RECOMP
  // A vertex stage has no implicit derivatives, so every fetch there has to name
  // its level explicitly. N&B does sample from vertex shaders - 1D ramps and 3D
-@@ -349,7 +968,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -349,7 +999,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
  float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
@@ -970,7 +1008,7 @@ index ee3830d..68da5a9 100644
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -483,6 +1108,83 @@ float4 tfetchR11G11B10(float4 value)
+@@ -483,6 +1139,83 @@ float4 tfetchR11G11B10(float4 value)
      return value;
  }
  
@@ -1055,7 +1093,7 @@ index ee3830d..68da5a9 100644
  float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
  {
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index c71e7c9..61ff16f 100644
+index c71e7c9..66ddf5f 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,7 +17,14 @@ static constexpr const char* USAGE_TYPES[] =
@@ -1346,7 +1384,22 @@ index c71e7c9..61ff16f 100644
  
          switch (instr.dimension)
          {
-@@ -949,17 +1110,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -727,8 +888,13 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+                 if (relative)
+                 {
+-                    regFormatted = fmt::format("cReg({} + {})", reg,
++                    // A vertex shader's relative reads go through cRegRel, which
++                    // the host can serve from one contiguous block (see
++                    // g_VertexShaderConstantRel); the flag tells it to place one.
++                    regFormatted = fmt::format("{}({} + {})", isPixelShader ? "cReg" : "cRegRel", reg,
+                         instr.constAddressRegisterRelative ? "a0" : "aL");
++                    if (!isPixelShader)
++                        specConstantsMask |= RENUT_SHADER_FLAG_REL_CONSTANTS;
+                 }
+                 else if (literalConstants.count(reg) != 0)
+                 {
+@@ -949,17 +1115,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                      exportRegister = "oPointSizeEdgeKill";
                      break;
  
@@ -1383,7 +1436,7 @@ index c71e7c9..61ff16f 100644
  
                  default:
                  {
-@@ -987,7 +1163,14 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -987,7 +1168,14 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
      if (instr.vectorOpcode >= AluVectorOpcode::SetpEqPush && instr.vectorOpcode <= AluVectorOpcode::SetpGePush)
      {
          indent();
@@ -1398,7 +1451,7 @@ index c71e7c9..61ff16f 100644
  
          switch (instr.vectorOpcode)
          {
-@@ -1024,20 +1207,41 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1024,20 +1212,41 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          vectorWriteMask &= 0b1;
  #endif
  
@@ -1442,7 +1495,7 @@ index c71e7c9..61ff16f 100644
          {
              if ((vectorWriteMask >> i) & 0x1)
                  out += SWIZZLES[i];
-@@ -1142,8 +1346,23 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1142,8 +1351,23 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          case AluVectorOpcode::SetpNePush:
          case AluVectorOpcode::SetpGtPush:
          case AluVectorOpcode::SetpGePush:
@@ -1466,7 +1519,7 @@ index c71e7c9..61ff16f 100644
  
          case AluVectorOpcode::KillEq:
              print("any({} == {})", op(VECTOR_0, true), op(VECTOR_1, true));
-@@ -1402,6 +1621,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1402,6 +1626,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
      }
  
@@ -1491,7 +1544,7 @@ index c71e7c9..61ff16f 100644
      uint32_t scalarWriteMask = instr.scalarWriteMask;
      if (instr.exportData)
          scalarWriteMask &= ~instr.vectorWriteMask;
-@@ -1421,6 +1658,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -1421,6 +1663,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
          }
          else
          {
@@ -1501,7 +1554,7 @@ index c71e7c9..61ff16f 100644
              print("r{}.", instr.scalarDest);
          }
  
-@@ -1492,8 +1732,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1492,8 +1737,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      isPixelShader = (shaderContainer->flags & 0x1) == 0;
  
  #ifdef RENUT_RECOMP
@@ -1524,16 +1577,17 @@ index c71e7c9..61ff16f 100644
      println("#define RENUT_STAGE_{}", isPixelShader ? "PIXEL" : "VERTEX");
  #endif
  
-@@ -1562,7 +1815,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1562,7 +1820,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      // shader_common.h. Aliasing the names would only help the handful of
      // shaders that carry a table, so the body always uses raw indices.
      out += "#ifdef __spirv__\n\n";
 -    println("#define RENUT_STAGE_CONSTANTS g_PushConstants.{}ShaderConstants", stageName);
 +    println("#define RENUT_STAGE_CONSTANTS g_{}ShaderConstant", stageName);
++    println("#define RENUT_STAGE_REL_CONSTANTS g_{}ShaderConstantRel", stageName);
      out += "\n#else\n\n";
  
      println("cbuffer {}ShaderConstants : register(b{}, space4)", stageName, isPixelShader ? 1 : 0);
-@@ -1603,6 +1856,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1603,6 +1862,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #endif
              println("\tin {3}float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)], interpolation);
          }
@@ -1544,7 +1598,7 @@ index c71e7c9..61ff16f 100644
  
          out += "#ifdef __spirv__\n";
          out += "\tin bool iFace : SV_IsFrontFace\n";
-@@ -1661,6 +1918,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1661,6 +1924,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
          #endif
  
@@ -1562,7 +1616,7 @@ index c71e7c9..61ff16f 100644
              out += '\t';
  
              bool locatedInput = false;
-@@ -1689,6 +1957,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1689,6 +1963,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
          }
  
@@ -1581,7 +1635,7 @@ index c71e7c9..61ff16f 100644
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
          {
-@@ -1701,6 +1981,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1701,6 +1987,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
@@ -1595,7 +1649,7 @@ index c71e7c9..61ff16f 100644
      }
  
      out += ")\n";
-@@ -1792,14 +2079,29 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1792,14 +2085,29 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          if (isPixelShader)
          {
              value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
@@ -1625,7 +1679,7 @@ index c71e7c9..61ff16f 100644
          }
      }
  
-@@ -1815,6 +2117,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1815,6 +2123,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
@@ -1636,7 +1690,7 @@ index c71e7c9..61ff16f 100644
  
          out += "\n";
      }
-@@ -1826,8 +2132,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1826,8 +2138,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
@@ -1673,7 +1727,7 @@ index c71e7c9..61ff16f 100644
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
              {
-@@ -1849,11 +2182,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1849,11 +2188,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  #ifdef RENUT_RECOMP
      if (!isPixelShader)
      {
@@ -1694,7 +1748,7 @@ index c71e7c9..61ff16f 100644
      }
  #endif
      if (isPixelShader)
-@@ -2463,6 +2800,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2463,6 +2806,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      // Kill vertex: a non-zero .z means the vertex is discarded.
                      // Feeding SV_Position a NaN drops every primitive that uses
                      // it, which is the closest a raster pipeline gets.
@@ -1704,7 +1758,7 @@ index c71e7c9..61ff16f 100644
                      indent();
                      out += "if (oPointSizeEdgeKill.z != 0.0)\n";
                      indent();
-@@ -2482,8 +2822,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2482,8 +2828,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                          // (2/w, 2/h, -1, -1) for those draws and an identity
                          // (1, 1, 0, 0) for every normal one, so this costs a
                          // multiply-add and changes nothing in the common case.
@@ -1717,7 +1771,7 @@ index c71e7c9..61ff16f 100644
                      #else
                          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                      #endif
-@@ -2553,5 +2897,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -2553,5 +2903,42 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
  #endif
  
@@ -1735,9 +1789,15 @@ index c71e7c9..61ff16f 100644
 +            size_t end = out.find('\n', at);
 +            if (end == std::string::npos)
 +                end = out.size();
-+            for (size_t c = out.find("cReg(", at); c != std::string::npos && c < end; c = out.find("cReg(", c + 5))
++            for (size_t c = out.find("cReg", at); c != std::string::npos && c < end; c = out.find("cReg", c + 4))
 +            {
-+                uint32_t index = uint32_t(std::strtoul(out.c_str() + c + 5, nullptr, 10));
++                // cReg( or cRegRel( - a relative read counts by its base index.
++                const char* arg = out.c_str() + c + 4;
++                if (std::strncmp(arg, "Rel", 3) == 0)
++                    arg += 3;
++                if (*arg != '(')
++                    continue;
++                uint32_t index = uint32_t(std::strtoul(arg + 1, nullptr, 10));
 +                first = std::min(first, index);
 +                last = std::max(last, index);
 +            }
