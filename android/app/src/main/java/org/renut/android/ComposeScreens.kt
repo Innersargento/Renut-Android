@@ -292,7 +292,6 @@ object ComposeScreens {
     val busy = activity.uiBusy()
     val canCancel = activity.uiCanCancel()
     val fpsEnabled = activity.uiFpsEnabled()
-    val msaaEnabled = activity.uiMsaaEnabled()
     val controlsEnabled = activity.uiShowControls()
     val oneUiEnabled = activity.uiOneUiEnabled()
     val tuMode = activity.uiTuMode()
@@ -309,7 +308,6 @@ object ComposeScreens {
                     activity.uiSetRuntimeOption("renut_plume_uncap_fps", it.toString())
                 }
                 Text("Usa o modo de apresentação imediato e a maior frequência da tela na próxima partida. Pode alterar o ritmo de partes do jogo.", color = Muted, fontSize = 12.sp)
-                ToggleRow("MSAA", msaaEnabled, !busy) { activity.uiSetMsaa(it) }
             }
         }
         item {
