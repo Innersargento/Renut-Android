@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <cmath>
 #include <chrono>
 #include <condition_variable>
@@ -1168,6 +1169,12 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   RenderFormat snap_format_ = RenderFormat::UNKNOWN;
   RenderTextureLayout snap_layout_ = RenderTextureLayout::UNKNOWN;
   bool snap_taken_ = false;
+  // Debug: <files>/plume-snap-shader holds a pixel shader hash (hex). With
+  // plume-snap-dump present too, the first colour resolve one of its draws
+  // samples is snapshotted and dumped, then both files go - for a texture
+  // whose resolve address changes every run, like the world portal's photo.
+  uint64_t snap_shader_ = 0;
+  void SnapshotResolved(Resolved& dest);
   // Debug: while <files>/plume-snap-dump exists, the next snapshot is also
   // read back into <files>/plume-snap.rgba (a text header, then the texels) -
   // the blit that presents it cannot show the alpha channel.
@@ -3995,6 +4002,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     Resolved* found = FindResolved(fetch.base_address << 12);
     if (found && found->descriptor) {
       Resolved& r = *found;
+      if (snap_shader_ && !snap_taken_ && !r.depth && r.texture && ps && ps->entry->hash == snap_shader_ &&
+          !miss_dump_directory_.empty() &&
+          access((miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/plume-snap-dump").c_str(),
+                 F_OK) == 0) {
+        SnapshotResolved(r);
+        Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
+      }
       const uint32_t fw = fetch.size_2d.width + 1, fh = fetch.size_2d.height + 1;
       // A depth resolve goes through a view that repeats the depth (see
       // Resolved::swizzled). A colour resolve already holds the channels in
@@ -4186,6 +4200,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(skip_mask_ & 4096);
   bool alpha_test = ps && (alpha_test_enabled || alpha_to_mask);
   float alpha_ref = alpha_test_enabled ? regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF) : 0.5f;
+  // The pixel shaders only clip(alpha - ref), i.e. pass at alpha >= ref. N&B's
+  // alpha tests are GREATER (97% of the traced ones, mostly against 0) and
+  // GREATER_EQUAL, so GREATER takes the next float up: against 0 the shader
+  // used to keep the fully transparent texels (the world portal's photo).
+  // Not the denormal after 0, which the GPU may flush to zero.
+  if (alpha_test_enabled && color_control.alpha_func == xenos::CompareFunction::kGreater) {
+    alpha_ref = std::max(std::nextafter(alpha_ref, INFINITY), FLT_MIN);
+  }
   std::memcpy(sh + RENUT_SHARED_MISC_OFFSET + 12, &alpha_ref, 4);
 
   // Vertex inputs: the layout the bound vertex shader's vfetches describe
@@ -5469,20 +5491,7 @@ bool PlumeCommandProcessor::IssueCopy() {
     }
     if (dest.texture) {
       if (snap_address_ && info.copy_dest_base == snap_address_ && ++snap_seen_ == snap_ordinal_) {
-        if (!snap_ || snap_width_ != dest.width || snap_height_ != dest.height || snap_format_ != dest.format) {
-          snap_ = device_->createTexture(
-              RenderTextureDesc::Texture2D(dest.width, dest.height, 1, dest.format));
-          snap_width_ = dest.width;
-          snap_height_ = dest.height;
-          snap_format_ = dest.format;
-          snap_layout_ = RenderTextureLayout::UNKNOWN;
-        }
-        if (snap_) {
-          Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_SOURCE);
-          Transition(snap_.get(), snap_layout_, RenderTextureLayout::COPY_DEST);
-          L()->copyTexture(snap_.get(), dest.texture.get());
-          snap_taken_ = true;
-        }
+        SnapshotResolved(dest);
       }
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
       if (dest.descriptor) {
@@ -5641,6 +5650,22 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
                                                                       RenderFormat::R32_FLOAT, w, h, 1, w),
                            dest_x, dest_y);
   return true;
+}
+
+void PlumeCommandProcessor::SnapshotResolved(Resolved& dest) {
+  if (!snap_ || snap_width_ != dest.width || snap_height_ != dest.height || snap_format_ != dest.format) {
+    snap_ = device_->createTexture(RenderTextureDesc::Texture2D(dest.width, dest.height, 1, dest.format));
+    snap_width_ = dest.width;
+    snap_height_ = dest.height;
+    snap_format_ = dest.format;
+    snap_layout_ = RenderTextureLayout::UNKNOWN;
+  }
+  if (snap_) {
+    Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_SOURCE);
+    Transition(snap_.get(), snap_layout_, RenderTextureLayout::COPY_DEST);
+    L()->copyTexture(snap_.get(), dest.texture.get());
+    snap_taken_ = true;
+  }
 }
 
 void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
@@ -5859,6 +5884,10 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       std::fclose(file);
     }
     std::remove((root + "/plume-snap-dump").c_str());
+    if (snap_shader_) {
+      std::remove((root + "/plume-snap-shader").c_str());
+      snap_shader_ = 0;
+    }
     snap_dump_.reset();
     REXLOG_INFO("Renut: Plume snapshot written ({}x{}, format {})", snap_width_, snap_height_, uint32_t(snap_format_));
   }
@@ -6156,6 +6185,15 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     snap_address_ = address;
     snap_ordinal_ = ordinal;
+    unsigned long long snap_shader = 0;
+    if (FILE* file = std::fopen((root + "/plume-snap-shader").c_str(), "r")) {
+      if (std::fscanf(file, "%llx", &snap_shader) != 1) snap_shader = 0;
+      std::fclose(file);
+    }
+    if (snap_shader != snap_shader_) {
+      REXLOG_INFO("Renut: Plume snapshot of the first resolve shader {:016X} samples", snap_shader);
+    }
+    snap_shader_ = snap_shader;
     uint32_t first = 0, end = 0;
     if (FILE* file = std::fopen((root + "/plume-drawskip").c_str(), "r")) {
       if (std::fscanf(file, "%u %u", &first, &end) != 2) first = end = 0;
