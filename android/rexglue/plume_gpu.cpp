@@ -850,6 +850,7 @@ struct Stats {
   // those windows had in game order against the order they were recorded in.
   uint64_t deferred_draws = 0, defer_windows = 0, defer_binds_before = 0, defer_binds_after = 0;
   uint64_t shadow_culled = 0;  // plume-shadowmin
+  uint64_t twin_skipped = 0;   // MSAA off: per-band copies of a draw already drawn
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -1180,6 +1181,43 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // the blit that presents it cannot show the alpha channel.
   std::unique_ptr<RenderBuffer> snap_dump_;
   uint32_t snap_dump_row_ = 0;
+  // Debug: <files>/plume-const holds lines "ps|vs <register> x y z w", float
+  // constants written over the guest's before every draw - to try another
+  // value (the water picks its tile layout from ps c222) without a rebuild.
+  // A line "bool <word> <set hex> <clear hex>" ors and clears bits of that
+  // boolean-register word instead.
+  struct ConstOverride {
+    bool pixel;
+    uint32_t reg;
+    float value[4];
+    bool bool_word = false;
+    uint32_t set = 0, clear = 0;
+  };
+  std::vector<ConstOverride> const_overrides_;
+  // MSAA off: the game still records some draws once per band mask - the
+  // screen-space shadow multiply as masks ...03 then ...0C, the water's patches
+  // as 3 then C - and with a single tile every predicated packet runs
+  // (SetSingleBinTiling), so the second copy drew the same thing over the first:
+  // shadows applied twice. A predicated draw whose whole state matches an
+  // earlier one of the frame under a mask that shares no tile with its own is
+  // that copy, and is dropped. <files>/plume-dedupe "0" turns it off.
+  struct TwinEntry {
+    uint64_t sig = 0, mask = 0, frame = UINT64_MAX;
+  };
+  bool twin_dedupe_ = true;
+  // <files>/plume-refractfix "0" turns off the refraction sprite bounds fix.
+  bool refraction_fix_ = true;
+  std::array<TwinEntry, 128> twin_ring_{};
+  uint32_t twin_pos_ = 0;
+  // Debug: <files>/plume-depth-dump holds a pixel shader hash (hex). The first
+  // depth resolve one of its draws samples is read back, as the shader sees it,
+  // into <files>/plume-depth.f32 (a text header "width height row format
+  // generation frame", then row-padded texels: R32G32_FLOAT is depth, stencil),
+  // and the trigger goes. The splash's soft fade reads it and nothing else.
+  uint64_t depth_dump_ps_ = 0;
+  std::unique_ptr<RenderBuffer> depth_dump_;
+  uint32_t depth_dump_w_ = 0, depth_dump_h_ = 0, depth_dump_row_ = 0, depth_dump_format_ = 0;
+  uint64_t depth_dump_generation_ = 0, depth_dump_frame_ = 0;
   // Debug: touching <files>/plume-texdump-request re-decodes every texture
   // the next frame uses and writes each to <files>/texdump/ (raw RGBA).
   std::string texdump_directory_;
@@ -3768,6 +3806,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   ++stats_.draws;
   const uint32_t draw_index = frame_draw_++;
   if (draw_index >= drawskip_first_ && draw_index < drawskip_end_) return true;
+  for (const ConstOverride& o : const_overrides_) {
+    if (o.bool_word) {
+      uint32_t& word = register_file_->values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + o.reg];
+      word = (word | o.set) & ~o.clear;
+      continue;
+    }
+    const uint32_t at = (o.pixel ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X) + o.reg * 4;
+    std::memcpy(&register_file_->values[at], o.value, sizeof(o.value));
+    MarkConstantsWritten(at, 4);
+  }
 
   auto* vs = static_cast<HostShader*>(active_vertex_shader());
   if (trace_ && (!vs || !vs->entry)) {
@@ -4009,6 +4057,23 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         SnapshotResolved(r);
         Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
       }
+      if (depth_dump_ps_ && !depth_dump_ && r.depth && r.texture && ps && ps->entry->hash == depth_dump_ps_) {
+        const uint32_t bytes = r.format == RenderFormat::R32G32_FLOAT ? 8 : 4;
+        depth_dump_row_ = (r.width + 63) & ~63u;
+        depth_dump_ = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(depth_dump_row_) * r.height * bytes));
+        if (depth_dump_) {
+          Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
+          L()->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(depth_dump_.get(), r.format, r.width,
+                                                                              r.height, 1, depth_dump_row_),
+                                   RenderTextureCopyLocation::Subresource(r.texture.get()));
+          Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
+          depth_dump_w_ = r.width;
+          depth_dump_h_ = r.height;
+          depth_dump_format_ = uint32_t(r.format);
+          depth_dump_generation_ = r.generation;
+          depth_dump_frame_ = r.written_frame;
+        }
+      }
       const uint32_t fw = fetch.size_2d.width + 1, fh = fetch.size_2d.height + 1;
       // A depth resolve goes through a view that repeats the depth (see
       // Resolved::swizzled). A colour resolve already holds the channels in
@@ -4084,8 +4149,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           FindResolved(fetch.base_address << 12) ? "/R" : "", uint32_t(fetch.swizzle) & 0xFFF);
     }
     Trace("{}", line);
-    Trace("  depthcontrol={:08X} stencilrefmask={:08X} bf={:08X}", regs[XE_GPU_REG_RB_DEPTHCONTROL],
-          regs[XE_GPU_REG_RB_STENCILREFMASK], regs[XE_GPU_REG_RB_STENCILREFMASK_BF]);
+    Trace("  depthcontrol={:08X} stencilrefmask={:08X} bf={:08X} sqconst vs={:08X} ps={:08X} bool={:08X}.{:08X}.{:08X}.{:08X}.{:08X}.{:08X}.{:08X}.{:08X}",
+          regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_STENCILREFMASK],
+          regs[XE_GPU_REG_RB_STENCILREFMASK_BF], regs[XE_GPU_REG_SQ_VS_CONST], regs[XE_GPU_REG_SQ_PS_CONST],
+          regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 1],
+          regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 2], regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 3],
+          regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 4], regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 5],
+          regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 6], regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 7]);
     Trace("  raster mode={:08X} clip={:08X} offset=({},{},{},{}) blend={:08X} constants=({},{},{},{}) alpha={}",
           regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_CL_CLIP_CNTL],
           regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
@@ -4570,6 +4640,37 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // file placed as one block too, when rel_constants_mode_ asks for it. Patch
   // draws run the shader's domain variant, which has its own entry: they keep
   // the four blocks.
+  // The refraction sprites (PS A8DCAC79: the swim splash, the wake) look up the
+  // scene copy at the screen position plus a distortion, with the row clamped
+  // to [c5.y, c5.z] - the part of the screen the tile being drawn covers. With
+  // one tile (MSAA off) the game leaves (c5.y, c5.z) = (1, 0): the minimum
+  // above the maximum pins every lookup to the top row, and the splash came out
+  // as blocks of the sky's blue or the cliff's brown. The bounds are put in
+  // order for this draw only; the register goes back afterwards.
+  constexpr uint64_t kRefractionSpritePs = 0xA8DCAC7963881F1Cull;
+  constexpr uint32_t kRefractionBoundsAt = XE_GPU_REG_SHADER_CONSTANT_256_X + 5 * 4;
+  float refraction_saved[4] = {};
+  bool refraction_fixed = false;
+  if (refraction_fix_ && ps && ps->entry && ps->entry->hash == kRefractionSpritePs &&
+      !REXCVAR_GET(renut_scene_msaa)) {
+    float* bounds = reinterpret_cast<float*>(&register_file_->values[kRefractionBoundsAt]);
+    if (bounds[1] > bounds[2]) {
+      std::memcpy(refraction_saved, bounds, sizeof(refraction_saved));
+      std::swap(bounds[1], bounds[2]);
+      MarkConstantsWritten(kRefractionBoundsAt, 4);
+      refraction_fixed = true;
+    }
+  }
+  struct RefractionBoundsRestore {
+    PlumeCommandProcessor* self;
+    const float* saved;
+    bool active;
+    ~RefractionBoundsRestore() {
+      if (!active) return;
+      std::memcpy(&self->register_file_->values[kRefractionBoundsAt], saved, 4 * sizeof(float));
+      self->MarkConstantsWritten(kRefractionBoundsAt, 4);
+    }
+  } refraction_restore{this, refraction_saved, refraction_fixed};
   uint32_t rel_variant = 0;
   if (rel_constants_mode_ && !patch_list && (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_REL_CONSTANTS)) {
     rel_variant = rel_constants_mode_ < 10
@@ -4605,6 +4706,67 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       return Drop("constants upload", vs, ps);
     }
   } while (generation != upload_generation_);
+
+  if (twin_dedupe_ && packet_predicated_ && !REXCVAR_GET(renut_scene_msaa)) {
+    const uint64_t tiles = bin_mask_ & 0xF;
+    // Only the draws seen recorded twice: screen-space rectangles (the
+    // shadow multiply) and the water's patches. Objects the game splits by
+    // band must all run, and the band jobs may draw look-alikes.
+    const bool twin_kind = prim_type == xenos::PrimitiveType::kRectangleList ||
+                           prim_type == xenos::PrimitiveType::kQuadList || patch_list;
+    if (tiles != 0 && tiles != 0xF && twin_kind) {
+      uint64_t parts[16];
+      uint32_t n = 0;
+      parts[n++] = vs->entry->hash;
+      parts[n++] = ps ? ps->entry->hash : 0;
+      parts[n++] = (uint64_t(uint32_t(prim_type)) << 32) | index_count;
+      parts[n++] = index_buffer_info ? (uint64_t(index_buffer_info->guest_base) << 8) |
+                                           uint32_t(index_buffer_info->format)
+                                     : 0;
+      // The float constants each shader reads, by value. Offsets would not do
+      // - a block lands at a new place in the ring whenever another draw's
+      // constants were placed in between - and neither would whole blocks:
+      // registers the shader never reads keep what the draw before left.
+      auto used_hash = [](HostShader* shader, const uint8_t* file) -> uint64_t {
+        if (!shader) return 0;
+        if (!shader->bool_mask_decoded) {
+          rex::string::StringBuffer disassembly;
+          shader->AnalyzeUcode(disassembly);
+          std::memcpy(shader->bool_mask, shader->constant_register_map().bool_bitmap, sizeof(shader->bool_mask));
+          shader->bool_mask_decoded = true;
+        }
+        const auto& map = shader->constant_register_map();
+        uint64_t h = 0;
+        for (uint32_t block = 0; block < 4; ++block) {
+          for (uint64_t bits = map.float_bitmap[block]; bits; bits &= bits - 1) {
+            const uint32_t index = block * 64 + uint32_t(__builtin_ctzll(bits));
+            h = XXH3_64bits_withSeed(file + index * 16, 16, h);
+          }
+        }
+        return h;
+      };
+      parts[n++] = used_hash(vs, vs_shadow_);
+      parts[n++] = used_hash(ps, ps_shadow_);
+      uint64_t sig = XXH3_64bits(parts, n * sizeof(uint64_t));
+      // The RB/PA/SC/VGT registers (blend, depth, targets, viewport, scissor,
+      // window offset) and the fetch constants (textures, vertex streams).
+      sig = XXH3_64bits_withSeed(&regs.values[0x2000], 1024 * sizeof(uint32_t), sig);
+      sig = XXH3_64bits_withSeed(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 192 * sizeof(uint32_t), sig);
+      bool twin = false;
+      for (const TwinEntry& e : twin_ring_) {
+        if (e.frame == swaps_ && e.sig == sig && (e.mask & tiles) == 0) {
+          twin = true;
+          break;
+        }
+      }
+      if (twin) {
+        ++stats_.twin_skipped;
+        Trace("twin of an earlier draw under mask {:X}, skipped", uint64_t(bin_mask_));
+        return true;
+      }
+      twin_ring_[twin_pos_++ % twin_ring_.size()] = {sig, tiles, swaps_};
+    }
+  }
 
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
@@ -5891,6 +6053,22 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     snap_dump_.reset();
     REXLOG_INFO("Renut: Plume snapshot written ({}x{}, format {})", snap_width_, snap_height_, uint32_t(snap_format_));
   }
+  if (depth_dump_ && renderer) {
+    renderer->WaitForAllSlots();
+    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    const uint32_t bytes = depth_dump_format_ == uint32_t(RenderFormat::R32G32_FLOAT) ? 8 : 4;
+    if (FILE* file = std::fopen((root + "/plume-depth.f32").c_str(), "wb")) {
+      std::fprintf(file, "%u %u %u %u %llu %llu\n", depth_dump_w_, depth_dump_h_, depth_dump_row_, bytes,
+                   (unsigned long long)depth_dump_generation_, (unsigned long long)depth_dump_frame_);
+      std::fwrite(depth_dump_->map(), 1, size_t(depth_dump_row_) * depth_dump_h_ * bytes, file);
+      depth_dump_->unmap();
+      std::fclose(file);
+    }
+    std::remove((root + "/plume-depth-dump").c_str());
+    depth_dump_ps_ = 0;
+    depth_dump_.reset();
+    REXLOG_INFO("Renut: Plume depth resolve written ({}x{}, {} bytes a texel)", depth_dump_w_, depth_dump_h_, bytes);
+  }
   const uint64_t cpu_now = ThreadCpuMicroseconds();
   if (cpu_at_swap_) stats_.cp_cpu_us += cpu_now - cpu_at_swap_;
   cpu_at_swap_ = cpu_now;
@@ -6194,6 +6372,61 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       REXLOG_INFO("Renut: Plume snapshot of the first resolve shader {:016X} samples", snap_shader);
     }
     snap_shader_ = snap_shader;
+    {
+      std::vector<ConstOverride> overrides;
+      if (FILE* file = std::fopen((root + "/plume-const").c_str(), "r")) {
+        char stage[8];
+        while (std::fscanf(file, "%7s", stage) == 1) {
+          if (stage[0] == 'b') {
+            unsigned int word = 0, set = 0, clear = 0;
+            if (std::fscanf(file, "%u %x %x", &word, &set, &clear) != 3) break;
+            if (word < 8) {
+              ConstOverride o = {false, word, {}};
+              o.bool_word = true;
+              o.set = set;
+              o.clear = clear;
+              overrides.push_back(o);
+            }
+          } else {
+            unsigned int reg;
+            float v[4];
+            if (std::fscanf(file, "%u %f %f %f %f", &reg, &v[0], &v[1], &v[2], &v[3]) != 5) break;
+            if (reg < 256) overrides.push_back({stage[0] == 'p', reg, {v[0], v[1], v[2], v[3]}});
+          }
+        }
+        std::fclose(file);
+      }
+      if (overrides.size() != const_overrides_.size()) {
+        REXLOG_INFO("Renut: Plume constant overrides: {}", overrides.size());
+      }
+      const_overrides_ = std::move(overrides);
+    }
+    {
+      unsigned int fix = 1;
+      if (FILE* file = std::fopen((root + "/plume-refractfix").c_str(), "r")) {
+        if (std::fscanf(file, "%u", &fix) != 1) fix = 1;
+        std::fclose(file);
+      }
+      refraction_fix_ = fix != 0;
+    }
+    {
+      unsigned int dedupe = 1;
+      if (FILE* file = std::fopen((root + "/plume-dedupe").c_str(), "r")) {
+        if (std::fscanf(file, "%u", &dedupe) != 1) dedupe = 1;
+        std::fclose(file);
+      }
+      if ((dedupe != 0) != twin_dedupe_) REXLOG_INFO("Renut: Plume twin-draw dedupe {}", dedupe ? "on" : "off");
+      twin_dedupe_ = dedupe != 0;
+    }
+    unsigned long long depth_dump_ps = 0;
+    if (FILE* file = std::fopen((root + "/plume-depth-dump").c_str(), "r")) {
+      if (std::fscanf(file, "%llx", &depth_dump_ps) != 1) depth_dump_ps = 0;
+      std::fclose(file);
+    }
+    if (depth_dump_ps != depth_dump_ps_ && !depth_dump_) {
+      REXLOG_INFO("Renut: Plume depth dump of the first depth resolve shader {:016X} samples", depth_dump_ps);
+    }
+    if (!depth_dump_) depth_dump_ps_ = depth_dump_ps;
     uint32_t first = 0, end = 0;
     if (FILE* file = std::fopen((root + "/plume-drawskip").c_str(), "r")) {
       if (std::fscanf(file, "%u %u", &first, &end) != 2) first = end = 0;
