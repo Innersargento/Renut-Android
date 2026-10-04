@@ -673,6 +673,27 @@ bool IsSixteenBitFormat(uint32_t format) {
   return format == 25 || format == 26 || format == 31 || format == 32;
 }
 
+// Xenos k_11_11_10 (vertex format 17) keeps X in the low 10 bits and Y and Z
+// in 11 bits each; k_10_11_11 (16) is the other way round (X and Y 11 bits, Z
+// 10). tfetchR11G11B10 in the recompiled shaders decodes only the second
+// layout, so a format 17 vector - the ground decals' tangent and binormal -
+// came out a different, non-unit vector for every small change of its bits,
+// and the tread ribbon's relief and light jumped from quad to quad. Move the
+// same vector into the layout the shader reads.
+uint32_t RepackFormat17(uint32_t word) {
+  auto signed_field = [](uint32_t value, int bits) { return int32_t(value << (32 - bits)) >> (32 - bits); };
+  const float x = std::max(-1.0f, float(signed_field(word & 0x3FF, 10)) / 511.0f);
+  const float y = std::max(-1.0f, float(signed_field((word >> 10) & 0x7FF, 11)) / 1023.0f);
+  const float z = std::max(-1.0f, float(signed_field(word >> 21, 11)) / 1023.0f);
+  auto quantize = [](float v, float scale, int32_t lo, int32_t hi) {
+    return std::clamp(int32_t(std::lround(v * scale)), lo, hi);
+  };
+  const int32_t xi = quantize(x, 1024.0f, -1024, 1023);
+  const int32_t yi = quantize(y, 1024.0f, -1024, 1023);
+  const int32_t zi = quantize(z, 512.0f, -512, 511);
+  return (uint32_t(xi) & 0x7FF) | ((uint32_t(yi) & 0x7FF) << 11) | ((uint32_t(zi) & 0x3FF) << 22);
+}
+
 RenderBlend Blend(xenos::BlendFactor factor) {
   switch (factor) {
     case xenos::BlendFactor::kZero: return RenderBlend::ZERO;
@@ -935,6 +956,12 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint8_t* Pointer(uint64_t offset) { return upload_data_ + offset; }
   uint64_t Address(uint64_t offset) const { return upload_address_ + offset; }
   bool UploadGuest(uint32_t address, uint32_t size, xenos::Endian endian, uint64_t& offset);
+  // A stream copied into the ring for this draw alone, with the format 17
+  // vectors at the given (offset, stride) pairs moved into the layout the
+  // shaders decode (RepackFormat17).
+  bool UploadRepacked(uint32_t address, uint32_t size, xenos::Endian endian,
+                      const std::pair<uint32_t, uint32_t>* elements, uint32_t element_count, uint64_t& offset);
+  bool ExportOverlaps(uint32_t address, uint32_t size) const;
   // A guest vertex or index stream, from a buffer of its own that outlives the
   // frame while the guest leaves that memory alone, or copied into the ring.
   //
@@ -1207,6 +1234,14 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool twin_dedupe_ = true;
   // <files>/plume-refractfix "0" turns off the refraction sprite bounds fix.
   bool refraction_fix_ = true;
+  // The game's polygon offset (PA_SU_POLY_OFFSET_*): ground decals - footprints,
+  // the tread blocks and skid marks a vehicle leaves - are quads lying on the
+  // terrain and ask to be pulled a little toward the camera. Applying it made
+  // no visible difference to those marks (measured 04/10, scales 1 and 16), and
+  // other scenes were not looked at, so it is off unless
+  // <files>/plume-polyoffset "<on> [scale]" turns it on.
+  bool poly_offset_ = false;
+  float poly_offset_scale_ = 1.0f;
   std::array<TwinEntry, 128> twin_ring_{};
   uint32_t twin_pos_ = 0;
   // Debug: <files>/plume-depth-dump holds a pixel shader hash (hex). The first
@@ -1991,6 +2026,41 @@ bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::
   stats_.stream_bytes += size;
   uploaded_streams_.emplace(key, offset);
   return true;
+}
+
+bool PlumeCommandProcessor::UploadRepacked(uint32_t address, uint32_t size, xenos::Endian endian,
+                                           const std::pair<uint32_t, uint32_t>* elements,
+                                           uint32_t element_count, uint64_t& offset) {
+  if (!address || !size || size > (4u << 20)) return false;
+  offset = Allocate(size, 256);
+  if (offset == UINT64_MAX) return false;
+  uint8_t* data = Pointer(offset);
+  CopySwapped(data, memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
+  for (uint32_t i = 0; i < element_count; ++i) {
+    const uint32_t stride = elements[i].second;
+    if (!stride) continue;
+    for (uint64_t at = elements[i].first; at + 4 <= size; at += stride) {
+      uint32_t word;
+      std::memcpy(&word, data + at, 4);
+      word = RepackFormat17(word);
+      std::memcpy(data + at, &word, 4);
+    }
+  }
+  stats_.stream_bytes += size;
+  return true;
+}
+
+// Whether a memory export range touches the stream: what the GPU wrote there
+// is not in guest memory.
+bool PlumeCommandProcessor::ExportOverlaps(uint32_t address, uint32_t size) const {
+  if (exports_.empty()) return false;
+  auto first = exports_.upper_bound(address);
+  if (first != exports_.begin()) --first;
+  for (auto it = first; it != exports_.end() && it->first < uint64_t(address) + size; ++it) {
+    const ExportRange& range = it->second;
+    if (range.base < uint64_t(address) + size && address < uint64_t(range.base) + range.size) return true;
+  }
+  return false;
 }
 
 // The guest wrote into watched pages: which pages is all that is known, so
@@ -4310,7 +4380,29 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       traced_streams_.push_back({frame_draw_ - 1, stream, uint32_t(fetch.address << 2),
                                  std::vector<uint8_t>(guest, guest + (fetch.size << 2))});
     }
-    if (BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset)) {
+    // A stream with format 17 vectors the input assembler hands to the shader
+    // (see RepackFormat17) is copied for this draw with those moved into the
+    // layout the shader decodes.
+    bool repacked = false;
+    if (!patch_list && stream != RENUT_DIRECT_FETCH_STREAM && vs->compiled) {
+      std::pair<uint32_t, uint32_t> repack[8];
+      uint32_t repack_count = 0;
+      for (const LiveElement& e : vs->elements) {
+        if (e.format != 17 || e.slot != stream || !e.stride || repack_count == 8) continue;
+        for (const auto& [location, integer] : vs->compiled->inputs) {
+          if (location == e.location && !integer) {
+            repack[repack_count++] = {e.offset, e.stride};
+            break;
+          }
+        }
+      }
+      if (repack_count && !ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
+        buffer = upload_.get();
+        repacked = UploadRepacked(fetch.address << 2, fetch.size << 2, fetch.endian, repack, repack_count, offset);
+        if (repacked) Trace("  stream{} repacked: {} format 17 element(s)", stream, repack_count);
+      }
+    }
+    if (repacked || BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset)) {
       streams[stream] = buffer == upload_.get() ? Address(offset) : buffer->getDeviceAddress() + offset;
       slot_offsets[stream] = offset;
       slot_buffers[stream] = buffer;
@@ -4823,6 +4915,21 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   const bool depth_enabled =
       depth && depth_control.z_enable && !(skip_mask_ & 1024) && !(debug_draw && (debug_mode_ & 1));
   const bool depth_write = depth_enabled && depth_control.z_write_enable;
+  // Polygon offset, converted like the Xenia Vulkan path does: the constant is
+  // a fraction of the depth range, times 2^24 for a float depth target (Vulkan
+  // counts it in units of the smallest depth step), the slope is in 1/16 of a
+  // pixel. The guest's depth is the one stored (reversed through the viewport),
+  // so a positive offset moves toward the camera here too.
+  int32_t depth_bias = 0;
+  float depth_slope = 0.0f;
+  if (poly_offset_ && depth_enabled) {
+    float slope_scale = 0.0f, offset = 0.0f;
+    draw_util::GetPreferredFacePolygonOffset(regs, polygonal, slope_scale, offset);
+    const float bias = offset * 16777216.0f * poly_offset_scale_;
+    if (std::isfinite(bias)) depth_bias = int32_t(std::clamp(bias, -2.0e9f, 2.0e9f));
+    const float slope = slope_scale * xenos::kPolygonOffsetScaleSubpixelUnit * poly_offset_scale_;
+    if (std::isfinite(slope)) depth_slope = slope;
+  }
   // Stencil: the game marks pixels in the stencil buffer and later draws shade
   // only where they are marked; without the test those draws covered their
   // whole volume. Plume takes one reference and one pair of masks for both
@@ -4961,6 +5068,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // keep their keys. The reference and masks are dynamic: the game changes
   // them from draw to draw, and keying on them made thousands of pipelines.
   if (stencil_enabled) key_bytes.Put(uint32_t(depth_control.value & 0xFFFFFF81u));
+  // Likewise only biased draws add bytes.
+  if (depth_bias != 0 || depth_slope != 0.0f) {
+    key_bytes.Put(depth_bias);
+    key_bytes.Put(depth_slope);
+  }
   for (const RenderSpecConstant& c : spec_constants) {
     key_bytes.Put(c.index);
     key_bytes.Put(c.value);
@@ -5044,6 +5156,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.depthWriteEnabled = depth_write;
     desc.depthFunction = depth_enabled ? Compare(depth_control.zfunc) : RenderComparisonFunction::ALWAYS;
     desc.depthTargetFormat = depth ? depth->format : RenderFormat::UNKNOWN;
+    desc.depthBias = depth_bias;
+    desc.slopeScaledDepthBias = depth_slope;
     desc.dynamicBlendFactorEnabled = blend_constants;
     desc.stencilEnabled = stencil_enabled;
     if (stencil_enabled) {
@@ -6408,6 +6522,21 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         std::fclose(file);
       }
       refraction_fix_ = fix != 0;
+    }
+    {
+      unsigned int on = 0;
+      float scale = 1.0f;
+      if (FILE* file = std::fopen((root + "/plume-polyoffset").c_str(), "r")) {
+        const int read = std::fscanf(file, "%u %f", &on, &scale);
+        if (read < 1) on = 0;
+        if (read < 2) scale = 1.0f;
+        std::fclose(file);
+      }
+      if ((on != 0) != poly_offset_ || scale != poly_offset_scale_) {
+        REXLOG_INFO("Renut: Plume polygon offset {} x{}", on ? "on" : "off", scale);
+      }
+      poly_offset_ = on != 0;
+      poly_offset_scale_ = scale;
     }
     {
       unsigned int dedupe = 1;
