@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <unistd.h>
 #include <rex/runtime.h>
 #include <rex/cvar.h>
 #include <rex/kernel/init.h>
@@ -37,7 +38,33 @@ void AchievementsStop(rex::Runtime&);
 void renutConfigureXenosDriver(const std::string&,const std::string&,const std::string&,bool,const std::string&);
 // Own this entry point so the loader cannot resolve SDL's JNI_OnLoad through
 // our transitive dependencies. SDL is explicitly loaded/initialized by Java.
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) { return JNI_VERSION_1_6; }
+// Android drops a native process's stderr unless a system property asks for it,
+// which hides Plume's own error lines (failed shader modules and pipelines).
+// Forward it to logcat instead.
+static void ForwardStderrToLogcat() {
+  int fds[2];
+  if (pipe(fds) != 0) return;
+  if (dup2(fds[1], STDERR_FILENO) < 0) { close(fds[0]); close(fds[1]); return; }
+  close(fds[1]);
+  std::thread([fd = fds[0]] {
+    std::string line;
+    char buffer[512];
+    ssize_t n;
+    while ((n = read(fd, buffer, sizeof buffer)) > 0) {
+      for (ssize_t i = 0; i < n; ++i) {
+        if (buffer[i] == '\n') {
+          __android_log_write(ANDROID_LOG_ERROR, "renut-stderr", line.c_str());
+          line.clear();
+        } else line.push_back(buffer[i]);
+      }
+    }
+  }).detach();
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
+  ForwardStderrToLogcat();
+  return JNI_VERSION_1_6;
+}
 static std::atomic<bool> render_stopped{false};
 // The window the game loop pumps, reachable from the UI thread for surface changes.
 static std::mutex game_window_mutex;

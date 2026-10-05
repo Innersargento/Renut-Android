@@ -57,7 +57,7 @@ index 9dcfedf..9ce1c92 100644
          bool depthWriteEnabled = false;
          bool stencilEnabled = false;
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..ad8834c 100644
+index f1dd503..bfc5dad 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -87,6 +87,8 @@ namespace plume {
@@ -184,6 +184,24 @@ index f1dd503..ad8834c 100644
          VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
          VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
          const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
+@@ -4177,7 +4243,16 @@ namespace plume {
+     }
+ 
+     std::unique_ptr<RenderPipeline> VulkanDevice::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
+-        return std::make_unique<VulkanGraphicsPipeline>(this, desc);
++        auto pipeline = std::make_unique<VulkanGraphicsPipeline>(this, desc);
++
++        // reNut: a driver that refuses to build the pipeline (vkCreateGraphicsPipelines
++        // returned an error) leaves a null handle. Callers tell failure from success by
++        // the pointer, and binding a null pipeline hangs the stock Qualcomm driver.
++        if (pipeline->vk == VK_NULL_HANDLE) {
++            return nullptr;
++        }
++
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
 diff --git a/plume_vulkan.h b/plume_vulkan.h
 index 0a1edbe..2eb1d98 100644
 --- a/plume_vulkan.h

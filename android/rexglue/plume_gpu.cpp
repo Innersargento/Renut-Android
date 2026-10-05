@@ -1549,6 +1549,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     uint64_t duration_us = 0;
     // Pipelines that differ only in the boolean registers share one.
     uint64_t family = 0;
+    // For the log when the driver refuses to build it.
+    uint64_t vs_hash = 0;
+    uint64_t ps_hash = 0;
   };
   std::mutex pipeline_mutex_;
   std::condition_variable pipeline_ready_;
@@ -1760,6 +1763,7 @@ void PlumeCommandProcessor::ReapPipelines() {
       standins_[job.family] = slot.get();
     } else {
       failed_pipelines_.insert(it->first);
+      REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})", job.vs_hash, job.ps_hash);
     }
     it = pending_pipelines_.erase(it);
   }
@@ -5275,7 +5279,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           ++stats_.pipelines;
           if (pipeline) standins_[pending->second->family] = pipeline.get();
           pending_pipelines_.erase(pending);
-          if (!pipeline) failed_pipelines_.insert(key);
+          if (!pipeline) {
+            failed_pipelines_.insert(key);
+            REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
+                        vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
+          }
         }
       } else if (!failed_pipelines_.count(key)) {
         // Past the limit the draw waits for a free slot rather than compiling
@@ -5291,6 +5299,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           std::memset(family_bytes.data + bool_spans[i], 0, sizeof(RenderSpecConstant::value));
         }
         job->family = family_bytes.Hash();
+        job->vs_hash = vs->ucode_data_hash();
+        job->ps_hash = ps ? ps->ucode_data_hash() : 0;
         const bool covered = use_standin(job->family);
         StartPipelineWorker();
         pending_pipelines_.emplace(key, job);
