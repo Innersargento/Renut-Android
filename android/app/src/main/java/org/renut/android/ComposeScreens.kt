@@ -333,9 +333,7 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
 @Composable private fun SettingsScreen(activity: MainActivity, modifier: Modifier, tick: Int) {
     @Suppress("UNUSED_VARIABLE") val update = tick
     val driver = activity.uiDriver()
-    val status = activity.uiStatus()
     val busy = activity.uiBusy()
-    val canCancel = activity.uiCanCancel()
     val fpsEnabled = activity.uiFpsEnabled()
     val controlsEnabled = activity.uiShowControls()
     val oneUiEnabled = activity.uiOneUiEnabled()
@@ -344,6 +342,8 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     val logLevel = activity.uiRuntimeOption("log_level", "info")
     val shaderAsync = activity.uiRuntimeOption("renut_plume_async_pipelines", "false") == "true"
     val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
+    val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
+    val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Header("RENUT / ANDROID", "Configurações", "Jogo, vídeo, controles e diagnóstico.") }
         item {
@@ -383,16 +383,13 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
                     activity.uiSetRuntimeOption("renut_plume_async_pipelines", it.toString())
                 }
                 Text("Compila pipelines novos em segundo plano. O primeiro desenho pode faltar até ficar pronto; desenhos de memexport continuam síncronos.", color = Muted, fontSize = 12.sp)
-            }
-        }
-        item {
-            Panel("Testes e diagnóstico") {
-                Text(status, color = Muted, fontSize = 13.sp, maxLines = 8, overflow = TextOverflow.Ellipsis)
-                if (canCancel) ActionButton("Cancelar importação", true, outlined = true) { activity.uiCancelImport() }
-                ActionButton("Validar runtime ARM64", !busy, outlined = true) { activity.uiAction("Validar runtime ARM64") }
-                ActionButton("Testar runtime com Plume", !busy, outlined = true) { activity.uiAction("Testar runtime com Plume") }
-                ActionButton("Testar Plume no aparelho", !busy, outlined = true) { activity.uiAction("Testar Plume no aparelho") }
-                ActionButton("Exportar diagnóstico", !busy, outlined = true) { activity.uiAction("Exportar diagnóstico") }
+                ToggleRow("Remover sombras", noShadows, !busy) {
+                    activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
+                }
+                ToggleRow("Remover bloom", noBloom, !busy) {
+                    activity.uiSetRuntimeOption("renut_plume_no_bloom", it.toString())
+                }
+                Text("Também podem ser definidos no renut.toml (renut_plume_no_shadows, renut_plume_no_bloom). Reduzem o custo de GPU.", color = Muted, fontSize = 12.sp)
             }
         }
         item { Text("reNut · prévia de desenvolvimento", color = Muted, fontSize = 12.sp) }

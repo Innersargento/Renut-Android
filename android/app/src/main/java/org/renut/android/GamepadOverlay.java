@@ -29,9 +29,9 @@ final class GamepadOverlay extends View {
     static final int UP = 0x1, DOWN = 0x2, LEFT = 0x4, RIGHT = 0x8, START = 0x10, BACK = 0x20,
             L3 = 0x40, R3 = 0x80, LB = 0x100, RB = 0x200, A = 0x1000, B = 0x2000, X = 0x4000, Y = 0x8000;
 
-    private static final int K_BUTTON = 0, K_STICK = 1, K_DPAD = 2, K_TRIGGER = 3, K_GUIDE = 4;
+    private static final int K_BUTTON = 0, K_STICK = 1, K_DPAD = 2, K_TRIGGER = 3;
     private static final float DEAD_ZONE = 0.12f;
-    private static final long CLICK_MS = 180, CLICK_PULSE_MS = 150, GUIDE_HOLD_MS = 700;
+    private static final long CLICK_MS = 180, CLICK_PULSE_MS = 150;
 
     private static final class Control {
         final int kind, mask, index;
@@ -62,7 +62,7 @@ final class GamepadOverlay extends View {
 
     private final Sink sink;
     private final Control[] controls;
-    private final Control leftStick, rightStick, dpad, guide;
+    private final Control leftStick, rightStick, dpad;
     private final SparseArray<Touch> touches = new SparseArray<>();
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), line = new Paint(Paint.ANTI_ALIAS_FLAG),
             text = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -74,7 +74,6 @@ final class GamepadOverlay extends View {
         leftStick = new Control(K_STICK, L3, 0, "", Color.WHITE);
         rightStick = new Control(K_STICK, R3, 1, "", Color.WHITE);
         dpad = new Control(K_DPAD, 0, 0, "", Color.WHITE);
-        guide = new Control(K_GUIDE, 0, 0, "", Color.rgb(90, 200, 80));
         controls = new Control[] {
             new Control(K_TRIGGER, 0, 0, "LT", Color.WHITE),
             new Control(K_TRIGGER, 0, 1, "RT", Color.WHITE),
@@ -86,7 +85,7 @@ final class GamepadOverlay extends View {
             new Control(K_BUTTON, B, 0, "B", Color.rgb(216, 39, 42)),
             new Control(K_BUTTON, X, 0, "X", Color.rgb(30, 115, 190)),
             new Control(K_BUTTON, Y, 0, "Y", Color.rgb(245, 184, 0)),
-            leftStick, rightStick, dpad, guide,
+            leftStick, rightStick, dpad,
         };
         line.setStyle(Paint.Style.STROKE);
         text.setTextAlign(Paint.Align.CENTER);
@@ -118,9 +117,8 @@ final class GamepadOverlay extends View {
         place(find("B"), fx + gap, fy, br);
         place(find("A"), fx, fy + gap, br);
         place(rightStick, w - side - u * 5.0f, h - u * 1.9f, u * 1.45f);
-        // Back, Guide and Start centred near the top.
+        // Back and Start centred near the top.
         float cy = u * 0.95f;
-        place(guide, w / 2f, cy, u * 0.6f);
         Control back = find("BACK"), start = find("START");
         back.rect.set(w / 2f - u * 2.9f, cy - u * 0.38f, w / 2f - u * 1.0f, cy + u * 0.38f);
         start.rect.set(w / 2f + u * 1.0f, cy - u * 0.38f, w / 2f + u * 2.9f, cy + u * 0.38f);
@@ -165,11 +163,6 @@ final class GamepadOverlay extends View {
                         canvas.drawCircle(c.cx, c.cy, c.r, line);
                         canvas.drawText(c.label, c.cx, c.cy + textY, text);
                     }
-                    break;
-                case K_GUIDE:
-                    canvas.drawCircle(c.cx, c.cy, c.r, fill);
-                    canvas.drawCircle(c.cx, c.cy, c.r, line);
-                    canvas.drawText("✕", c.cx, c.cy + textY, text);
                     break;
                 case K_STICK: {
                     fill.setColor(Color.WHITE); fill.setAlpha(40);
@@ -268,7 +261,6 @@ final class GamepadOverlay extends View {
             case K_STICK: c.pressed = true; updateStick(c, x, y); break;
             case K_DPAD: updateDpad(x, y); break;
             case K_TRIGGER: c.pressed = true; updateTrigger(c, y); break;
-            case K_GUIDE: c.pressed = true; break;
         }
     }
 
@@ -315,10 +307,6 @@ final class GamepadOverlay extends View {
             }
             case K_DPAD: setDpad(0); break;
             case K_TRIGGER: c.pressed = false; c.valueX = 0; sink.trigger(c.index, 0); break;
-            case K_GUIDE:
-                c.pressed = false;
-                if (!cancelled && SystemClock.uptimeMillis() - t.downAt >= GUIDE_HOLD_MS) sink.exit();
-                break;
         }
     }
 

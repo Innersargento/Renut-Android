@@ -79,6 +79,12 @@ REXCVAR_DEFINE_INT32(renut_plume_rel_constants, 2, "reNut/Plume",
                      "0 by the file's four blocks, 1 by the whole file as one block, 2 by that block "
                      "declared too large for the driver to promote into the constant file")
     .range(0, 2);
+REXCVAR_DEFINE_BOOL(renut_plume_no_shadows, false, "reNut/Plume",
+                    "Drop the shadow casters (depth-only draws into the shadow maps): the scene is drawn "
+                    "without shadows.");
+REXCVAR_DEFINE_BOOL(renut_plume_no_bloom, false, "reNut/Plume",
+                    "Make the bloom's bright pass write black, so the blur chain and the final blend add "
+                    "no glow.");
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_readback, false, "reNut/Plume",
                     "Copy shader exports back to guest memory (experimental; may overwrite reused memory).");
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_fast, true, "reNut/Plume",
@@ -1520,6 +1526,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // files/plume-shadowmin: shadow casters (depth-only draws into a shadow map)
   // with fewer indices than this are dropped; 0 keeps them all.
   uint32_t shadow_min_indices_ = 0;
+  bool no_shadows_ = false, no_bloom_ = false;  // cvars renut_plume_no_shadows / _no_bloom
   void FlushDeferred();
   void EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count);
   // The command list, after recording any draws that are waiting.
@@ -1845,6 +1852,9 @@ bool PlumeCommandProcessor::SetupContext() {
   fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
   depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
   rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
+  no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
+  no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
+  if (no_shadows_) shadow_min_indices_ = UINT32_MAX;
   fence_ = device_->createCommandFence();
 
   // Fallback textures: opaque white, for every slot without a texture yet.
@@ -5026,6 +5036,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       b.blendEnabled = false;
       b.renderTargetWriteMask = 0xF;
     }
+    // renut_plume_no_bloom: the bright pass (scene * its alpha + glow) writes
+    // black, so every blur after it and the final add are black too.
+    if (no_bloom_ && ps && ps->entry->hash == 0x1B958C7DC860BBBEull && IsBlendable(colors[i]->format)) {
+      b.blendEnabled = true;
+      b.srcBlend = b.dstBlend = b.srcBlendAlpha = b.dstBlendAlpha = RenderBlend::ZERO;
+      b.blendOp = b.blendOpAlpha = RenderBlendOperation::ADD;
+    }
   }
   // Blend constants (RB_BLEND_RED..ALPHA) are dynamic state, set per draw, in
   // the pipelines whose factors use them. Plume left them at zero, so the
@@ -6458,8 +6475,8 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       patch_level_percent_ = percent;
     }
     {
-      unsigned int minimum = 0;
-      if (FILE* file = std::fopen((root + "/plume-shadowmin").c_str(), "r")) {
+      unsigned int minimum = no_shadows_ ? UINT32_MAX : 0;
+      if (!no_shadows_) if (FILE* file = std::fopen((root + "/plume-shadowmin").c_str(), "r")) {
         if (std::fscanf(file, "%u", &minimum) != 1) minimum = 0;
         std::fclose(file);
       }

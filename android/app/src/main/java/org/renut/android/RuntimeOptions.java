@@ -22,7 +22,8 @@ final class RuntimeOptions {
     static final String[] SKINS = {"default", "robot", "tuxedo"};
 
     private static final Set<String> BOOLEANS = new java.util.HashSet<>(java.util.Arrays.asList(
-        "renut_plume_async_pipelines", "renut_plume_uncap_fps", CHEATS));
+        "renut_plume_async_pipelines", "renut_plume_uncap_fps", "renut_plume_no_shadows", "renut_plume_no_bloom",
+        CHEATS));
     static {
         BOOLEANS.addAll(java.util.Arrays.asList(CHEAT_FLAGS));
     }
