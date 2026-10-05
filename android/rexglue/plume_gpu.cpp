@@ -13,6 +13,7 @@
 #include "spirv_depth_only.h"
 #include "spirv_fetch_spec.h"
 
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -1539,16 +1540,25 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     std::unique_ptr<RenderPipeline> result;
     std::atomic<bool> done{false};
     uint64_t duration_us = 0;
+    // Pipelines that differ only in the boolean registers share one.
+    uint64_t family = 0;
   };
   std::mutex pipeline_mutex_;
   std::condition_variable pipeline_ready_;
+  // Jobs whose draw has nothing to stand in for it go first.
+  std::deque<std::shared_ptr<PipelineJob>> pipeline_urgent_queue_;
   std::deque<std::shared_ptr<PipelineJob>> pipeline_queue_;
+  // The newest ready pipeline of each family, drawn in place of a sibling
+  // that is still compiling. Points into pipelines_, which never erases.
+  std::unordered_map<uint64_t, RenderPipeline*> standins_;
   std::unordered_map<uint64_t, std::shared_ptr<PipelineJob>> pending_pipelines_;
   std::unordered_set<uint64_t> failed_pipelines_;
-  std::thread pipeline_worker_;
+  std::vector<std::thread> pipeline_workers_;
   bool stop_pipeline_worker_ = false;
   void StartPipelineWorker();
   void StopPipelineWorker();
+  // Moves every finished job into pipelines_, whether or not its draw came back.
+  void ReapPipelines();
   // Keyed by guest address and host format: N&B reuses an address within a
   // frame for different things (a 768x768 shadow map, then the bloom chain),
   // and draws recorded earlier must keep the texture they sampled.
@@ -1673,41 +1683,79 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
 };
 
 void PlumeCommandProcessor::StartPipelineWorker() {
-  if (pipeline_worker_.joinable()) return;
+  if (!pipeline_workers_.empty()) return;
   stop_pipeline_worker_ = false;
-  pipeline_worker_ = std::thread([this] {
-    for (;;) {
-      std::shared_ptr<PipelineJob> job;
-      {
-        std::unique_lock lock(pipeline_mutex_);
-        pipeline_ready_.wait(lock, [this] { return stop_pipeline_worker_ || !pipeline_queue_.empty(); });
-        if (stop_pipeline_worker_) return;
-        job = std::move(pipeline_queue_.front());
-        pipeline_queue_.pop_front();
+  // Compiling is slow on one core and free on others: a few workers, kept off
+  // the cores' best share so the guest and command list threads win contention.
+  const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
+  const uint32_t count = std::clamp(cores / 3, 1u, 3u);
+  for (uint32_t i = 0; i < count; ++i) {
+    pipeline_workers_.emplace_back([this] {
+      setpriority(PRIO_PROCESS, uint32_t(gettid()), 4);
+      for (;;) {
+        std::shared_ptr<PipelineJob> job;
+        {
+          std::unique_lock lock(pipeline_mutex_);
+          pipeline_ready_.wait(lock, [this] {
+            return stop_pipeline_worker_ || !pipeline_urgent_queue_.empty() || !pipeline_queue_.empty();
+          });
+          if (stop_pipeline_worker_) return;
+          // Oldest first within each queue, so a steady stream of new
+          // pipelines cannot starve one that was queued earlier.
+          auto& queue = pipeline_urgent_queue_.empty() ? pipeline_queue_ : pipeline_urgent_queue_;
+          job = std::move(queue.front());
+          queue.pop_front();
+        }
+        job->desc.inputElements = job->elements.data();
+        job->desc.inputSlots = job->slots.data();
+        job->desc.specConstants = job->constants.data();
+        const auto start = std::chrono::steady_clock::now();
+        try { job->result = device_->createGraphicsPipeline(job->desc); }
+        catch (const std::exception& e) { REXLOG_WARN("Renut: Plume async pipeline failed: {}", e.what()); }
+        job->duration_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count());
+        job->done.store(true, std::memory_order_release);
       }
-      job->desc.inputElements = job->elements.data();
-      job->desc.inputSlots = job->slots.data();
-      job->desc.specConstants = job->constants.data();
-      const auto start = std::chrono::steady_clock::now();
-      try { job->result = device_->createGraphicsPipeline(job->desc); }
-      catch (const std::exception& e) { REXLOG_WARN("Renut: Plume async pipeline failed: {}", e.what()); }
-      job->duration_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::steady_clock::now() - start).count());
-      job->done.store(true, std::memory_order_release);
-    }
-  });
+    });
+  }
 }
 
 void PlumeCommandProcessor::StopPipelineWorker() {
-  if (!pipeline_worker_.joinable()) return;
+  if (pipeline_workers_.empty()) return;
   {
     std::lock_guard lock(pipeline_mutex_);
     stop_pipeline_worker_ = true;
+    pipeline_urgent_queue_.clear();
     pipeline_queue_.clear();
   }
-  pipeline_ready_.notify_one();
-  pipeline_worker_.join();
+  pipeline_ready_.notify_all();
+  for (std::thread& worker : pipeline_workers_) worker.join();
+  pipeline_workers_.clear();
   pending_pipelines_.clear();
+}
+
+// A finished job used to wait for its own draw to come back and claim it. One
+// that never did (a scene change, a one-off effect) kept its slot forever, and
+// once 128 of those piled up every new pipeline compiled on the command list
+// thread again. Called once a frame, this installs them all.
+void PlumeCommandProcessor::ReapPipelines() {
+  for (auto it = pending_pipelines_.begin(); it != pending_pipelines_.end();) {
+    PipelineJob& job = *it->second;
+    if (!job.done.load(std::memory_order_acquire)) {
+      ++it;
+      continue;
+    }
+    stats_.pipeline_us += job.duration_us;
+    ++stats_.pipelines;
+    if (job.result) {
+      std::unique_ptr<RenderPipeline>& slot = pipelines_[it->first];
+      slot = std::move(job.result);
+      standins_[job.family] = slot.get();
+    } else {
+      failed_pipelines_.insert(it->first);
+    }
+    it = pending_pipelines_.erase(it);
+  }
 }
 
 bool PlumeCommandProcessor::SetupContext() {
@@ -1879,6 +1927,7 @@ void PlumeCommandProcessor::ShutdownContext() {
   // Frames may still be running; nothing below may be freed under them.
   if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForAllSlots();
   pipelines_.clear();
+  standins_.clear();
   pipeline_memo_.Clear();
   framebuffers_.clear();
   targets_.clear();
@@ -5073,8 +5122,15 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     key_bytes.Put(depth_bias);
     key_bytes.Put(depth_slope);
   }
+  // Where the boolean registers' values sit in the key, so the family key can
+  // blank them.
+  std::array<size_t, 8> bool_spans;
+  uint32_t bool_span_count = 0;
   for (const RenderSpecConstant& c : spec_constants) {
     key_bytes.Put(c.index);
+    if (c.index >= RENUT_SPEC_BOOLS_BASE && c.index < RENUT_SPEC_BOOLS_BASE + 8 && bool_span_count < 8) {
+      bool_spans[bool_span_count++] = key_bytes.size;
+    }
     key_bytes.Put(c.value);
   }
   // Mode 8 swaps a point list's pixel shader for the sprite-coordinate view.
@@ -5136,6 +5192,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     pipeline_memo_.Put(key, pipeline_node);
   }
   auto& pipeline = *pipeline_node;
+  RenderPipeline* standin = nullptr;
   if (!pipeline) {
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = layout_.get();
@@ -5180,32 +5237,55 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     // skip those draws merely because their first pipeline is still compiling.
     if (REXCVAR_GET(renut_plume_async_pipelines) &&
         !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
+      // A draw whose pipeline is still compiling is drawn with a ready sibling
+      // (same shaders, targets, blending and vertex layout; other boolean
+      // registers) when there is one. Dropping it instead left holes in the
+      // scene for as long as the compile took, and the screen flickered.
+      auto use_standin = [&](uint64_t family) {
+        auto found = standins_.find(family);
+        if (found == standins_.end()) return false;
+        standin = found->second;
+        ++drops_[{"pipeline stand-in", vs->entry->hash, ps ? ps->entry->hash : 0, false}];
+        return true;
+      };
       auto pending = pending_pipelines_.find(key);
       if (pending != pending_pipelines_.end()) {
-        if (!pending->second->done.load(std::memory_order_acquire))
-          return Drop("pipeline compiling", vs, ps);
-        pipeline = std::move(pending->second->result);
-        stats_.pipeline_us += pending->second->duration_us;
-        ++stats_.pipelines;
-        pending_pipelines_.erase(pending);
-        if (!pipeline) failed_pipelines_.insert(key);
-      } else if (!failed_pipelines_.count(key) && pending_pipelines_.size() < 128) {
+        if (!pending->second->done.load(std::memory_order_acquire)) {
+          if (!use_standin(pending->second->family)) return Drop("pipeline compiling", vs, ps);
+        } else {
+          pipeline = std::move(pending->second->result);
+          stats_.pipeline_us += pending->second->duration_us;
+          ++stats_.pipelines;
+          if (pipeline) standins_[pending->second->family] = pipeline.get();
+          pending_pipelines_.erase(pending);
+          if (!pipeline) failed_pipelines_.insert(key);
+        }
+      } else if (!failed_pipelines_.count(key)) {
+        // Past the limit the draw waits for a free slot rather than compiling
+        // here: a stall on the command list thread is what this option avoids.
+        if (pending_pipelines_.size() >= 256) return Drop("pipeline queue full", vs, ps);
         auto job = std::make_shared<PipelineJob>();
         job->desc = desc;
         job->elements = input_elements;
         job->slots = input_slots;
         job->constants = spec_constants;
+        KeyBytes family_bytes = key_bytes;
+        for (uint32_t i = 0; i < bool_span_count; ++i) {
+          std::memset(family_bytes.data + bool_spans[i], 0, sizeof(RenderSpecConstant::value));
+        }
+        job->family = family_bytes.Hash();
+        const bool covered = use_standin(job->family);
         StartPipelineWorker();
         pending_pipelines_.emplace(key, job);
         {
           std::lock_guard lock(pipeline_mutex_);
-          pipeline_queue_.push_back(std::move(job));
+          (covered ? pipeline_queue_ : pipeline_urgent_queue_).push_back(std::move(job));
         }
         pipeline_ready_.notify_one();
-        return Drop("pipeline compiling", vs, ps);
+        if (!covered) return Drop("pipeline compiling", vs, ps);
       }
     }
-    if (!pipeline && !failed_pipelines_.count(key) && !pending_pipelines_.count(key)) {
+    if (!pipeline && !standin && !failed_pipelines_.count(key) && !pending_pipelines_.count(key)) {
       const auto pipeline_start = std::chrono::steady_clock::now();
       pipeline = device_->createGraphicsPipeline(desc);
       stats_.pipeline_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -5217,12 +5297,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     if (pipeline && getenv("RENUT_PIPELINE_IR")) {
       DumpPipelineInternals(*pipeline, vs, ps, miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')));
     }
-    if (!pipeline) {
+    if (!pipeline && !standin) {
       REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
                   vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
     }
   }
-  if (!pipeline) {
+  if (!pipeline && !standin) {
     ++stats_.bad_shader;
     return true;
   }
@@ -5311,7 +5391,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   pk.framebuffer = framebuffer;
   pk.pass_colors = color_count_of_pass_;
   pk.pass_depth = depth_of_pass_;
-  pk.pipeline = pipeline.get();
+  pk.pipeline = standin ? standin : pipeline.get();
   pk.interface_key = interface_key;
   pk.vs_hash = vs->entry->hash ^ (uint64_t(rel_constants_mode_ >= 10 ? rel_variant : 0) << 60);
   pk.ps_hash = ps ? ps->entry->hash : 0;
@@ -6239,6 +6319,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
   }
   ++swaps_;
+  if (!pending_pipelines_.empty()) ReapPipelines();
   if (!miss_dump_directory_.empty()) {
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
     if (swaps_ % 30 == 0) {
