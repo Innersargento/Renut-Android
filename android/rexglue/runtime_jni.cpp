@@ -29,6 +29,7 @@
 using rex::X_STATUS;
 extern const rex::PPCImageInfo PPCImageConfig;
 void renutSetContentActivity(JNIEnv*, jobject);
+std::string renutCheatsSummary();
 namespace renut {
 void AchievementsStart(JNIEnv*, jobject, rex::Runtime&, const std::filesystem::path&);
 void AchievementsStop(rex::Runtime&);
@@ -210,6 +211,10 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     auto log_level = spdlog::level::from_str(rex::cvar::GetFlagByName("log_level"));
     rex::InitLogging(log_path.c_str(), log_level);
     if (has_config) note("Configuração: renut.toml aplicado.");
+    if (launch) {
+      const auto cheats = renutCheatsSummary();
+      note(cheats.empty() ? std::string("Cheats: desligados") : "Cheats: " + cheats);
+    }
     note("Renderizador: Plume");
     // So does its MSAA choice.
     rex::cvar::SetFlagByName("renut_scene_msaa", sceneMsaa ? "true" : "false");

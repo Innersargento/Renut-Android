@@ -1,0 +1,75 @@
+# Cheats of the Android build (Jogar > Cheats). The addresses are the ones the
+# desktop build already hooks in renut_hooks.toml; they are valid for the
+# European XEX this build is generated from. The hook functions live in
+# android/rexglue/cheats.cpp and read cvars, so a cheat that is off costs one
+# flag test where the hook sits.
+
+# Infinite health: skip the call that applies the health amount
+# (sub_823F4720 -> sub_822AC798), as the desktop hook does. 0x823F47D0 is the
+# epilogue.
+[[midasm_hook]]
+address = 0x823F47C8
+name = "renut_cheat_infinite_health"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x823F47D0
+
+# Infinite fuel and ammo: return from the consumption routine (sub_82278378)
+# right after its register save, before it touches anything. The desktop hook
+# returns unconditionally; here it returns only with the cheat on.
+[[midasm_hook]]
+address = 0x82278380
+name = "renut_cheat_infinite_fuel_ammo"
+registers = []
+after_instruction = false
+return_on_true = true
+
+# Infinite parts: the part counter is stored from r10 at 0x8251DD10; the
+# cheat stores 100 there, so using a part never lowers it.
+[[midasm_hook]]
+address = 0x8251DD10
+name = "renut_cheat_infinite_parts"
+registers = ["r10"]
+after_instruction = false
+
+# No timer: skip the countdown of missions that have one.
+[[midasm_hook]]
+address = 0x82526200
+name = "renut_cheat_no_timer"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x8252620C
+
+# No notes spent: skip the note debit.
+[[midasm_hook]]
+address = 0x824CE324
+name = "renut_cheat_no_notes_spent"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x824CE32C
+
+# Change/build vehicle anywhere: while the pause-menu list is built, r26 is the
+# "Change Vehicle" row and r23 the "Build Vehicle" row. Forcing both on
+# adds them outside Showdown Town too.
+[[midasm_hook]]
+address = 0x825A8BF8
+name = "renut_cheat_vehicles_anywhere"
+registers = ["r23", "r26"]
+after_instruction = false
+
+# Extended build range of Mumbo's Motors.
+[[midasm_hook]]
+address = 0x8264AC14
+name = "renut_cheat_extended_build_range"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x8264AE28
+
+# Banjo skin: swaps the actor name Banjo is spawned with. Returns false to jump
+# past the original selection once r3/r5 are replaced.
+[[midasm_hook]]
+address = 0x8251CA9C
+name = "renut_cheat_banjo_skin"
+registers = ["r3", "r5"]
+after_instruction = true
+jump_address_on_false = 0x8251CABC

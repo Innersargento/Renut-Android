@@ -184,6 +184,8 @@ object ComposeScreens {
                         else "Importe a imagem ISO do jogo abaixo para começar.",
                         color = Muted, fontSize = 13.sp)
                     else Text("Experimental: o desempenho e a compatibilidade ainda estão em desenvolvimento.", color = Muted, fontSize = 12.sp)
+                    if (state == 2 && activity.uiRuntimeOption(RuntimeOptions.CHEATS, "false") == "true")
+                        Text("Cheats ligados nesta partida", color = Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -205,6 +207,7 @@ object ComposeScreens {
                 }
             }
         }
+        item { CheatsPanel(activity, !busy) }
         item {
             Panel("Ao abrir o app") {
                 ToggleRow("Iniciar direto no jogo", autoStart, !busy) { activity.uiSetAutoStart(it) }
@@ -220,6 +223,48 @@ object ComposeScreens {
                 Text("A importação da ISO precisa de espaço livre para a imagem e os arquivos extraídos.", color = Muted, fontSize = 12.sp)
             }
         }
+    }
+}
+
+private val CHEAT_LABELS = listOf(
+    "renut_cheat_infinite_health" to "Vida infinita",
+    "renut_cheat_infinite_fuel_ammo" to "Combustível e munição infinitos",
+    "renut_cheat_infinite_parts" to "Peças infinitas",
+    "renut_cheat_no_timer" to "Sem limite de tempo nas missões",
+    "renut_cheat_no_notes_spent" to "Notas não são gastas",
+    "renut_cheat_vehicles_anywhere" to "Trocar e montar veículo em qualquer lugar",
+    "renut_cheat_extended_build_range" to "Área de montagem maior (Mumbo's Motors)")
+private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tuxedo" to "Smoking")
+
+/** Cheats of the next game start. The switches live in renut.toml, which the runtime reads at launch. */
+@Composable private fun CheatsPanel(activity: MainActivity, enabled: Boolean) {
+    var master by remember { mutableStateOf(activity.uiRuntimeOption(RuntimeOptions.CHEATS, "false") == "true") }
+    val flags = remember {
+        mutableStateMapOf<String, Boolean>().apply {
+            CHEAT_LABELS.forEach { (key, _) -> put(key, activity.uiRuntimeOption(key, "false") == "true") }
+        }
+    }
+    var skin by remember { mutableStateOf(activity.uiRuntimeOption(RuntimeOptions.CHEAT_SKIN, "default")) }
+    Panel("Cheats") {
+        ToggleRow("Aplicar cheats ao jogar", master, enabled) {
+            master = it
+            activity.uiSetRuntimeOption(RuntimeOptions.CHEATS, it.toString())
+        }
+        if (master) {
+            CHEAT_LABELS.forEach { (key, label) ->
+                ToggleRow(label, flags[key] == true, enabled) {
+                    flags[key] = it
+                    activity.uiSetRuntimeOption(key, it.toString())
+                }
+            }
+            SingleChoiceSelector("Visual do Banjo", SKIN_LABELS.firstOrNull { it.first == skin }?.second ?: "Normal",
+                SKIN_LABELS.map { it.second }) { label ->
+                val value = SKIN_LABELS.first { it.second == label }.first
+                skin = value
+                activity.uiSetRuntimeOption(RuntimeOptions.CHEAT_SKIN, value)
+            }
+        }
+        Text("Valem a partir da próxima partida. Peças infinitas altera as contagens de peças do seu save.", color = Muted, fontSize = 12.sp)
     }
 }
 

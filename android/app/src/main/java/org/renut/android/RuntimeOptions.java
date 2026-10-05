@@ -12,8 +12,20 @@ import java.util.Set;
 
 /** Edits only the runtime cvars exposed by the Android settings screen. */
 final class RuntimeOptions {
-    private static final Set<String> BOOLEANS = Set.of(
-        "renut_plume_async_pipelines", "renut_plume_uncap_fps");
+    /** The cheats of cheats.cpp: a master switch, one flag per cheat and Banjo's outfit. */
+    static final String CHEATS = "renut_cheats";
+    static final String[] CHEAT_FLAGS = {
+        "renut_cheat_infinite_health", "renut_cheat_infinite_fuel_ammo", "renut_cheat_infinite_parts",
+        "renut_cheat_no_timer", "renut_cheat_no_notes_spent", "renut_cheat_vehicles_anywhere",
+        "renut_cheat_extended_build_range"};
+    static final String CHEAT_SKIN = "renut_cheat_banjo_skin";
+    static final String[] SKINS = {"default", "robot", "tuxedo"};
+
+    private static final Set<String> BOOLEANS = new java.util.HashSet<>(java.util.Arrays.asList(
+        "renut_plume_async_pipelines", "renut_plume_uncap_fps", CHEATS));
+    static {
+        BOOLEANS.addAll(java.util.Arrays.asList(CHEAT_FLAGS));
+    }
     private static final Set<String> LEVELS = Set.of("trace", "debug", "info", "warn", "error", "critical", "off");
 
     private RuntimeOptions() {}
@@ -37,13 +49,15 @@ final class RuntimeOptions {
     }
 
     static void set(Context context, String key, String value) throws IOException {
+        boolean text = key.equals("log_level") || key.equals(CHEAT_SKIN);
         if (!(BOOLEANS.contains(key) && (value.equals("true") || value.equals("false"))
-            || key.equals("log_level") && LEVELS.contains(value)))
+            || key.equals("log_level") && LEVELS.contains(value)
+            || key.equals(CHEAT_SKIN) && java.util.Arrays.asList(SKINS).contains(value)))
             throw new IllegalArgumentException("Opção inválida: " + key);
         File file = config(context);
         List<String> lines = file.isFile()
             ? new ArrayList<>(Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)) : new ArrayList<>();
-        String assignment = key + " = " + (key.equals("log_level") ? "\"" + value + "\"" : value);
+        String assignment = key + " = " + (text ? "\"" + value + "\"" : value);
         boolean found = false;
         for (int i = 0; i < lines.size(); i++) {
             String trimmed = lines.get(i).trim();
