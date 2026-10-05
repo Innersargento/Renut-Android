@@ -332,7 +332,14 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
 
 @Composable private fun SettingsScreen(activity: MainActivity, modifier: Modifier, tick: Int) {
     @Suppress("UNUSED_VARIABLE") val update = tick
-    val driver = activity.uiDriver()
+    val driver = activity.uiDriverSelected()
+    var confirmDeleteDriver by remember { mutableStateOf(false) }
+    if (confirmDeleteDriver) AlertDialog(
+        onDismissRequest = { confirmDeleteDriver = false },
+        title = { Text("Apagar driver?") },
+        text = { Text("\"$driver\" será removido do aparelho e o driver do sistema passará a ser usado. Você poderá importá-lo de novo.") },
+        confirmButton = { TextButton(onClick = { confirmDeleteDriver = false; activity.uiDeleteDriver() }) { Text("Apagar") } },
+        dismissButton = { TextButton(onClick = { confirmDeleteDriver = false }) { Text("Cancelar") } })
     val busy = activity.uiBusy()
     val fpsEnabled = activity.uiFpsEnabled()
     val controlsEnabled = activity.uiShowControls()
@@ -363,9 +370,9 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
         }
         item {
             Panel("Avançado") {
-                InfoRow("Driver", driver)
+                SingleChoiceSelector("Driver", driver, activity.uiDriverChoices(), !busy) { activity.uiSelectDriver(it) }
                 ActionButton("Importar driver Adreno (.zip)", !busy, outlined = true) { activity.uiAction("Importar driver Adreno (.zip)") }
-                ActionButton("Usar driver do sistema", !busy, outlined = true) { activity.uiAction("Usar driver do sistema") }
+                if (activity.uiDriverStored()) ActionButton("Apagar driver selecionado", !busy, outlined = true) { confirmDeleteDriver = true }
                 ToggleRow("One UI fix", oneUiEnabled, !busy) { activity.uiSetOneUi(it) }
                 MultiModeSelector("TU_DEBUG", tuMode, listOf("perf", "sysmem", "gmem")) { activity.uiSetTuMode(it) }
                 MultiModeSelector("IR3_SHADER_DEBUG", ir3Mode, listOf("nopreamble", "noearlypreamble", "nouboopt", "nodescprefetch")) { activity.uiSetIr3Mode(it) }
@@ -455,10 +462,10 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     }
 }
 
-@Composable private fun SingleChoiceSelector(label: String, selected: String, choices: List<String>, onSelect: (String) -> Unit) {
+@Composable private fun SingleChoiceSelector(label: String, selected: String, choices: List<String>, enabled: Boolean = true, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box {
-        OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
+        OutlinedButton(onClick = { expanded = true }, enabled = enabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
             Text("$label: $selected")
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {

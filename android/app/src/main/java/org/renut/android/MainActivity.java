@@ -184,6 +184,68 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     public String uiLibrary(){return library.getText().toString();}
     public String uiStatus(){return status.getText().toString();}
     public String uiDriver(){return driver.getText().toString();}
+    private static final String SYSTEM_DRIVER="Driver do sistema";
+    /** Drivers kept on the device: {dir, lib, name}. The one in use is mirrored in driverDir/driverLib. */
+    private java.util.List<JSONObject> storedDrivers(){
+        ArrayList<JSONObject> list=new ArrayList<>();
+        SharedPreferences prefs=getPreferences(0);
+        try{
+            org.json.JSONArray array=new org.json.JSONArray(prefs.getString("drivers","[]"));
+            for(int i=0;i<array.length();i++){
+                JSONObject d=array.getJSONObject(i);
+                if(new File(d.getString("dir"),d.getString("lib")).isFile())list.add(d);
+            }
+            String dir=prefs.getString("driverDir",""),lib=prefs.getString("driverLib","");
+            if(!dir.isEmpty()&&new File(dir,lib).isFile()&&list.stream().noneMatch(d->d.optString("dir").equals(dir))){
+                list.add(new JSONObject().put("dir",dir).put("lib",lib).put("name",lib));
+                saveDrivers(list);
+            }
+        }catch(Exception ignored){}
+        return list;
+    }
+    private void saveDrivers(java.util.List<JSONObject> list){
+        getPreferences(0).edit().putString("drivers",new org.json.JSONArray(list).toString()).apply();
+    }
+    private String driverLabel(java.util.List<JSONObject> list,int index){
+        String name=list.get(index).optString("name");int same=0;
+        for(int i=0;i<index;i++)if(list.get(i).optString("name").equals(name))same++;
+        return same==0?name:name+" ("+(same+1)+")";
+    }
+    public java.util.List<String> uiDriverChoices(){
+        ArrayList<String> out=new ArrayList<>();out.add(SYSTEM_DRIVER);
+        java.util.List<JSONObject> list=storedDrivers();
+        for(int i=0;i<list.size();i++)out.add(driverLabel(list,i));
+        return out;
+    }
+    public String uiDriverSelected(){
+        String dir=getPreferences(0).getString("driverDir","");
+        if(dir.isEmpty())return SYSTEM_DRIVER;
+        java.util.List<JSONObject> list=storedDrivers();
+        for(int i=0;i<list.size();i++)if(list.get(i).optString("dir").equals(dir))return driverLabel(list,i);
+        return SYSTEM_DRIVER;
+    }
+    public void uiSelectDriver(String label){
+        SharedPreferences.Editor edit=getPreferences(0).edit();
+        java.util.List<JSONObject> list=storedDrivers();
+        boolean found=false;
+        for(int i=0;i<list.size()&&!found;i++)if(driverLabel(list,i).equals(label)){
+            edit.putString("driverDir",list.get(i).optString("dir")).putString("driverLib",list.get(i).optString("lib"));found=true;
+        }
+        if(!found)edit.remove("driverDir").remove("driverLib");
+        edit.apply();refresh();
+    }
+    public boolean uiDriverStored(){return !getPreferences(0).getString("driverDir","").isEmpty();}
+    /** Removes the selected stored driver from the device and falls back to the system one. */
+    public void uiDeleteDriver(){
+        String dir=getPreferences(0).getString("driverDir","");
+        if(dir.isEmpty()||worker!=null)return;
+        java.util.List<JSONObject> list=storedDrivers();
+        list.removeIf(d->d.optString("dir").equals(dir));
+        saveDrivers(list);
+        getPreferences(0).edit().remove("driverDir").remove("driverLib").apply();
+        try{GameFiles.removeTree(new File(dir));}catch(IOException e){status.setText("Driver removido da lista, mas os arquivos não foram apagados: "+e.getMessage());}
+        refresh();
+    }
     public String uiFps(){return fpsCounter.getText().toString();}
     public String uiOneUi(){return oneUiFix.getText().toString();}
     public String uiTu(){return tuDebug.getText().toString();}
@@ -234,7 +296,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             boolean full=new File(folder,"Bundle").isDirectory();
             library.setText("Banjo-Kazooie: Nuts & Bolts\nEuropa · "+(full?"assets presentes":"XEX identificado; importe a ISO para obter os assets")+"\nInicialização experimental disponível");
         }catch(IOException e){library.setText("Nenhum arquivo importado");}
-        driver.setText(getPreferences(0).getString("driverLib","Driver do sistema"));
+        driver.setText(uiDriverSelected());
         fpsCounter.setText(getPreferences(0).getBoolean("fps",false)?"Contador de FPS: ativado":"Contador de FPS: desativado");
         oneUiFix.setText(getPreferences(0).getBoolean("oneui",true)?"One UI fix: ativado":"One UI fix: desativado");
         String debug=getPreferences(0).getString("tuDebug","");
@@ -379,7 +441,10 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
                 throw new IOException("O driver precisa ser uma biblioteca ELF ARM64.");
         }
         if(Thread.currentThread().isInterrupted())throw new InterruptedIOException("Importação cancelada.");
-        if(!getPreferences(0).edit().putString("driverDir",stage.getAbsolutePath()).putString("driverLib",lib).commit())throw new IOException("Não foi possível salvar o driver.");
+        java.util.List<JSONObject> list=storedDrivers();
+        list.add(new JSONObject().put("dir",stage.getAbsolutePath()).put("lib",lib).put("name",json.optString("name",lib).trim().isEmpty()?lib:json.optString("name",lib).trim()));
+        if(!getPreferences(0).edit().putString("drivers",new org.json.JSONArray(list).toString())
+            .putString("driverDir",stage.getAbsolutePath()).putString("driverLib",lib).commit())throw new IOException("Não foi possível salvar o driver.");
     }
     @Override protected void onDestroy(){Thread t=worker;if(t!=null)t.interrupt();super.onDestroy();}
 }
