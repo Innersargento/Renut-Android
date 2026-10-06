@@ -14,38 +14,70 @@ index 2048557..4cf1f47 100644
          virtual void clearDepthStencil(bool clearDepth = true, bool clearStencil = true, float depthValue = 1.0f, uint32_t stencilValue = 0, const RenderRect *clearRects = nullptr, uint32_t clearRectsCount = 0) = 0;
          virtual void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) = 0;
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
-index 9dcfedf..9ce1c92 100644
+index 9dcfedf..1e918e2 100644
 --- a/plume_render_interface_types.h
 +++ b/plume_render_interface_types.h
-@@ -160,6 +160,9 @@ namespace plume {
+@@ -160,6 +160,20 @@ namespace plume {
          BC7_TYPELESS,
          BC7_UNORM,
          BC7_UNORM_SRGB,
 +        // X in the low bits, the 2-bit W on top (Vulkan's A2B10G10R10 packs).
 +        R10G10B10A2_UNORM,
 +        R10G10B10A2_UINT,
++        // Integers the hardware converts to floats: what a Direct3D vertex
++        // declaration of UBYTE4 or SHORT2/4 hands a shader, and the only way
++        // a float shader input gets a number on every GPU (a UINT or SINT
++        // format reaches one as raw bits on some and as a float on others).
++        R8G8B8A8_USCALED,
++        R8G8B8A8_SSCALED,
++        R16G16_USCALED,
++        R16G16_SSCALED,
++        R16G16B16A16_USCALED,
++        R16G16B16A16_SSCALED,
++        R10G10B10A2_USCALED,
          MAX
      };
  
-@@ -548,6 +551,8 @@ namespace plume {
+@@ -528,6 +542,8 @@ namespace plume {
+         case RenderFormat::R16G16B16A16_UINT:
+         case RenderFormat::R16G16B16A16_SNORM:
+         case RenderFormat::R16G16B16A16_SINT:
++        case RenderFormat::R16G16B16A16_USCALED:
++        case RenderFormat::R16G16B16A16_SSCALED:
+         case RenderFormat::R32G32_TYPELESS:
+         case RenderFormat::R32G32_FLOAT:
+         case RenderFormat::R32G32_UINT:
+@@ -548,6 +564,13 @@ namespace plume {
          case RenderFormat::R16G16_SINT:
          case RenderFormat::R32_TYPELESS:
          case RenderFormat::D32_FLOAT:
 +        case RenderFormat::R10G10B10A2_UNORM:
 +        case RenderFormat::R10G10B10A2_UINT:
++        case RenderFormat::R10G10B10A2_USCALED:
++        case RenderFormat::R8G8B8A8_USCALED:
++        case RenderFormat::R8G8B8A8_SSCALED:
++        case RenderFormat::R16G16_USCALED:
++        case RenderFormat::R16G16_SSCALED:
          case RenderFormat::R32_FLOAT:
          case RenderFormat::R32_UINT:
          case RenderFormat::R32_SINT:
-@@ -632,6 +637,8 @@ namespace plume {
+@@ -632,6 +655,15 @@ namespace plume {
          case RenderFormat::R32_TYPELESS:
          case RenderFormat::D32_FLOAT:
          case RenderFormat::D32_FLOAT_S8_UINT:
 +        case RenderFormat::R10G10B10A2_UNORM:
 +        case RenderFormat::R10G10B10A2_UINT:
++        case RenderFormat::R10G10B10A2_USCALED:
++        case RenderFormat::R8G8B8A8_USCALED:
++        case RenderFormat::R8G8B8A8_SSCALED:
++        case RenderFormat::R16G16_USCALED:
++        case RenderFormat::R16G16_SSCALED:
++        case RenderFormat::R16G16B16A16_USCALED:
++        case RenderFormat::R16G16B16A16_SSCALED:
          case RenderFormat::R32_FLOAT:
          case RenderFormat::R32_UINT:
          case RenderFormat::R32_SINT:
-@@ -1280,6 +1287,10 @@ namespace plume {
+@@ -1280,6 +1312,10 @@ namespace plume {
          float depthBiasClamp = 0.0f;
          float slopeScaledDepthBias = 0.0f;
          bool dynamicDepthBiasEnabled = false;
@@ -57,10 +89,19 @@ index 9dcfedf..9ce1c92 100644
          bool depthWriteEnabled = false;
          bool stencilEnabled = false;
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..bfc5dad 100644
+index f1dd503..f8cfc13 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -87,6 +87,8 @@ namespace plume {
+@@ -28,6 +28,8 @@
+ // - Fix resource pools.
+ 
+ namespace plume {
++    std::atomic<int> g_plumeDeviceLost{0};
++
+     // Backend constants.
+ 
+     // Required buffer alignment for acceleration structures.
+@@ -87,6 +89,8 @@ namespace plume {
          VK_KHR_PRESENT_ID_EXTENSION_NAME,
          VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
          VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
@@ -69,7 +110,7 @@ index f1dd503..bfc5dad 100644
          // Vulkan spec requires this to be enabled if supported by the driver.
          VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
      };
-@@ -249,6 +251,10 @@ namespace plume {
+@@ -249,6 +253,24 @@ namespace plume {
              return VK_FORMAT_BC7_UNORM_BLOCK;
          case RenderFormat::BC7_UNORM_SRGB:
              return VK_FORMAT_BC7_SRGB_BLOCK;
@@ -77,10 +118,24 @@ index f1dd503..bfc5dad 100644
 +            return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
 +        case RenderFormat::R10G10B10A2_UINT:
 +            return VK_FORMAT_A2B10G10R10_UINT_PACK32;
++        case RenderFormat::R8G8B8A8_USCALED:
++            return VK_FORMAT_R8G8B8A8_USCALED;
++        case RenderFormat::R8G8B8A8_SSCALED:
++            return VK_FORMAT_R8G8B8A8_SSCALED;
++        case RenderFormat::R16G16_USCALED:
++            return VK_FORMAT_R16G16_USCALED;
++        case RenderFormat::R16G16_SSCALED:
++            return VK_FORMAT_R16G16_SSCALED;
++        case RenderFormat::R16G16B16A16_USCALED:
++            return VK_FORMAT_R16G16B16A16_USCALED;
++        case RenderFormat::R16G16B16A16_SSCALED:
++            return VK_FORMAT_R16G16B16A16_SSCALED;
++        case RenderFormat::R10G10B10A2_USCALED:
++            return VK_FORMAT_A2B10G10R10_USCALED_PACK32;
          default:
              assert(false && "Unknown format.");
              return VK_FORMAT_UNDEFINED;
-@@ -930,7 +936,10 @@ namespace plume {
+@@ -930,7 +952,10 @@ namespace plume {
          info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
          info.pNext = nullptr;
          info.buffer = vk;
@@ -92,7 +147,7 @@ index f1dd503..bfc5dad 100644
      }
  
      // VulkanBufferFormattedView
-@@ -1617,6 +1626,16 @@ namespace plume {
+@@ -1617,6 +1642,16 @@ namespace plume {
              dynamicStates.emplace_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
          }
  
@@ -109,7 +164,7 @@ index f1dd503..bfc5dad 100644
          VkPipelineDynamicStateCreateInfo dynamicState = {};
          dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
          dynamicState.pDynamicStates = dynamicStates.data();
-@@ -1648,6 +1667,17 @@ namespace plume {
+@@ -1648,6 +1683,17 @@ namespace plume {
          pipelineInfo.pDynamicState = &dynamicState;
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.renderPass = renderPass;
@@ -127,7 +182,7 @@ index f1dd503..bfc5dad 100644
  
          VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
          if (res != VK_SUCCESS) {
-@@ -3112,6 +3142,16 @@ namespace plume {
+@@ -3112,6 +3158,16 @@ namespace plume {
          vkCmdSetDepthBias(vk, depthBias, depthBiasClamp, slopeScaledDepthBias);
      }
  
@@ -144,7 +199,7 @@ index f1dd503..bfc5dad 100644
      static void clearCommonRectVector(uint32_t width, uint32_t height, const RenderRect *clearRects, uint32_t clearRectsCount, std::vector<VkClearRect> &rectVector) {
          rectVector.clear();
  
-@@ -3229,6 +3269,25 @@ namespace plume {
+@@ -3229,6 +3285,25 @@ namespace plume {
              imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
              vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
          }
@@ -170,7 +225,23 @@ index f1dd503..bfc5dad 100644
          else {
              VkImageCopy imageCopy = {};
              imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
-@@ -3883,6 +3942,13 @@ namespace plume {
+@@ -3626,6 +3701,7 @@ namespace plume {
+         }
+ 
+         if (res != VK_SUCCESS) {
++            if (res == VK_ERROR_DEVICE_LOST) g_plumeDeviceLost.store(int(res));
+             fprintf(stderr, "vkQueueSubmit failed with error code 0x%X.\n", res);
+             return;
+         }
+@@ -3637,6 +3713,7 @@ namespace plume {
+         VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
+         VkResult res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, UINT64_MAX);
+         if (res != VK_SUCCESS) {
++            if (res == VK_ERROR_DEVICE_LOST) g_plumeDeviceLost.store(int(res));
+             fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
+             return;
+         }
+@@ -3883,6 +3960,13 @@ namespace plume {
              featuresChain = &portabilityFeatures;
          }
  
@@ -184,7 +255,7 @@ index f1dd503..bfc5dad 100644
          VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
          VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
          const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
-@@ -4177,7 +4243,16 @@ namespace plume {
+@@ -4177,7 +4261,16 @@ namespace plume {
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
@@ -203,10 +274,30 @@ index f1dd503..bfc5dad 100644
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 0a1edbe..2eb1d98 100644
+index 0a1edbe..0500227 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -56,6 +56,8 @@ namespace plume {
+@@ -9,6 +9,7 @@
+ 
+ #include "plume_render_interface.h"
+ 
++#include <atomic>
+ #include <mutex>
+ #include <set>
+ #include <unordered_map>
+@@ -42,6 +43,11 @@
+ #endif
+ 
+ namespace plume {
++    // The last VkResult that said the device is gone (VK_ERROR_DEVICE_LOST), set by
++    // a failed submit or fence wait; 0 while the device is fine. A GPU that faults
++    // answers every later call the same way, so the host polls this to notice.
++    extern std::atomic<int> g_plumeDeviceLost;
++
+     struct VulkanCommandQueue;
+     struct VulkanDevice;
+     struct VulkanInterface;
+@@ -56,6 +62,8 @@ namespace plume {
          VmaAllocationInfo allocationInfo = {};
          RenderBufferDesc desc;
          RenderBarrierStages barrierStages = RenderBarrierStage::NONE;
@@ -215,7 +306,7 @@ index 0a1edbe..2eb1d98 100644
  
          VulkanBuffer() = default;
          VulkanBuffer(VulkanDevice *device, VulkanPool *pool, const RenderBufferDesc &desc);
-@@ -329,6 +331,8 @@ namespace plume {
+@@ -329,6 +337,8 @@ namespace plume {
          void setScissors(const RenderRect *scissorRects, uint32_t count) override;
          void setFramebuffer(const RenderFramebuffer *framebuffer) override;
          void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) override;

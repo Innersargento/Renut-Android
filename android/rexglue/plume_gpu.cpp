@@ -14,6 +14,7 @@
 #include "spirv_fetch_spec.h"
 
 #include <sys/resource.h>
+#include <thread>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -89,6 +90,12 @@ REXCVAR_DEFINE_BOOL(renut_plume_memexport_readback, false, "reNut/Plume",
                     "Copy shader exports back to guest memory (experimental; may overwrite reused memory).");
 REXCVAR_DEFINE_BOOL(renut_plume_memexport_fast, true, "reNut/Plume",
                     "Batch Plume memexport readback across frames; off waits for the current frame.");
+REXCVAR_DEFINE_INT32(renut_plume_low_memory, -1, "reNut/Plume",
+                     "Keep less on the GPU for a device with little RAM: -1 decides from the device (under 6 GB), "
+                     "0 off, 1 on.");
+REXCVAR_DEFINE_INT32(renut_plume_texture_max_dim, 0, "reNut/Plume",
+                     "Largest side a guest texture keeps on the host; the top mips of a larger one are dropped. "
+                     "0 follows low-memory mode (512 there, no limit otherwise).");
 
 // game_fixes.cpp: how the MSAA-off path treats the scene's band split
 // (<files>/plume-keep-split: 0 clear, 1 leave, 2 whole-screen projection).
@@ -633,21 +640,32 @@ enum class InputDecode { kNone, kInteger, kPacked1010102, kPacked111110 };
 // arrive as raw bits, and the packed formats have no host equivalent.
 RenderFormat VertexFormat(uint32_t format, bool is_signed, bool normalized, InputDecode& decode) {
   decode = InputDecode::kNone;
+  // The shaders take every input as a float4 and, for the locations flagged
+  // integer, read the bits of a UINT/SINT attribute with asint(). That works
+  // where such an attribute reaches a float input unconverted (Adreno) and not
+  // where the hardware converts it (Mali): the bone index of a skinned mesh
+  // came out as asint(28.0) and the vertex shader addressed its matrix palette
+  // gigabytes away - a page fault that took the whole device down. A UBYTE4 or
+  // SHORT is a number to the guest anyway, so for the 8 and 16-bit formats the
+  // hardware does the conversion (USCALED/SSCALED) and nothing is flagged.
   auto integer = [&](RenderFormat unsigned_format, RenderFormat signed_format) {
     decode = InputDecode::kInteger;
+    return is_signed ? signed_format : unsigned_format;
+  };
+  auto scaled = [&](RenderFormat unsigned_format, RenderFormat signed_format) {
     return is_signed ? signed_format : unsigned_format;
   };
   switch (format) {
     case 6:
       return normalized ? (is_signed ? RenderFormat::R8G8B8A8_SNORM : RenderFormat::R8G8B8A8_UNORM)
-                        : integer(RenderFormat::R8G8B8A8_UINT, RenderFormat::R8G8B8A8_SINT);
+                        : scaled(RenderFormat::R8G8B8A8_USCALED, RenderFormat::R8G8B8A8_SSCALED);
     case 25:
       return normalized ? (is_signed ? RenderFormat::R16G16_SNORM : RenderFormat::R16G16_UNORM)
-                        : integer(RenderFormat::R16G16_UINT, RenderFormat::R16G16_SINT);
+                        : scaled(RenderFormat::R16G16_USCALED, RenderFormat::R16G16_SSCALED);
     case 26:
       return normalized
                  ? (is_signed ? RenderFormat::R16G16B16A16_SNORM : RenderFormat::R16G16B16A16_UNORM)
-                 : integer(RenderFormat::R16G16B16A16_UINT, RenderFormat::R16G16B16A16_SINT);
+                 : scaled(RenderFormat::R16G16B16A16_USCALED, RenderFormat::R16G16B16A16_SSCALED);
     case 31: return RenderFormat::R16G16_FLOAT;
     case 32: return RenderFormat::R16G16B16A16_FLOAT;
     case 33: return integer(RenderFormat::R32_UINT, RenderFormat::R32_SINT);
@@ -664,7 +682,7 @@ RenderFormat VertexFormat(uint32_t format, bool is_signed, bool normalized, Inpu
       // into a world portal (35D0D3DF02172D01) streaked across the screen.
       if (!is_signed) {
         return normalized ? RenderFormat::R10G10B10A2_UNORM
-                          : integer(RenderFormat::R10G10B10A2_UINT, RenderFormat::R10G10B10A2_UINT);
+                          : scaled(RenderFormat::R10G10B10A2_USCALED, RenderFormat::R10G10B10A2_USCALED);
       }
       decode = InputDecode::kPacked1010102;
       return RenderFormat::R32_FLOAT;
@@ -994,6 +1012,16 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint64_t, KeptStream> kept_streams_;
   LookupMemo<KeptStream, 13> kept_memo_;
   uint64_t kept_bytes_ = 0;
+  // Host memory profile (see InitializeContext). A phone with 3 GB of RAM
+  // shares it with the GPU: the ring, the textures and the kept streams are
+  // the whole of what the driver holds, and left at the desktop-class sizes
+  // they pushed the game past what Android lets a process keep - the system
+  // killed it (or the Mali lost its device) as the first scene loaded.
+  bool low_memory_ = false;
+  uint64_t upload_slice_size_ = kUploadSize;
+  uint64_t kept_budget_ = 384ull << 20;
+  uint32_t max_texture_dim_ = 0;
+  uint64_t texture_budget_ = 0;  // bytes of decoded 2D textures; 0 = unlimited
   // Filled by the guest thread that tripped a watch (inside its fault
   // handler), drained by this one.
   std::mutex watch_mutex_;
@@ -1088,6 +1116,10 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint32_t GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch);
   void Report();
+  // Host memory the cache holds, by category. Printed when the driver's block
+  // total moved by 32 MB since the last line (and never twice within 15 frames).
+  void ReportMemory();
+  uint64_t reported_memory_blocks_ = 0;
 
   RenderDevice* device_ = nullptr;
   RenderCommandQueue* queue_ = nullptr;
@@ -1501,10 +1533,48 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     RenderFormat index_format = RenderFormat::R16_UINT;
     uint32_t count = 0, first = 0;
     int32_t base_vertex = 0;
-    // Only for the pair profile.
+    // Only for the pair profile, and the trail a lost device prints.
     uint64_t vs_hash = 0, ps_hash = 0;
+    uint64_t s0_addr = 0, s10_addr = 0;
+    uint32_t s0_size = 0, s10_size = 0;
   };
+  // The draws recorded last, for the report a lost device prints (see
+  // ReportDeviceLost). Written by this thread only; the watcher reads it after
+  // the GPU has already faulted, so a torn entry costs a wrong line at worst.
+  struct RecentDraw {
+    uint64_t frame = 0, vs = 0, ps = 0, pipeline = 0, framebuffer = 0, s0_addr = 0, s10_addr = 0;
+    uint64_t pair_first_frame = 0;  // the frame this vertex/pixel pair was first recorded in
+    uint32_t kind = 0, count = 0, first = 0, s0_size = 0, s10_size = 0;
+  };
+  static constexpr size_t kRecentDraws = 6144;
+  std::vector<RecentDraw> recent_draws_ = std::vector<RecentDraw>(kRecentDraws);
+  std::atomic<uint64_t> recent_draw_count_{0};
+  std::unordered_map<uint64_t, uint64_t> pair_first_frame_;  // frame a pair was first recorded
+  std::atomic<bool> device_watch_stop_{false};
+  // Joins on destruction, so a processor that never reaches ShutdownContext
+  // does not terminate the process with a running thread.
+  struct WatchThread {
+    std::atomic<bool>& stop;
+    std::thread thread;
+    explicit WatchThread(std::atomic<bool>& flag) : stop(flag) {}
+    ~WatchThread() {
+      stop = true;
+      if (thread.joinable()) thread.join();
+    }
+  };
+  WatchThread device_watch_{device_watch_stop_};
+  void ReportDeviceLost();
   bool PairBegin(const DrawPacket& pk);
+  // Debug: <files>/plume-syncdraws submits and waits (3 s at most) after every
+  // draw, so a draw that takes the GPU down is the last one named in the log.
+  // Draws stop being deferred while it is on.
+  bool sync_draws_ = false;
+  uint64_t sync_draw_count_ = 0;
+  std::unordered_set<uint64_t> sync_seen_;
+  std::unordered_map<uint64_t, uint32_t> sync_diag_;
+  std::string sync_draw_info_;
+  std::array<std::string, 6> sync_recent_;
+  void SyncAfterDraw(const DrawPacket& pk);
   static constexpr size_t kMaxDeferred = 384;
   std::vector<DrawPacket> deferred_, flushing_;
   std::vector<DeferredSlot> deferred_slots_, flushing_slots_, draw_slots_;
@@ -1817,8 +1887,27 @@ bool PlumeCommandProcessor::SetupContext() {
   set_samplers_->setSampler(kSamplerDefault, samplers_[kSamplerDefault].get());
   next_sampler_ = kSamplerDefault + 1;
 
+  {
+    const uint64_t total_ram = uint64_t(sysconf(_SC_PHYS_PAGES)) * uint64_t(sysconf(_SC_PAGESIZE));
+    const int32_t mode = REXCVAR_GET(renut_plume_low_memory);
+    low_memory_ = mode < 0 ? total_ram < (6ull << 30) : mode > 0;
+    if (low_memory_) {
+      // Showdown Town has peaked at 126 MB of ring a frame on a big device; a
+      // slice this size overflows there and costs a drain of the GPU each
+      // time, which is the price of not holding 256 MB of RAM for it.
+      upload_slice_size_ = 64ull << 20;
+      kept_budget_ = 96ull << 20;
+      max_texture_dim_ = 512;
+      texture_budget_ = 256ull << 20;
+    }
+    if (const int32_t dim = REXCVAR_GET(renut_plume_texture_max_dim); dim > 0) max_texture_dim_ = uint32_t(dim);
+    REXLOG_INFO("Renut: Plume memory profile {}: {} MB of RAM, ring {} MB a slice, kept streams {} MB, textures "
+                "{} MB over {} px",
+                low_memory_ ? "low" : "full", total_ram >> 20, upload_slice_size_ >> 20, kept_budget_ >> 20,
+                texture_budget_ >> 20, max_texture_dim_);
+  }
   // One slice per frame in flight, after the permanent allocations.
-  const uint64_t upload_bytes = kUploadSize * kPlumeFramesInFlight + 4096;
+  const uint64_t upload_bytes = upload_slice_size_ * kPlumeFramesInFlight + 4096;
   upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
       upload_bytes, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::CONSTANT |
                         RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::STORAGE));
@@ -1929,10 +2018,22 @@ bool PlumeCommandProcessor::SetupContext() {
   BeginFrame();
   REXLOG_INFO("Renut: Plume command processor ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);
+  device_watch_stop_ = false;
+  device_watch_.thread = std::thread([this] {
+    while (!device_watch_stop_.load()) {
+      if (plume::g_plumeDeviceLost.load()) {
+        ReportDeviceLost();
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  });
   return true;
 }
 
 void PlumeCommandProcessor::ShutdownContext() {
+  device_watch_stop_ = true;
+  if (device_watch_.thread.joinable()) device_watch_.thread.join();
   StopPipelineWorker();
   if (list_open_) {
     L()->end();
@@ -2062,7 +2163,7 @@ bool PlumeCommandProcessor::CreateConstantBuffers() {
 }
 
 uint64_t PlumeCommandProcessor::Allocate(uint64_t size, uint64_t alignment) {
-  const uint64_t limit = slice_base_ + kUploadSize;
+  const uint64_t limit = slice_base_ + upload_slice_size_;
   uint64_t offset = (upload_used_ + alignment - 1) & ~(alignment - 1);
   if (offset + size > limit) {
     ++stats_.overflow;
@@ -2181,7 +2282,7 @@ void PlumeCommandProcessor::DrainWatchHits() {
 bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::Endian endian,
                                         RenderBuffer*& buffer, uint64_t& offset) {
   // Streams are kept up to this much in all; past it they are copied as before.
-  constexpr uint64_t kKeptBudget = 384ull << 20;
+  const uint64_t kKeptBudget = kept_budget_;
   buffer = upload_.get();
   if (!keep_streams_ || !address || !size || size > (32u << 20)) {
     return UploadGuest(address, size, endian, offset);
@@ -2816,7 +2917,9 @@ void PlumeCommandProcessor::EvictIdleTextures() {
   const uint32_t free_3d = kMaxTextures3D - next_3d_descriptor_ + uint32_t(free_3d_descriptors_.size());
   const uint32_t free_cube = kMaxTexturesCube - next_cube_descriptor_ + uint32_t(free_cube_descriptors_.size());
   // About a minute at the game's frame rate, a few seconds when a set runs low.
-  auto idle_for = [&](bool short_of) { return short_of ? uint64_t(60) : uint64_t(900); };
+  auto idle_for = [&](bool short_of) {
+    return short_of ? uint64_t(60) : (low_memory_ ? uint64_t(300) : uint64_t(900));
+  };
   auto idle = [&](uint64_t frame, uint64_t limit) { return frame == ~0ull || swaps_ - frame >= limit; };
   uint32_t evicted = 0;
 
@@ -2826,6 +2929,32 @@ void PlumeCommandProcessor::EvictIdleTextures() {
     RetireTexture(it->second.texture, it->second.descriptor);
     it = guest_textures_.erase(it);
     ++evicted;
+  }
+  // A budget on top of the idle rule, for a host that cannot wait for a texture
+  // to have gone unused: the oldest go first, never one drawn in the last few
+  // frames (the frames in flight may still read it).
+  if (texture_budget_) {
+    uint64_t bytes = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> by_age;  // frame last checked, key
+    for (const auto& [key, t] : guest_textures_) {
+      if (!t.texture) continue;
+      const uint64_t base = uint64_t(t.width) * t.height * 4;
+      bytes += t.levels > 1 ? base * 4 / 3 : base;
+      by_age.emplace_back(t.checked_frame == ~0ull ? 0 : t.checked_frame, key);
+    }
+    if (bytes > texture_budget_) {
+      std::sort(by_age.begin(), by_age.end());
+      for (const auto& [frame, key] : by_age) {
+        if (bytes <= texture_budget_ || swaps_ - frame < 3) break;
+        auto it = guest_textures_.find(key);
+        if (it == guest_textures_.end()) continue;
+        const uint64_t base = uint64_t(it->second.width) * it->second.height * 4;
+        bytes -= it->second.levels > 1 ? base * 4 / 3 : base;
+        RetireTexture(it->second.texture, it->second.descriptor);
+        guest_textures_.erase(it);
+        ++evicted;
+      }
+    }
   }
   // Once, not per erased entry: the memo is 64 KB.
   texture_memo_.Clear();
@@ -2891,7 +3020,7 @@ void PlumeCommandProcessor::BeginFrame() {
   ReadPairTimestamps(slot_);
   ApplyWritebacks(slot_);
   list_ = lists_[slot_].get();
-  slice_base_ = slice_origin_ + uint64_t(slot_) * kUploadSize;
+  slice_base_ = slice_origin_ + uint64_t(slot_) * upload_slice_size_;
   for (uint32_t index : retired_descriptor_slots_[slot_]) {
     set_2d_->setTexture(index, white_2d_.get(), RenderTextureLayout::SHADER_READ);
     free_descriptors_.push_back(index);
@@ -2911,7 +3040,7 @@ void PlumeCommandProcessor::BeginFrame() {
   retired_slots_[slot_].clear();
   retired_views_[slot_].clear();
   retired_buffers_[slot_].clear();
-  if (swaps_ - last_eviction_ >= 30) {
+  if (swaps_ - last_eviction_ >= (low_memory_ ? 8u : 30u)) {
     last_eviction_ = swaps_;
     EvictIdleTextures();
   }
@@ -3319,6 +3448,15 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   for (uint32_t i = 0; i < levels; ++i) {
     data[i] = memory_->TranslatePhysical<const uint8_t*>(fetch_layout->starts[i]);
   }
+  // The guest's top mips a low-memory host does not keep: a texture a side of
+  // 2048 held as RGBA8 is 21 MB with its chain and 1.4 MB from 512 down, and
+  // at this render size nothing shows the difference. Coordinates are
+  // normalised, so the shaders sample the smaller image the same way.
+  uint32_t skip = 0;
+  if (max_texture_dim_) {
+    while (skip + 1 < levels && std::max(layouts[skip].width, layouts[skip].height) > max_texture_dim_) ++skip;
+  }
+  const uint32_t host_levels = levels - skip;
   GuestTexture* texture_node = texture_memo_.Find(key);
   if (!texture_node) {
     texture_node = &guest_textures_[key];
@@ -3368,8 +3506,8 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     return texture.descriptor;
   }
   std::vector<uint32_t> rgba;
-  const uint32_t width = layouts[0].width, height = layouts[0].height;
-  if (!DecodeTextureLevel(fetch, layouts[0], data[0], 0, rgba)) {
+  const uint32_t width = layouts[skip].width, height = layouts[skip].height;
+  if (!DecodeTextureLevel(fetch, layouts[skip], data[skip], 0, rgba)) {
     texture.failed = true;
     ++stats_.texture_failures;
     if (unsupported_formats_.insert(uint32_t(fetch.format)).second) {
@@ -3380,11 +3518,11 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   if (!texdump_directory_.empty()) DumpTexture(fetch, rgba, width, height, "2d");
   // New contents reuse the image when its shape is unchanged: earlier draws of
   // this frame may still reference it, and the upload is ordered after them.
-  if (!texture.texture || texture.levels != levels || texture.width != width || texture.height != height) {
+  if (!texture.texture || texture.levels != host_levels || texture.width != width || texture.height != height) {
     RetireTexture(texture.texture, texture.descriptor);
     texture.texture = device_->createTexture(
-        RenderTextureDesc::Texture2D(width, height, levels, RenderFormat::R8G8B8A8_UNORM));
-    texture.levels = levels;
+        RenderTextureDesc::Texture2D(width, height, host_levels, RenderFormat::R8G8B8A8_UNORM));
+    texture.levels = host_levels;
     texture.width = width;
     texture.height = height;
     texture.layout = RenderTextureLayout::UNKNOWN;
@@ -3403,10 +3541,10 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   }
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
   uint32_t w = width, h = height;
-  for (uint32_t level = 0; level < levels; ++level) {
-    if (level && !DecodeTextureLevel(fetch, layouts[level], data[level], 0, rgba)) return 0;
-    w = layouts[level].width;
-    h = layouts[level].height;
+  for (uint32_t level = 0; level < host_levels; ++level) {
+    if (level && !DecodeTextureLevel(fetch, layouts[skip + level], data[skip + level], 0, rgba)) return 0;
+    w = layouts[skip + level].width;
+    h = layouts[skip + level].height;
     const uint64_t staging = Allocate(uint64_t(w) * h * 4, 512);
     if (staging == UINT64_MAX) return 0;
     std::memcpy(Pointer(staging), rgba.data(), size_t(w) * h * 4);
@@ -4473,6 +4611,30 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   std::memcpy(sh + RENUT_SHARED_STREAMS_OFFSET, streams, sizeof(streams));
+  if (sync_draws_) {
+    // What this draw hands the GPU, kept for the line a failure prints.
+    std::string info = fmt::format("vs={:016X} ps={:016X} index_count={} streams:", vs->entry->hash,
+                                   ps ? ps->entry->hash : 0, index_count);
+    for (uint32_t s = 0; s < slot_sizes.size(); ++s) {
+      if (!slot_sizes[s]) continue;
+      info += fmt::format(" {}:{}B/{}@{:X}", s, slot_sizes[s], slot_buffers[s] == upload_.get() ? "ring" : "kept",
+                          s < RENUT_VERTEX_STREAM_COUNT ? streams[s] : 0);
+    }
+    for (uint32_t s = 0; s < RENUT_VERTEX_STREAM_COUNT; ++s) {
+      if (s == RENUT_DIRECT_FETCH_STREAM || !slot_sizes[s] || slot_sizes[s] > 256) continue;
+      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - s);
+      std::vector<uint8_t> bytes(slot_sizes[s]);
+      CopySwapped(bytes.data(), memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), slot_sizes[s],
+                  fetch.endian);
+      info += fmt::format(" data{}:", s);
+      for (uint32_t i = 0; i + 4 <= bytes.size() && i < 64; i += 4) {
+        float f;
+        std::memcpy(&f, bytes.data() + i, 4);
+        info += fmt::format(" {:.3g}", f);
+      }
+    }
+    sync_draw_info_ = std::move(info);
+  }
 
   // Memory export. What a shader exports into is named by the stream
   // constants it was handed - Direct3D's own layout, recognisable by its bit
@@ -4606,6 +4768,59 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       }
       if (which >= 0) swapped[which] |= 1u << element->usage_index;
     }
+  }
+  if (sync_draws_ && !patch_list && vs->compiled && sync_diag_[vs->entry->hash]++ < 1) {
+    // One line per vertex shader: what its fetches can reach, for finding the
+    // draw that reads past a stream (the Mali faults where other GPUs read on).
+    std::string diag = fmt::format("Renut: Plume draw diag vs={:016X} ps={:016X} count={} indexed={} streams:",
+                                   vs->entry->hash, ps ? ps->entry->hash : 0, index_count,
+                                   index_buffer_info && index_buffer_info->guest_base);
+    for (uint32_t s = 0; s < slot_sizes.size(); ++s) {
+      if (slot_sizes[s]) diag += fmt::format(" {}:{}B@{:X}", s, slot_sizes[s], s < RENUT_VERTEX_STREAM_COUNT ? streams[s] : 0);
+    }
+    diag += " live:";
+    for (const auto& [k, entry] : vs->live_fetches) {
+      diag += fmt::format(" #{}(stream {} fmt {} stride {} off {})", k, entry[0] & 0xFF, (entry[0] >> 8) & 0xFF,
+                          entry[1], entry[2]);
+    }
+    // The vertices the draw names, then the extremes of each integer attribute.
+    std::vector<uint32_t> used;
+    if (index_buffer_info && index_buffer_info->guest_base) {
+      const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
+      std::vector<uint8_t> raw(size_t(index_count) * (is32 ? 4 : 2));
+      CopySwapped(raw.data(), memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
+                  uint32_t(raw.size()), index_buffer_info->endianness);
+      for (uint32_t i = 0; i < index_count; ++i) {
+        used.push_back(is32 ? reinterpret_cast<const uint32_t*>(raw.data())[i]
+                            : reinterpret_cast<const uint16_t*>(raw.data())[i]);
+      }
+    } else {
+      for (uint32_t i = 0; i < index_count && i < 65536; ++i) used.push_back(i);
+    }
+    uint32_t max_vertex = 0;
+    for (uint32_t v : used) max_vertex = std::max(max_vertex, v);
+    diag += fmt::format(" max_index={} base_vertex={} elements:", max_vertex, int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]));
+    for (const LiveElement& e : vs->elements) {
+      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - e.slot);
+      diag += fmt::format(" L{}(slot {} fmt {}{} stride {} off {} cap {})", e.location, e.slot, e.format,
+                          e.is_signed ? "s" : "", e.stride, e.offset, e.stride ? (fetch.size << 2) / e.stride : 0);
+      if (e.format != 26 || e.normalized || !e.stride || fetch.size == 0) continue;
+      std::vector<uint8_t> stream(fetch.size << 2);
+      CopySwapped(stream.data(), memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2),
+                  uint32_t(stream.size()), fetch.endian);
+      int32_t lo = INT32_MAX, hi = INT32_MIN;
+      for (uint32_t v : used) {
+        const uint64_t at = uint64_t(int64_t(v) + int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET])) * e.stride + e.offset;
+        if (at + 8 > stream.size()) continue;
+        const int16_t* comps = reinterpret_cast<const int16_t*>(stream.data() + at);
+        for (int c = 0; c < 4; ++c) {
+          lo = std::min<int32_t>(lo, comps[c]);
+          hi = std::max<int32_t>(hi, comps[c]);
+        }
+      }
+      diag += fmt::format("[int16 range {}..{}]", lo, hi);
+    }
+    REXLOG_INFO("{}", diag);
   }
   if (trace_) {
     std::string line = "  inputs";
@@ -5422,6 +5637,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   pk.interface_key = interface_key;
   pk.vs_hash = vs->entry->hash ^ (uint64_t(rel_constants_mode_ >= 10 ? rel_variant : 0) << 60);
   pk.ps_hash = ps ? ps->entry->hash : 0;
+  pk.s0_addr = streams[0];
+  pk.s0_size = slot_sizes[0];
+  pk.s10_addr = streams[10];
+  pk.s10_size = slot_sizes[10];
   if (blend_constants) {
     pk.blend_constants = true;
     pk.blend_factor[0] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED);
@@ -5568,7 +5787,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // order.
   bool defer = false;
   uint64_t window_signature = 0;
-  if (defer_mode_ && !trace_ && !skip_mask_ && !bind_skip_ && !trivial_mode_ && !debug_draw && !patch_list &&
+  if (defer_mode_ && !sync_draws_ && !trace_ && !skip_mask_ && !bind_skip_ && !trivial_mode_ && !debug_draw && !patch_list &&
       !merge_frame_ && !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && depth_write) {
     const xenos::CompareFunction zf = depth_control.zfunc;
     const bool strict = zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual ||
@@ -5696,6 +5915,120 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
   if (pair_stamped) PairStamp();
   ++stats_.drawn;
   if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
+  {
+    const uint64_t first_frame =
+        pair_first_frame_.try_emplace(pk.vs_hash * 1099511628211ull ^ pk.ps_hash, swaps_).first->second;
+    const uint64_t at = recent_draw_count_.load(std::memory_order_relaxed);
+    recent_draws_[at % kRecentDraws] = {swaps_, pk.vs_hash, pk.ps_hash, uint64_t(uintptr_t(pk.pipeline)),
+                                        uint64_t(uintptr_t(pk.framebuffer)), pk.s0_addr, pk.s10_addr, first_frame,
+                                        uint32_t(pk.kind), pk.count, pk.first, pk.s0_size, pk.s10_size};
+    recent_draw_count_.store(at + 1, std::memory_order_release);
+  }
+  if (sync_draws_) SyncAfterDraw(pk);
+}
+
+// A lost device answers every later call with an error and nothing in the guest
+// ever learns of it: the watchdog just keeps waiting for a fence nobody will
+// signal. Names the draws of the last frames, new vertex/pixel pairs first -
+// the Mali takes the device down on a draw's data or program, and the draw is
+// recorded a frame or two before the submit that reports it.
+void PlumeCommandProcessor::ReportDeviceLost() {
+  unsigned long long avail_kb = 0;
+  if (FILE* meminfo = std::fopen("/proc/meminfo", "r")) {
+    char line[128];
+    while (std::fgets(line, sizeof line, meminfo)) {
+      if (std::sscanf(line, "MemAvailable: %llu kB", &avail_kb) == 1) break;
+    }
+    std::fclose(meminfo);
+  }
+  const uint64_t now = swaps_;
+  REXLOG_ERROR("Renut: Plume device lost at swap {}; {} MB of RAM available; {} draws recorded", now,
+               avail_kb >> 10, recent_draw_count_.load());
+  const uint64_t total = recent_draw_count_.load(std::memory_order_acquire);
+  const uint64_t begin = total > kRecentDraws ? total - kRecentDraws : 0;
+  struct Group {
+    RecentDraw draw;
+    uint32_t draws = 0;
+    uint64_t indices = 0;
+  };
+  std::vector<std::pair<uint64_t, Group>> groups;
+  std::unordered_map<uint64_t, size_t> index_of;
+  for (uint64_t i = begin; i < total; ++i) {
+    const RecentDraw& d = recent_draws_[i % kRecentDraws];
+    if (d.frame + 3 < now) continue;
+    uint64_t key = d.frame;
+    key = key * 1099511628211ull ^ d.vs;
+    key = key * 1099511628211ull ^ d.ps;
+    key = key * 1099511628211ull ^ d.pipeline;
+    key = key * 1099511628211ull ^ d.framebuffer;
+    auto [it, fresh] = index_of.try_emplace(key, groups.size());
+    if (fresh) groups.push_back({key, Group{d, 0, 0}});
+    Group& group = groups[it->second].second;
+    ++group.draws;
+    group.indices += d.count;
+  }
+  // Newest pairs first, then the rest in the order they were recorded.
+  std::stable_sort(groups.begin(), groups.end(), [](const auto& a, const auto& b) {
+    return a.second.draw.pair_first_frame > b.second.draw.pair_first_frame;
+  });
+  size_t shown = 0;
+  for (const auto& [key, group] : groups) {
+    if (shown++ >= 160) break;
+    const RecentDraw& d = group.draw;
+    REXLOG_ERROR(
+        "Renut: Plume   frame {}{} vs={:016X} ps={:016X} x{} indices={} kind={} first={} pipeline={:X} fb={:X} "
+        "s0={}B@{:X} s10={}B@{:X}",
+        d.frame, d.pair_first_frame + 3 >= now ? " NEW" : "", d.vs, d.ps, group.draws, group.indices, d.kind,
+        d.first, d.pipeline, d.framebuffer, d.s0_size, d.s0_addr, d.s10_size, d.s10_addr);
+  }
+}
+
+void PlumeCommandProcessor::SyncAfterDraw(const DrawPacket& pk) {
+  if (!list_open_) return;
+  L()->end();
+  list_open_ = false;
+  const RenderCommandList* lists = list_;
+  queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  VkFence vk_fence = static_cast<VulkanCommandFence*>(fence_.get())->vk;
+  const auto wait_start = std::chrono::steady_clock::now();
+  const VkResult result = vkWaitForFences(vk_device, 1, &vk_fence, VK_TRUE, 3000000000ull);
+  const auto wait_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start).count();
+  ++sync_draw_count_;
+  if (result == VK_ERROR_DEVICE_LOST) plume::g_plumeDeviceLost.store(int(result));
+  sync_recent_[sync_draw_count_ % sync_recent_.size()] = fmt::format("#{}: {}", sync_draw_count_, sync_draw_info_);
+  if (result != VK_SUCCESS) {
+    {
+      unsigned long long avail_kb = 0;
+      if (FILE* meminfo = std::fopen("/proc/meminfo", "r")) {
+        char line[128];
+        while (std::fgets(line, sizeof line, meminfo)) {
+          if (std::sscanf(line, "MemAvailable: %llu kB", &avail_kb) == 1) break;
+        }
+        std::fclose(meminfo);
+      }
+      REXLOG_ERROR("Renut: Plume system memory at the failure: {} MB available", avail_kb >> 10);
+    }
+    for (size_t i = 1; i <= sync_recent_.size(); ++i) {
+      const std::string& line = sync_recent_[(sync_draw_count_ + i) % sync_recent_.size()];
+      if (!line.empty()) REXLOG_ERROR("Renut: Plume   recent draw {}", line);
+    }
+    REXLOG_ERROR(
+        "Renut: Plume GPU failed ({}) after {} ms on synced draw #{} in frame {}: vs={:016X} ps={:016X} kind={} "
+        "count={} first={} base={} pipeline={}",
+        int(result), wait_ms, sync_draw_count_, swaps_, pk.vs_hash, pk.ps_hash, int(pk.kind), pk.count, pk.first,
+        pk.base_vertex, static_cast<const void*>(pk.pipeline));
+    sync_draws_ = false;
+  } else {
+    vkResetFences(vk_device, 1, &vk_fence);
+    // Each pair is named once, the first time it ran to completion.
+    if (sync_seen_.insert(pk.vs_hash * 1099511628211ull ^ pk.ps_hash).second) {
+      REXLOG_INFO("Renut: Plume synced draw #{} ok, new pair (frame {}): vs={:016X} ps={:016X} count={}",
+                  sync_draw_count_, swaps_, pk.vs_hash, pk.ps_hash, pk.count);
+    }
+  }
+  StartList();
 }
 
 // Records the draws that are waiting, grouped by pipeline. The groups keep the
@@ -6555,6 +6888,9 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       layout_memo_.Clear();
     }
     skip_mask_ = mask;
+    const bool sync_draws = access((root + "/plume-syncdraws").c_str(), F_OK) == 0;
+    if (sync_draws != sync_draws_) REXLOG_INFO("Renut: Plume synced draws {}", sync_draws ? "on" : "off");
+    sync_draws_ = sync_draws;
     const bool keep_streams = access((root + "/plume-no-persist").c_str(), F_OK) != 0;
     if (keep_streams != keep_streams_) {
       REXLOG_INFO("Renut: Plume kept streams {}", keep_streams ? "on" : "off");
@@ -6735,7 +7071,70 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
   }
   if (swaps_ % 300 == 1) Report();
+  if (swaps_ % 15 == 3) ReportMemory();
   BeginFrame();
+}
+
+void PlumeCommandProcessor::ReportMemory() {
+  auto mb = [](uint64_t bytes) { return bytes >> 20; };
+  // Base level plus the rest of the chain, in the 4-byte form every guest
+  // texture is decoded to.
+  auto chain = [](uint64_t base, uint32_t levels, uint32_t num, uint32_t den) {
+    return levels > 1 ? base * num / den : base;
+  };
+  uint64_t tex2d = 0, tex2d_n = 0, stacks = 0, volumes = 0, cubes = 0, resolved = 0, resolved_n = 0, target_bytes = 0;
+  for (const auto& [key, t] : guest_textures_) {
+    if (!t.texture) continue;
+    tex2d += chain(uint64_t(t.width) * t.height * 4, t.levels, 4, 3);
+    ++tex2d_n;
+  }
+  for (const auto& [key, t] : guest_stacks_) {
+    if (t.texture) stacks += chain(uint64_t(t.width) * t.height * t.depth * 4, t.levels, 4, 3);
+  }
+  for (const auto& [key, t] : guest_volumes_) {
+    if (t.texture) volumes += chain(uint64_t(t.width) * t.height * t.depth * 4, t.levels, 8, 7);
+  }
+  for (const auto& [key, t] : guest_cubes_) {
+    if (t.texture) cubes += chain(uint64_t(t.width) * t.height * 6 * 4, t.levels, 4, 3);
+  }
+  for (const auto& [key, r] : resolved_) {
+    if (r.texture) {
+      resolved += uint64_t(r.width) * r.height * RenderFormatSize(r.format);
+      ++resolved_n;
+    }
+    if (r.fitted) resolved += uint64_t(r.width) * r.height * RenderFormatSize(r.format);
+  }
+  for (const auto& [key, t] : targets_) {
+    if (t.texture) target_bytes += uint64_t(t.width) * t.height * RenderFormatSize(t.format);
+  }
+  uint64_t export_bytes = 0;
+  for (const auto& [key, e] : exports_) export_bytes += e.size;
+  VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+  vmaGetHeapBudgets(static_cast<VulkanDevice*>(device_)->allocator, budgets);
+  uint64_t blocks = 0, allocations = 0;
+  for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; ++i) {
+    blocks += budgets[i].statistics.blockBytes;
+    allocations += budgets[i].statistics.allocationBytes;
+  }
+  const uint64_t previous = reported_memory_blocks_;
+  if (blocks + (32ull << 20) > previous && blocks < previous + (32ull << 20)) return;
+  reported_memory_blocks_ = blocks;
+  uint64_t rss_kb = 0, swap_kb = 0;
+  if (FILE* status = std::fopen("/proc/self/status", "r")) {
+    char line[256];
+    while (std::fgets(line, sizeof line, status)) {
+      std::sscanf(line, "VmRSS: %llu kB", reinterpret_cast<unsigned long long*>(&rss_kb));
+      std::sscanf(line, "VmSwap: %llu kB", reinterpret_cast<unsigned long long*>(&swap_kb));
+    }
+    std::fclose(status);
+  }
+  REXLOG_INFO(
+      "Renut: Plume memory @{}: vma blocks {} MB allocations {} MB | tex2d {} MB ({}) stacks {} MB "
+      "volumes {} MB cubes {} MB resolved {} MB ({}) targets {} MB ({}) kept {} MB exports {} MB "
+      "upload {} MB | rss {} MB swap {} MB",
+      swaps_, mb(blocks), mb(allocations), mb(tex2d), tex2d_n, mb(stacks), mb(volumes), mb(cubes),
+      mb(resolved), resolved_n, mb(target_bytes), targets_.size(), mb(kept_bytes_), mb(export_bytes),
+      mb(upload_slice_size_ * kPlumeFramesInFlight), rss_kb >> 10, swap_kb >> 10);
 }
 
 void PlumeCommandProcessor::Report() {
