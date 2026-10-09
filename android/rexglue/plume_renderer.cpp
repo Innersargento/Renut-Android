@@ -10,12 +10,18 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <chrono>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <rex/logging.h>
 
@@ -88,72 +94,260 @@ struct PlumeRenderer::State {
 
 namespace {
 
-// The generated copy of plume_vulkan.cpp asks for this cache on every pipeline
-// it creates; the seam is in android/app/src/main/cpp/CMakeLists.txt. Upstream
-// passes VK_NULL_HANDLE, which makes the driver recompile every pipeline on
-// every launch: the first pass through Showdown Town spent 67% of its frame
-// time inside vkCreateGraphicsPipelines, and none of that work survived.
-std::mutex pipeline_cache_mutex;
-std::string pipeline_cache_path;
-VkDevice pipeline_cache_device = VK_NULL_HANDLE;
-VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+// The pipeline cache kept on disk between runs. Upstream Plume passes no cache,
+// which makes the driver recompile every pipeline on every launch: the first
+// pass through Showdown Town spent 67% of its frame time inside
+// vkCreateGraphicsPipelines, and none of that work survived.
+//
+// Every pipeline the generated copy of plume_vulkan.cpp creates comes through
+// renutCreateGraphicsPipelines below (the seam is in
+// android/app/src/main/cpp/CMakeLists.txt). When the driver can be asked for a
+// pipeline without compiling one (VK_EXT_pipeline_creation_cache_control), it
+// is looked up in `shared` first, which holds everything compiled so far; one
+// that is not there is compiled into an empty cache of its own and then merged
+// into `shared` and into `delta`. So no lookup ever waits behind a compile, and
+// what is written while the game runs is `delta` - what is new - instead of the
+// whole blob: that grows past 300 MB, and copying it out held the driver's
+// cache lock, and so every pipeline creation, for as long as the copy took.
+// The delta is folded into the base file at launch once it is large.
+//
+// A driver without the extension gets the old arrangement: one cache, written
+// whole.
+struct PipelineCache {
+  std::mutex mutex;  // loading; `path` and `delta` are set under it
+  std::string path;
+  std::atomic<VkDevice> device{VK_NULL_HANDLE};
+  bool lookup = false;  // the driver honours FAIL_ON_PIPELINE_COMPILE_REQUIRED
+  std::atomic<VkPipelineCache> shared{VK_NULL_HANDLE};
+  VkPipelineCache delta = VK_NULL_HANDLE;
+  // vkMergePipelineCaches wants its destination externally synchronized:
+  // merges take these exclusively, lookups in `shared` take it shared.
+  std::shared_mutex shared_merge;
+  std::mutex delta_merge;
+  std::atomic<bool> dirty{false};
+  std::atomic<bool> saving{false};
+  std::chrono::steady_clock::time_point saved{};
+  std::atomic<uint64_t> found{0}, compiled{0};
+};
+PipelineCache pipeline_cache;
+thread_local bool pipeline_lookup_only = false;
 
+// plume-pipelines.bin -> plume-pipelines.delta.bin
+std::string DeltaPath(const std::string& path) {
+  const std::string suffix = ".bin";
+  if (path.size() > suffix.size() && path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0) {
+    return path.substr(0, path.size() - suffix.size()) + ".delta.bin";
+  }
+  return path + ".delta";
+}
+
+VkPipelineCache CreateEmptyCache(VkDevice device) {
+  VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+  VkPipelineCache cache = VK_NULL_HANDLE;
+  if (vkCreatePipelineCache(device, &info, nullptr, &cache) != VK_SUCCESS) return VK_NULL_HANDLE;
+  return cache;
+}
+
+// A cache seeded from `path`, read through a mapping rather than copied into
+// memory first. A blob the driver does not recognise (another device or driver
+// version) is ignored or refused, and the cache starts empty.
+VkPipelineCache LoadCacheFile(VkDevice device, const std::string& path, size_t* bytes) {
+  *bytes = 0;
+  void* data = nullptr;
+  size_t size = 0;
+  const int fd = path.empty() ? -1 : open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    struct stat st {};
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+      void* mapped = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+      if (mapped != MAP_FAILED) {
+        madvise(mapped, size_t(st.st_size), MADV_SEQUENTIAL);
+        data = mapped;
+        size = size_t(st.st_size);
+      }
+    }
+    close(fd);
+  }
+  VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+  info.initialDataSize = size;
+  info.pInitialData = data;
+  VkPipelineCache cache = VK_NULL_HANDLE;
+  if (vkCreatePipelineCache(device, &info, nullptr, &cache) == VK_SUCCESS) {
+    *bytes = size;
+  } else {
+    cache = CreateEmptyCache(device);
+  }
+  if (data) munmap(data, size);
+  return cache;
+}
+
+// Writes `cache` beside `path` and renames it over: Android kills the process
+// without warning, and a truncated blob is one the driver rejects on the next
+// run. The copy goes straight into a mapping of the file, so even the whole
+// blob costs the process no memory of its own; the space is reserved first, so
+// a full disk fails the write instead of faulting inside the copy.
+bool WriteCacheFile(VkDevice device, VkPipelineCache cache, const std::string& path, size_t* written) {
+  size_t size = 0;
+  if (vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS || !size) return false;
+  // Room for what other threads add between the two calls.
+  const size_t room = size + size / 16 + (size_t(1) << 20);
+  const std::string temporary = path + ".tmp";
+  const int fd = open(temporary.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) return false;
+  bool ok = false;
+  if (posix_fallocate(fd, 0, off_t(room)) == 0) {
+    void* map = mmap(nullptr, room, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map != MAP_FAILED) {
+      size = room;
+      ok = vkGetPipelineCacheData(device, cache, &size, map) == VK_SUCCESS;
+      munmap(map, room);
+    }
+  } else {
+    // A file system without fallocate: through memory, then.
+    std::vector<uint8_t> data(room);
+    size = room;
+    ok = vkGetPipelineCacheData(device, cache, &size, data.data()) == VK_SUCCESS &&
+         write(fd, data.data(), size) == ssize_t(size);
+  }
+  ok = ok && ftruncate(fd, off_t(size)) == 0;
+  close(fd);
+  ok = ok && std::rename(temporary.c_str(), path.c_str()) == 0;
+  if (!ok) {
+    std::remove(temporary.c_str());
+  } else if (written) {
+    *written = size;
+  }
+  return ok;
+}
+
+// Called with `mutex` held, before anything else can use the caches.
+VkPipelineCache LoadPipelineCaches(VkDevice device) {
+  PipelineCache& c = pipeline_cache;
+  const auto start = std::chrono::steady_clock::now();
+  size_t base_bytes = 0, delta_bytes = 0, folded = 0;
+  VkPipelineCache shared = LoadCacheFile(device, c.path, &base_bytes);
+  if (shared == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+  if (c.lookup) {
+    const std::string delta_path = DeltaPath(c.path);
+    VkPipelineCache delta = LoadCacheFile(device, delta_path, &delta_bytes);
+    if (delta != VK_NULL_HANDLE) vkMergePipelineCaches(device, shared, 1, &delta);
+    // Once the delta is a sizeable part of the whole, it goes into the base file:
+    // written here, before `shared` is handed out, so no lookup waits on the copy.
+    // Capped, so the delta written while the game runs stays small.
+    const size_t fold_at = std::max(size_t(8) << 20, std::min(size_t(32) << 20, base_bytes / 4));
+    if (delta_bytes > fold_at && !c.path.empty() &&
+        WriteCacheFile(device, shared, c.path, &folded)) {
+      std::remove(delta_path.c_str());
+      if (delta != VK_NULL_HANDLE) vkDestroyPipelineCache(device, delta, nullptr);
+      delta = VK_NULL_HANDLE;
+    }
+    c.delta = delta != VK_NULL_HANDLE ? delta : CreateEmptyCache(device);
+    // Nowhere to keep what is new: back to one cache, written whole.
+    if (c.delta == VK_NULL_HANDLE) c.lookup = false;
+  }
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+  REXLOG_INFO("Renut: Plume pipeline cache {} ({} KB from disk, {} KB of it new since the last fold; {}{} ms; {})",
+              base_bytes || delta_bytes ? "carregado" : "criado", (base_bytes + delta_bytes) >> 10,
+              delta_bytes >> 10, folded ? fmt::format("folded into {} KB, ", folded >> 10) : std::string(), ms,
+              c.lookup ? "lookups without compiling" : "one cache, written whole");
+  c.device.store(device);
+  c.shared.store(shared, std::memory_order_release);
+  return shared;
+}
+
+VkPipelineCache SharedPipelineCache(VkDevice device) {
+  PipelineCache& c = pipeline_cache;
+  VkPipelineCache shared = c.shared.load(std::memory_order_acquire);
+  if (shared != VK_NULL_HANDLE && c.device.load() == device) return shared;
+  std::lock_guard lock(c.mutex);
+  shared = c.shared.load(std::memory_order_acquire);
+  if (shared != VK_NULL_HANDLE && c.device.load() == device) return shared;
+  return LoadPipelineCaches(device);
+}
+
+// Loading a large cache takes a while, so it starts as soon as both the device
+// and the file are known, off the thread that boots the game. A pipeline asked
+// for meanwhile waits for it, as it would have anyway.
+void PreloadPipelineCache(VkDevice device) {
+  if (device == VK_NULL_HANDLE) return;
+  {
+    std::lock_guard lock(pipeline_cache.mutex);
+    if (pipeline_cache.path.empty() || pipeline_cache.shared.load() != VK_NULL_HANDLE) return;
+  }
+  std::thread([device] { SharedPipelineCache(device); }).detach();
+}
+
+void WritePlumePipelineCache() {
+  PipelineCache& c = pipeline_cache;
+  const VkPipelineCache shared = c.shared.load(std::memory_order_acquire);
+  const VkDevice device = c.device.load();
+  std::string path;
+  {
+    std::lock_guard lock(c.mutex);
+    path = c.path;
+  }
+  if (shared == VK_NULL_HANDLE || path.empty()) return;
+  c.dirty = false;
+  bool ok = false;
+  if (c.lookup) {
+    // A snapshot of the delta, so a merge into it waits for the snapshot and
+    // not for the copy.
+    VkPipelineCache snapshot = CreateEmptyCache(device);
+    if (snapshot != VK_NULL_HANDLE) {
+      {
+        std::lock_guard lock(c.delta_merge);
+        vkMergePipelineCaches(device, snapshot, 1, &c.delta);
+      }
+      ok = WriteCacheFile(device, snapshot, DeltaPath(path), nullptr);
+      vkDestroyPipelineCache(device, snapshot, nullptr);
+    }
+  } else {
+    ok = WriteCacheFile(device, shared, path, nullptr);
+  }
+  if (!ok) c.dirty = true;
+}
 }  // namespace
 
 void SetPlumePipelineCachePath(const std::string& path) {
-  std::lock_guard lock(pipeline_cache_mutex);
-  pipeline_cache_path = path;
-}
-
-namespace {
-void WritePlumePipelineCache() {
-  std::lock_guard lock(pipeline_cache_mutex);
-  if (pipeline_cache == VK_NULL_HANDLE || pipeline_cache_path.empty()) return;
-  size_t size = 0;
-  if (vkGetPipelineCacheData(pipeline_cache_device, pipeline_cache, &size, nullptr) != VK_SUCCESS ||
-      !size) {
-    return;
-  }
-  std::vector<uint8_t> data(size);
-  if (vkGetPipelineCacheData(pipeline_cache_device, pipeline_cache, &size, data.data()) !=
-      VK_SUCCESS) {
-    return;
-  }
-  // Write beside the target and rename: Android kills the process without
-  // warning, and a truncated blob is one the driver rejects on the next run.
-  const std::string temporary = pipeline_cache_path + ".tmp";
   {
-    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-    if (!out) return;
-    out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(size));
-    if (!out) return;
+    std::lock_guard lock(pipeline_cache.mutex);
+    pipeline_cache.path = path;
   }
-  std::error_code error;
-  std::filesystem::rename(temporary, pipeline_cache_path, error);
+  if (PlumeRenderer* renderer = PlumeRenderer::Get()) {
+    PreloadPipelineCache(static_cast<VulkanDevice*>(renderer->device())->vk);
+  }
 }
 
-std::atomic<bool> pipeline_cache_saving{false};
-std::chrono::steady_clock::time_point pipeline_cache_saved{};
-}  // namespace
-
-// On a thread of its own, at most once a minute. The blob grows past 300 MB,
-// and writing it from the command list thread - after every report interval
-// that compiled a pipeline - stalled the game for seconds at a time and was
-// the thread's largest cost while a new area was being seen. A pipeline cache
-// is internally synchronized, so reading it here while that thread keeps
-// creating pipelines is allowed.
-void SavePlumePipelineCache() {
-  const auto now = std::chrono::steady_clock::now();
-  if (pipeline_cache_saved.time_since_epoch().count() && now - pipeline_cache_saved < std::chrono::seconds(60)) {
+// On a thread of its own. What is written is only what is new (see
+// PipelineCache), so it can go out every few seconds; a driver without lookups
+// still writes the whole blob, at most once a minute. `now` skips the wait, for
+// when the app leaves the screen and may be killed.
+void SavePlumePipelineCache(bool now) {
+  PipelineCache& c = pipeline_cache;
+  if (!c.dirty.load()) return;
+  bool idle = false;
+  if (!c.saving.compare_exchange_strong(idle, true)) return;
+  const auto time = std::chrono::steady_clock::now();
+  const auto interval = c.lookup ? std::chrono::seconds(15) : std::chrono::seconds(60);
+  if (!now && c.saved.time_since_epoch().count() && time - c.saved < interval) {
+    c.saving = false;
     return;
   }
-  bool idle = false;
-  if (!pipeline_cache_saving.compare_exchange_strong(idle, true)) return;
-  pipeline_cache_saved = now;
+  c.saved = time;
   std::thread([] {
     WritePlumePipelineCache();
-    pipeline_cache_saving = false;
+    pipeline_cache.saving = false;
   }).detach();
+}
+
+bool PlumePipelineLookupSupported() { return pipeline_cache.lookup; }
+
+PlumePipelineLookupOnly::PlumePipelineLookupOnly() { pipeline_lookup_only = true; }
+PlumePipelineLookupOnly::~PlumePipelineLookupOnly() { pipeline_lookup_only = false; }
+
+void PlumePipelineCacheCounts(uint64_t* found, uint64_t* compiled) {
+  *found = pipeline_cache.found.load(std::memory_order_relaxed);
+  *compiled = pipeline_cache.compiled.load(std::memory_order_relaxed);
 }
 
 PlumeRenderer::PlumeRenderer() : state_(std::make_unique<State>()) {}
@@ -212,6 +406,11 @@ bool PlumeRenderer::Start(ANativeWindow* window, std::string* error) {
     }
     REXLOG_INFO("Renut: Plume renderer started on {} ({}x{})", s.gpu, s.swap->getWidth(),
                 s.swap->getHeight());
+    {
+      std::lock_guard cache_lock(pipeline_cache.mutex);
+      pipeline_cache.lookup = s.device->getCapabilities().pipelineCacheLookup;
+    }
+    PreloadPipelineCache(device->vk);
     instance = std::move(renderer);
     return true;
   } catch (const std::exception& e) {
@@ -358,8 +557,12 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
 }
 
 void PlumeRenderer::PauseForBackground() {
-  std::lock_guard lock(state_->pause_mutex);
-  state_->paused = true;
+  {
+    std::lock_guard lock(state_->pause_mutex);
+    state_->paused = true;
+  }
+  // Leaving the screen is when Android is most likely to kill the process.
+  SavePlumePipelineCache(true);
 }
 
 void PlumeRenderer::ReleaseForShutdown() {
@@ -411,31 +614,69 @@ std::string PlumeRenderer::report() const {
 
 }  // namespace renut
 
-// Called by the generated copy of plume_vulkan.cpp, on the thread that creates
-// pipelines. Seeded from the last run's blob; one the driver does not recognise
-// (another device or driver version) is refused and the cache starts empty.
-VkPipelineCache renutVulkanPipelineCache(VkDevice device) {
-  std::lock_guard lock(renut::pipeline_cache_mutex);
-  if (renut::pipeline_cache != VK_NULL_HANDLE && renut::pipeline_cache_device == device) {
-    return renut::pipeline_cache;
+namespace {
+// Looks the pipeline up first and compiles it only if the cache misses it, into
+// a cache of its own that is merged afterwards (see PipelineCache).
+template <typename Info, typename Create>
+VkResult CreatePipelines(VkDevice device, uint32_t count, const Info* infos, const VkAllocationCallbacks* allocator,
+                         VkPipeline* pipelines, Create create) {
+  using namespace renut;
+  PipelineCache& c = pipeline_cache;
+  const VkPipelineCache shared = SharedPipelineCache(device);
+  if (!c.lookup || shared == VK_NULL_HANDLE || count != 1) {
+    if (pipeline_lookup_only) {
+      for (uint32_t i = 0; i < count; ++i) pipelines[i] = VK_NULL_HANDLE;
+      return VK_PIPELINE_COMPILE_REQUIRED;
+    }
+    const VkResult result = create(device, shared, count, infos, allocator, pipelines);
+    if (result == VK_SUCCESS) c.dirty = true;
+    return result;
   }
-  std::vector<uint8_t> blob;
-  if (!renut::pipeline_cache_path.empty()) {
-    std::ifstream in(renut::pipeline_cache_path, std::ios::binary);
-    if (in) blob.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  Info info = *infos;
+  info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  VkResult result;
+  {
+    std::shared_lock lock(c.shared_merge);
+    result = create(device, shared, 1, &info, allocator, pipelines);
   }
-  VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-  info.initialDataSize = blob.size();
-  info.pInitialData = blob.empty() ? nullptr : blob.data();
-  VkPipelineCache cache = VK_NULL_HANDLE;
-  if (vkCreatePipelineCache(device, &info, nullptr, &cache) != VK_SUCCESS) {
-    info.initialDataSize = 0;
-    info.pInitialData = nullptr;
-    if (vkCreatePipelineCache(device, &info, nullptr, &cache) != VK_SUCCESS) return VK_NULL_HANDLE;
+  if (result != VK_PIPELINE_COMPILE_REQUIRED) {
+    if (result == VK_SUCCESS) c.found.fetch_add(1, std::memory_order_relaxed);
+    return result;
   }
-  REXLOG_INFO("Renut: Plume pipeline cache {} ({} KB from disk)",
-              blob.empty() ? "criado" : "carregado", blob.size() >> 10);
-  renut::pipeline_cache_device = device;
-  renut::pipeline_cache = cache;
-  return cache;
+  if (pipeline_lookup_only) return result;
+  info.flags = infos->flags;
+  VkPipelineCache own = CreateEmptyCache(device);
+  result = create(device, own != VK_NULL_HANDLE ? own : shared, 1, &info, allocator, pipelines);
+  if (own != VK_NULL_HANDLE) {
+    if (result == VK_SUCCESS) {
+      {
+        std::unique_lock lock(c.shared_merge);
+        vkMergePipelineCaches(device, shared, 1, &own);
+      }
+      {
+        std::lock_guard lock(c.delta_merge);
+        vkMergePipelineCaches(device, c.delta, 1, &own);
+      }
+      c.dirty = true;
+    }
+    vkDestroyPipelineCache(device, own, nullptr);
+  }
+  if (result == VK_SUCCESS) c.compiled.fetch_add(1, std::memory_order_relaxed);
+  return result;
+}
+}  // namespace
+
+// The seams in the generated copy of plume_vulkan.cpp, in place of its
+// vkCreateGraphicsPipelines and vkCreateComputePipelines calls (which pass no
+// cache).
+VkResult renutCreateGraphicsPipelines(VkDevice device, VkPipelineCache, uint32_t count,
+                                      const VkGraphicsPipelineCreateInfo* infos,
+                                      const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+  return CreatePipelines(device, count, infos, allocator, pipelines, vkCreateGraphicsPipelines);
+}
+
+VkResult renutCreateComputePipelines(VkDevice device, VkPipelineCache, uint32_t count,
+                                     const VkComputePipelineCreateInfo* infos,
+                                     const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+  return CreatePipelines(device, count, infos, allocator, pipelines, vkCreateComputePipelines);
 }

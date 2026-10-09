@@ -347,7 +347,7 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     val tuMode = activity.uiTuMode()
     val ir3Mode = activity.uiIr3Mode()
     val logLevel = activity.uiRuntimeOption("log_level", "info")
-    val shaderAsync = activity.uiRuntimeOption("renut_plume_async_pipelines", "false") == "true"
+    val shaderAsync = activity.uiRuntimeOption("renut_plume_async_pipelines", "true") == "true"
     val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
@@ -389,7 +389,7 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
                 ToggleRow("Compilação assíncrona de shaders e pipelines", shaderAsync, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_async_pipelines", it.toString())
                 }
-                Text("Compila pipelines novos em segundo plano. O primeiro desenho pode faltar até ficar pronto; desenhos de memexport continuam síncronos.", color = Muted, fontSize = 12.sp)
+                Text("Compila pipelines novos em segundo plano. O que o driver já tem em cache aparece na hora; o resto usa um pipeline parecido ou falta por alguns quadros até ficar pronto. Desenhos de memexport continuam síncronos.", color = Muted, fontSize = 12.sp)
                 ToggleRow("Remover sombras", noShadows, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
                 }

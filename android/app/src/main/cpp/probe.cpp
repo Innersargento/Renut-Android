@@ -49,10 +49,19 @@ VkResult renutInitializeVulkanLoader() {
     return vkCreateInstance ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
 }
 
-// The other seam in the generated copy of plume_vulkan.cpp. The probe draws a
+// The other seams in the generated copy of plume_vulkan.cpp. The probe draws a
 // handful of pipelines once, so it has nothing worth caching; the runtime's own
-// definition (android/rexglue/plume_renderer.cpp) is the one that keeps them.
-VkPipelineCache renutVulkanPipelineCache(VkDevice) { return VK_NULL_HANDLE; }
+// definitions (android/rexglue/plume_renderer.cpp) are the ones that keep them.
+VkResult renutCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                      const VkGraphicsPipelineCreateInfo* infos,
+                                      const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+    return vkCreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
+}
+VkResult renutCreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                     const VkComputePipelineCreateInfo* infos,
+                                     const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+    return vkCreateComputePipelines(device, cache, count, infos, allocator, pipelines);
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_renut_android_ProbeActivity_nativeStop(JNIEnv*, jclass) { stopped = true; }

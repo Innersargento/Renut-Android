@@ -20,18 +20,20 @@ endif()
 string(REPLACE "VkResult res = volkInitialize();"
     "VkResult res = renutInitializeVulkanLoader();" PLUME_SOURCE "${PLUME_SOURCE}")
 string(REPLACE "#include \"plume_vulkan.h\""
-    "#include \"plume_vulkan.h\"\nextern VkResult renutInitializeVulkanLoader();\nextern VkPipelineCache renutVulkanPipelineCache(VkDevice);"
+    "#include \"plume_vulkan.h\"\nextern VkResult renutInitializeVulkanLoader();\nextern VkResult renutCreateGraphicsPipelines(VkDevice, VkPipelineCache, uint32_t, const VkGraphicsPipelineCreateInfo*, const VkAllocationCallbacks*, VkPipeline*);\nextern VkResult renutCreateComputePipelines(VkDevice, VkPipelineCache, uint32_t, const VkComputePipelineCreateInfo*, const VkAllocationCallbacks*, VkPipeline*);"
     PLUME_SOURCE "${PLUME_SOURCE}")
 # Upstream compiles every pipeline with no cache, so the driver recompiles all of
 # them on every launch. Entering Showdown Town spent 67% of its frame time inside
-# vkCreateGraphicsPipelines; the cache itself lives in plume_renderer.cpp.
-foreach(PLUME_PIPELINE_CALL vkCreateGraphicsPipelines vkCreateComputePipelines)
-    string(FIND "${PLUME_SOURCE}" "${PLUME_PIPELINE_CALL}(device->vk, VK_NULL_HANDLE," PLUME_PIPELINE_AT)
+# vkCreateGraphicsPipelines. Every pipeline goes through reNut instead, which
+# looks it up in the cache kept on disk and compiles only what is not there
+# (plume_renderer.cpp).
+foreach(PLUME_PIPELINE_CALL GraphicsPipelines ComputePipelines)
+    string(FIND "${PLUME_SOURCE}" "vkCreate${PLUME_PIPELINE_CALL}(device->vk, VK_NULL_HANDLE," PLUME_PIPELINE_AT)
     if(PLUME_PIPELINE_AT EQUAL -1)
         message(FATAL_ERROR "A criacao de pipelines do Plume mudou; revisar o cache de pipelines.")
     endif()
-    string(REPLACE "${PLUME_PIPELINE_CALL}(device->vk, VK_NULL_HANDLE,"
-        "${PLUME_PIPELINE_CALL}(device->vk, renutVulkanPipelineCache(device->vk),"
+    string(REPLACE "vkCreate${PLUME_PIPELINE_CALL}(device->vk, VK_NULL_HANDLE,"
+        "renutCreate${PLUME_PIPELINE_CALL}(device->vk, VK_NULL_HANDLE,"
         PLUME_SOURCE "${PLUME_SOURCE}")
 endforeach()
 

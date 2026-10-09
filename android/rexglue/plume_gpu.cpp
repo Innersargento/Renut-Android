@@ -11,8 +11,10 @@
 #include "xenos_ucode_key.h"
 #include "smolv.h"
 #include "spirv_depth_only.h"
+#include "spirv_dynamic_bools.h"
 #include "spirv_fetch_spec.h"
 
+#include <pthread.h>
 #include <sys/resource.h>
 #include <thread>
 #include <sys/stat.h>
@@ -59,9 +61,24 @@
 #include <string>
 
 void renutReportShadowEngineProfile();
+// Frames of silence the audio output played for want of one from the title
+// (the SDL driver in rexglue).
+extern "C" uint64_t renut_audio_silent_frames();
 
-REXCVAR_DEFINE_BOOL(renut_plume_async_pipelines, false, "reNut/Plume",
-                    "Create new Plume graphics pipelines on a worker; non-export draws are skipped until ready.");
+REXCVAR_DEFINE_BOOL(renut_plume_async_pipelines, true, "reNut/Plume",
+                    "Compile new Plume graphics pipelines on workers; until one is ready its draw is drawn "
+                    "with a sibling pipeline or skipped. Pipelines the driver already has are taken at the "
+                    "draw. Draws that export to memory always wait for theirs.");
+REXCVAR_DEFINE_INT32(renut_plume_pipeline_lookup_ms, 4, "reNut/Plume",
+                     "Milliseconds per frame the command thread may spend asking the driver's cache for "
+                     "new pipelines it already has, so their draws appear at once; past it they go to the "
+                     "workers. 0 leaves every new pipeline to the workers.")
+    .range(0, 33);
+REXCVAR_DEFINE_INT32(renut_plume_bool_spec, 0, "reNut/Plume",
+                     "How shaders see the Xenos boolean registers: 0 read from the shared block every draw "
+                     "(about a quarter of the pipelines to compile), 1 as specialization constants (a "
+                     "pipeline per combination of the bits a pair of shaders tests)")
+    .range(0, 1);
 REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 1, "reNut/Plume",
                      "Record draws in windows grouped by pipeline: 0 off, 1 depth-only draws (the shadow "
                      "maps), 2 also opaque colour draws that test and write depth (reordering them is "
@@ -318,6 +335,9 @@ struct CompiledShader {
   std::unique_ptr<RenderShader> depth_module;
   std::unique_ptr<RenderShader> depth_fetch_spec_module;
   std::vector<std::pair<uint32_t, bool>> inputs;  // vertex shaders only
+  // Its boolean registers are read from the shared block rather than
+  // specialized on (spirv_dynamic_bools.h), so they stay out of the pipeline.
+  bool dynamic_bools = false;
   bool failed = false;
 };
 
@@ -426,6 +446,19 @@ class ShaderStore {
           }
         }
         std::fclose(file);
+      }
+    }
+    // The boolean registers from the shared block (set 4, binding 8, where the
+    // host writes them every draw) instead of specialization constants: one
+    // pipeline for every combination of them a scene shows was most of what a
+    // first visit compiled. A module of another shape keeps them specialized.
+    if (REXCVAR_GET(renut_plume_bool_spec) == 0) {
+      std::vector<uint32_t> dynamic = renut::MakeBooleansDynamic(spirv, 4, 8, RENUT_SHARED_BOOLEANS_OFFSET / 16,
+                                                                 RENUT_SPEC_BOOLS_BASE);
+      if (!dynamic.empty()) {
+        spirv = std::move(dynamic);
+        size = spirv.size() * 4;
+        compiled.dynamic_bools = true;
       }
     }
     compiled.module = device->createShader(spirv.data(), size, "main", RenderShaderFormat::SPIRV);
@@ -919,6 +952,12 @@ struct Stats {
   uint64_t deferred_draws = 0, defer_windows = 0, defer_binds_before = 0, defer_binds_after = 0;
   uint64_t shadow_culled = 0;  // plume-shadowmin
   uint64_t twin_skipped = 0;   // MSAA off: per-band copies of a draw already drawn
+  // New pipelines by how they were made: found in the driver's cache at the
+  // draw, found by a worker, or compiled (and of those, how many waited for a
+  // sibling's compile of the same program); the lookups at the draw that
+  // missed; and the time spent on lookups at the draw and on compiles.
+  uint64_t pipelines_found_here = 0, pipelines_found_ahead = 0, pipelines_compiled = 0, pipelines_waited = 0,
+           lookups_missed = 0, lookup_us = 0, compile_us = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -1692,15 +1731,75 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     uint64_t duration_us = 0;
     // Pipelines that differ only in the boolean registers share one.
     uint64_t family = 0;
+    // The shaders and their specialization: what the driver compiles and
+    // caches. Pipelines that differ in anything else (blending, depth, targets,
+    // vertex layout) share the compiled program (ProgramKey).
+    uint64_t program = 0;
+    // The driver's cache was already asked for it and did not have it.
+    bool looked_up = false;
+    // Nothing stands in for its draw, which is missing from the screen until
+    // the pipeline is ready.
+    bool urgent = false;
+    // How it ended: found in the cache rather than compiled; and whether it
+    // waited for a sibling's compile of its program first.
+    bool found = false, waited = false;
+    // How much its draw is missed while it waits: the draws that went without
+    // it, weighed by kind and size, and the last frame one did. The urgent queue is served by these rather than in order.
+    std::atomic<uint32_t> demand{0};
+    std::atomic<uint64_t> wanted_frame{0};
     // For the log when the driver refuses to build it.
     uint64_t vs_hash = 0;
     uint64_t ps_hash = 0;
   };
   std::mutex pipeline_mutex_;
   std::condition_variable pipeline_ready_;
-  // Jobs whose draw has nothing to stand in for it go first.
+  // Jobs that only need a look in the driver's cache go first: each takes
+  // about a millisecond, and behind a compile it would wait fifty. Then the
+  // compiles whose draw has nothing to stand in for it, then the rest.
+  std::deque<std::shared_ptr<PipelineJob>> pipeline_lookup_queue_;
   std::deque<std::shared_ptr<PipelineJob>> pipeline_urgent_queue_;
   std::deque<std::shared_ptr<PipelineJob>> pipeline_queue_;
+  // The programs workers are compiling, each with the jobs of the same program
+  // that wait to find it in the cache instead of compiling it again: several
+  // pipelines of one program are usually asked for in the same frame.
+  // Under pipeline_mutex_.
+  std::unordered_map<uint64_t, std::vector<std::shared_ptr<PipelineJob>>> compiling_programs_;
+  // The frame the command thread is on, for the workers' choice of job.
+  std::atomic<uint64_t> pipeline_frame_{0};
+  // The urgent job a worker takes next: one whose draw was missed in the last
+  // few frames before one that has left the screen, then the one missed most.
+  // A scene's first frames queue hundreds at once, and in order the walls and
+  // floors waited behind every effect queued before them. Under pipeline_mutex_.
+  std::shared_ptr<PipelineJob> TakeUrgentJob() {
+    const uint64_t now = pipeline_frame_.load(std::memory_order_relaxed);
+    auto best = pipeline_urgent_queue_.begin();
+    uint64_t best_score = 0;
+    for (auto it = pipeline_urgent_queue_.begin(); it != pipeline_urgent_queue_.end(); ++it) {
+      const PipelineJob& job = **it;
+      const uint64_t recent = now - std::min(now, job.wanted_frame.load(std::memory_order_relaxed)) <= 3;
+      const uint64_t score = (recent << 32) | job.demand.load(std::memory_order_relaxed);
+      if (score > best_score) {
+        best_score = score;
+        best = it;
+      }
+    }
+    std::shared_ptr<PipelineJob> job = std::move(*best);
+    pipeline_urgent_queue_.erase(best);
+    return job;
+  }
+  // Programs with a job queued or running, for this thread: the cache cannot
+  // have those yet, so a lookup at the draw would be wasted.
+  std::unordered_map<uint64_t, uint32_t> pending_programs_;
+  // Lookups at the draw (renut_plume_pipeline_lookup_ms): whether they are
+  // made, the budget per frame and what this frame has spent of it, and the
+  // lookups that took a compile's time (a driver ignoring the request).
+  bool lookup_here_ = false;
+  uint64_t lookup_budget_us_ = 0, lookup_spent_us_ = 0;
+  uint32_t slow_lookups_ = 0;
+  bool lookup_on_workers_ = false;
+  static uint64_t ProgramKey(const RenderGraphicsPipelineDesc& desc);
+  // Takes a finished job's numbers into the stats and out of pending_programs_.
+  void CountJob(const PipelineJob& job);
   // The newest ready pipeline of each family, drawn in place of a sibling
   // that is still compiling. Points into pipelines_, which never erases.
   std::unordered_map<uint64_t, RenderPipeline*> standins_;
@@ -1856,41 +1955,126 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
 
   Stats stats_;
   uint64_t swaps_ = 0;
+  uint64_t reported_silent_frames_ = 0;
 };
+
+uint64_t PlumeCommandProcessor::ProgramKey(const RenderGraphicsPipelineDesc& desc) {
+  KeyBytes bytes;
+  bytes.Put(desc.vertexShader);
+  bytes.Put(desc.geometryShader);
+  bytes.Put(desc.pixelShader);
+  for (uint32_t i = 0; i < desc.specConstantsCount; ++i) {
+    bytes.Put(desc.specConstants[i].index);
+    bytes.Put(desc.specConstants[i].value);
+  }
+  return bytes.Hash();
+}
 
 void PlumeCommandProcessor::StartPipelineWorker() {
   if (!pipeline_workers_.empty()) return;
   stop_pipeline_worker_ = false;
+  lookup_on_workers_ = PlumePipelineLookupSupported();
   // Compiling is slow on one core and free on others: a few workers, kept off
   // the cores' best share so the guest and command list threads win contention.
   const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
   const uint32_t count = std::clamp(cores / 3, 1u, 3u);
-  for (uint32_t i = 0; i < count; ++i) {
-    pipeline_workers_.emplace_back([this] {
-      setpriority(PRIO_PROCESS, uint32_t(gettid()), 4);
+  // One more on a device with cores to spare, for work whose draw is missing
+  // from the screen only: it sleeps whenever nothing is.
+  const uint32_t urgent_only = cores >= 8 ? 1 : 0;
+  for (uint32_t i = 0; i < count + urgent_only; ++i) {
+    pipeline_workers_.emplace_back([this, i, urgent = i >= count] {
+      pthread_setname_np(pthread_self(), fmt::format("PlumePipeline{}", i).c_str());
+      int nice = INT32_MIN;
       for (;;) {
         std::shared_ptr<PipelineJob> job;
         {
           std::unique_lock lock(pipeline_mutex_);
-          pipeline_ready_.wait(lock, [this] {
-            return stop_pipeline_worker_ || !pipeline_urgent_queue_.empty() || !pipeline_queue_.empty();
+          pipeline_ready_.wait(lock, [this, urgent] {
+            return stop_pipeline_worker_ || !pipeline_lookup_queue_.empty() || !pipeline_urgent_queue_.empty() ||
+                   (!urgent && !pipeline_queue_.empty());
           });
           if (stop_pipeline_worker_) return;
-          // Oldest first within each queue, so a steady stream of new
-          // pipelines cannot starve one that was queued earlier.
-          auto& queue = pipeline_urgent_queue_.empty() ? pipeline_queue_ : pipeline_urgent_queue_;
-          job = std::move(queue.front());
-          queue.pop_front();
+          // Lookups and the rest oldest first, so a steady stream of new
+          // pipelines cannot starve one that was queued earlier; urgent ones
+          // by how much their draw is missed.
+          if (!pipeline_lookup_queue_.empty()) {
+            job = std::move(pipeline_lookup_queue_.front());
+            pipeline_lookup_queue_.pop_front();
+          } else if (!pipeline_urgent_queue_.empty()) {
+            job = TakeUrgentJob();
+          } else {
+            job = std::move(pipeline_queue_.front());
+            pipeline_queue_.pop_front();
+          }
+        }
+        // A job whose draw is missing from the screen competes for the CPU; one
+        // that only replaces a stand-in yields to the game further.
+        const int wanted = job->urgent ? 4 : 10;
+        if (wanted != nice) {
+          setpriority(PRIO_PROCESS, uint32_t(gettid()), wanted);
+          nice = wanted;
         }
         job->desc.inputElements = job->elements.data();
         job->desc.inputSlots = job->slots.data();
         job->desc.specConstants = job->constants.data();
         const auto start = std::chrono::steady_clock::now();
+        auto finish = [&] {
+          job->duration_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - start).count());
+          job->done.store(true, std::memory_order_release);
+        };
+        // First the cache: a sibling of the same program may have compiled it
+        // since the job was queued. A miss joins the compiles, behind the
+        // lookups still waiting.
+        if (lookup_on_workers_ && !job->looked_up) {
+          {
+            PlumePipelineLookupOnly only;
+            try { job->result = device_->createGraphicsPipeline(job->desc); } catch (const std::exception&) {}
+          }
+          job->looked_up = true;
+          if (job->result) {
+            job->found = true;
+            finish();
+          } else {
+            {
+              std::lock_guard lock(pipeline_mutex_);
+              (job->urgent ? pipeline_urgent_queue_ : pipeline_queue_).push_back(std::move(job));
+            }
+            pipeline_ready_.notify_all();
+          }
+          continue;
+        }
+        // Then one compile per program: a job whose program another worker is
+        // compiling waits for that compile and looks it up afterwards.
+        {
+          std::lock_guard lock(pipeline_mutex_);
+          auto [waiting, first] = compiling_programs_.try_emplace(job->program);
+          if (!first) {
+            job->waited = true;
+            waiting->second.push_back(std::move(job));
+            continue;
+          }
+        }
         try { job->result = device_->createGraphicsPipeline(job->desc); }
         catch (const std::exception& e) { REXLOG_WARN("Renut: Plume async pipeline failed: {}", e.what()); }
-        job->duration_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - start).count());
-        job->done.store(true, std::memory_order_release);
+        const uint64_t program = job->program;
+        finish();
+        bool requeued = false;
+        {
+          std::lock_guard lock(pipeline_mutex_);
+          auto waiting = compiling_programs_.find(program);
+          if (waiting != compiling_programs_.end()) {
+            for (auto& sibling : waiting->second) {
+              sibling->looked_up = false;
+              (lookup_on_workers_ ? pipeline_lookup_queue_
+               : sibling->urgent  ? pipeline_urgent_queue_
+                                  : pipeline_queue_).push_front(std::move(sibling));
+              requeued = true;
+            }
+            compiling_programs_.erase(waiting);
+          }
+        }
+        if (requeued) pipeline_ready_.notify_all();
       }
     });
   }
@@ -1901,13 +2085,30 @@ void PlumeCommandProcessor::StopPipelineWorker() {
   {
     std::lock_guard lock(pipeline_mutex_);
     stop_pipeline_worker_ = true;
+    pipeline_lookup_queue_.clear();
     pipeline_urgent_queue_.clear();
     pipeline_queue_.clear();
+    compiling_programs_.clear();
   }
   pipeline_ready_.notify_all();
   for (std::thread& worker : pipeline_workers_) worker.join();
   pipeline_workers_.clear();
   pending_pipelines_.clear();
+  pending_programs_.clear();
+}
+
+void PlumeCommandProcessor::CountJob(const PipelineJob& job) {
+  stats_.pipeline_us += job.duration_us;
+  ++stats_.pipelines;
+  if (job.found) {
+    ++stats_.pipelines_found_ahead;
+  } else {
+    ++stats_.pipelines_compiled;
+    stats_.compile_us += job.duration_us;
+  }
+  if (job.waited) ++stats_.pipelines_waited;
+  auto program = pending_programs_.find(job.program);
+  if (program != pending_programs_.end() && --program->second == 0) pending_programs_.erase(program);
 }
 
 // A finished job used to wait for its own draw to come back and claim it. One
@@ -1921,8 +2122,7 @@ void PlumeCommandProcessor::ReapPipelines() {
       ++it;
       continue;
     }
-    stats_.pipeline_us += job.duration_us;
-    ++stats_.pipelines;
+    CountJob(job);
     if (job.result) {
       std::unique_ptr<RenderPipeline>& slot = pipelines_[it->first];
       slot = std::move(job.result);
@@ -2109,6 +2309,13 @@ bool PlumeCommandProcessor::SetupContext() {
     set_cube_->setTexture(i, white_cube_.get(), RenderTextureLayout::SHADER_READ,
                           white_cube_view_.get());
   }
+  lookup_budget_us_ = uint64_t(REXCVAR_GET(renut_plume_pipeline_lookup_ms)) * 1000;
+  lookup_here_ = lookup_budget_us_ && PlumePipelineLookupSupported();
+  REXLOG_INFO("Renut: Plume pipelines: {} compile, {}, boolean registers {}",
+              REXCVAR_GET(renut_plume_async_pipelines) ? "async" : "sync",
+              lookup_here_ ? fmt::format("cache lookups at the draw up to {} ms a frame", lookup_budget_us_ / 1000)
+                           : std::string("no cache lookups at the draw"),
+              REXCVAR_GET(renut_plume_bool_spec) ? "specialized" : "read from the shared block");
   validate_windows_ = g_validate_windows;
   dedupe_descriptors_ = g_dedupe_descriptors;
   if (dedupe_descriptors_) REXLOG_INFO("Renut: Plume 2D descriptors are written once per texture (plume-dedupe-desc)");
@@ -5516,10 +5723,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     return shader->bool_mask;
   };
-  const uint32_t* vs_bools = bools_of(vs);
-  const uint32_t* ps_bools = bools_of(ps);
-  for (uint32_t word = 0; word < 8; ++word) {
-    const uint32_t tested = vs_bools[word] | (ps_bools ? ps_bools[word] : 0);
+  // A shader that reads them from the shared block adds none.
+  const CompiledShader* vs_module = patch_list ? vs->domain_compiled : vs->compiled;
+  const uint32_t* vs_bools = vs_module && vs_module->dynamic_bools ? nullptr : bools_of(vs);
+  const uint32_t* ps_bools = ps && ps->compiled && ps->compiled->dynamic_bools ? nullptr : bools_of(ps);
+  for (uint32_t word = 0; word < 8 && (vs_bools || ps_bools); ++word) {
+    const uint32_t tested = (vs_bools ? vs_bools[word] : 0) | (ps_bools ? ps_bools[word] : 0);
     const uint32_t value = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + word] & tested;
     if (value) spec_constants.emplace_back(RENUT_SPEC_BOOLS_BASE + word, value);
   }
@@ -5695,14 +5904,23 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         ++drops_[{"pipeline stand-in", vs->entry->hash, ps ? ps->entry->hash : 0, false}];
         return true;
       };
+      // A draw that goes without its pipeline says so to the job, which
+      // decides what the workers take first (TakeUrgentJob): more for a
+      // colour draw than a shadow caster, and more for a large mesh than a
+      // particle, so walls and floors come before the effects around them.
+      auto missed = [&](PipelineJob& job) {
+        const uint32_t weight = (ps ? 4u : 1u) * (1u + std::min<uint32_t>(index_count, 65535u) / 512u);
+        job.demand.fetch_add(weight, std::memory_order_relaxed);
+        job.wanted_frame.store(swaps_, std::memory_order_relaxed);
+      };
       auto pending = pending_pipelines_.find(key);
       if (pending != pending_pipelines_.end()) {
         if (!pending->second->done.load(std::memory_order_acquire)) {
+          missed(*pending->second);
           if (!use_standin(pending->second->family)) return Drop("pipeline compiling", vs, ps);
         } else {
+          CountJob(*pending->second);
           pipeline = std::move(pending->second->result);
-          stats_.pipeline_us += pending->second->duration_us;
-          ++stats_.pipelines;
           if (pipeline) standins_[pending->second->family] = pipeline.get();
           pending_pipelines_.erase(pending);
           if (!pipeline) {
@@ -5712,30 +5930,74 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           }
         }
       } else if (!failed_pipelines_.count(key)) {
-        // Past the limit the draw waits for a free slot rather than compiling
-        // here: a stall on the command list thread is what this option avoids.
-        if (pending_pipelines_.size() >= 256) return Drop("pipeline queue full", vs, ps);
-        auto job = std::make_shared<PipelineJob>();
-        job->desc = desc;
-        job->elements = input_elements;
-        job->slots = input_slots;
-        job->constants = spec_constants;
         KeyBytes family_bytes = key_bytes;
         for (uint32_t i = 0; i < bool_span_count; ++i) {
           std::memset(family_bytes.data + bool_spans[i], 0, sizeof(RenderSpecConstant::value));
         }
-        job->family = family_bytes.Hash();
-        job->vs_hash = vs->ucode_data_hash();
-        job->ps_hash = ps ? ps->ucode_data_hash() : 0;
-        const bool covered = use_standin(job->family);
-        StartPipelineWorker();
-        pending_pipelines_.emplace(key, job);
-        {
-          std::lock_guard lock(pipeline_mutex_);
-          (covered ? pipeline_queue_ : pipeline_urgent_queue_).push_back(std::move(job));
+        const uint64_t family = family_bytes.Hash();
+        const uint64_t program = ProgramKey(desc);
+        // Most new pipelines differ from one already built only in blending,
+        // depth, targets or vertex layout, which the driver does not compile
+        // for: their program is in its cache - from this run or an earlier one
+        // - and a lookup only links them. Asked here, within a budget per
+        // frame, the draw is drawn now instead of a frame or more later. Not
+        // for a program a worker has yet to finish: the cache cannot have it.
+        bool looked_up = false;
+        if (lookup_here_ && lookup_spent_us_ < lookup_budget_us_ && !pending_programs_.count(program)) {
+          const auto lookup_start = std::chrono::steady_clock::now();
+          {
+            PlumePipelineLookupOnly only;
+            pipeline = device_->createGraphicsPipeline(desc);
+          }
+          const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - lookup_start).count());
+          lookup_spent_us_ += us;
+          stats_.lookup_us += us;
+          looked_up = true;
+          if (pipeline) {
+            ++stats_.pipelines;
+            ++stats_.pipelines_found_here;
+            stats_.pipeline_us += us;
+            standins_[family] = pipeline.get();
+            // A lookup that takes a compile's time is a driver that compiled
+            // anyway; on this thread that is the stall the workers exist for.
+            if (us > 40000 && swaps_ > 300 && ++slow_lookups_ >= 5) {
+              lookup_here_ = false;
+              REXLOG_WARN("Renut: Plume pipeline lookups at the draw compiled instead; left to the workers");
+            }
+          } else {
+            ++stats_.lookups_missed;
+          }
         }
-        pipeline_ready_.notify_one();
-        if (!covered) return Drop("pipeline compiling", vs, ps);
+        if (!pipeline) {
+          // Past the limit the draw waits for a free slot rather than compiling
+          // here: a stall on the command list thread is what this option avoids.
+          if (pending_pipelines_.size() >= 4096) return Drop("pipeline queue full", vs, ps);
+          auto job = std::make_shared<PipelineJob>();
+          job->desc = desc;
+          job->elements = input_elements;
+          job->slots = input_slots;
+          job->constants = spec_constants;
+          job->family = family;
+          job->program = program;
+          job->looked_up = looked_up;
+          job->vs_hash = vs->ucode_data_hash();
+          job->ps_hash = ps ? ps->ucode_data_hash() : 0;
+          const bool covered = use_standin(family);
+          job->urgent = !covered;
+          missed(*job);
+          StartPipelineWorker();
+          ++pending_programs_[program];
+          pending_pipelines_.emplace(key, job);
+          {
+            std::lock_guard lock(pipeline_mutex_);
+            (!looked_up && lookup_on_workers_ ? pipeline_lookup_queue_
+             : covered                        ? pipeline_queue_
+                                              : pipeline_urgent_queue_).push_back(std::move(job));
+          }
+          pipeline_ready_.notify_all();
+          if (!covered) return Drop("pipeline compiling", vs, ps);
+        }
       }
     }
     if (!pipeline && !standin && !failed_pipelines_.count(key) && !pending_pipelines_.count(key)) {
@@ -7066,6 +7328,8 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   ++swaps_;
   plume::g_plumeFrame.store(swaps_, std::memory_order_relaxed);
   if (!pending_pipelines_.empty()) ReapPipelines();
+  lookup_spent_us_ = 0;
+  pipeline_frame_.store(swaps_, std::memory_order_relaxed);
   if (!miss_dump_directory_.empty()) {
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
     if (swaps_ % 30 == 0) {
@@ -7627,7 +7891,27 @@ void PlumeCommandProcessor::Report() {
     pass_totals_.clear();
     gpu_ns_ = 0;
   }
-  if (stats_.pipelines) SavePlumePipelineCache();
+  if (stats_.pipelines || stats_.lookups_missed) {
+    uint64_t found = 0, compiled = 0;
+    PlumePipelineCacheCounts(&found, &compiled);
+    REXLOG_INFO("Renut: Plume new pipelines: {} found in the cache at the draw ({} us per lookup, {} missed), "
+                "{} found by a worker, {} compiled ({} ms each, {} after waiting for a sibling's compile); "
+                "since launch the driver's cache had {} and compiled {}",
+                stats_.pipelines_found_here,
+                stats_.lookup_us / std::max<uint64_t>(1, stats_.pipelines_found_here + stats_.lookups_missed),
+                stats_.lookups_missed, stats_.pipelines_found_ahead, stats_.pipelines_compiled,
+                stats_.compile_us / 1000 / std::max<uint64_t>(1, stats_.pipelines_compiled),
+                stats_.pipelines_waited, found, compiled);
+  }
+  SavePlumePipelineCache();
+  // A gap in the sound is a frame the output had to fill with silence; each is
+  // 256 samples, 5.3 ms at 48 kHz.
+  const uint64_t silent = renut_audio_silent_frames();
+  if (silent != reported_silent_frames_) {
+    REXLOG_INFO("Renut: audio played {} frames of silence ({} ms) since the last report",
+                silent - reported_silent_frames_, (silent - reported_silent_frames_) * 16 / 3);
+    reported_silent_frames_ = silent;
+  }
   for (const auto& [hash, count] : missed_draws_) {
     REXLOG_INFO("Renut: Plume   missing VS {:016X}: {} draws", hash, count);
   }

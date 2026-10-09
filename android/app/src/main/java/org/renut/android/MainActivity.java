@@ -281,8 +281,10 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     private void clearShaderCache(){
         File root=getFilesDir();
         try{
-            boolean removed=Files.deleteIfExists(new File(root,"plume-pipelines.bin").toPath());
-            removed=Files.deleteIfExists(new File(root,"plume-pipelines.bin.tmp").toPath())||removed;
+            // plume-pipelines.bin, its .delta.bin (what was compiled since), variants and temporaries.
+            boolean removed=false;
+            File[] files=root.listFiles((dir,name)->name.startsWith("plume-pipelines"));
+            if(files!=null)for(File file:files)removed=Files.deleteIfExists(file.toPath())||removed;
             status.setText(removed?"Cache de shaders apagado. Será recriado na próxima execução.":"Nenhum cache de shaders salvo para apagar.");
         }catch(IOException e){status.setText("Não foi possível apagar o cache de shaders: "+e.getMessage());}
     }

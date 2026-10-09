@@ -5,6 +5,7 @@
 // path from the game's Direct3D calls to the screen.
 #include <android/native_window.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -24,12 +25,28 @@ namespace renut {
 inline constexpr uint32_t kPlumeFramesInFlight = 2;
 
 // Where the driver's compiled pipelines are kept between runs. Call it before
-// the renderer starts: entering a scene for the first time spends most of its
-// frames inside vkCreateGraphicsPipelines, and a warm cache skips that.
+// the first pipeline: entering a scene for the first time spends most of its
+// frames inside vkCreateGraphicsPipelines, and a warm cache skips that. Once the
+// renderer has started, the file starts loading in the background.
 void SetPlumePipelineCachePath(const std::string& path);
-// Writes it out. Worth calling whenever new pipelines were built, since the
-// process is usually killed rather than shut down.
-void SavePlumePipelineCache();
+// Writes out what is new, if anything. Worth calling often, since the process is
+// usually killed rather than shut down; `now` skips the minimum interval.
+void SavePlumePipelineCache(bool now = false);
+// Whether the driver can be asked for a pipeline it already has without
+// compiling one (VK_EXT_pipeline_creation_cache_control). Known once the
+// renderer has started.
+bool PlumePipelineLookupSupported();
+// While one is alive on a thread, pipeline creation there only looks in the
+// cache: a pipeline that would have to be compiled comes back null at once.
+class PlumePipelineLookupOnly {
+ public:
+  PlumePipelineLookupOnly();
+  ~PlumePipelineLookupOnly();
+  PlumePipelineLookupOnly(const PlumePipelineLookupOnly&) = delete;
+  PlumePipelineLookupOnly& operator=(const PlumePipelineLookupOnly&) = delete;
+};
+// Pipelines since launch that the cache already had, and that were compiled.
+void PlumePipelineCacheCounts(uint64_t* found, uint64_t* compiled);
 
 class PlumeRenderer {
  public:

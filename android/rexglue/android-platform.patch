@@ -1,8 +1,23 @@
 diff --git a/include/rex/audio/audio_system.h b/include/rex/audio/audio_system.h
-index 33fd32c..ad02d4b 100644
+index 33fd32c..9fae4ec 100644
 --- a/include/rex/audio/audio_system.h
 +++ b/include/rex/audio/audio_system.h
-@@ -84,6 +84,7 @@ class AudioSystem : public system::IAudioSystem {
+@@ -33,6 +33,14 @@ constexpr memory::fourcc_t kAudioSaveSignature = memory::make_fourcc("XAUD");
+ class AudioDriver;
+ class XmaDecoder;
+ 
++// Puts the calling thread ahead of the game's other threads and of background
++// work (the renderer's pipeline compiles): the threads that carry a frame of
++// audio to the output - the worker that runs the title's callback, the title's
++// own mixer, the XMA decoder - each wake every few milliseconds, and when one
++// waits for a core the output plays silence. Android only; `what` names it in
++// the log the first time.
++void RaiseAudioThreadPriority(const char* what);
++
+ class AudioSystem : public system::IAudioSystem {
+  public:
+   virtual ~AudioSystem();
+@@ -84,6 +92,7 @@ class AudioSystem : public system::IAudioSystem {
      uint32_t callback_arg;
      uint32_t wrapped_callback_arg;
      bool in_use;
@@ -311,10 +326,23 @@ index 27a5136..4dc7d14 100644
  
  template <typename DestroyFunction, typename Object>
 diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
-index 7a711a8..bd487c3 100644
+index 7a711a8..74e34e9 100644
 --- a/src/audio/audio_system.cpp
 +++ b/src/audio/audio_system.cpp
-@@ -21,6 +21,7 @@
+@@ -10,6 +10,12 @@
+  */
+ 
+ #include <rex/assert.h>
++#if defined(__ANDROID__)
++#include <sys/resource.h>
++#include <unistd.h>
++#include <cerrno>
++#include <cstring>
++#endif
+ #include <rex/audio/audio_driver.h>
+ #include <rex/audio/audio_system.h>
+ #include <rex/audio/flags.h>
+@@ -21,6 +27,7 @@
  #include <rex/stream.h>
  #include <rex/string/buffer.h>
  #include <rex/system/thread_state.h>
@@ -322,7 +350,40 @@ index 7a711a8..bd487c3 100644
  #include <rex/thread.h>
  #include <rex/cvar.h>
  
-@@ -137,6 +138,7 @@ void AudioSystem::WorkerThreadMain() {
+@@ -46,6 +53,24 @@ namespace {
+ constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
+ }  // namespace
+ 
++// Nice -10 (Android's audio threads use -16 and -19): far enough above the
++// game's threads at 0 and the compile workers at 4 and 10 that the scheduler
++// hands one of these a core as soon as it wakes. Measured 05/10 under heavy
++// compiling: the Audio Worker waited 100-158 us per wake for a core instead of
++// ~35 us, 13-21% of its time, and the output filled the gaps with silence.
++void RaiseAudioThreadPriority(const char* what) {
++#if defined(__ANDROID__)
++  constexpr int kAudioNice = -10;
++  if (setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), kAudioNice) == 0) {
++    REXAPU_INFO("Renut: audio thread '{}' (tid {}) at nice {}", what, gettid(), kAudioNice);
++  } else {
++    REXAPU_WARN("Renut: could not raise audio thread '{}': {}", what, std::strerror(errno));
++  }
++#else
++  (void)what;
++#endif
++}
++
+ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
+     : memory_(function_dispatcher->memory()),
+       function_dispatcher_(function_dispatcher),
+@@ -97,6 +122,7 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
+ }
+ 
+ void AudioSystem::WorkerThreadMain() {
++  RaiseAudioThreadPriority("Audio Worker");
+   // Initialize driver and ringbuffer.
+   Initialize();
+ 
+@@ -137,6 +163,7 @@ void AudioSystem::WorkerThreadMain() {
        auto global_lock = global_critical_region_.Acquire();
        uint32_t client_callback = clients_[index].callback;
        uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
@@ -330,7 +391,7 @@ index 7a711a8..bd487c3 100644
        global_lock.unlock();
  
        if (client_callback) {
-@@ -148,6 +150,17 @@ void AudioSystem::WorkerThreadMain() {
+@@ -148,6 +175,17 @@ void AudioSystem::WorkerThreadMain() {
          uint64_t args[] = {client_callback_arg};
          function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                        rex::countof(args));
@@ -348,7 +409,7 @@ index 7a711a8..bd487c3 100644
          if (diag_pump_count < 10) {
            REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
          }
-@@ -176,7 +189,7 @@ void AudioSystem::WorkerThreadMain() {
+@@ -176,7 +214,7 @@ void AudioSystem::WorkerThreadMain() {
  int AudioSystem::FindFreeClient() {
    for (size_t i = 0; i < kMaximumClientCount; i++) {
      auto& client = clients_[i];
@@ -357,7 +418,7 @@ index 7a711a8..bd487c3 100644
        return i;
      }
    }
-@@ -217,7 +230,7 @@ void AudioSystem::Shutdown() {
+@@ -217,7 +255,7 @@ void AudioSystem::Shutdown() {
    // Destroy all active client drivers (closes SDL audio devices, stopping
    // callback threads) before the semaphores they reference are destroyed.
    for (size_t i = 0; i < kMaximumClientCount; i++) {
@@ -366,7 +427,7 @@ index 7a711a8..bd487c3 100644
        DestroyDriver(clients_[i].driver);
        if (clients_[i].wrapped_callback_arg) {
          memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
-@@ -233,7 +246,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
+@@ -233,7 +271,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
    auto global_lock = global_critical_region_.Acquire();
  
    auto index = FindFreeClient();
@@ -375,7 +436,21 @@ index 7a711a8..bd487c3 100644
    REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
                 queued_frames_);
  
-@@ -272,6 +285,10 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+@@ -262,6 +300,13 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
+ 
+ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+   SCOPE_profile_cpu_f("apu");
++  // Whichever guest thread hands frames over is the title's mixer (in Banjo
++  // its 5.1 DSP thread): it is as much a part of the audio path as the worker.
++  thread_local bool raised = false;
++  if (!raised) {
++    raised = true;
++    RaiseAudioThreadPriority("title mixer");
++  }
+ 
+   static uint32_t submit_count = 0;
+   if (submit_count < 10) {
+@@ -272,6 +317,10 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
  
    auto global_lock = global_critical_region_.Acquire();
    assert_true(index < kMaximumClientCount);
@@ -386,7 +461,7 @@ index 7a711a8..bd487c3 100644
    assert_true(clients_[index].driver != NULL);
    (clients_[index].driver)->SubmitFrame(samples_ptr);
  }
-@@ -281,9 +298,32 @@ void AudioSystem::UnregisterClient(size_t index) {
+@@ -281,9 +330,32 @@ void AudioSystem::UnregisterClient(size_t index) {
  
    auto global_lock = global_critical_region_.Acquire();
    assert_true(index < kMaximumClientCount);
@@ -423,10 +498,19 @@ index 7a711a8..bd487c3 100644
    // Drain the semaphore of its count.
    auto client_semaphore = client_semaphores_[index].get();
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..6bf8b03 100644
+index 20a2cd8..f41cc5b 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
-@@ -22,6 +22,7 @@
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <cstdint>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
+@@ -22,10 +24,20 @@
  #include <rex/dbg.h>
  #include <rex/logging.h>
  #include <rex/perf/counter.h>
@@ -434,7 +518,20 @@ index 20a2cd8..6bf8b03 100644
  #include <SDL3/SDL.h>
  
  REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
-@@ -75,7 +76,11 @@ bool SDLAudioDriver::Initialize() {
+ 
++namespace {
++// Frames of silence the output played because no frame had been handed over
++// in time: what a listener hears as stutter or slowdown. The renderer's report
++// prints it (renut_audio_silent_frames).
++std::atomic<uint64_t> g_silent_frames{0};
++}  // namespace
++
++extern "C" uint64_t renut_audio_silent_frames() { return g_silent_frames.load(std::memory_order_relaxed); }
++
+ namespace rex::audio::sdl {
+ 
+ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
+@@ -75,7 +87,11 @@ bool SDLAudioDriver::Initialize() {
  
    // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
    // Handing it a 6ch stream instead would use SDL's own downmix.
@@ -447,6 +544,14 @@ index 20a2cd8..6bf8b03 100644
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
      desired_spec.channels = 2;
+@@ -186,6 +202,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+         sdl_callback_count++;
+       }
++      g_silent_frames.fetch_add(1, std::memory_order_relaxed);
+       std::memset(data, 0, len);
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
 index 11b83be..1cba64a 100644
 --- a/src/audio/xma_context.cpp
@@ -477,18 +582,27 @@ index 11b83be..1cba64a 100644
          GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
      if (next_input_offset == kBitsPerPacketHeader) {
 diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
-index a0a178d..f1396c5 100644
+index a0a178d..3ca2dd9 100644
 --- a/src/audio/xma_decoder.cpp
 +++ b/src/audio/xma_decoder.cpp
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,8 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
 +#include <atomic>
++#include <rex/audio/audio_system.h>
  #include <rex/audio/xma/context.h>
  #include <rex/audio/xma/decoder.h>
  #include <rex/cvar.h>
-@@ -213,6 +214,7 @@ uint32_t XmaDecoder::AllocateContext() {
+@@ -138,6 +140,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
+ }
+ 
+ void XmaDecoder::WorkerThreadMain() {
++  RaiseAudioThreadPriority("XMA Decoder");
+   while (worker_running_) {
+     // Okay, let's loop through XMA contexts to find ones we need to decode!
+     bool did_work = false;
+@@ -213,6 +216,7 @@ uint32_t XmaDecoder::AllocateContext() {
    XmaContext& context = contexts_[index];
    assert_false(context.is_allocated());
    context.set_is_allocated(true);
@@ -496,7 +610,7 @@ index a0a178d..f1396c5 100644
    return context.guest_ptr();
  }
  
-@@ -224,6 +226,7 @@ void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
+@@ -224,6 +228,7 @@ void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
    assert_true(context.is_allocated());
    context.Release();
    context_bitmap_.Release(context_id);
@@ -504,7 +618,7 @@ index a0a178d..f1396c5 100644
  }
  
  bool XmaDecoder::BlockOnContext(uint32_t guest_ptr, bool poll) {
-@@ -295,12 +298,20 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -295,12 +300,20 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
      }
      // Decode inline. waiting on the worker sweep stalls the realtime
      // audio thread 50-100ms during kick bursts.
