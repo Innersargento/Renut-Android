@@ -19,4 +19,9 @@ rex::system::IGraphicsSystem* CreatePlumeGraphicsSystem();
 // here (first 32), to extend the capture.
 void SetPlumeMissDumpDirectory(const std::string& directory);
 
+// Debug: with <root>/plume-memtrace present, Plume logs every memory block, buffer and
+// image it makes or frees (with device addresses) and writes it to <root>/plume-mem.txt
+// when the device is lost. Call before PlumeRenderer::Start so the first blocks are seen.
+void ArmPlumeMemoryTrace(const std::string& root);
+
 }  // namespace renut

@@ -123,6 +123,8 @@ using namespace rex::graphics;
 
 // Where microcode without a recompiled shader is saved (SetPlumeMissDumpDirectory).
 std::string g_miss_dump_directory;
+bool g_dedupe_descriptors = false;  // files/plume-dedupe-desc (see SetTexture2D)
+bool g_validate_windows = false;    // files/plume-validate (see ValidateKeptWindows)
 
 // The game's own VdSwap count, which is what the on-screen counter shows. Plume
 // presents more often than the game swaps, so the two rates have to be read
@@ -405,6 +407,26 @@ class ShaderStore {
     if (!size || !smolv::Decode(data, entry->spirvSize, spirv.data(), size)) {
       compiled.failed = true;
       return nullptr;
+    }
+    // Debug: <files>/plume-spv/<container hash>.spv stands in for the cached
+    // SPIR-V of that shader, to try a changed shader without rebuilding the cache.
+    if (!g_miss_dump_directory.empty()) {
+      const std::string path = fmt::format("{}/plume-spv/{:016X}.spv",
+                                           g_miss_dump_directory.substr(0, g_miss_dump_directory.rfind('/')),
+                                           entry->hash);
+      if (FILE* file = std::fopen(path.c_str(), "rb")) {
+        std::fseek(file, 0, SEEK_END);
+        const long bytes = std::ftell(file);
+        std::fseek(file, 0, SEEK_SET);
+        if (bytes > 0 && bytes % 4 == 0) {
+          spirv.assign(size_t(bytes) / 4, 0);
+          if (std::fread(spirv.data(), 1, size_t(bytes), file) == size_t(bytes)) {
+            size = size_t(bytes);
+            REXLOG_INFO("Renut: Plume shader {:016X} replaced by {} ({} bytes)", entry->hash, path, bytes);
+          }
+        }
+        std::fclose(file);
+      }
     }
     compiled.module = device->createShader(spirv.data(), size, "main", RenderShaderFormat::SPIRV);
     if (!compiled.module) {
@@ -1005,10 +1027,20 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   struct KeptStream {
     std::unique_ptr<RenderBuffer> buffer;
     uint32_t base = 0, size = 0;
-    uint64_t last_used = 0, dropped_frame = 0;
-    uint32_t drops = 0;
+    uint64_t last_used = 0, dropped_frame = 0, made_frame = 0;
+    uint32_t drops = 0, endian = 0;
     bool valid = false;
   };
+  // Debug (files/plume-validate): at every swap from frame 800, each kept window used in the last two
+  // frames is compared with guest memory; one that differs was missed by the write watch.
+  void ValidateKeptWindows();
+  // The same check at the moment of a draw, on the bytes it is about to read: a kept range that
+  // differs from guest memory while no write hit is pending is one the GPU would read wrong.
+  void ValidateRange(const char* what, uint64_t draw_hash, RenderBuffer* buffer, uint64_t offset, uint32_t guest_address,
+                     uint32_t size, xenos::Endian endian);
+  bool validate_windows_ = false;
+  uint32_t validate_logged_ = 0;
+  uint64_t kept_drop_events_ = 0, validate_ranges_ = 0, validate_stale_ = 0;
   std::unordered_map<uint64_t, KeptStream> kept_streams_;
   LookupMemo<KeptStream, 13> kept_memo_;
   uint64_t kept_bytes_ = 0;
@@ -1328,6 +1360,11 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Keyed by guest base. Never overlapping: a new range swallows the ones it touches.
   std::map<uint32_t, ExportRange> exports_;
   std::array<std::vector<std::unique_ptr<RenderBuffer>>, kPlumeFramesInFlight> retired_buffers_;
+  // Debug: files/plume-retire-delay (frames) keeps retired buffers alive that much longer than the
+  // frames in flight need, to tell a read past a buffer's end from a read of one freed too soon.
+  std::deque<std::pair<uint64_t, std::shared_ptr<void>>> delayed_buffers_;
+  uint64_t retire_delay_ = 0;
+  uint32_t retire_mask_ = 15;  // which classes: 1 framebuffers, 2 textures, 4 views, 8 buffers
 
   std::unique_ptr<RenderBuffer> upload_;
   uint8_t* upload_data_ = nullptr;
@@ -1537,6 +1574,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     uint64_t vs_hash = 0, ps_hash = 0;
     uint64_t s0_addr = 0, s10_addr = 0;
     uint32_t s0_size = 0, s10_size = 0;
+    // The device address and size of each of the 17 streams the shaders read by address.
+    uint64_t stream_addr[17] = {};
+    uint32_t stream_size[17] = {};
   };
   // The draws recorded last, for the report a lost device prints (see
   // ReportDeviceLost). Written by this thread only; the watcher reads it after
@@ -1545,6 +1585,18 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     uint64_t frame = 0, vs = 0, ps = 0, pipeline = 0, framebuffer = 0, s0_addr = 0, s10_addr = 0;
     uint64_t pair_first_frame = 0;  // the frame this vertex/pixel pair was first recorded in
     uint32_t kind = 0, count = 0, first = 0, s0_size = 0, s10_size = 0;
+    // Everything the GPU reads for this draw by address: the streams, the vertex
+    // buffers the input assembler walks and the index range.
+    uint64_t stream_addr[17] = {};
+    uint32_t stream_size[17] = {};
+    uint64_t index_addr = 0;
+    uint32_t index_bytes = 0, index_size = 0;
+    int32_t base_vertex = 0;
+    struct VertexRange {
+      uint64_t addr = 0;
+      uint32_t size = 0, slot = 0;
+    } vertex[6];
+    uint32_t vertex_count = 0;
   };
   static constexpr size_t kRecentDraws = 6144;
   std::vector<RecentDraw> recent_draws_ = std::vector<RecentDraw>(kRecentDraws);
@@ -1569,12 +1621,33 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // draw, so a draw that takes the GPU down is the last one named in the log.
   // Draws stop being deferred while it is on.
   bool sync_draws_ = false;
+  // files/plume-syncwatch (hex hash): a synced draw whose vertex or pixel shader is this one is logged whole.
+  uint64_t sync_watch_ = 0;
+  uint32_t sync_watch_count_ = 0;
   uint64_t sync_draw_count_ = 0;
+  uint64_t sync_stale_streams_ = 0;  // streams, over all synced draws, whose kept window differed from guest memory
+  uint32_t sync_stale_logged_ = 0;
+  // Debug (files/plume-skin-skip: hex vertex shader hashes): draws of those skinned shaders are dropped,
+  // and every skinned vertex shader seen is counted and listed (LogSkinned) - a bisect of the culprit.
+  struct SkinnedSeen {
+    uint64_t draws = 0, first_frame = 0, last_frame = 0;
+  };
+  bool skin_log_ = false;
+  std::unordered_set<uint64_t> skin_skip_;
+  std::unordered_map<uint64_t, SkinnedSeen> skinned_seen_;
+  std::mutex skinned_mutex_;
+  void LogSkinned();
   std::unordered_set<uint64_t> sync_seen_;
+  // The first draw of each pair that ran to completion, for the line a failure prints.
+  std::unordered_map<uint64_t, std::string> sync_first_ok_;
   std::unordered_map<uint64_t, uint32_t> sync_diag_;
   std::string sync_draw_info_;
   std::array<std::string, 6> sync_recent_;
   void SyncAfterDraw(const DrawPacket& pk);
+  // files/plume-syncevery (N > 1): the list is submitted and waited for after every Nth draw, with
+  // none of plume-syncdraws' bookkeeping - how many draws in flight the failure needs.
+  void SyncEvery();
+  uint32_t sync_every_ = 0, sync_every_counter_ = 0;
   static constexpr size_t kMaxDeferred = 384;
   std::vector<DrawPacket> deferred_, flushing_;
   std::vector<DeferredSlot> deferred_slots_, flushing_slots_, draw_slots_;
@@ -1652,12 +1725,35 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::array<std::vector<uint32_t>, kPlumeFramesInFlight> retired_descriptor_slots_;
   std::vector<uint32_t> free_descriptors_;
   uint32_t AllocateTextureDescriptor() {
+    uint32_t index = 0;
     if (!free_descriptors_.empty()) {
-      uint32_t index = free_descriptors_.back();
+      index = free_descriptors_.back();
       free_descriptors_.pop_back();
-      return index;
+    } else if (next_descriptor_ < kMaxTextures2D) {
+      index = next_descriptor_++;
     }
-    return next_descriptor_ < kMaxTextures2D ? next_descriptor_++ : 0;
+    written_2d_[index] = {};
+    return index;
+  }
+  // Debug (files/plume-dedupe-desc): a 2D descriptor already holding this texture and view is not
+  // written again. The set is bound whole and read by the GPU when the draws run, so a write into
+  // it while an earlier frame is still running races with that frame's reads, whatever it writes.
+  struct WrittenDescriptor {
+    const RenderTexture* texture = nullptr;
+    const RenderTextureView* view = nullptr;
+  };
+  std::array<WrittenDescriptor, kMaxTextures2D> written_2d_ = {};
+  bool dedupe_descriptors_ = false;
+  uint64_t descriptor_writes_ = 0, descriptor_writes_skipped_ = 0;
+  void SetTexture2D(uint32_t index, const RenderTexture* texture, const RenderTextureView* view = nullptr) {
+    WrittenDescriptor& written = written_2d_[index];
+    if (dedupe_descriptors_ && written.texture == texture && written.view == view) {
+      ++descriptor_writes_skipped_;
+      return;
+    }
+    written = {texture, view};
+    ++descriptor_writes_;
+    set_2d_->setTexture(index, texture, RenderTextureLayout::SHADER_READ, view);
   }
   // Volumes and stacks share the 3D set, cube maps have their own; both are far
   // smaller than the 2D one and recycled the same way.
@@ -2013,6 +2109,9 @@ bool PlumeCommandProcessor::SetupContext() {
     set_cube_->setTexture(i, white_cube_.get(), RenderTextureLayout::SHADER_READ,
                           white_cube_view_.get());
   }
+  validate_windows_ = g_validate_windows;
+  dedupe_descriptors_ = g_dedupe_descriptors;
+  if (dedupe_descriptors_) REXLOG_INFO("Renut: Plume 2D descriptors are written once per texture (plume-dedupe-desc)");
   writeback_ = REXCVAR_GET(renut_plume_memexport_readback);
   writeback_fast_ = REXCVAR_GET(renut_plume_memexport_fast);
   BeginFrame();
@@ -2273,6 +2372,7 @@ void PlumeCommandProcessor::DrainWatchHits() {
         ++kept.drops;
         kept.dropped_frame = swaps_;
         ++stats_.kept_drops;
+        ++kept_drop_events_;
         break;
       }
     }
@@ -2344,6 +2444,8 @@ bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::
   kept.buffer = std::move(made);
   kept.base = window_base;
   kept.size = window_size;
+  kept.endian = uint32_t(endian);
+  kept.made_frame = swaps_;
   kept.valid = true;
   kept_bytes_ += window_size;
   stats_.kept_bytes_made += window_size;
@@ -3023,6 +3125,7 @@ void PlumeCommandProcessor::BeginFrame() {
   slice_base_ = slice_origin_ + uint64_t(slot_) * upload_slice_size_;
   for (uint32_t index : retired_descriptor_slots_[slot_]) {
     set_2d_->setTexture(index, white_2d_.get(), RenderTextureLayout::SHADER_READ);
+    written_2d_[index] = {white_2d_.get(), nullptr};
     free_descriptors_.push_back(index);
   }
   retired_descriptor_slots_[slot_].clear();
@@ -3036,10 +3139,20 @@ void PlumeCommandProcessor::BeginFrame() {
     free_cube_descriptors_.push_back(index);
   }
   retired_cube_descriptor_slots_[slot_].clear();
+  if (retire_delay_) {
+    // Debug: hold what the frames in flight no longer need a while longer.
+    if (retire_mask_ & 1) for (auto& object : retired_framebuffer_slots_[slot_]) delayed_buffers_.emplace_back(swaps_, std::shared_ptr<void>(std::move(object)));
+    if (retire_mask_ & 2) for (auto& object : retired_slots_[slot_]) delayed_buffers_.emplace_back(swaps_, std::shared_ptr<void>(std::move(object)));
+    if (retire_mask_ & 4) for (auto& object : retired_views_[slot_]) delayed_buffers_.emplace_back(swaps_, std::shared_ptr<void>(std::move(object)));
+    if (retire_mask_ & 8) for (auto& object : retired_buffers_[slot_]) delayed_buffers_.emplace_back(swaps_, std::shared_ptr<void>(std::move(object)));
+  }
   retired_framebuffer_slots_[slot_].clear();
   retired_slots_[slot_].clear();
   retired_views_[slot_].clear();
   retired_buffers_[slot_].clear();
+  while (!delayed_buffers_.empty() && swaps_ - delayed_buffers_.front().first >= retire_delay_) {
+    delayed_buffers_.pop_front();
+  }
   if (swaps_ - last_eviction_ >= (low_memory_ ? 8u : 30u)) {
     last_eviction_ = swaps_;
     EvictIdleTextures();
@@ -3232,7 +3345,7 @@ uint32_t PlumeCommandProcessor::SwizzledResolved(Resolved& r, bool fitted, uint3
     s.descriptor = AllocateTextureDescriptor();
     s.texture = texture;
     if (!s.view || !s.descriptor) return 0;
-    set_2d_->setTexture(s.descriptor, texture, RenderTextureLayout::SHADER_READ, s.view.get());
+    SetTexture2D(s.descriptor, texture, s.view.get());
   }
   return s.descriptor;
 }
@@ -3248,7 +3361,7 @@ uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint
     r.fitted_generation = UINT64_MAX;
     r.fitted_descriptor = AllocateTextureDescriptor();
     if (!r.fitted || !r.fitted_descriptor) return 0;
-    set_2d_->setTexture(r.fitted_descriptor, r.fitted.get(), RenderTextureLayout::SHADER_READ);
+    SetTexture2D(r.fitted_descriptor, r.fitted.get());
   }
   if (r.fitted_generation != r.generation) {
     Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
@@ -3553,7 +3666,7 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
                                  upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, w, staging));
   }
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
-  set_2d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
+  SetTexture2D(texture.descriptor, texture.texture.get());
   ++stats_.textures_decoded;
   return texture.descriptor;
 }
@@ -4611,6 +4724,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   std::memcpy(sh + RENUT_SHARED_STREAMS_OFFSET, streams, sizeof(streams));
+  if (validate_windows_) {
+    for (uint32_t s = 0; s < RENUT_VERTEX_STREAM_COUNT; ++s) {
+      if (!slot_sizes[s] || !slot_buffers[s]) continue;
+      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(s == RENUT_DIRECT_FETCH_STREAM ? 0 : 95 - s);
+      ValidateRange(fmt::format("stream{}", s).c_str(), vs->entry->hash, slot_buffers[s], slot_offsets[s],
+                    fetch.address << 2, slot_sizes[s], fetch.endian);
+    }
+  }
   if (sync_draws_) {
     // What this draw hands the GPU, kept for the line a failure prints.
     std::string info = fmt::format("vs={:016X} ps={:016X} index_count={} streams:", vs->entry->hash,
@@ -4631,6 +4752,85 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         float f;
         std::memcpy(&f, bytes.data() + i, 4);
         info += fmt::format(" {:.3g}", f);
+      }
+    }
+    // Whether each kept window still holds what the guest holds: the GPU reads
+    // the window, the checks below read the guest. A window the watch missed
+    // would give the shader another mesh's bytes.
+    for (uint32_t s = 0; s < RENUT_VERTEX_STREAM_COUNT; ++s) {
+      if (s == RENUT_DIRECT_FETCH_STREAM || !slot_sizes[s] || !slot_buffers[s] || slot_buffers[s] == upload_.get()) continue;
+      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - s);
+      std::vector<uint8_t> guest(slot_sizes[s]);
+      CopySwapped(guest.data(), memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), slot_sizes[s], fetch.endian);
+      const auto* window = static_cast<const uint8_t*>(slot_buffers[s]->map());
+      if (!window) continue;
+      uint32_t differ = 0, first = UINT32_MAX;
+      for (uint32_t i = 0; i < guest.size(); ++i) {
+        if (window[slot_offsets[s] + i] != guest[i]) {
+          if (first == UINT32_MAX) first = i;
+          ++differ;
+        }
+      }
+      slot_buffers[s]->unmap();
+      if (differ) {
+        info += fmt::format(" STALE{}[{}B differ of {}, first at {}]", s, differ, guest.size(), first);
+        ++sync_stale_streams_;
+      }
+    }
+    // What the integer attributes hold over the vertices this draw names: a
+    // blend index past the palette is a read past the stream, which the Mali
+    // faults on (the stream is read through a device address).
+    if (!patch_list && vs->compiled) {
+      std::vector<uint32_t> used;
+      const bool indexed = index_buffer_info && index_buffer_info->guest_base;
+      if (indexed) {
+        const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
+        std::vector<uint8_t> raw(size_t(index_count) * (is32 ? 4 : 2));
+        CopySwapped(raw.data(), memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
+                    uint32_t(raw.size()), index_buffer_info->endianness);
+        for (uint32_t i = 0; i < index_count; ++i) {
+          used.push_back(is32 ? reinterpret_cast<const uint32_t*>(raw.data())[i]
+                              : reinterpret_cast<const uint16_t*>(raw.data())[i]);
+        }
+      } else {
+        for (uint32_t i = 0; i < index_count && i < 65536; ++i) used.push_back(i);
+      }
+      uint32_t max_vertex = 0;
+      for (uint32_t v : used) max_vertex = std::max(max_vertex, v);
+      const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+      info += fmt::format(" max_index={} base={} palette={}", max_vertex, base_vertex, slot_sizes[10] / 64);
+      for (const LiveElement& e : vs->elements) {
+        if (e.normalized || !e.stride || (e.format != 6 && e.format != 25 && e.format != 26)) continue;
+        xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - e.slot);
+        if (fetch.size == 0 || (fetch.size << 2) > (4u << 20)) continue;
+        std::vector<uint8_t> stream(fetch.size << 2);
+        CopySwapped(stream.data(), memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2),
+                    uint32_t(stream.size()), fetch.endian);
+        const uint32_t width = e.format == 6 ? 1 : 2;
+        const uint32_t count = e.format == 26 ? 4 : (e.format == 25 ? 2 : 4);
+        int32_t lo = INT32_MAX, hi = INT32_MIN;
+        uint32_t outside = 0;
+        for (uint32_t v : used) {
+          const int64_t at = (int64_t(v) + base_vertex) * e.stride + e.offset;
+          if (at < 0 || uint64_t(at) + count * width > stream.size()) {
+            ++outside;
+            continue;
+          }
+          for (uint32_t c = 0; c < count; ++c) {
+            const uint8_t* p = stream.data() + at + c * width;
+            int32_t value;
+            if (width == 1) {
+              value = e.is_signed ? int32_t(int8_t(p[0])) : int32_t(p[0]);
+            } else {
+              uint16_t w;
+              std::memcpy(&w, p, 2);
+              value = e.is_signed ? int32_t(int16_t(w)) : int32_t(w);
+            }
+            lo = std::min(lo, value);
+            hi = std::max(hi, value);
+          }
+        }
+        info += fmt::format(" L{}[f{} {}..{} outside={}]", e.location, e.format, lo, hi, outside);
       }
     }
     sync_draw_info_ = std::move(info);
@@ -4897,6 +5097,17 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         ((skip_mask_ & 16) && quad_list) || ((skip_mask_ & 32) && base != 0) ||
         ((skip_mask_ & 64) && !skinned) || ((skip_mask_ & 128) && zero_used)) {
       return true;
+    }
+  }
+  if (skin_log_) {
+    bool skinned = false;
+    for (const LiveElement& e : vs->elements) skinned |= e.usage == 2;
+    if (skinned) {
+      std::lock_guard<std::mutex> lock(skinned_mutex_);
+      SkinnedSeen& seen = skinned_seen_[vs->entry->hash];
+      if (!seen.draws++) seen.first_frame = swaps_;
+      seen.last_frame = swaps_;
+      if (skin_skip_.count(vs->entry->hash)) return true;
     }
   }
   if (zero_used) input_slots.emplace_back(kZeroBinding, 0);
@@ -5590,6 +5801,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                   : GuestStream(index_buffer_info->guest_base, size, index_buffer_info->endianness,
                                 index_buffer, index_offset);
     if (!uploaded) return Drop("index upload", vs, ps);
+    if (validate_windows_ && !quad_list) {
+      ValidateRange("index", vs->entry->hash, index_buffer, index_offset, index_buffer_info->guest_base, size,
+                    index_buffer_info->endianness);
+    }
     index_bytes = size;
   }
   if (quad_list) {
@@ -5641,6 +5856,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   pk.s0_size = slot_sizes[0];
   pk.s10_addr = streams[10];
   pk.s10_size = slot_sizes[10];
+  for (uint32_t i = 0; i < RENUT_VERTEX_STREAM_COUNT; ++i) {
+    pk.stream_addr[i] = streams[i];
+    pk.stream_size[i] = slot_sizes[i];
+  }
   if (blend_constants) {
     pk.blend_constants = true;
     pk.blend_factor[0] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED);
@@ -5919,12 +6138,36 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
     const uint64_t first_frame =
         pair_first_frame_.try_emplace(pk.vs_hash * 1099511628211ull ^ pk.ps_hash, swaps_).first->second;
     const uint64_t at = recent_draw_count_.load(std::memory_order_relaxed);
-    recent_draws_[at % kRecentDraws] = {swaps_, pk.vs_hash, pk.ps_hash, uint64_t(uintptr_t(pk.pipeline)),
-                                        uint64_t(uintptr_t(pk.framebuffer)), pk.s0_addr, pk.s10_addr, first_frame,
-                                        uint32_t(pk.kind), pk.count, pk.first, pk.s0_size, pk.s10_size};
+    RecentDraw& recent = recent_draws_[at % kRecentDraws];
+    recent = {swaps_, pk.vs_hash, pk.ps_hash, uint64_t(uintptr_t(pk.pipeline)),
+              uint64_t(uintptr_t(pk.framebuffer)), pk.s0_addr, pk.s10_addr, first_frame,
+              uint32_t(pk.kind), pk.count, pk.first, pk.s0_size, pk.s10_size};
+    std::memcpy(recent.stream_addr, pk.stream_addr, sizeof(recent.stream_addr));
+    std::memcpy(recent.stream_size, pk.stream_size, sizeof(recent.stream_size));
+    recent.base_vertex = pk.base_vertex;
+    auto address_of = [](const RenderBuffer* buffer) -> uint64_t {
+      const auto* vulkan = static_cast<const VulkanBuffer*>(buffer);
+      return vulkan && (vulkan->desc.flags & RenderBufferFlag::DEVICE_ADDRESSABLE) ? vulkan->getDeviceAddress() : 0;
+    };
+    if (pk.kind == DrawPacket::Kind::kIndexed || pk.kind == DrawPacket::Kind::kPatch) {
+      recent.index_size = pk.index_format == RenderFormat::R32_UINT ? 4 : 2;
+      recent.index_addr = address_of(pk.index_buffer);
+      recent.index_bytes = pk.count * recent.index_size;
+      if (pk.kind == DrawPacket::Kind::kIndexed) recent.index_addr += uint64_t(pk.first) * recent.index_size;
+    }
+    for (uint32_t i = 0; i < slot_count && recent.vertex_count < 6; ++i) {
+      const RenderVertexBufferView& view = slots[i].view;
+      recent.vertex[recent.vertex_count++] = {address_of(view.buffer.ref) + view.buffer.offset, view.size,
+                                              slots[i].slot.index};
+    }
     recent_draw_count_.store(at + 1, std::memory_order_release);
   }
-  if (sync_draws_) SyncAfterDraw(pk);
+  if (sync_draws_) {
+    SyncAfterDraw(pk);
+  } else if (sync_every_ > 1 && ++sync_every_counter_ >= sync_every_) {
+    sync_every_counter_ = 0;
+    SyncEvery();
+  }
 }
 
 // A lost device answers every later call with an error and nothing in the guest
@@ -5944,8 +6187,44 @@ void PlumeCommandProcessor::ReportDeviceLost() {
   const uint64_t now = swaps_;
   REXLOG_ERROR("Renut: Plume device lost at swap {}; {} MB of RAM available; {} draws recorded", now,
                avail_kb >> 10, recent_draw_count_.load());
+  REXLOG_ERROR("Renut: Plume 2D descriptor writes {} (skipped {} as unchanged)", descriptor_writes_,
+               descriptor_writes_skipped_);
+  if (validate_windows_) {
+    REXLOG_ERROR("Renut: Plume validation: {} ranges compared, {} stale", validate_ranges_, validate_stale_);
+  }
+  if (skin_log_) LogSkinned();
   const uint64_t total = recent_draw_count_.load(std::memory_order_acquire);
   const uint64_t begin = total > kRecentDraws ? total - kRecentDraws : 0;
+  // Every draw of the last two frames with the memory it reads, for matching
+  // against the fault address the kernel logs (dmesg, via adb bugreport).
+  if (!miss_dump_directory_.empty()) {
+    const std::string path = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/plume-lost.txt";
+    if (FILE* out = std::fopen(path.c_str(), "w")) {
+      std::fprintf(out, "device lost at swap %llu\n", (unsigned long long)now);
+      for (uint64_t i = begin; i < total; ++i) {
+        const RecentDraw& d = recent_draws_[i % kRecentDraws];
+        if (d.frame + 2 < now) continue;
+        std::fprintf(out, "d%llu f%llu vs=%016llX ps=%016llX kind=%u n=%u first=%u base=%d pipe=%llX fb=%llX",
+                     (unsigned long long)i, (unsigned long long)d.frame, (unsigned long long)d.vs,
+                     (unsigned long long)d.ps, d.kind, d.count, d.first, d.base_vertex, (unsigned long long)d.pipeline,
+                     (unsigned long long)d.framebuffer);
+        std::fprintf(out, " ib=%llX+%X/%u", (unsigned long long)d.index_addr, d.index_bytes, d.index_size);
+        for (uint32_t v = 0; v < d.vertex_count; ++v) {
+          std::fprintf(out, " vb%u=%llX+%X", d.vertex[v].slot, (unsigned long long)d.vertex[v].addr, d.vertex[v].size);
+        }
+        for (uint32_t st = 0; st < 17; ++st) {
+          if (d.stream_addr[st]) {
+            std::fprintf(out, " s%u=%llX+%X", st, (unsigned long long)d.stream_addr[st], d.stream_size[st]);
+          }
+        }
+        std::fprintf(out, "\n");
+      }
+      std::fclose(out);
+    }
+    if (plume::g_plumeMemTrace.load()) {
+      plume::plumeMemTraceDump((miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/plume-mem.txt").c_str());
+    }
+  }
   struct Group {
     RecentDraw draw;
     uint32_t draws = 0;
@@ -5981,6 +6260,20 @@ void PlumeCommandProcessor::ReportDeviceLost() {
         d.frame, d.pair_first_frame + 3 >= now ? " NEW" : "", d.vs, d.ps, group.draws, group.indices, d.kind,
         d.first, d.pipeline, d.framebuffer, d.s0_size, d.s0_addr, d.s10_size, d.s10_addr);
   }
+}
+
+void PlumeCommandProcessor::SyncEvery() {
+  if (!list_open_) return;
+  L()->end();
+  list_open_ = false;
+  const RenderCommandList* lists = list_;
+  queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  VkFence vk_fence = static_cast<VulkanCommandFence*>(fence_.get())->vk;
+  const VkResult result = vkWaitForFences(vk_device, 1, &vk_fence, VK_TRUE, 3000000000ull);
+  if (result == VK_ERROR_DEVICE_LOST) plume::g_plumeDeviceLost.store(int(result));
+  else if (result == VK_SUCCESS) vkResetFences(vk_device, 1, &vk_fence);
+  StartList();
 }
 
 void PlumeCommandProcessor::SyncAfterDraw(const DrawPacket& pk) {
@@ -6019,11 +6312,26 @@ void PlumeCommandProcessor::SyncAfterDraw(const DrawPacket& pk) {
         "count={} first={} base={} pipeline={}",
         int(result), wait_ms, sync_draw_count_, swaps_, pk.vs_hash, pk.ps_hash, int(pk.kind), pk.count, pk.first,
         pk.base_vertex, static_cast<const void*>(pk.pipeline));
+    REXLOG_ERROR("Renut: Plume   {} streams of synced draws had a stale kept window before this one", sync_stale_streams_);
+    const auto first_ok = sync_first_ok_.find(pk.vs_hash * 1099511628211ull ^ pk.ps_hash);
+    if (first_ok != sync_first_ok_.end()) REXLOG_ERROR("Renut: Plume   first OK draw of this pair {}", first_ok->second);
     sync_draws_ = false;
   } else {
     vkResetFences(vk_device, 1, &vk_fence);
+    if (sync_draw_info_.find("STALE") != std::string::npos && sync_stale_logged_ < 200) {
+      ++sync_stale_logged_;
+      REXLOG_INFO("Renut: Plume stale window under draw #{} frame {}: {}", sync_draw_count_, swaps_, sync_draw_info_);
+    }
+    if (sync_watch_ && (pk.vs_hash == sync_watch_ || pk.ps_hash == sync_watch_) && sync_watch_count_ < 600) {
+      ++sync_watch_count_;
+      REXLOG_INFO("Renut: Plume watched draw #{} frame {} pipeline={} fb={} ok: {}", sync_draw_count_, swaps_,
+                  static_cast<const void*>(pk.pipeline), static_cast<const void*>(pk.framebuffer), sync_draw_info_);
+    }
     // Each pair is named once, the first time it ran to completion.
     if (sync_seen_.insert(pk.vs_hash * 1099511628211ull ^ pk.ps_hash).second) {
+      sync_first_ok_[pk.vs_hash * 1099511628211ull ^ pk.ps_hash] =
+          fmt::format("frame {} pipeline={} fb={}: {}", swaps_, static_cast<const void*>(pk.pipeline),
+                      static_cast<const void*>(pk.framebuffer), sync_draw_info_);
       REXLOG_INFO("Renut: Plume synced draw #{} ok, new pair (frame {}): vs={:016X} ps={:016X} count={}",
                   sync_draw_count_, swaps_, pk.vs_hash, pk.ps_hash, pk.count);
     }
@@ -6211,7 +6519,7 @@ bool PlumeCommandProcessor::IssueCopy() {
       }
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
       if (dest.descriptor) {
-        set_2d_->setTexture(dest.descriptor, dest.texture.get(), RenderTextureLayout::SHADER_READ);
+        SetTexture2D(dest.descriptor, dest.texture.get());
       }
     }
   }
@@ -6509,10 +6817,87 @@ void PlumeCommandProcessor::FlushImagesForNextFrame() {
   }
 }
 
+void PlumeCommandProcessor::LogSkinned() {
+  std::lock_guard<std::mutex> lock(skinned_mutex_);
+  REXLOG_ERROR("Renut: Plume skinned vertex shaders seen: {}", skinned_seen_.size());
+  for (const auto& [hash, seen] : skinned_seen_) {
+    REXLOG_ERROR("Renut: Plume   skinned vs={:016X} draws={} frames {}..{}", hash, seen.draws, seen.first_frame,
+                 seen.last_frame);
+  }
+}
+
+void PlumeCommandProcessor::ValidateRange(const char* what, uint64_t draw_hash, RenderBuffer* buffer, uint64_t offset,
+                                          uint32_t guest_address, uint32_t size, xenos::Endian endian) {
+  if (!buffer || buffer == upload_.get() || !size) return;
+  std::vector<uint8_t> guest(size);
+  CopySwapped(guest.data(), memory_->TranslatePhysical<const uint8_t*>(guest_address), size, endian);
+  const auto* window = static_cast<const uint8_t*>(buffer->map());
+  if (!window) return;
+  uint32_t differ = 0, first = UINT32_MAX;
+  for (uint32_t i = 0; i < size; ++i) {
+    if (window[offset + i] != guest[i]) {
+      if (first == UINT32_MAX) first = i;
+      ++differ;
+    }
+  }
+  buffer->unmap();
+  ++validate_ranges_;
+  if (!differ) return;
+  // A write that landed since the window was made has already been recorded (the callback runs before
+  // the write completes); the next drain drops the window. Only a difference with nothing pending counts.
+  const uint64_t drops_before = kept_drop_events_;
+  DrainWatchHits();
+  if (kept_drop_events_ != drops_before) return;
+  ++validate_stale_;
+  if (validate_logged_ < 120) {
+    ++validate_logged_;
+    REXLOG_ERROR("Renut: Plume STALE {} at draw: frame {} vs/ps hash {:016X} guest {:08X}+{:X}: {} bytes differ, first at +{:X}",
+                 what, swaps_, draw_hash, guest_address, size, differ, first);
+  }
+}
+
+void PlumeCommandProcessor::ValidateKeptWindows() {
+  DrainWatchHits();
+  uint32_t checked = 0, stale = 0;
+  std::vector<uint8_t> guest;
+  for (auto& [key, kept] : kept_streams_) {
+    if (!kept.valid || !kept.buffer || kept.last_used + 1 < swaps_) continue;
+    guest.resize(kept.size);
+    CopySwapped(guest.data(), memory_->TranslatePhysical<const uint8_t*>(kept.base), kept.size,
+                static_cast<xenos::Endian>(kept.endian));
+    const auto* window = static_cast<const uint8_t*>(kept.buffer->map());
+    if (!window) continue;
+    ++checked;
+    uint32_t differ = 0, first = UINT32_MAX;
+    for (uint32_t i = 0; i < kept.size; ++i) {
+      if (window[i] != guest[i]) {
+        if (first == UINT32_MAX) first = i;
+        ++differ;
+      }
+    }
+    kept.buffer->unmap();
+    if (differ) {
+      ++stale;
+      if (validate_logged_ < 120) {
+        ++validate_logged_;
+        REXLOG_ERROR("Renut: Plume STALE kept window {:08X}+{:X} frame {} (made {}, used {}, dropped {}x): {} of {} bytes differ, first at +{:X}",
+                     kept.base, kept.size, swaps_, kept.made_frame, kept.last_used, kept.drops, differ, kept.size, first);
+      }
+    }
+  }
+  if (stale || swaps_ % 10 == 0) {
+    REXLOG_INFO("Renut: Plume kept windows checked at swap {}: {} used recently, {} stale", swaps_, checked, stale);
+  }
+}
+
 void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
   FlushDeferred();
+  if (skin_log_ && swaps_ == 930) LogSkinned();
+  if (validate_windows_ && swaps_ % 60 == 0) {
+    REXLOG_INFO("Renut: Plume validation at swap {}: {} ranges compared, {} stale", swaps_, validate_ranges_, validate_stale_);
+  }
   // Before anything is picked for presenting: the one that is moves on to
   // COPY_SOURCE below, which is a transition of its own.
   FlushImagesForNextFrame();
@@ -6679,6 +7064,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
   }
   ++swaps_;
+  plume::g_plumeFrame.store(swaps_, std::memory_order_relaxed);
   if (!pending_pipelines_.empty()) ReapPipelines();
   if (!miss_dump_directory_.empty()) {
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
@@ -6891,6 +7277,34 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     const bool sync_draws = access((root + "/plume-syncdraws").c_str(), F_OK) == 0;
     if (sync_draws != sync_draws_) REXLOG_INFO("Renut: Plume synced draws {}", sync_draws ? "on" : "off");
     sync_draws_ = sync_draws;
+    {
+      unsigned every = 0;
+      if (FILE* file = std::fopen((root + "/plume-syncevery").c_str(), "r")) {
+        if (std::fscanf(file, "%u", &every) != 1) every = 0;
+        std::fclose(file);
+      }
+      if (every != sync_every_) REXLOG_INFO("Renut: Plume list submitted and waited for every {} draws", every);
+      sync_every_ = every;
+    }
+    {
+      unsigned long long watch = 0;
+      if (FILE* file = std::fopen((root + "/plume-syncwatch").c_str(), "r")) {
+        if (std::fscanf(file, "%llx", &watch) != 1) watch = 0;
+        std::fclose(file);
+      }
+      sync_watch_ = watch;
+      unsigned long long delay = 0;
+      unsigned mask = 15;
+      if (FILE* file = std::fopen((root + "/plume-retire-delay").c_str(), "r")) {
+        if (std::fscanf(file, "%llu %u", &delay, &mask) < 1) delay = 0;
+        std::fclose(file);
+      }
+      if (delay != retire_delay_ || mask != retire_mask_) {
+        REXLOG_INFO("Renut: Plume retired objects (classes {:X}) kept {} frames", mask, delay);
+      }
+      retire_delay_ = delay;
+      retire_mask_ = mask;
+    }
     const bool keep_streams = access((root + "/plume-no-persist").c_str(), F_OK) != 0;
     if (keep_streams != keep_streams_) {
       REXLOG_INFO("Renut: Plume kept streams {}", keep_streams ? "on" : "off");
@@ -7017,6 +7431,20 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     if (skip_shader != skip_shader_) REXLOG_INFO("Renut: Plume dropping shader {:016X}", skip_shader);
     skip_shader_ = skip_shader;
+    {
+      std::unordered_set<uint64_t> list;
+      bool present = false;
+      if (FILE* file = std::fopen((root + "/plume-skin-skip").c_str(), "r")) {
+        present = true;
+        unsigned long long hash;
+        while (std::fscanf(file, "%llx", &hash) == 1) list.insert(hash);
+        std::fclose(file);
+      }
+      std::lock_guard<std::mutex> lock(skinned_mutex_);
+      if (list != skin_skip_) REXLOG_INFO("Renut: Plume dropping {} skinned vertex shaders", list.size());
+      skin_skip_ = std::move(list);
+      skin_log_ = present || access((root + "/plume-skin-log").c_str(), F_OK) == 0;
+    }
     unsigned long long debug_shader = 0;
     uint32_t debug_mode = 7;
     if (FILE* file = std::fopen((root + "/plume-debug-shader").c_str(), "r")) {
@@ -7250,6 +7678,14 @@ void SetPlumeMissDumpDirectory(const std::string& directory) {
   std::error_code error;
   std::filesystem::create_directories(directory, error);
   g_miss_dump_directory = directory;
+}
+
+void ArmPlumeMemoryTrace(const std::string& root) {
+  if (access((root + "/plume-memtrace").c_str(), F_OK) == 0) plume::g_plumeMemTrace.store(true);
+  if (access((root + "/plume-persistmap").c_str(), F_OK) == 0) plume::g_plumePersistentMap.store(true);
+  g_dedupe_descriptors = access((root + "/plume-dedupe-desc").c_str(), F_OK) == 0;
+  if (access((root + "/plume-nocompress").c_str(), F_OK) == 0) plume::g_plumeNoCompression.store(true);
+  g_validate_windows = access((root + "/plume-validate").c_str(), F_OK) == 0;
 }
 
 }  // namespace renut

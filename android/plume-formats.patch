@@ -89,19 +89,92 @@ index 9dcfedf..1e918e2 100644
          bool depthWriteEnabled = false;
          bool stencilEnabled = false;
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..f8cfc13 100644
+index f1dd503..60d76cc 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -28,6 +28,8 @@
+@@ -13,6 +13,8 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <climits>
++#include <mutex>
++#include <vector>
+ #include <unordered_map>
+ 
+ #if DLSS_ENABLED
+@@ -28,6 +30,72 @@
  // - Fix resource pools.
  
  namespace plume {
 +    std::atomic<int> g_plumeDeviceLost{0};
++    std::atomic<bool> g_plumeMemTrace{false};
++    std::atomic<bool> g_plumePersistentMap{false};
++    std::atomic<bool> g_plumeNoCompression{false};
++    std::atomic<uint64_t> g_plumeFrame{0};
++
++    namespace {
++        struct MemEvent {
++            uint64_t frame;
++            char kind;
++            uint64_t a, b, c, d, e, f;
++        };
++        std::mutex g_memMutex;
++        std::vector<MemEvent> g_memEvents;
++
++        void memEvent(char kind, uint64_t a, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0, uint64_t e = 0, uint64_t f = 0) {
++            if (!g_plumeMemTrace.load(std::memory_order_relaxed)) return;
++            std::lock_guard<std::mutex> lock(g_memMutex);
++            if (g_memEvents.size() < (4u << 20)) g_memEvents.push_back({ g_plumeFrame.load(std::memory_order_relaxed), kind, a, b, c, d, e, f });
++        }
++
++        VKAPI_ATTR void VKAPI_CALL memTraceAllocate(VmaAllocator, uint32_t type, VkDeviceMemory memory, VkDeviceSize size, void *user) {
++            // The device address of the block's first byte: a small buffer bound at offset 0
++            // is asked for it and dropped, so even a block that holds only images has a known VA.
++            uint64_t address = 0;
++            if (g_plumeMemTrace.load(std::memory_order_relaxed) && user != nullptr) {
++                VkDevice device = static_cast<VulkanDevice *>(user)->vk;
++                VkBufferCreateInfo info = {};
++                info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++                info.size = std::min<VkDeviceSize>(size, 4096);
++                info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++                info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++                VkBuffer probe = VK_NULL_HANDLE;
++                if (vkCreateBuffer(device, &info, nullptr, &probe) == VK_SUCCESS) {
++                    if (vkBindBufferMemory(device, probe, memory, 0) == VK_SUCCESS) {
++                        VkBufferDeviceAddressInfo addressInfo = {};
++                        addressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
++                        addressInfo.buffer = probe;
++                        address = vkGetBufferDeviceAddress(device, &addressInfo);
++                    }
++                    vkDestroyBuffer(device, probe, nullptr);
++                }
++            }
++            memEvent('M', uint64_t(memory), size, type, address);
++        }
++
++        VKAPI_ATTR void VKAPI_CALL memTraceFree(VmaAllocator, uint32_t type, VkDeviceMemory memory, VkDeviceSize size, void *) {
++            memEvent('m', uint64_t(memory), size, type);
++        }
++    }
++
++    // M/m: block made/freed (memory, size, type, address of its first byte). B/b: buffer made/destroyed (handle, address,
++    // size, memory, offset in it, flags | heap << 32). I/i: image (handle, memory, offset, size,
++    // width << 32 | height, format | mips << 32).
++    void plumeMemTraceDump(const char *path) {
++        std::lock_guard<std::mutex> lock(g_memMutex);
++        FILE *file = fopen(path, "w");
++        if (file == nullptr) return;
++        for (const MemEvent &event : g_memEvents) {
++            fprintf(file, "%llu %c %llx %llx %llx %llx %llx %llx\n", (unsigned long long)event.frame, event.kind,
++                (unsigned long long)event.a, (unsigned long long)event.b, (unsigned long long)event.c,
++                (unsigned long long)event.d, (unsigned long long)event.e, (unsigned long long)event.f);
++        }
++        fclose(file);
++    }
 +
      // Backend constants.
  
      // Required buffer alignment for acceleration structures.
-@@ -87,6 +89,8 @@ namespace plume {
+@@ -87,6 +155,8 @@ namespace plume {
          VK_KHR_PRESENT_ID_EXTENSION_NAME,
          VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
          VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
@@ -110,7 +183,7 @@ index f1dd503..f8cfc13 100644
          // Vulkan spec requires this to be enabled if supported by the driver.
          VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
      };
-@@ -249,6 +253,24 @@ namespace plume {
+@@ -249,6 +319,24 @@ namespace plume {
              return VK_FORMAT_BC7_UNORM_BLOCK;
          case RenderFormat::BC7_UNORM_SRGB:
              return VK_FORMAT_BC7_SRGB_BLOCK;
@@ -135,7 +208,49 @@ index f1dd503..f8cfc13 100644
          default:
              assert(false && "Unknown format.");
              return VK_FORMAT_UNDEFINED;
-@@ -930,7 +952,10 @@ namespace plume {
+@@ -835,7 +923,7 @@ namespace plume {
+         bufferInfo.usage |= (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT) ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
+         bufferInfo.usage |= (desc.flags & RenderBufferFlag::SHADER_BINDING_TABLE) ? VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR : 0;
+         
+-        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
++        const uint32_t deviceAddressMask = RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::CONSTANT | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
+         const bool useDeviceAddress = device->capabilities.bufferDeviceAddress && (desc.flags & deviceAddressMask);
+         bufferInfo.usage |= useDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0;
+         
+@@ -854,6 +942,9 @@ namespace plume {
+         case RenderHeapType::UPLOAD:
+             bufferInfo.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+             createInfo.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
++            if (g_plumePersistentMap.load(std::memory_order_relaxed)) {
++                createInfo.flags |= VMA_ALLOCATION_CREATE_MAPPED_BIT;
++            }
+             break;
+         case RenderHeapType::READBACK:
+             bufferInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+@@ -893,10 +984,22 @@ namespace plume {
+             fprintf(stderr, "vmaCreateBuffer failed with error code 0x%X.\n", res);
+             return;
+         }
++
++        if (g_plumeMemTrace.load(std::memory_order_relaxed)) {
++            if (useDeviceAddress) {
++                VkBufferDeviceAddressInfo addressInfo = {};
++                addressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
++                addressInfo.buffer = vk;
++                deviceAddress = vkGetBufferDeviceAddress(device->vk, &addressInfo);
++            }
++            memEvent('B', uint64_t(vk), deviceAddress, desc.size, uint64_t(allocationInfo.deviceMemory), allocationInfo.offset,
++                uint64_t(desc.flags) | (uint64_t(desc.heapType) << 32));
++        }
+     }
+ 
+     VulkanBuffer::~VulkanBuffer() {
+         if (vk != VK_NULL_HANDLE) {
++            memEvent('b', uint64_t(vk), deviceAddress, desc.size, uint64_t(allocationInfo.deviceMemory), allocationInfo.offset);
+             vmaDestroyBuffer(device->allocator, vk, allocation);
+         }
+     }
+@@ -930,7 +1033,10 @@ namespace plume {
          info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
          info.pNext = nullptr;
          info.buffer = vk;
@@ -147,7 +262,42 @@ index f1dd503..f8cfc13 100644
      }
  
      // VulkanBufferFormattedView
-@@ -1617,6 +1642,16 @@ namespace plume {
+@@ -989,6 +1095,17 @@ namespace plume {
+         imageInfo.usage |= (desc.flags & RenderTextureFlag::DEPTH_TARGET) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
+         imageInfo.usage |= (desc.flags & RenderTextureFlag::STORAGE) ? VK_IMAGE_USAGE_STORAGE_BIT : 0;
+ 
++        // reNut debug: a colour image that may be used as a storage image cannot be compressed (Mali's
++        // AFBC has no storage path), so every colour image is made one where the format allows it.
++        if (g_plumeNoCompression.load(std::memory_order_relaxed) && !(desc.flags & RenderTextureFlag::DEPTH_TARGET) &&
++            !(imageInfo.usage & VK_IMAGE_USAGE_STORAGE_BIT) && imageInfo.samples == VK_SAMPLE_COUNT_1_BIT) {
++            VkFormatProperties formatProperties = {};
++            vkGetPhysicalDeviceFormatProperties(device->physicalDevice, imageInfo.format, &formatProperties);
++            if (formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
++                imageInfo.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++            }
++        }
++
+         if (desc.multisampling.sampleLocationsEnabled && (desc.flags & RenderTextureFlag::DEPTH_TARGET)) {
+             imageInfo.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+         }
+@@ -1014,6 +1131,8 @@ namespace plume {
+             return;
+         }
+ 
++        memEvent('I', uint64_t(vk), uint64_t(allocationInfo.deviceMemory), allocationInfo.offset, allocationInfo.size,
++            (uint64_t(desc.width) << 32) | desc.height, uint64_t(desc.format) | (uint64_t(desc.mipLevels) << 32));
+         createImageView(imageInfo.format);
+     }
+ 
+@@ -1031,6 +1150,7 @@ namespace plume {
+         }
+ 
+         if (ownership && (vk != VK_NULL_HANDLE)) {
++            memEvent('i', uint64_t(vk), uint64_t(allocationInfo.deviceMemory), allocationInfo.offset, allocationInfo.size);
+             vmaDestroyImage(device->allocator, vk, allocation);
+         }
+     }
+@@ -1617,6 +1737,16 @@ namespace plume {
              dynamicStates.emplace_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
          }
  
@@ -164,7 +314,7 @@ index f1dd503..f8cfc13 100644
          VkPipelineDynamicStateCreateInfo dynamicState = {};
          dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
          dynamicState.pDynamicStates = dynamicStates.data();
-@@ -1648,6 +1683,17 @@ namespace plume {
+@@ -1648,6 +1778,17 @@ namespace plume {
          pipelineInfo.pDynamicState = &dynamicState;
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.renderPass = renderPass;
@@ -182,7 +332,7 @@ index f1dd503..f8cfc13 100644
  
          VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
          if (res != VK_SUCCESS) {
-@@ -3112,6 +3158,16 @@ namespace plume {
+@@ -3112,6 +3253,16 @@ namespace plume {
          vkCmdSetDepthBias(vk, depthBias, depthBiasClamp, slopeScaledDepthBias);
      }
  
@@ -199,7 +349,7 @@ index f1dd503..f8cfc13 100644
      static void clearCommonRectVector(uint32_t width, uint32_t height, const RenderRect *clearRects, uint32_t clearRectsCount, std::vector<VkClearRect> &rectVector) {
          rectVector.clear();
  
-@@ -3229,6 +3285,25 @@ namespace plume {
+@@ -3229,6 +3380,25 @@ namespace plume {
              imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
              vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
          }
@@ -225,7 +375,7 @@ index f1dd503..f8cfc13 100644
          else {
              VkImageCopy imageCopy = {};
              imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
-@@ -3626,6 +3701,7 @@ namespace plume {
+@@ -3626,6 +3796,7 @@ namespace plume {
          }
  
          if (res != VK_SUCCESS) {
@@ -233,7 +383,7 @@ index f1dd503..f8cfc13 100644
              fprintf(stderr, "vkQueueSubmit failed with error code 0x%X.\n", res);
              return;
          }
-@@ -3637,6 +3713,7 @@ namespace plume {
+@@ -3637,6 +3808,7 @@ namespace plume {
          VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
          VkResult res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, UINT64_MAX);
          if (res != VK_SUCCESS) {
@@ -241,7 +391,7 @@ index f1dd503..f8cfc13 100644
              fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
              return;
          }
-@@ -3883,6 +3960,13 @@ namespace plume {
+@@ -3883,6 +4055,13 @@ namespace plume {
              featuresChain = &portabilityFeatures;
          }
  
@@ -255,7 +405,21 @@ index f1dd503..f8cfc13 100644
          VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
          VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
          const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
-@@ -4177,7 +4261,16 @@ namespace plume {
+@@ -4082,7 +4261,13 @@ namespace plume {
+         vmaFunctions.vkUnmapMemory = vkUnmapMemory;
+         vmaFunctions.vkCmdCopyBuffer = vkCmdCopyBuffer;
+ 
++        VmaDeviceMemoryCallbacks memoryCallbacks = {};
++        memoryCallbacks.pfnAllocate = memTraceAllocate;
++        memoryCallbacks.pfnFree = memTraceFree;
++        memoryCallbacks.pUserData = this;
++
+         VmaAllocatorCreateInfo allocatorInfo = {};
++        allocatorInfo.pDeviceMemoryCallbacks = &memoryCallbacks;
+         allocatorInfo.flags |= bufferDeviceAddressSupported ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0;
+         allocatorInfo.physicalDevice = physicalDevice;
+         allocatorInfo.device = vk;
+@@ -4177,7 +4362,16 @@ namespace plume {
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
@@ -274,7 +438,7 @@ index f1dd503..f8cfc13 100644
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 0a1edbe..0500227 100644
+index 0a1edbe..6135b95 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -9,6 +9,7 @@
@@ -285,7 +449,7 @@ index 0a1edbe..0500227 100644
  #include <mutex>
  #include <set>
  #include <unordered_map>
-@@ -42,6 +43,11 @@
+@@ -42,6 +43,25 @@
  #endif
  
  namespace plume {
@@ -294,10 +458,24 @@ index 0a1edbe..0500227 100644
 +    // answers every later call the same way, so the host polls this to notice.
 +    extern std::atomic<int> g_plumeDeviceLost;
 +
++    // reNut debug: a memory trace. With g_plumeMemTrace on, every VkDeviceMemory block the
++    // allocator makes or frees and every buffer and image made or destroyed is logged with
++    // the frame number (g_plumeFrame) and, for buffers with a device address, the address -
++    // so the address a GPU fault names can be traced to what lived there and when it went.
++    extern std::atomic<bool> g_plumeMemTrace;
++    // reNut debug: upload buffers are created persistently mapped (VMA keeps their block mapped), so
++    // writing one no longer maps and unmaps the whole block under the GPU.
++    extern std::atomic<bool> g_plumePersistentMap;
++    // reNut debug: colour images also get STORAGE usage where the format allows it, which keeps the
++    // Mali from using frame buffer compression on them.
++    extern std::atomic<bool> g_plumeNoCompression;
++    extern std::atomic<uint64_t> g_plumeFrame;
++    void plumeMemTraceDump(const char *path);
++
      struct VulkanCommandQueue;
      struct VulkanDevice;
      struct VulkanInterface;
-@@ -56,6 +62,8 @@ namespace plume {
+@@ -56,6 +76,8 @@ namespace plume {
          VmaAllocationInfo allocationInfo = {};
          RenderBufferDesc desc;
          RenderBarrierStages barrierStages = RenderBarrierStage::NONE;
@@ -306,7 +484,7 @@ index 0a1edbe..0500227 100644
  
          VulkanBuffer() = default;
          VulkanBuffer(VulkanDevice *device, VulkanPool *pool, const RenderBufferDesc &desc);
-@@ -329,6 +337,8 @@ namespace plume {
+@@ -329,6 +351,8 @@ namespace plume {
          void setScissors(const RenderRect *scissorRects, uint32_t count) override;
          void setFramebuffer(const RenderFramebuffer *framebuffer) override;
          void setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) override;
