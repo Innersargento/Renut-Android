@@ -164,8 +164,9 @@ struct Window {
   size_t sample_bytes = 0;
   // Frames and seconds spent in each native renderer mode (0 off, 1 rigid
   // depth draws, 2 also the native view), for comparing them in one window.
-  std::array<uint64_t, 3> mode_frames{};
-  std::array<double, 3> mode_seconds{};
+  // Index: native mode | 4 shadow texel cull | 8 shadow instancing | 16 native lit material.
+  std::array<uint64_t, 32> mode_frames{};
+  std::array<double, 32> mode_seconds{};
 };
 
 uint64_t g_swaps = 0;
@@ -233,7 +234,8 @@ void WriteReport() {
       double(w.draws_immediate) / frames, double(w.replayed_draws) / frames, double(w.begins) / frames,
       double(w.ends) / frames, double(w.runs) / frames, w.run_buffers.size(), w.age[0], w.age[1], w.age[2], w.age[3],
       w.age[4]);
-  out += "== Frame rate by native renderer mode (plume-native) in this window:";
+  out += "== Frame rate by native renderer mode (plume-native, +4 shadow texel cull, +8 shadow instancing, "
+         "+16 native lit material):";
   for (uint32_t m = 0; m < w.mode_frames.size(); ++m) {
     if (w.mode_frames[m]) {
       out += fmt::format(" mode {} {:.2f} FPS ({} frames, {:.1f} s);", m, w.mode_frames[m] / w.mode_seconds[m],
@@ -354,7 +356,7 @@ void D3DEnter(uint32_t f, PPCContext& ctx, uint8_t* base) {
     const auto now = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(now - last).count();
     last = now;
-    const uint32_t mode = std::min<uint32_t>(g_renut_native_mode.load(std::memory_order_relaxed), 2);
+    const uint32_t mode = std::min<uint32_t>(g_renut_native_mode.load(std::memory_order_relaxed), 31);
     ++g_window.mode_frames[mode];
     g_window.mode_seconds[mode] += seconds;
     if (++g_swaps - g_window.start_swap >= kSwapsPerReport) WriteReport();

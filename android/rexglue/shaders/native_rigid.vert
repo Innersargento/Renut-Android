@@ -1,4 +1,6 @@
 #version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 // Native renderer v0: the vertex shader of a depth-only draw whose guest
 // shader is a rigid transform (tools/native/scan_native_vs.py lists them in
 // native_vs_table.inc). It computes the same position from the same input,
@@ -9,6 +11,10 @@
 // The input decode is the recompiled shaders' (unpackInput, swapFloats in
 // shader_common.h) for location 0, driven by the same specialization
 // constants the host already passes them.
+//
+// Several draws of the same mesh into the same shadow map are drawn as one
+// instanced draw (plume_gpu.cpp, FlushDeferred): their rows then come from
+// rowsAddress, four per instance, instead of the push constants.
 layout(constant_id = 1) const uint kPackedInputs = 0u;
 layout(constant_id = 2) const uint kIntInputs = 0u;
 layout(constant_id = 9) const uint kSwappedPositions = 0u;
@@ -21,7 +27,12 @@ layout(location = 0) in vec4 iPosition;
 layout(push_constant) uniform Native {
     layout(offset = 32) vec4 rows[4];   // the guest's c0..c3 (or whichever four it names)
     layout(offset = 96) vec4 viewport;  // xy scale, zw offset (g_ViewportScaleOffset)
+    layout(offset = 112) uvec2 rowsAddress;  // 0: one draw, rows above
 } pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer InstanceRows {
+    vec4 rows[];
+};
 
 out gl_PerVertex {
     vec4 gl_Position;
@@ -51,7 +62,16 @@ void main() {
     value = remap(value, kInputRemap0);
     if ((kSwappedPositions & 1u) != 0u) value = value.yxwz;
     vec4 p = vec4(value[kSwizzle & 3u], value[(kSwizzle >> 2u) & 3u], value[(kSwizzle >> 4u) & 3u], 1.0);
-    vec4 o = vec4(dot(p, pc.rows[0]), dot(p, pc.rows[1]), dot(p, pc.rows[2]), dot(p, pc.rows[3]));
+    vec4 r0 = pc.rows[0], r1 = pc.rows[1], r2 = pc.rows[2], r3 = pc.rows[3];
+    if (pc.rowsAddress != uvec2(0u)) {
+        InstanceRows instance = InstanceRows(pc.rowsAddress);
+        uint i = uint(gl_InstanceIndex) * 4u;
+        r0 = instance.rows[i];
+        r1 = instance.rows[i + 1u];
+        r2 = instance.rows[i + 2u];
+        r3 = instance.rows[i + 3u];
+    }
+    vec4 o = vec4(dot(p, r0), dot(p, r1), dot(p, r2), dot(p, r3));
     // g_HalfPixelOffset is never set (the host draws pixel centres through
     // the viewport), so the guest's epilogue adds only the viewport offset.
     o.xy = o.xy * pc.viewport.xy + pc.viewport.zw * o.w;

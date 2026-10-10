@@ -19,7 +19,10 @@
 // back at the draw (plume_gpu.cpp) and knows which engine draw it has.
 #include "native_engine.h"
 
+#include <algorithm>
 #include <array>
+#include <unordered_map>
+#include <vector>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -48,7 +51,13 @@ std::array<Slot, kRingSize> g_ring;
 std::atomic<uint32_t> g_next{1};
 
 std::atomic<uint64_t> g_tagged{0}, g_seen{0}, g_found{0}, g_count_ok{0}, g_untagged{0}, g_native_view{0};
+std::atomic<uint64_t> g_shadow_culled{0}, g_shadow_batches{0}, g_shadow_batched{0}, g_native_lit{0};
+thread_local bool t_has_sphere = false;
+thread_local float t_sphere[4] = {};
 std::array<std::atomic<uint64_t>, 9> g_vb_word{}, g_ib_word{};
+std::mutex g_shader_mutex;
+std::unordered_map<uint64_t, uint64_t> g_pixel_draws, g_vertex_draws, g_pair_draws;
+uint64_t g_colour_draws = 0;
 std::mutex g_sample_mutex;
 std::string g_samples;
 uint32_t g_sample_count = 0;
@@ -61,6 +70,13 @@ uint32_t Load32(const uint8_t* base, uint32_t address) {
 void Store32(uint8_t* base, uint32_t address, uint32_t value) {
   value = __builtin_bswap32(value);
   std::memcpy(base + address, &value, 4);
+}
+
+float LoadFloat(const uint8_t* base, uint32_t address) {
+  const uint32_t bits = Load32(base, address);
+  float value;
+  std::memcpy(&value, &bits, 4);
+  return value;
 }
 
 void Tag(PPCContext& ctx, uint8_t* base) {
@@ -94,6 +110,8 @@ void Tag(PPCContext& ctx, uint8_t* base) {
     if (d.vertex_buffer >= 0x10000u) d.vb_words[i] = Load32(base, d.vertex_buffer + i * 4);
     if (d.index_buffer >= 0x10000u) d.ib_words[i] = Load32(base, d.index_buffer + i * 4);
   }
+  d.has_sphere = t_has_sphere;
+  if (t_has_sphere) std::memcpy(d.sphere, t_sphere, sizeof(t_sphere));
   slot.tag.store(tag, std::memory_order_release);
   // Booleans 104..127 = the tag; 96..103 keep whatever the game set.
   const uint32_t word = device + 10112 + 3 * 4;
@@ -126,6 +144,33 @@ void NoteDraw(bool found, bool count_matches, int vb_word, int ib_word, bool nat
 
 void NoteUntagged() { g_untagged.fetch_add(1, std::memory_order_relaxed); }
 
+void NoteShaders(uint64_t vertex_shader, uint64_t pixel_shader) {
+  std::lock_guard lock(g_shader_mutex);
+  ++g_pixel_draws[pixel_shader];
+  ++g_vertex_draws[vertex_shader];
+  ++g_pair_draws[vertex_shader * 1099511628211ull ^ pixel_shader];
+  ++g_colour_draws;
+}
+
+void SetObject(uint32_t object, const uint8_t* base) {
+  t_has_sphere = false;
+  if (object < 0x10000u) return;
+  t_sphere[0] = LoadFloat(base, object + 16);
+  t_sphere[1] = LoadFloat(base, object + 20);
+  t_sphere[2] = LoadFloat(base, object + 24);
+  t_sphere[3] = LoadFloat(base, object + 32);
+  t_has_sphere = t_sphere[3] > 0.f && t_sphere[3] < 1e6f;
+}
+
+void NoteShadowCull() { g_shadow_culled.fetch_add(1, std::memory_order_relaxed); }
+
+void NoteNativeLit() { g_native_lit.fetch_add(1, std::memory_order_relaxed); }
+
+void NoteShadowBatch(uint32_t instances) {
+  g_shadow_batches.fetch_add(1, std::memory_order_relaxed);
+  g_shadow_batched.fetch_add(instances, std::memory_order_relaxed);
+}
+
 void AddSample(const std::string& line) {
   std::lock_guard lock(g_sample_mutex);
   if (g_sample_count >= 24) return;
@@ -140,6 +185,31 @@ void Report(std::string& out, uint64_t frames) {
       "resolved {:.1f}, index count matches {:.1f}, untagged {:.1f}, drawn by the native view {:.1f}\n",
       g_tagged.exchange(0) / f, g_seen.exchange(0) / f, g_found.exchange(0) / f, g_count_ok.exchange(0) / f,
       g_untagged.exchange(0) / f, g_native_view.exchange(0) / f);
+  out += fmt::format(
+      "== Shadow maps (per frame): casters under the texel threshold dropped {:.1f}; instanced batches {:.1f} "
+      "holding {:.1f} draws\n== Native lit material: {:.1f} draws/frame\n",
+      g_shadow_culled.exchange(0) / f, g_shadow_batches.exchange(0) / f, g_shadow_batched.exchange(0) / f,
+      g_native_lit.exchange(0) / f);
+  {
+    std::lock_guard lock(g_shader_mutex);
+    auto top = [&](std::unordered_map<uint64_t, uint64_t>& map, const char* what, size_t limit) {
+      std::vector<std::pair<uint64_t, uint64_t>> sorted(map.begin(), map.end());
+      std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
+      out += fmt::format("== Engine colour draws by {} ({} distinct, {:.1f} draws/frame in all)\n", what, sorted.size(),
+                         g_colour_draws / f);
+      uint64_t running = 0;
+      for (size_t i = 0; i < std::min(limit, sorted.size()); ++i) {
+        running += sorted[i].second;
+        out += fmt::format("   {:016X} {:8.1f}/f  cumulative {:5.1f}%\n", sorted[i].first, sorted[i].second / f,
+                           g_colour_draws ? 100.0 * double(running) / double(g_colour_draws) : 0.0);
+      }
+      map.clear();
+    };
+    top(g_pixel_draws, "pixel shader", 60);
+    top(g_vertex_draws, "vertex shader", 30);
+    g_pair_draws.clear();
+    g_colour_draws = 0;
+  }
   out += "   vertex buffer address decoded from the engine object = the PM4 stream 0 (by word 0..7, none):";
   for (auto& w : g_vb_word) out += fmt::format(" {}", w.exchange(0));
   out += "\n   index buffer address decoded from the engine object = the PM4 indices (by word 0..7, none):";

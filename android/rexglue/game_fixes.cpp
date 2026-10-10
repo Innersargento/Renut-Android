@@ -1,6 +1,7 @@
 // Game-specific overrides of recompiled functions. The generated definitions
 // are weak symbols, so a strong definition here replaces them at link time.
 
+#include "native_engine.h"
 #include "native_probe.h"
 #include <atomic>
 #include <cstdint>
@@ -147,7 +148,11 @@ REX_EXTERN(sub_823B0698) {
   } else if (shadow_pass == ShadowPass::Cached) {
     shadow_cached_casters.fetch_add(1, std::memory_order_relaxed);
   }
+  // Its draws carry the object's bounding sphere to the Plume renderer, which
+  // drops shadow casters too small to show in the map (native_engine.h).
+  renut::native_engine::SetObject(ctx.r4.u32, base);
   __imp__sub_823B0698(ctx, base);
+  renut::native_engine::SetObject(0, base);
 }
 
 void renutReportShadowEngineProfile() {
