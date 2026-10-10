@@ -1,4 +1,5 @@
 #include "plume_gpu.h"
+#include "native_d3d.h"
 #include "native_engine.h"
 
 #include "plume_renderer.h"
@@ -1361,7 +1362,24 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
       std::fprintf(trace_, "predicated %s op=%X select=%llX mask=%llX\n", pred_pass_all_ ? "passed" : "skip",
                    opcode, (unsigned long long)bin_select_, (unsigned long long)bin_mask_);
     }
+    if (!pred_pass_all_ && (opcode == xenos::PM4_DRAW_INDX || opcode == xenos::PM4_DRAW_INDX_2) &&
+        native_d3d::GetMode() == native_d3d::Mode::kVerify) {
+      native_d3d::VerifySkipped(bin_mask_, bin_select_);
+    }
     return pred_pass_all_;
+  }
+  // The native Direct3D front end's NOP markers (verify mode).
+  void OnTracePacket(uint32_t address, uint32_t packet, uint32_t, uint32_t) override {
+    if (((packet >> 8) & 0x7F) != 0x10 || ((packet >> 16) & 0x3FFF) != 1) return;
+    if (native_d3d::GetMode() != native_d3d::Mode::kVerify) return;
+    const uint32_t* words = memory_->TranslatePhysical<const uint32_t*>(address);
+    if (__builtin_bswap32(words[1]) != native_d3d::kNopMagic) return;
+    const uint32_t payload = __builtin_bswap32(words[2]);
+    if ((payload >> 24) == 0xFF) {
+      native_d3d::VerifyTag(payload);
+    } else {
+      native_d3d::VerifyMarker(payload);
+    }
   }
   bool pred_pass_all_ = false;
   bool band_fragpos_ = false;
@@ -5136,6 +5154,27 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                       IndexBufferInfo* index_buffer_info, bool) {
   const gfx::RegisterFile& regs = *register_file_;
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  if (native_d3d::GetMode() == native_d3d::Mode::kVerify) {
+    native_d3d::Pm4Draw check;
+    check.regs = regs.values;
+    if (auto* shader = active_vertex_shader()) {
+      check.vs_hash = shader->ucode_data_hash();
+      check.vs_dwords = uint32_t(shader->ucode_dword_count());
+    }
+    if (auto* shader = active_pixel_shader()) {
+      check.ps_hash = shader->ucode_data_hash();
+      check.ps_dwords = uint32_t(shader->ucode_dword_count());
+    }
+    check.initiator = regs[XE_GPU_REG_VGT_DRAW_INITIATOR];
+    check.indexed = index_buffer_info != nullptr;
+    check.dma_base = regs[XE_GPU_REG_VGT_DMA_BASE];
+    check.dma_size = regs[XE_GPU_REG_VGT_DMA_SIZE];
+    check.bin_mask = bin_mask_;
+    check.bin_select = bin_select_;
+    check.edram_mode = uint32_t(edram_mode);
+    check.frame = swaps_;
+    native_d3d::VerifyDraw(check);
+  }
   if (edram_mode == xenos::EdramMode::kCopy) return IssueCopy();
   ++stats_.draws;
   const uint32_t draw_index = frame_draw_++;
@@ -8349,6 +8388,7 @@ void PlumeCommandProcessor::ValidateKeptWindows() {
 void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
+  if (native_d3d::GetMode() == native_d3d::Mode::kVerify) native_d3d::VerifySwap(swaps_);
   FlushDeferred();
   if (skin_log_ && swaps_ == 930) LogSkinned();
   if (validate_windows_ && swaps_ % 60 == 0) {

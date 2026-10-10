@@ -1,4 +1,5 @@
 #include "d3d_layer.h"
+#include "native_d3d.h"
 #include "native_probe.h"
 
 #include <algorithm>
@@ -191,6 +192,10 @@ inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
       }
     }
   }
+  if (renut::native_d3d::GetMode() != renut::native_d3d::Mode::kOff &&
+      renut::native_d3d::OnEnter(function, ctx, base)) {
+    return true;
+  }
   if (!PlumeActive()) {
     return false;
   }
@@ -203,6 +208,9 @@ inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
 // Called after the original (or a handler) ran; `r3`/`r4` are the arguments
 // it was called with.
 inline void Leave(Function function, uint32_t r3, uint32_t r4, PPCContext& ctx, uint8_t* base) {
+  if (renut::native_d3d::GetMode() != renut::native_d3d::Mode::kOff) {
+    renut::native_d3d::OnLeave(function, r3, ctx, base);
+  }
   switch (function) {
     case kXGRegisterVertexShader:
       DumpShaderObject(base, r3, true);

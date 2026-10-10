@@ -868,7 +868,7 @@ index 9ac8d15..5093d10 100644
      int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
  #endif
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..90d83bf 100644
+index a744375..40e0497 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,7 +10,9 @@
@@ -985,7 +985,7 @@ index a744375..90d83bf 100644
    const uint32_t packet = reader->ReadAndSwap<uint32_t>();
 +  if ((packet >> 30) == 3) {
 +    const uint32_t opcode = (packet >> 8) & 127;
-+    if (opcode == 0x22 || opcode == 0x36 || opcode == 0x3F || opcode == 0x64) {
++    if (opcode == 0x22 || opcode == 0x36 || opcode == 0x3F || opcode == 0x64 || opcode == 0x10) {
 +      OnTracePacket(uint32_t(packet_host - uintptr_t(memory_->physical_membase())), packet,
 +          uint32_t(reader->buffer() - memory_->physical_membase()), reader->capacity());
 +    }
@@ -1779,7 +1779,7 @@ index dcb3af6..06075d5 100644
  
    // Wire kernel object type variables to KernelGuestGlobals.
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
-index 57fd161..8565046 100644
+index 57fd161..7f8a5f5 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 @@ -15,7 +15,12 @@
@@ -1893,6 +1893,19 @@ index 57fd161..8565046 100644
    // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
    return result;
  }
+@@ -968,7 +1040,11 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
+   uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
+   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
+   const uint32_t self = rex::byte_swap(pcr_addr);
+-  assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
++  // No self-deadlock assertion: a graphics interrupt runs on the command
++  // processor's host thread with the PCR of the processor it targets, so it
++  // can find the lock held by a guest thread of that same processor - which
++  // on the console the raised IRQL would have kept it from interrupting.
++  // That holder runs on another host thread and releases it; wait.
+   while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
+     rex::thread::MaybeYield();
+   }
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 index 1254710..6fa91bf 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp

@@ -16,6 +16,7 @@
 #include <atomic>
 #include <android/native_window_jni.h>
 #include <rex/graphics/xenos.h>
+#include "native_d3d.h"
 #include "native_probe.h"
 #include "plume_graphics.h"
 #include "android_game_window.h"
@@ -317,6 +318,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       renut::d3d::SetShaderDumpDirectory((root / "shader-dump").string());
       renut::d3d::SetRuntimeFilesDirectory(root.string());
       renut::native_probe::SetFilesDirectory(root.string());
+      renut::native_d3d::SetFilesDirectory(root.string());
       // The emulated Xenos keeps fences, vertical blank and swaps but does not
       // present: the native Plume renderer owns the window.
       std::string plume_error;
