@@ -983,12 +983,12 @@ void OpaqueBegin(PPCContext& ctx, uint8_t* base, uint32_t kind, OpaqueFlush flus
     Builder(Current(dev)).Marker(kind, serial);
   }
   t_opaque_serial = serial;
-  if (GetMode() == Mode::kVerify) EmitNopMarker(ctx, base, dev, (kind << 24) | 0x10000 | serial);
+  EmitNopMarker(ctx, base, dev, (kind << 24) | 0x10000 | serial);
 }
 
 void OpaqueEnd(PPCContext& ctx, uint8_t* base, uint32_t dev, uint32_t kind) {
   if (!t_opaque_depth || --t_opaque_depth) return;
-  if (GetMode() == Mode::kVerify) EmitNopMarker(ctx, base, dev, (kind << 24) | t_opaque_serial);
+  EmitNopMarker(ctx, base, dev, (kind << 24) | t_opaque_serial);
 }
 
 // D3DDevice_BeginCommandBuffer(device, command buffer, flags, inherit, ...):
@@ -1086,9 +1086,6 @@ Mode GetMode() {
   int32_t mode = g_mode.load(std::memory_order_relaxed);
   if (mode < 0) {
     mode = std::clamp(REXCVAR_GET(renut_native_d3d), 0, 2);
-    // Native rendering needs the executor and the clears, resolves and
-    // tessellated draws in native form; until then it verifies.
-    if (mode == 2) mode = 1;
     g_mode.store(mode, std::memory_order_relaxed);
     if (mode) REXLOG_INFO("Renut: native Direct3D front end, mode {}", mode);
   }
@@ -1642,6 +1639,43 @@ void VerifySwap(uint64_t frame) {
     if (op == kOpDraw) ++v.native_extra;
   }
   if (v.frames >= 300) WriteReport(v, frame);
+}
+
+void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t markers, uint64_t bad) {
+  static uint64_t last_frame = 0, last_draws = 0, last_dropped = 0, last_markers = 0;
+  if (frame < last_frame + 300) return;
+  const double f = double(frame - last_frame);
+  auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
+  std::string out = fmt::format(
+      "native-d3d native mode - frames {}..{}\n\n== per frame: native draws issued {:.1f}, PM4 draws dropped {:.1f}, "
+      "opaque calls handed to the PM4 {:.1f}; problems so far {}\n",
+      last_frame, frame, (draws - last_draws) / f, (ring_draws_dropped - last_dropped) / f, (markers - last_markers) / f,
+      bad);
+  out += fmt::format(
+      "== front end (total): draws {}, flushes {}, shader loads {}, patched loads {}, begin vertices {}, markers {}, "
+      "runs {} (unknown {}), recordings {}, recording devices {}, immediate calls on another device {}, publishes {}, "
+      "screen extent {}, predicated tiling {}, SetPending_Predicated {}, no scratch {}\n",
+      c(g_counts.draws), c(g_counts.flushes), c(g_counts.shader_loads), c(g_counts.patched_loads),
+      c(g_counts.begin_vertices), c(g_counts.markers), c(g_counts.runs), c(g_counts.unknown_runs),
+      c(g_counts.recordings), c(g_counts.devices), c(g_counts.foreign_immediate), c(g_counts.publishes),
+      c(g_counts.screen_extent), c(g_counts.predicated_tiling), c(g_counts.set_pending_predicated),
+      c(g_counts.no_scratch));
+  last_frame = frame;
+  last_draws = draws;
+  last_dropped = ring_draws_dropped;
+  last_markers = markers;
+  std::string path;
+  {
+    std::lock_guard lock(g_verify_path_mutex);
+    path = g_verify.path;
+  }
+  if (path.size() > 4) {
+    path = path.substr(0, path.size() - 4) + "-native.txt";
+    if (FILE* file = std::fopen(path.c_str(), "w")) {
+      std::fwrite(out.data(), 1, out.size(), file);
+      std::fclose(file);
+    }
+  }
 }
 
 void SetFilesDirectory(std::string directory) {

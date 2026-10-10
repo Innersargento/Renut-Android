@@ -1368,19 +1368,68 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     }
     return pred_pass_all_;
   }
-  // The native Direct3D front end's NOP markers (verify mode).
+  // The native Direct3D front end's NOP markers: in verify mode a draw's
+  // serial or an opaque call's fence; in native mode the opaque calls'
+  // fences, where the native lists hand over to the PM4 and back.
   void OnTracePacket(uint32_t address, uint32_t packet, uint32_t, uint32_t) override {
     if (((packet >> 8) & 0x7F) != 0x10 || ((packet >> 16) & 0x3FFF) != 1) return;
-    if (native_d3d::GetMode() != native_d3d::Mode::kVerify) return;
+    const native_d3d::Mode mode = native_d3d::GetMode();
+    if (mode == native_d3d::Mode::kOff) return;
     const uint32_t* words = memory_->TranslatePhysical<const uint32_t*>(address);
     if (__builtin_bswap32(words[1]) != native_d3d::kNopMagic) return;
     const uint32_t payload = __builtin_bswap32(words[2]);
-    if ((payload >> 24) == 0xFF) {
+    if (mode == native_d3d::Mode::kNative) {
+      NativeMarker(payload);
+    } else if ((payload >> 24) == 0xFF) {
       native_d3d::VerifyTag(payload);
     } else {
       native_d3d::VerifyMarker(payload);
     }
   }
+
+  // ---- Native Direct3D lists (renut_native_d3d = 2) ----
+  // The lists draw with a register file of their own: the PM4 the game still
+  // writes (fences, ring segments, command buffer setup, the window scissor,
+  // GPR allocation) keeps the original one and draws nothing. The calls the
+  // lists do not hold yet (clears, resolves, the tessellated water, memory
+  // export) are fenced by NOP markers: at the opening one the lists have run
+  // up to that call, its PM4 then runs on the lists' state, and at the
+  // closing one the lists go on.
+  void OnPacketStart() override {
+    if (!native_checked_) {
+      native_on_ = native_d3d::GetMode() == native_d3d::Mode::kNative;
+      native_checked_ = true;
+    }
+    if (native_on_ && !native_opaque_) RunNative(UINT32_MAX);
+  }
+  bool native_checked_ = false;
+  void NativeMarker(uint32_t payload);
+  // Runs the published records until the end, or until the opaque-call
+  // marker `until` (consumed; returns true), never past another marker.
+  bool RunNative(uint32_t until);
+  void NativeSwapIn();
+  void NativeSwapOut();
+  void NativeWrite(uint32_t first, const uint32_t* values, uint32_t count);
+  void NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size);
+  bool native_on_ = false;
+  bool native_started_ = false;
+  uint32_t native_opaque_ = 0;     // inside an opaque call's PM4
+  bool native_swapped_ = false;    // the lists' state is in register_file_ & co.
+  std::unique_ptr<gfx::RegisterFile> native_regs_;
+  gfx::RegisterFile* ring_regs_ = nullptr;
+  gfx::Shader* native_vs_ = nullptr;
+  gfx::Shader* native_ps_ = nullptr;
+  gfx::Shader* ring_vs_ = nullptr;
+  gfx::Shader* ring_ps_ = nullptr;
+  uint64_t native_bin_mask_ = 0xFFFFFFFFull, native_bin_select_ = 0xFFFFFFFFull;
+  uint64_t ring_bin_mask_ = 0, ring_bin_select_ = 0;
+  struct NativeFrame {
+    std::shared_ptr<const native_d3d::List> list;
+    size_t pos = 0;
+  };
+  std::vector<NativeFrame> native_stack_;
+  std::deque<std::shared_ptr<const native_d3d::List>> native_queue_;
+  uint64_t native_draws_ = 0, native_ring_draws_dropped_ = 0, native_markers_ = 0, native_bad_ = 0;
   bool pred_pass_all_ = false;
   bool band_fragpos_ = false;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
@@ -5150,8 +5199,206 @@ bool PlumeCommandProcessor::Drop(const char* reason, const HostShader* vs, const
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Native Direct3D lists (renut_native_d3d = 2; see the declarations).
+
+void PlumeCommandProcessor::NativeSwapIn() {
+  if (native_swapped_) return;
+  if (!native_regs_) {
+    // The device's initial state came as PM4 at start-up: begin from it.
+    native_regs_ = std::make_unique<gfx::RegisterFile>();
+    std::memcpy(native_regs_->values, register_file_->values, sizeof(native_regs_->values));
+  }
+  ring_regs_ = register_file_;
+  register_file_ = native_regs_.get();
+  ring_vs_ = active_vertex_shader_;
+  ring_ps_ = active_pixel_shader_;
+  active_vertex_shader_ = native_vs_;
+  active_pixel_shader_ = native_ps_;
+  ring_bin_mask_ = bin_mask_;
+  ring_bin_select_ = bin_select_;
+  bin_mask_ = native_bin_mask_;
+  bin_select_ = native_bin_select_;
+  // The constant blocks are compared with what was last uploaded only when
+  // marked written; another register file may hold anything.
+  for (auto& stage : constants_written_) std::fill(std::begin(stage), std::end(stage), true);
+  loop_constants_dirty_ = true;
+  native_swapped_ = true;
+}
+
+void PlumeCommandProcessor::NativeSwapOut() {
+  if (!native_swapped_) return;
+  native_vs_ = active_vertex_shader_;
+  native_ps_ = active_pixel_shader_;
+  native_bin_mask_ = bin_mask_;
+  native_bin_select_ = bin_select_;
+  register_file_ = ring_regs_;
+  active_vertex_shader_ = ring_vs_;
+  active_pixel_shader_ = ring_ps_;
+  bin_mask_ = ring_bin_mask_;
+  bin_select_ = ring_bin_select_;
+  for (auto& stage : constants_written_) std::fill(std::begin(stage), std::end(stage), true);
+  loop_constants_dirty_ = true;
+  native_swapped_ = false;
+}
+
+void PlumeCommandProcessor::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) {
+  if (first >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      uint64_t(first) + count <= uint64_t(XE_GPU_REG_SHADER_CONSTANT_LOOP_31) + 1) {
+    std::memcpy(&register_file_->values[first], values, size_t(count) * sizeof(uint32_t));
+    MarkConstantsWritten(first, count);
+    return;
+  }
+  for (uint32_t i = 0; i < count; ++i) WriteRegister(first + i, values[i]);
+}
+
+// A draw record, as the command processor runs a DRAW_INDX packet.
+void PlumeCommandProcessor::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
+  if ((flags & native_d3d::kDrawPredicated) &&
+      !((bin_select_ & bin_mask_) != 0 || (bin_mask_ != 0 && gfx::GetSingleBinTiling())) &&
+      !OnPredicatedSkip(xenos::PM4_DRAW_INDX)) {
+    return;
+  }
+  WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator);
+  reg::VGT_DRAW_INITIATOR draw;
+  draw.value = initiator;
+  IndexBufferInfo info;
+  bool indexed = false;
+  if (draw.source_select == xenos::SourceSelect::kDMA) {
+    WriteRegister(XE_GPU_REG_VGT_DMA_BASE, dma_base);
+    WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, dma_size);
+    reg::VGT_DMA_SIZE size;
+    size.value = dma_size;
+    const uint32_t bytes = draw.index_size == xenos::IndexFormat::kInt16 ? 2 : 4;
+    info.guest_base = dma_base & ~(bytes - 1);
+    info.endianness = size.swap_mode;
+    info.format = draw.index_size;
+    info.length = size.num_words * bytes;
+    info.count = draw.num_indices;
+    indexed = true;
+  } else if (draw.source_select != xenos::SourceSelect::kAutoIndex) {
+    ++native_bad_;
+    return;
+  }
+  const auto viz = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+  if (viz.viz_query_ena && viz.kill_pix_post_hi_z) return;
+  ++native_draws_;
+  IssueDraw(draw.prim_type, draw.num_indices, indexed ? &info : nullptr,
+            xenos::IsMajorModeExplicit(draw.major_mode, draw.prim_type));
+}
+
+bool PlumeCommandProcessor::RunNative(uint32_t until) {
+  bool found = false, swapped_here = false;
+  for (;;) {
+    if (native_stack_.empty()) {
+      if (native_queue_.empty()) {
+        std::vector<std::shared_ptr<const native_d3d::List>> more;
+        native_d3d::TakePublished(more);
+        for (auto& list : more) native_queue_.push_back(std::move(list));
+        if (native_queue_.empty()) break;
+      }
+      native_stack_.push_back({std::move(native_queue_.front()), 0});
+      native_queue_.pop_front();
+    }
+    NativeFrame& f = native_stack_.back();
+    const std::vector<uint32_t>& words = f.list->words;
+    if (f.pos >= words.size()) {
+      native_stack_.pop_back();
+      continue;
+    }
+    const uint32_t* w = words.data() + f.pos;
+    const uint32_t op = w[0] & 0xFF;
+    if (op == native_d3d::kOpMarker) {
+      // Never past an opaque call the ring has not reached.
+      if (w[1] == until) {
+        f.pos += 2;
+        found = true;
+        ++native_markers_;
+      }
+      break;
+    }
+    if (!native_swapped_) {
+      NativeSwapIn();
+      swapped_here = true;
+    }
+    switch (op) {
+      case native_d3d::kOpRegs: {
+        const uint32_t count = w[0] >> 8, first = w[1];
+        if (f.pos + 2 + count > words.size() || first + count > gfx::RegisterFile::kRegisterCount) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        NativeWrite(first, w + 2, count);
+        f.pos += 2 + count;
+        break;
+      }
+      case native_d3d::kOpShader: {
+        const auto type = xenos::ShaderType(w[1] & 3);
+        const uint32_t address = w[1] & ~3u, dwords = w[2];
+        gfx::Shader* shader = LoadShader(type, address, memory_->TranslatePhysical<const uint32_t*>(address), dwords);
+        if (type == xenos::ShaderType::kVertex) {
+          active_vertex_shader_ = shader;
+        } else {
+          active_pixel_shader_ = shader;
+        }
+        f.pos += 5;
+        break;
+      }
+      case native_d3d::kOpDraw:
+        f.pos += 6;
+        NativeDraw(w[0] >> 8, w[2], w[3], w[4]);
+        break;
+      case native_d3d::kOpBin: {
+        const uint32_t which = w[0] >> 8, value = w[1];
+        if (which == 0) bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | value;
+        if (which == 1) bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) | (uint64_t(value) << 32);
+        if (which == 2) bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | value;
+        if (which == 3) bin_select_ = (bin_select_ & 0xFFFFFFFFull) | (uint64_t(value) << 32);
+        f.pos += 2;
+        break;
+      }
+      case native_d3d::kOpRun: {
+        std::shared_ptr<const native_d3d::List> child = w[1] < f.list->runs.size() ? f.list->runs[w[1]] : nullptr;
+        f.pos += 2;
+        if (child) native_stack_.push_back({std::move(child), 0});
+        break;
+      }
+      case native_d3d::kOpSwap:
+        f.pos += 4;
+        break;
+      default:
+        ++native_bad_;
+        f.pos = words.size();
+        break;
+    }
+  }
+  if (swapped_here) NativeSwapOut();
+  return found;
+}
+
+void PlumeCommandProcessor::NativeMarker(uint32_t payload) {
+  const uint32_t serial = payload & 0xFFFF;
+  if (payload & 0x10000) {
+    if (native_opaque_) NativeSwapOut();
+    native_opaque_ = 0;
+    if (!RunNative(serial)) ++native_bad_;
+    // The call's PM4 runs on the lists' state.
+    NativeSwapIn();
+    native_opaque_ = 1;
+  } else if (native_opaque_) {
+    native_opaque_ = 0;
+    NativeSwapOut();
+  }
+}
+
 bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool) {
+  // Native lists: the PM4 draws nothing outside the calls the lists fence.
+  if (native_on_ && !native_swapped_) {
+    ++native_ring_draws_dropped_;
+    return true;
+  }
   const gfx::RegisterFile& regs = *register_file_;
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (native_d3d::GetMode() == native_d3d::Mode::kVerify) {
@@ -8389,6 +8636,16 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
   if (native_d3d::GetMode() == native_d3d::Mode::kVerify) native_d3d::VerifySwap(swaps_);
+  if (native_on_) {
+    // Everything the lists hold for this frame, before it is shown.
+    if (native_opaque_) {
+      native_opaque_ = 0;
+      NativeSwapOut();
+      ++native_bad_;
+    }
+    RunNative(UINT32_MAX);
+    native_d3d::NativeReport(swaps_, native_draws_, native_ring_draws_dropped_, native_markers_, native_bad_);
+  }
   FlushDeferred();
   if (skin_log_ && swaps_ == 930) LogSkinned();
   if (validate_windows_ && swaps_ % 60 == 0) {

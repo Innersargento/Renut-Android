@@ -95,6 +95,9 @@ void VerifyTag(uint32_t serial);
 void VerifySwap(uint64_t frame);
 // The magic word of the front end's NOP markers (verify mode).
 constexpr uint32_t kNopMagic = 0x4E415444;  // "NATD"
+// Native mode: the executor's counters, written with the front end's to
+// files/native-d3d-verify-native.txt every 300 frames.
+void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t markers, uint64_t bad);
 // Where the report goes (the runtime's files directory).
 void SetFilesDirectory(std::string directory);
 
