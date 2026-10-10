@@ -1,6 +1,7 @@
 // Game-specific overrides of recompiled functions. The generated definitions
 // are weak symbols, so a strong definition here replaces them at link time.
 
+#include "native_probe.h"
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -113,6 +114,7 @@ REX_EXTERN(sub_822BC0D8) {
 // measure each category before it takes ownership of any draw.
 extern "C" void __imp__sub_823B3598(PPCContext& __restrict, uint8_t*);
 REX_EXTERN(sub_823B3598) {
+  renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B3598, ctx, base);
   if (!REXCVAR_GET(renut_shadow_engine_profile)) {
     __imp__sub_823B3598(ctx, base);
     return;
@@ -124,6 +126,7 @@ REX_EXTERN(sub_823B3598) {
 
 extern "C" void __imp__sub_823B3CE0(PPCContext& __restrict, uint8_t*);
 REX_EXTERN(sub_823B3CE0) {
+  renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B3CE0, ctx, base);
   if (!REXCVAR_GET(renut_shadow_engine_profile)) {
     __imp__sub_823B3CE0(ctx, base);
     return;
@@ -138,6 +141,7 @@ REX_EXTERN(sub_823B3CE0) {
 // changed, and an unclassified invocation is left alone.
 extern "C" void __imp__sub_823B0698(PPCContext& __restrict, uint8_t*);
 REX_EXTERN(sub_823B0698) {
+  renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B0698, ctx, base);
   if (shadow_pass == ShadowPass::Dynamic) {
     shadow_dynamic_casters.fetch_add(1, std::memory_order_relaxed);
   } else if (shadow_pass == ShadowPass::Cached) {
@@ -201,6 +205,7 @@ extern "C" void __imp__sub_823B18C8(PPCContext& __restrict, uint8_t*);
 // (wrong: with one tile the game predicates almost everything to mask 3).
 std::atomic<int> g_renut_scene_split_mode{2};
 REX_EXTERN(sub_823B18C8) {
+  renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B18C8, ctx, base);
   const int mode = g_renut_scene_split_mode.load(std::memory_order_relaxed);
   if (!REXCVAR_GET(renut_scene_msaa) && (mode == 0 || mode == 2 || mode == 5)) {
     const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r3.u32 + 40));

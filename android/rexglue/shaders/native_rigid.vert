@@ -21,7 +21,6 @@ layout(location = 0) in vec4 iPosition;
 layout(push_constant) uniform Native {
     layout(offset = 32) vec4 rows[4];   // the guest's c0..c3 (or whichever four it names)
     layout(offset = 96) vec4 viewport;  // xy scale, zw offset (g_ViewportScaleOffset)
-    layout(offset = 112) vec2 halfPixel;
 } pc;
 
 out gl_PerVertex {
@@ -53,7 +52,9 @@ void main() {
     if ((kSwappedPositions & 1u) != 0u) value = value.yxwz;
     vec4 p = vec4(value[kSwizzle & 3u], value[(kSwizzle >> 2u) & 3u], value[(kSwizzle >> 4u) & 3u], 1.0);
     vec4 o = vec4(dot(p, pc.rows[0]), dot(p, pc.rows[1]), dot(p, pc.rows[2]), dot(p, pc.rows[3]));
-    o.xy = o.xy * pc.viewport.xy + (pc.viewport.zw + pc.halfPixel) * o.w;
+    // g_HalfPixelOffset is never set (the host draws pixel centres through
+    // the viewport), so the guest's epilogue adds only the viewport offset.
+    o.xy = o.xy * pc.viewport.xy + pc.viewport.zw * o.w;
     o.y = -o.y;
     gl_Position = o;
 }
