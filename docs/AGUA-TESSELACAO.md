@@ -77,12 +77,37 @@ dois desenhos `prim=17` da passagem inicial passam de `dropped` a desenhados;
 captura em `out/graphics-next/water-drawn.png` e registro em
 `out/graphics-next/water-sw-trace.txt`.
 
+## Fatores por aresta (10/10/2026)
+
+Com o memory export emulado, os fatores que o jogo calcula chegam ao desenho
+num buffer de export da GPU, três floats por patch: aresta P0–P1, P1–P2 e P2–P0
+(`vs 1DF3417E`: tamanho da aresta na tela, distância do ponto médio, 16 perto da
+câmera, e **0 nas três arestas de um patch sem nenhum ponto na tela**). Como no
+Xenia, um fator `f` vira `f + 1` segmentos, limitado a `[MIN + 1, MAX + 1]`
+(aqui 2..16).
+
+Antes o Plume cortava os 851 patches do lago no nível 16, duas vezes por quadro
+(uma por faixa do tiling predicado): 130 mil pontos e 654 mil índices por
+desenho, mesmo com a água fora da tela. Agora (`ExpandAdaptivePatches`,
+`renut_plume_adaptive_patches`, chave ao vivo `files/plume-adaptive`), dois
+compute shaders fazem isso na GPU, no mesmo quadro:
+
+- `patch_levels.comp` dá a cada aresta o seu nível e ao patch o maior deles, e
+  dispõe pontos e índices em ordem de patch (soma de prefixos), escrevendo os
+  argumentos de um `vkCmdDrawIndexedIndirect`;
+- `patch_expand.comp` escreve a grade de cada patch, igual à da `GetPatchGrid`,
+  levando os pontos de uma aresta mais grossa que o patch para o corte mais
+  próximo da aresta (arredondamento espelhado no meio dela). Os dois patches que
+  dividem uma aresta recebem o mesmo fator e põem os pontos nos mesmos lugares,
+  então não abre fresta; os triângulos a mais viram degenerados.
+
+A segunda faixa reaproveita a expansão da primeira. Patches de quadriláteros
+continuam na grade. Medido na praça de Showdown Town: 827 de 851 patches no
+nível 2, 8,5 mil pontos e 27,7 mil índices; a água 2,94 → 1,23 ms por quadro no
+perfil por desenho, e o quadro −7,7% em ciclos de GPU.
+
 ## O que falta
 
-- **Memory export**, para os fatores adaptativos reais por aresta em vez do teto
-  do registrador. Exige emitir as escritas `eA`/`eM#` no recompilador — hoje vão
-  para um registrador descartado — e, no Plume, rodar esses desenhos com o
-  rasterizador descartado sobre um buffer que o desenho seguinte leia.
 - **Patches de quadriláteros** (`kQuadPatch`), que outros cenários usam para o
   terreno. A expansão e a inicialização de registradores são diferentes.
 - O caminho por hardware, se algum driver do aparelho passar a expor

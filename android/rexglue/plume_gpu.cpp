@@ -98,6 +98,11 @@ REXCVAR_DEFINE_INT32(renut_plume_rel_constants, 2, "reNut/Plume",
                      "0 by the file's four blocks, 1 by the whole file as one block, 2 by that block "
                      "declared too large for the driver to promote into the constant file")
     .range(0, 2);
+REXCVAR_DEFINE_INT32(renut_plume_adaptive_patches, 1, "reNut/Plume",
+                     "Tessellate adaptive triangle patches (the water) at the levels the game works out for "
+                     "each edge, a patch off screen being one triangle, instead of every patch at the draw's "
+                     "highest level: 0 off, 1 on")
+    .range(0, 1);
 REXCVAR_DEFINE_BOOL(renut_plume_no_shadows, false, "reNut/Plume",
                     "Drop the shadow casters (depth-only draws into the shadow maps): the scene is drawn "
                     "without shadows.");
@@ -138,6 +143,8 @@ using namespace rex::graphics;
 
 #include "shaders/point_list.geom.inc"
 #include "shaders/depth_stencil_pack.comp.inc"
+#include "shaders/patch_expand.comp.inc"
+#include "shaders/patch_levels.comp.inc"
 #include "shaders/debug_point.frag.inc"
 #include "shaders/debug_trivial.frag.inc"
 #include "shaders/debug_trivial.vert.inc"
@@ -1178,6 +1185,7 @@ struct Stats {
   // that take a geometry shader (rectangle lists) or are CPU-tessellated
   // patches (the water) and the vertices those patches expand to.
   uint64_t pipeline_binds = 0, vertices = 0, gs_draws = 0, patch_draws = 0, patch_vertices = 0;
+  uint64_t adaptive_patch_draws = 0;  // patch draws laid out on the GPU (vertices not counted)
   // Wall clock, in microseconds: whole frames, the pipelines built inside them
   // and the submit that ends them. What is left is the rest of the draw path.
   uint64_t frame_us = 0, pipeline_us = 0, submit_us = 0;
@@ -1287,6 +1295,33 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   VkPipelineLayout pack_layout_ = VK_NULL_HANDLE;
   VkPipeline pack_pipeline_ = VK_NULL_HANDLE;
   bool CreatePackPipeline();
+
+  // Adaptive triangle patches (ExpandAdaptivePatches): patch_levels.comp and
+  // patch_expand.comp write each draw's points, indices and indirect
+  // arguments into the slot's buffer, filled from its start every frame.
+  struct AdaptiveDraw {
+    RenderBuffer* buffer = nullptr;
+    uint64_t points_offset = 0, points_bytes = 0, args_offset = 0;
+  };
+  bool CreatePatchPipelines();
+  bool ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endian, uint32_t patches, uint32_t min_level,
+                             uint32_t max_level, AdaptiveDraw& out);
+  VkShaderModule patch_modules_[2] = {};
+  VkPipelineLayout patch_layout_ = VK_NULL_HANDLE;
+  VkPipeline patch_pipelines_[2] = {};
+  bool patch_pipelines_failed_ = false;
+  std::unique_ptr<RenderBuffer> patch_out_[kPlumeFramesInFlight];
+  uint64_t patch_out_capacity_[kPlumeFramesInFlight] = {};
+  uint64_t patch_out_used_ = 0;
+  // The last expansion, which the same draw repeated for the next band of a
+  // predicated frame takes as it is while no export has happened in between.
+  struct {
+    uint64_t frame = UINT64_MAX, factors = 0, exports = 0;
+    uint32_t patches = 0, levels = 0;
+    AdaptiveDraw draw;
+  } patch_reuse_;
+  uint64_t export_draws_total_ = 0;
+  uint32_t adaptive_mode_ = 1;
 
  private:
   // Upload ring (one frame; reset after every swap).
@@ -1841,7 +1876,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     RenderVertexBufferView view;
   };
   struct DrawPacket {
-    enum class Kind : uint8_t { kNone, kIndexed, kPatch, kPlain };
+    // kPatchIndirect: an adaptive patch draw, whose index count the GPU wrote
+    // at indirect_offset of index_buffer (ExpandAdaptivePatches).
+    enum class Kind : uint8_t { kNone, kIndexed, kPatch, kPlain, kPatchIndirect };
     RenderFramebuffer* framebuffer = nullptr;
     uint32_t pass_colors = 0;
     bool pass_depth = false;
@@ -1861,6 +1898,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     RenderFormat index_format = RenderFormat::R16_UINT;
     uint32_t count = 0, first = 0;
     int32_t base_vertex = 0;
+    uint64_t indirect_offset = 0;
     // Only for the pair profile, and the trail a lost device prints.
     uint64_t vs_hash = 0, ps_hash = 0;
     uint64_t s0_addr = 0, s10_addr = 0;
@@ -2773,6 +2811,7 @@ bool PlumeCommandProcessor::SetupContext() {
   rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
   no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
   no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
+  adaptive_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1));
   if (no_shadows_) shadow_min_indices_ = UINT32_MAX;
   fence_ = device_->createCommandFence();
 
@@ -2919,6 +2958,15 @@ void PlumeCommandProcessor::ShutdownContext() {
     pack_pipeline_ = VK_NULL_HANDLE;
     pack_layout_ = VK_NULL_HANDLE;
     pack_module_ = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < 2; ++i) {
+      if (patch_pipelines_[i] != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, patch_pipelines_[i], nullptr);
+      if (patch_modules_[i] != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, patch_modules_[i], nullptr);
+      patch_pipelines_[i] = VK_NULL_HANDLE;
+      patch_modules_[i] = VK_NULL_HANDLE;
+    }
+    if (patch_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, patch_layout_, nullptr);
+    patch_layout_ = VK_NULL_HANDLE;
+    for (auto& buffer : patch_out_) buffer.reset();
     stencil_staging_.reset();
     packed_staging_.reset();
     if (constants_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(vk_device, constants_pool_, nullptr);
@@ -3889,6 +3937,7 @@ void PlumeCommandProcessor::BeginFrame() {
   retired_slots_[slot_].clear();
   retired_views_[slot_].clear();
   retired_buffers_[slot_].clear();
+  patch_out_used_ = 0;
   while (!delayed_buffers_.empty() && swaps_ - delayed_buffers_.front().first >= retire_delay_) {
     delayed_buffers_.pop_front();
   }
@@ -5621,6 +5670,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     std::memcpy(sh + RENUT_SHARED_EXPORT_OFFSET, ranges, sizeof(ranges));
     ++stats_.export_draws;
+    ++export_draws_total_;
     if (trace_) {
       std::string line = "  export";
       for (uint32_t r = 0; r < range_count; ++r) {
@@ -6584,6 +6634,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   RenderBuffer* index_buffer = upload_.get();
   uint32_t index_bytes = 0;
   const PatchGrid* patch_grid = nullptr;
+  AdaptiveDraw adaptive_draw;
+  bool adaptive = false;
   if (patch_list) {
     // Every three control points are a patch - four for a quad patch - and
     // each is expanded into a grid of level * level triangles over the
@@ -6602,9 +6654,25 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       ++stats_.skipped_prim;
       return true;
     }
-    patch_grid = GetPatchGrid(quad_patch, level, patches);
-    if (!patch_grid) return Drop("patch grid", vs, ps);
-    vertex_count = patches * patch_grid->indices_per_patch;
+    // In adaptive mode the "indices" are the factors, three per triangle
+    // patch, which the guest exported just before: those patches are cut per
+    // edge on the GPU, most of them - all that are off screen - into a single
+    // triangle. Quad patches stay on the grid.
+    if (adaptive_mode_ && !quad_patch &&
+        regs.Get<reg::VGT_HOS_CNTL>().tess_mode == xenos::TessellationMode::kAdaptive && index_buffer_info &&
+        index_buffer_info->guest_base && index_buffer_info->format == xenos::IndexFormat::kInt32) {
+      const float least = regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
+      const uint32_t min_level = std::clamp(uint32_t(least > 1.0f ? least : 1.0f), 1u, level);
+      adaptive = ExpandAdaptivePatches(index_buffer_info->guest_base, index_buffer_info->endianness, patches,
+                                       min_level, level, adaptive_draw);
+    }
+    if (!adaptive) {
+      patch_grid = GetPatchGrid(quad_patch, level, patches);
+      if (!patch_grid) return Drop("patch grid", vs, ps);
+      vertex_count = patches * patch_grid->indices_per_patch;
+    } else {
+      vertex_count = 0;
+    }
   }
   if (indexed) {
     const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
@@ -6718,7 +6786,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   for (const auto& slot : input_slots) {
     DeferredSlot entry;
     entry.slot = slot;
-    if (patch_list) {
+    if (adaptive) {
+      entry.view = RenderVertexBufferView(RenderBufferReference(adaptive_draw.buffer, adaptive_draw.points_offset),
+                                          uint32_t(adaptive_draw.points_bytes));
+    } else if (patch_list) {
       entry.view = RenderVertexBufferView(RenderBufferReference(patch_grid->points.get(), 0),
                                           patch_grid->patches * patch_grid->points_per_patch * 4 *
                                               uint32_t(sizeof(float)));
@@ -6799,6 +6870,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     pk.count = draw_count;
     pk.first = uint32_t(index_offset / index_size);
     pk.base_vertex = base_vertex;
+  } else if (adaptive) {
+    pk.kind = DrawPacket::Kind::kPatchIndirect;
+    pk.index_buffer = adaptive_draw.buffer;
+    pk.index_format = RenderFormat::R32_UINT;
+    pk.indirect_offset = adaptive_draw.args_offset;
   } else if (patch_list) {
     pk.kind = DrawPacket::Kind::kPatch;
     pk.index_buffer = patch_grid->indices.get();
@@ -6945,6 +7021,14 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
       BindIndexBuffer(pk.index_buffer, pk.index_format);
       L()->drawIndexedInstanced(pk.count, 1, 0, 0, 0);
       break;
+    case DrawPacket::Kind::kPatchIndirect: {
+      BindIndexBuffer(pk.index_buffer, pk.index_format);
+      auto* vulkan = static_cast<VulkanCommandList*>(L());
+      vulkan->checkActiveRenderPass();
+      vkCmdDrawIndexedIndirect(vulkan->vk, static_cast<VulkanBuffer*>(pk.index_buffer)->vk, pk.indirect_offset, 1,
+                               sizeof(VkDrawIndexedIndirectCommand));
+      break;
+    }
     case DrawPacket::Kind::kPlain: L()->drawInstanced(pk.count, 1, pk.first, 0); break;
   }
   if (pair_stamped) PairStamp();
@@ -7403,6 +7487,151 @@ bool PlumeCommandProcessor::CreatePackPipeline() {
     pack_pipeline_ = VK_NULL_HANDLE;
     return false;
   }
+  return true;
+}
+
+bool PlumeCommandProcessor::CreatePatchPipelines() {
+  if (patch_pipelines_[1] != VK_NULL_HANDLE) return true;
+  if (patch_pipelines_failed_) return false;
+  patch_pipelines_failed_ = true;
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  if (patch_layout_ == VK_NULL_HANDLE) {
+    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
+    VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(vk_device, &layout_info, nullptr, &patch_layout_) != VK_SUCCESS) return false;
+  }
+  const std::pair<const uint32_t*, size_t> code[2] = {{k_patch_levels_comp, sizeof(k_patch_levels_comp)},
+                                                      {k_patch_expand_comp, sizeof(k_patch_expand_comp)}};
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (patch_pipelines_[i] != VK_NULL_HANDLE) continue;
+    VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    module_info.codeSize = code[i].second;
+    module_info.pCode = code[i].first;
+    if (vkCreateShaderModule(vk_device, &module_info, nullptr, &patch_modules_[i]) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo pipeline_info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline_info.stage.module = patch_modules_[i];
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = patch_layout_;
+    if (vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &patch_pipelines_[i]) !=
+        VK_SUCCESS) {
+      patch_pipelines_[i] = VK_NULL_HANDLE;
+      REXLOG_WARN("Renut: Plume adaptive patch pipelines unavailable; patches stay on the grid");
+      return false;
+    }
+  }
+  patch_pipelines_failed_ = false;
+  return true;
+}
+
+// An adaptive triangle patch draw (the water): N&B works out a factor for
+// every edge of every patch on the GPU, from the edge's length on screen and
+// its distance, and puts 0 on all three edges of a patch with no point on
+// screen - in a lake mostly behind the camera, nearly all of them. Cutting
+// every patch at the draw's highest level, as the grid does, ran the domain
+// shader on 153 points of each of them instead of 3. The factors stay on the
+// GPU, so the GPU lays the draw out too (patch_levels.comp, then
+// patch_expand.comp) and the draw reads its index count from what they wrote.
+// False leaves the draw to the grid.
+bool PlumeCommandProcessor::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endian, uint32_t patches,
+                                                  uint32_t min_level, uint32_t max_level, AdaptiveDraw& out) {
+  if (!CreatePatchPipelines()) return false;
+  RenderBuffer* factors = nullptr;
+  uint64_t factors_offset = 0;
+  if (!BindStream(factors_base, patches * 12, endian, factors, factors_offset) || !factors) return false;
+  const uint64_t factors_address = factors->getDeviceAddress() + factors_offset;
+  const uint32_t levels = min_level | (max_level << 8);
+  Trace("  adaptive patches {} factors {:08X} levels {}..{}", patches, factors_base, min_level, max_level);
+  if (patch_reuse_.frame == swaps_ && patch_reuse_.factors == factors_address && patch_reuse_.patches == patches &&
+      patch_reuse_.levels == levels && patch_reuse_.exports == export_draws_total_) {
+    out = patch_reuse_.draw;
+    return true;
+  }
+
+  // Room for every patch at the highest level: records, the indirect
+  // arguments, the points, then the indices.
+  const uint64_t points = uint64_t(patches) * ((max_level + 1) * (max_level + 2) / 2);
+  const uint64_t indices = uint64_t(patches) * 3 * max_level * max_level;
+  const uint64_t records_bytes = uint64_t(patches) * 16;
+  const uint64_t need = records_bytes + 32 + 16 + points * 16 + indices * 4;
+  if (need > (256ull << 20)) return false;
+  std::unique_ptr<RenderBuffer>& buffer = patch_out_[slot_];
+  uint64_t at = (patch_out_used_ + 15) & ~uint64_t(15);
+  if (!buffer || at + need > patch_out_capacity_[slot_]) {
+    const uint64_t capacity = std::max({need, patch_out_capacity_[slot_] * 2, uint64_t(4) << 20});
+    auto made = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+        capacity, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::STORAGE |
+                      RenderBufferFlag::INDIRECT | RenderBufferFlag::DEVICE_ADDRESSABLE));
+    if (!made) return false;
+    // Draws recorded earlier this frame may still read the old one.
+    if (buffer) retired_buffers_[slot_].push_back(std::move(buffer));
+    buffer = std::move(made);
+    patch_out_capacity_[slot_] = capacity;
+    at = 0;
+  }
+  const uint64_t records_at = at;
+  const uint64_t args_at = records_at + records_bytes;
+  const uint64_t points_at = (args_at + 32 + 15) & ~uint64_t(15);
+  const uint64_t indices_at = points_at + points * 16;
+  patch_out_used_ = indices_at + indices * 4;
+  const uint64_t base = buffer->getDeviceAddress();
+
+  // Raw Vulkan, outside the render pass; it reopens at the draw.
+  auto* vulkan = static_cast<VulkanCommandList*>(L());
+  vulkan->endActiveRenderPass();
+  VkCommandBuffer cb = vulkan->vk;
+  VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(cb,
+                       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
+                           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+  struct {
+    uint64_t factors, records, args;
+    uint32_t patches, min_level, max_level, first_index;
+  } levels_push = {factors_address, base + records_at, base + args_at, patches, min_level, max_level,
+                   uint32_t(indices_at / 4)};
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, patch_pipelines_[0]);
+  vkCmdPushConstants(cb, patch_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(levels_push), &levels_push);
+  vkCmdDispatch(cb, 1, 1, 1);
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                       &barrier, 0, nullptr, 0, nullptr);
+  struct {
+    uint64_t records, points, indices;
+    uint32_t patches, pad;
+  } expand_push = {base + records_at, base + points_at, base + indices_at, patches, 0};
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, patch_pipelines_[1]);
+  vkCmdPushConstants(cb, patch_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(expand_push), &expand_push);
+  vkCmdDispatch(cb, std::min(patches, 65535u), 1, 1);
+  // Also orders the reads of the factors before the next export into them.
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                          VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                          VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                       0, 1, &barrier, 0, nullptr, 0, nullptr);
+  // The compute layout's push constants may disturb the graphics ones.
+  pushed_constants_[0] = pushed_constants_[1] = pushed_constants_[2] = UINT64_MAX;
+  ++stats_.adaptive_patch_draws;
+
+  out.buffer = buffer.get();
+  out.points_offset = points_at;
+  out.points_bytes = points * 16;
+  out.args_offset = args_at;
+  patch_reuse_.frame = swaps_;
+  patch_reuse_.factors = factors_address;
+  patch_reuse_.patches = patches;
+  patch_reuse_.levels = levels;
+  patch_reuse_.exports = export_draws_total_;
+  patch_reuse_.draw = out;
   return true;
 }
 
@@ -8012,6 +8241,18 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       depth_strip_mode_ = uint32_t(depth_strip);
     }
     {
+      int adaptive = std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1);
+      if (FILE* file = std::fopen((root + "/plume-adaptive").c_str(), "r")) {
+        int value = adaptive;
+        if (std::fscanf(file, "%d", &value) == 1) adaptive = std::clamp(value, 0, 1);
+        std::fclose(file);
+      }
+      if (uint32_t(adaptive) != adaptive_mode_) {
+        REXLOG_INFO("Renut: Plume adaptive patches {}", adaptive ? "on" : "off");
+      }
+      adaptive_mode_ = uint32_t(adaptive);
+    }
+    {
       unsigned int percent = 100;
       if (FILE* file = std::fopen((root + "/plume-patchlevel").c_str(), "r")) {
         if (std::fscanf(file, "%u", &percent) != 1) percent = 100;
@@ -8387,7 +8628,7 @@ void PlumeCommandProcessor::Report() {
   renutReportShadowEngineProfile();
   REXLOG_INFO(
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
-      "no_target={} resolves={} clears={} passes={} barriers={} pipeline_binds={} vertices={} gs_draws={} patch_draws={} patch_vertices={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
+      "no_target={} resolves={} clears={} passes={} barriers={} pipeline_binds={} vertices={} gs_draws={} patch_draws={} patch_vertices={} adaptive={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
       "missing_ucode={} upload_overflow={} upload_used={}KB textures={} decoded={} "
       "texture_failures={} frame_ms={} pipeline_ms={} submit_ms={} guest_swaps={} "
       "const_reused={} export(draws={} ranges={}/{} reads={} merges={} refreshes={} barriers={}) "
@@ -8395,7 +8636,7 @@ void PlumeCommandProcessor::Report() {
       "bands(skipped={} moved={} widened={})",
       swaps_, stats_.draws, stats_.drawn, stats_.no_vs, stats_.no_ps, stats_.bad_shader,
       stats_.skipped_prim, stats_.no_target, stats_.resolves, stats_.clears, stats_.passes, stats_.barriers,
-      stats_.pipeline_binds, stats_.vertices, stats_.gs_draws, stats_.patch_draws, stats_.patch_vertices,
+      stats_.pipeline_binds, stats_.vertices, stats_.gs_draws, stats_.patch_draws, stats_.patch_vertices, stats_.adaptive_patch_draws,
       stats_.split_by[uint32_t(RenderTextureLayout::COLOR_WRITE) & 7],
       stats_.split_by[uint32_t(RenderTextureLayout::DEPTH_WRITE) & 7],
       stats_.split_by[uint32_t(RenderTextureLayout::SHADER_READ) & 7],

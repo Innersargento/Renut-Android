@@ -1,0 +1,90 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// Second half of an adaptive triangle patch draw (see patch_levels.comp): one
+// workgroup a patch writes its grid at the patch's level - the same points, in
+// the same order and with the same triangles, as GetPatchGrid's - into the
+// place patch_levels.comp gave it.
+//
+// A point on an edge cut more coarsely than the patch is moved to the nearest
+// of that edge's own cuts, so the two patches sharing the edge, which the
+// guest gives the same factor, put their points at the same places along it:
+// no cracks, and the extra triangles along the edge are just degenerate. The
+// rounding is mirrored about the edge's middle, so it does not matter in which
+// direction each patch runs along the edge, and the weights are exact ratios
+// of small integers, so both patches compute the same floats.
+//
+// A point is (P0 weight, P1 weight, P2 weight, patch index): the recompiled
+// domain shader reads it as iDomainPatch, r0 = .zyx and r1.x = .w, and blends
+// P0 * r0.z + P1 * r0.y + P2 * r0.x. Row `row`, column `col` of a level-L grid
+// weighs P0 by col / L, P1 by (L - row - col) / L and P2 by row / L, so edge
+// P0-P1 is row 0, edge P1-P2 is col 0 and edge P2-P0 is row + col = L.
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Records { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Points { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Indices { uint v[]; };
+
+layout(push_constant) uniform Push {
+    Records records;
+    Points points;
+    Indices indices;
+    uint patches;
+} p;
+
+// Which of an edge's `e` cuts the patch's point `k` of `level` along it goes
+// to: the nearest, ties towards the edge's middle.
+uint Snap(uint k, uint level, uint e) {
+    if (2 * k <= level) return (2 * k * e + level) / (2 * level);
+    return e - (2 * (level - k) * e + level) / (2 * level);
+}
+
+uint RowStart(uint row, uint level) { return row * (level + 1) - row * (row - 1) / 2; }
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    for (uint pi = gl_WorkGroupID.x; pi < p.patches; pi += gl_NumWorkGroups.x) {
+        const uvec4 r = p.records.v[pi];
+        const uint level = r.x & 0xFF;
+        const uint e0 = (r.x >> 8) & 0xFF, e1 = (r.x >> 16) & 0xFF, e2 = r.x >> 24;
+        const uint count = (level + 1) * (level + 2) / 2;
+        for (uint n = t; n < count; n += 64) {
+            uint row = 0;
+            while (n >= RowStart(row + 1, level)) ++row;
+            const uint col = n - RowStart(row, level);
+            vec3 w;
+            if (row == 0) {
+                const uint j = Snap(col, level, e0);
+                w = vec3(float(j), float(e0 - j), 0.0) / float(e0);
+            } else if (col == 0) {
+                const uint j = Snap(row, level, e1);
+                w = vec3(0.0, float(e1 - j), float(j)) / float(e1);
+            } else if (row + col == level) {
+                const uint j = Snap(row, level, e2);
+                w = vec3(float(e2 - j), 0.0, float(j)) / float(e2);
+            } else {
+                w = vec3(float(col), float(level - row - col), float(row)) / float(level);
+            }
+            p.points.v[r.y + n] = vec4(w, float(pi));
+        }
+        // Row `row` has level - row upward triangles and one downward triangle
+        // between each two of them, alternating.
+        const uint triangles = level * level;
+        for (uint m = t; m < triangles; m += 64) {
+            uint row = 0, first = 0;
+            while (m >= first + 2 * (level - row) - 1) {
+                first += 2 * (level - row) - 1;
+                ++row;
+            }
+            const uint q = m - first;
+            const uint col = q >> 1;
+            const uint here = r.y + RowStart(row, level), next = r.y + RowStart(row + 1, level);
+            uvec3 tri = (q & 1) == 0 ? uvec3(here + col, here + col + 1, next + col)
+                                     : uvec3(here + col + 1, next + col + 1, next + col);
+            p.indices.v[r.z + m * 3 + 0] = tri.x;
+            p.indices.v[r.z + m * 3 + 1] = tri.y;
+            p.indices.v[r.z + m * 3 + 2] = tri.z;
+        }
+    }
+}

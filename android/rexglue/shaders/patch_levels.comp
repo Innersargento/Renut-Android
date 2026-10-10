@@ -1,0 +1,92 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// First half of an adaptive triangle patch draw (see patch_expand.comp): turns
+// the guest's per-edge tessellation factors into a level per edge and per
+// patch, and lays the patches' points and indices out one after the other in
+// patch order, so the draw that follows is one indexed draw over all of them.
+//
+// The factors are the "indices" of the draw, three floats a patch: edge P0-P1,
+// P1-P2 and P2-P0 (N&B's water works them out that way). Like Xenia, a factor
+// f asks for f + 1 segments, clamped to the draw's tessellation level range; a
+// patch none of whose points is on screen gets 0, so one triangle. The patch
+// itself is cut at the largest of its three edge levels.
+//
+// One workgroup: the patches go through it 256 at a time with a prefix sum
+// over each block.
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Floats { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Records { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Args { uint v[]; };
+
+layout(push_constant) uniform Push {
+    Floats factors;
+    Records records;  // per patch: levels (patch | e01 << 8 | e12 << 16 | e20 << 24), first point, first index
+    Args args;        // VkDrawIndexedIndirectCommand
+    uint patches;
+    uint min_level;
+    uint max_level;
+    uint first_index;  // where the indices start in the buffer the draw binds
+} p;
+
+shared uint s_points[256];
+shared uint s_indices[256];
+shared uint s_base_points;
+shared uint s_base_indices;
+
+uint EdgeLevel(float f) {
+    if (isnan(f)) return p.max_level;
+    return uint(clamp(ceil(f + 1.0), float(p.min_level), float(p.max_level)));
+}
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    if (t == 0) {
+        s_base_points = 0;
+        s_base_indices = 0;
+    }
+    barrier();
+    for (uint block = 0; block < p.patches; block += 256) {
+        const uint i = block + t;
+        uint points = 0, indices = 0, levels = 0;
+        if (i < p.patches) {
+            const uint e0 = EdgeLevel(p.factors.v[i * 3 + 0]);
+            const uint e1 = EdgeLevel(p.factors.v[i * 3 + 1]);
+            const uint e2 = EdgeLevel(p.factors.v[i * 3 + 2]);
+            const uint level = max(max(e0, e1), e2);
+            points = (level + 1) * (level + 2) / 2;
+            indices = 3 * level * level;
+            levels = level | (e0 << 8) | (e1 << 16) | (e2 << 24);
+        }
+        s_points[t] = points;
+        s_indices[t] = indices;
+        barrier();
+        for (uint d = 1; d < 256; d <<= 1) {
+            const uint a = t >= d ? s_points[t - d] : 0;
+            const uint b = t >= d ? s_indices[t - d] : 0;
+            barrier();
+            s_points[t] += a;
+            s_indices[t] += b;
+            barrier();
+        }
+        if (i < p.patches) {
+            p.records.v[i] = uvec4(levels, s_base_points + s_points[t] - points,
+                                   s_base_indices + s_indices[t] - indices, 0);
+        }
+        barrier();
+        if (t == 255) {
+            s_base_points += s_points[255];
+            s_base_indices += s_indices[255];
+        }
+        barrier();
+    }
+    if (t == 0) {
+        p.args.v[0] = s_base_indices;
+        p.args.v[1] = 1;
+        p.args.v[2] = p.first_index;
+        p.args.v[3] = 0;
+        p.args.v[4] = 0;
+    }
+}
