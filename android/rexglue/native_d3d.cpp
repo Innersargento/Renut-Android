@@ -309,6 +309,29 @@ void RenderStates(Device& d, uint64_t mask, uint32_t first, uint32_t shadow) {
   }
 }
 
+// The surfaces behind the target registers just sent. `mask` is the 0x2000
+// block's (register 0x2000 + i at bit 63 - i); RB_COLOR_INFO, RB_DEPTH_INFO
+// and RB_COLOR1..3_INFO are the bound objects' +28 (SetRenderTarget,
+// SetDepthStencilSurface, sub_8227AB68 / sub_8227AF40), which keep the
+// objects at +12440..+12452 and +12456. Every SetRenderTarget marks its
+// register, so each change of object comes through here.
+void Surfaces(Device& d, uint64_t mask) {
+  static constexpr uint32_t kSlotOfRegister[6] = {0, 0, 4, 1, 2, 3};
+  uint32_t slots = 0;
+  for (uint32_t r = 1; r < 6; ++r) {
+    if ((mask >> (63 - r)) & 1) slots |= 1u << kSlotOfRegister[r];
+  }
+  if (!slots) return;
+  List& list = d.out.list();
+  list.words.push_back(kOpSurfaces | (slots << 8));
+  for (uint32_t slot = 0; slot < 5; ++slot) {
+    if (!((slots >> slot) & 1)) continue;
+    const uint32_t surface = U32(d.base, d.dev + (slot < 4 ? 12440 + slot * 4 : 12456));
+    list.words.push_back(surface);
+    for (uint32_t at : {24u, 28u, 36u}) list.words.push_back(surface ? U32(d.base, surface + at) : 0);
+  }
+}
+
 // SetPending_AluConstants (sub_8222D0E8): four constants (16 registers) a bit.
 void AluConstants(Device& d, uint64_t mask, uint32_t first, uint32_t shadow) {
   while (mask) {
@@ -669,7 +692,11 @@ void Flush(Device& d, const uint64_t (&masks)[5]) {
     }
     if (d2 & 0xFFF) RenderStates(d, d2 << 52, 0x2200, dev + kRegs2200);
     if (d2 & 0x1F000) RenderStates(d, (d2 << 47) & 0xF800000000000000ull, 0x2180, dev + kRegs2180);
-    if (d2 & (0xFFFFull << 42)) RenderStates(d, (d2 << 6) & 0xFFFF000000000000ull, 0x2000, dev + kRegs2000);
+    if (d2 & (0xFFFFull << 42)) {
+      const uint64_t mask = (d2 << 6) & 0xFFFF000000000000ull;
+      RenderStates(d, mask, 0x2000, dev + kRegs2000);
+      Surfaces(d, mask);
+    }
     if (d2 & 0x000003FFFFE00000ull) {
       RenderStates(d, (d2 << 22) & 0xFFFFF80000000000ull, 0x2100, dev + kRegs2100);
     }
@@ -709,7 +736,9 @@ void FlushRenderStates(Device& d) {
       d2 &= ~0x1F000ull;
     }
     if (d2 & (0xFFFFull << 42)) {
-      RenderStates(d, (d2 << 6) & 0xFFFF000000000000ull, 0x2000, dev + kRegs2000);
+      const uint64_t mask = (d2 << 6) & 0xFFFF000000000000ull;
+      RenderStates(d, mask, 0x2000, dev + kRegs2000);
+      Surfaces(d, mask);
       d2 &= ~(0xFFFFull << 42);
     }
     if (d2 & 0x000003FFFFE00000ull) {
@@ -1312,6 +1341,7 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     // surface registers RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005).
     for (uint32_t r = 0x2318; r <= 0x2323; ++r) list.words.push_back(U32(base, dev + kRegs2300 + (r - 0x2300) * 4));
     for (uint32_t r = 0; r < 6; ++r) list.words.push_back(U32(base, dev + kRegs2000 + r * 4));
+    list.words.push_back(source);
   });
   // What the copy leaves in the device: the texture's fence, and the state it
   // would have clobbered marked for the next draw (harmless on the host).
@@ -1645,6 +1675,9 @@ const uint32_t* Peek(Verifier& v) {
         if (child) v.stack.push_back({std::move(child), 0});
         break;
       }
+      case kOpSurfaces:
+        f.pos += 1 + 4 * uint32_t(__builtin_popcount(w[0] >> 8));
+        break;
       case kOpDraw:
       case kOpMarker:
       case kOpSwap:
@@ -1979,7 +2012,8 @@ void VerifySwap(uint64_t frame) {
   if (v.frames >= 300) WriteReport(v, frame);
 }
 
-void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t markers, uint64_t bad) {
+void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t markers, uint64_t bad,
+                  const std::function<std::string()>& executor) {
   static uint64_t last_frame = 0, last_draws = 0, last_dropped = 0, last_markers = 0;
   if (frame < last_frame + 300) return;
   const double f = double(frame - last_frame);
@@ -1998,6 +2032,7 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
       c(g_counts.recordings), c(g_counts.devices), c(g_counts.foreign_immediate), c(g_counts.publishes),
       c(g_counts.screen_extent), c(g_counts.predicated_tiling), c(g_counts.set_pending_predicated),
       c(g_counts.no_scratch));
+  if (executor) out += executor();
   last_frame = frame;
   last_draws = draws;
   last_dropped = ring_draws_dropped;

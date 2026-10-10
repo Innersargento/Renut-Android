@@ -1174,6 +1174,22 @@ struct Target {
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
   // Serial of the last draw that rendered to it (see IssueD3DClear).
   uint64_t last_used = 0;
+  // Native lists: the D3DSurface it is (0 for a target found by EDRAM base),
+  // its RB_COLOR_INFO / RB_DEPTH_INFO, and the frame it was last used in.
+  uint32_t surface = 0, surface_info = 0;
+  uint64_t used_frame = 0;
+};
+
+// Keys of the targets made per surface (the others are EDRAM base, format,
+// depth and pitch; see GetTarget).
+constexpr uint64_t kSurfaceTargetKey = 1ull << 63;
+
+// A native resolve's source and the depth its clear goes to, by surface, and
+// the rectangle in the source's pixels.
+struct ResolveSurfaces {
+  Target* source = nullptr;
+  Target* depth = nullptr;
+  uint32_t x = 0, y = 0, width = 0, height = 0;
 };
 
 struct Resolved {
@@ -1412,6 +1428,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void NativeWrite(uint32_t first, const uint32_t* values, uint32_t count);
   void NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size);
   void NativeClear(const uint32_t* record);
+  void NativeClearEdram(const uint32_t* record);
+  // <files>/native-d3d-edram: targets by EDRAM base again (live, to compare).
+  bool edram_targets_ = false;
   bool native_on_ = false;
   bool native_started_ = false;
   uint32_t native_opaque_ = 0;     // inside an opaque call's PM4
@@ -1436,8 +1455,26 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
-  bool ExecuteResolve(const draw_util::ResolveInfo& info);
+  bool ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces* surfaces = nullptr);
   void NativeResolve(const uint32_t* record);
+  // The surfaces bound when the lists last sent the target registers
+  // (kOpSurfaces): render targets 0-3 and depth.
+  struct ListSurface {
+    uint32_t object = 0, surface_info = 0, info = 0, dims = 0;
+  };
+  std::array<ListSurface, 5> native_surfaces_{};
+  // The target of a slot's surface; `info_register` is what the register
+  // file holds for it, which must be the surface's.
+  Target* NativeTarget(uint32_t slot, uint32_t info_register);
+  Target* SurfaceTarget(uint32_t slot);
+  // A framebuffer is as big as its first attachment: the others grow to it.
+  void MatchSurfaceSizes(std::array<Target*, 4>& colors, uint32_t color_count, Target*& depth);
+  bool GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height);
+  void RetireFramebuffers();
+  void EvictSurfaceTargets();
+  std::string SurfaceReport();
+  uint64_t surface_created_ = 0, surface_grown_ = 0, surface_evicted_ = 0, surface_mismatch_ = 0;
+  uint64_t surface_missing_ = 0;
   // Direct3D's own Clear (see IssueDraw).
   void IssueD3DClear(xenos::EdramMode edram_mode);
   // Copies a rectangle of a depth target's depth into an R32_FLOAT texture, or
@@ -4398,6 +4435,7 @@ uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint
 Target* PlumeCommandProcessor::FindTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch) {
   Target* best = nullptr;
   for (auto& [key, target] : targets_) {
+    if (key & kSurfaceTargetKey) continue;
     if ((key & 0xFFF) == base && ((key >> 12) & 0xF) == format && bool((key >> 16) & 1) == depth) {
       if (pitch && target.width == pitch) return &target;
       if (!best || target.width * target.height > best->width * best->height) best = &target;
@@ -4436,6 +4474,130 @@ Target* PlumeCommandProcessor::GetTarget(uint32_t base, uint32_t format, bool de
   framebuffers_.clear();
   bound_framebuffer_ = nullptr;
   return &target;
+}
+
+// ---------------------------------------------------------------------------
+// Render targets per Direct3D surface (native lists). The surface object and
+// its header name the target, so two surfaces sharing EDRAM are two targets,
+// and its size is the surface's own (D3DSurface_GetDesc: +36 holds width - 1
+// from bit 18 and height - 1 from bit 3; the width is the pitch, as for the
+// EDRAM targets).
+
+Target* PlumeCommandProcessor::NativeTarget(uint32_t slot, uint32_t info_register) {
+  const ListSurface& s = native_surfaces_[slot];
+  if (!s.object) {
+    ++surface_missing_;
+    return nullptr;
+  }
+  if (s.info != info_register) ++surface_mismatch_;
+  return SurfaceTarget(slot);
+}
+
+Target* PlumeCommandProcessor::SurfaceTarget(uint32_t slot) {
+  const ListSurface& s = native_surfaces_[slot];
+  if (!s.object) return nullptr;
+  const bool depth = slot == 4;
+  const uint32_t format = depth ? (s.info >> 16) & 1 : (s.info >> 16) & 0xF;
+  const uint32_t header = s.surface_info * 0x9E3779B1u ^ s.info * 0x85EBCA77u ^ s.dims * 0xC2B2AE3Du ^
+                          uint32_t(depth);
+  const uint64_t key = kSurfaceTargetKey | (uint64_t(header & 0x7FFFFFFFu) << 32) | s.object;
+  Target& target = targets_[key];
+  target.last_used = ++target_serial_;
+  target.used_frame = swaps_;
+  if (target.texture) return &target;
+  const uint32_t pitch = s.surface_info & 0x3FFF;
+  const uint32_t width = std::max({pitch, ((s.dims >> 18) & 0x3FFF) + 1, 16u});
+  const uint32_t height = std::max(((((s.dims >> 3) & 0x7FFF) + 1) + 15) & ~15u, 16u);
+  const RenderFormat rf = depth ? RenderFormat::D32_FLOAT_S8_UINT
+                                : ColorFormat(xenos::ColorRenderTargetFormat(format));
+  target.texture = device_->createTexture(depth ? RenderTextureDesc::DepthTarget(width, height, rf)
+                                                : RenderTextureDesc::ColorTarget(width, height, rf));
+  if (!target.texture) {
+    targets_.erase(key);
+    return nullptr;
+  }
+  target.format = rf;
+  target.width = width;
+  target.height = height;
+  target.depth = depth;
+  target.layout = RenderTextureLayout::UNKNOWN;
+  target.surface = s.object;
+  target.surface_info = s.info;
+  ++surface_created_;
+  RetireFramebuffers();
+  return &target;
+}
+
+void PlumeCommandProcessor::RetireFramebuffers() {
+  for (auto& [key, framebuffer] : framebuffers_)
+    retired_framebuffer_slots_[slot_].push_back(std::move(framebuffer));
+  framebuffers_.clear();
+  bound_framebuffer_ = nullptr;
+}
+
+bool PlumeCommandProcessor::GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height) {
+  width = std::max(width, target.width);
+  height = std::max(height, target.height);
+  if (width == target.width && height == target.height) return true;
+  auto texture = device_->createTexture(target.depth ? RenderTextureDesc::DepthTarget(width, height, target.format)
+                                                     : RenderTextureDesc::ColorTarget(width, height, target.format));
+  if (!texture) return false;
+  if (target.texture) retired_slots_[slot_].push_back(std::move(target.texture));
+  target.texture = std::move(texture);
+  target.width = width;
+  target.height = height;
+  target.layout = RenderTextureLayout::UNKNOWN;
+  ++surface_grown_;
+  RetireFramebuffers();
+  return true;
+}
+
+void PlumeCommandProcessor::MatchSurfaceSizes(std::array<Target*, 4>& colors, uint32_t color_count, Target*& depth) {
+  Target* first = color_count ? colors[0] : depth;
+  if (!first) return;
+  uint32_t width = first->width, height = first->height;
+  for (uint32_t i = 1; i < color_count; ++i) {
+    if (colors[i]) width = std::max(width, colors[i]->width), height = std::max(height, colors[i]->height);
+  }
+  if (depth) width = std::max(width, depth->width), height = std::max(height, depth->height);
+  for (uint32_t i = 0; i < color_count; ++i) {
+    if (colors[i] && !GrowSurfaceTarget(*colors[i], width, height)) colors[i] = nullptr;
+  }
+  if (depth && !GrowSurfaceTarget(*depth, width, height)) depth = nullptr;
+}
+
+// Targets of surfaces not drawn to for ten seconds go (a released surface's
+// object is reused for another).
+void PlumeCommandProcessor::EvictSurfaceTargets() {
+  if (swaps_ % 60) return;
+  bool evicted = false;
+  for (auto it = targets_.begin(); it != targets_.end();) {
+    if ((it->first & kSurfaceTargetKey) && it->second.used_frame + 600 < swaps_) {
+      if (it->second.texture) retired_slots_[slot_].push_back(std::move(it->second.texture));
+      it = targets_.erase(it);
+      ++surface_evicted_;
+      evicted = true;
+    } else {
+      ++it;
+    }
+  }
+  if (evicted) RetireFramebuffers();
+}
+
+std::string PlumeCommandProcessor::SurfaceReport() {
+  size_t count = 0;
+  for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
+  std::string out = fmt::format(
+      "== surfaces: {} targets now, {} created, {} grown, {} evicted; register/surface mismatches {}, "
+      "slots without a surface {}\n",
+      count, surface_created_, surface_grown_, surface_evicted_, surface_mismatch_, surface_missing_);
+  for (const auto& [key, t] : targets_) {
+    if (!(key & kSurfaceTargetKey)) continue;
+    out += fmt::format("   surface {:08X} {} {}x{} base {} format {} last frame {}\n", t.surface,
+                       t.depth ? "depth" : "color", t.width, t.height, t.surface_info & 0xFFF,
+                       t.depth ? (t.surface_info >> 16) & 1 : (t.surface_info >> 16) & 0xF, t.used_frame);
+  }
+  return out;
 }
 
 RenderFramebuffer* PlumeCommandProcessor::GetFramebuffer(const std::array<Target*, 4>& colors,
@@ -5371,23 +5533,40 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
         f.pos += 4;
         break;
       case native_d3d::kOpResolve:
-        if (f.pos + 23 > words.size()) {
+        if (f.pos + native_d3d::kResolveWords > words.size()) {
           ++native_bad_;
           f.pos = words.size();
           break;
         }
-        f.pos += 23;
+        f.pos += native_d3d::kResolveWords;
         NativeResolve(w);
         break;
       case native_d3d::kOpClear:
-        if (f.pos + 18 > words.size()) {
+        if (f.pos + native_d3d::kClearWords > words.size()) {
           ++native_bad_;
           f.pos = words.size();
           break;
         }
-        f.pos += 18;
+        f.pos += native_d3d::kClearWords;
         NativeClear(w);
         break;
+      case native_d3d::kOpSurfaces: {
+        const uint32_t slots = (w[0] >> 8) & 0x1F;
+        const size_t n = 1 + 4 * size_t(__builtin_popcount(slots));
+        if (f.pos + n > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        const uint32_t* p = w + 1;
+        for (uint32_t slot = 0; slot < 5; ++slot) {
+          if (!((slots >> slot) & 1)) continue;
+          native_surfaces_[slot] = {p[0], p[1], p[2], p[3]};
+          p += 4;
+        }
+        f.pos += n;
+        break;
+      }
       default:
         ++native_bad_;
         f.pos = words.size();
@@ -5399,9 +5578,54 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
 }
 
 // A clear record: Direct3D's clear of the current targets, without its draw.
-// Targets are found as IssueD3DClear finds them (EDRAM base, format, the
-// surface pitch), and only the clear's rectangle is cleared.
+// The targets are the bound surfaces', and only the clear's rectangle is
+// cleared.
 void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
+  if (edram_targets_) return NativeClearEdram(w);
+  FlushDeferred();
+  if (skip_mask_ & 134217728) return;
+  const uint32_t flags = w[0] >> 8, present = w[17];
+  const int32_t x1 = int32_t(w[1]), y1 = int32_t(w[2]), x2 = int32_t(w[3]), y2 = int32_t(w[4]);
+  float color[4], z;
+  std::memcpy(color, w + 5, sizeof(color));
+  std::memcpy(&z, w + 9, sizeof(z));
+  const uint32_t stencil = w[10] & 0xFF;
+  ++stats_.clears;
+  auto clip = [&](const Target& t) {
+    return RenderRect(std::clamp(x1, 0, int32_t(t.width)), std::clamp(y1, 0, int32_t(t.height)),
+                      std::clamp(x2, 0, int32_t(t.width)), std::clamp(y2, 0, int32_t(t.height)));
+  };
+  Trace("native clear flags={:X} present={:X} rect=({},{})-({},{}) color=({}, {}, {}, {}) z={} s={}", flags,
+        present, x1, y1, x2, y2, color[0], color[1], color[2], color[3], z, stencil);
+  std::array<Target*, 4> cleared{};
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!((flags >> i) & 1) || !((present >> i) & 1)) continue;
+    Target* target = NativeTarget(i, w[12 + i]);
+    if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
+    cleared[i] = target;
+    const RenderRect rect = clip(*target);
+    if (rect.right <= rect.left || rect.bottom <= rect.top) continue;
+    Transition(target->texture.get(), target->layout, RenderTextureLayout::COLOR_WRITE);
+    std::array<Target*, 4> colors{target};
+    SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
+    L()->clearColor(0, RenderColor(color[0], color[1], color[2], color[3]), &rect, 1);
+  }
+  const bool clear_depth = flags & 0x10, clear_stencil = flags & 0x20;
+  if ((clear_depth || clear_stencil) && (present & 0x10)) {
+    if (Target* depth = NativeTarget(4, w[16])) {
+      const RenderRect rect = clip(*depth);
+      if (rect.right > rect.left && rect.bottom > rect.top) {
+        Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+        std::array<Target*, 4> none{};
+        SetFramebuffer(GetFramebuffer(none, 0, depth));
+        L()->clearDepthStencil(clear_depth, clear_stencil, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
+      }
+    }
+  }
+}
+
+// <files>/native-d3d-edram: the clear by EDRAM base, as before targets per surface.
+void PlumeCommandProcessor::NativeClearEdram(const uint32_t* w) {
   FlushDeferred();
   if (skip_mask_ & 134217728) return;
   const uint32_t flags = w[0] >> 8, present = w[17];
@@ -5419,6 +5643,7 @@ void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
   auto find = [&](uint32_t base, uint32_t format, bool depth) -> Target* {
     Target* best = nullptr;
     for (auto& [key, target] : targets_) {
+      if (key & kSurfaceTargetKey) continue;
       if ((key & 0xFFF) != base || ((key >> 12) & 0xF) != format || bool((key >> 16) & 1) != depth) continue;
       if (target.width != pitch && target.width != 2 * pitch) continue;
       if (!best || target.last_used > best->last_used) best = &target;
@@ -5703,7 +5928,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     for (uint32_t i = 0; i < color_count; ++i) {
       reg::RB_COLOR_INFO info;
       info.value = regs[kColorInfo[i]];
-      colors[i] = GetTarget(info.color_base, uint32_t(info.color_format), false, pitch, height);
+      colors[i] = native_swapped_ && !edram_targets_ ? NativeTarget(i, info.value)
+                                  : GetTarget(info.color_base, uint32_t(info.color_format), false, pitch, height);
       if (!colors[i]) {
         ++stats_.no_target;
         return true;
@@ -5714,7 +5940,17 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   Target* depth = nullptr;
   if (depth_control.z_enable || depth_control.stencil_enable) {
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-    depth = GetTarget(depth_info.depth_base, uint32_t(depth_info.depth_format), true, pitch, height);
+    depth = native_swapped_ && !edram_targets_ ? NativeTarget(4, depth_info.value)
+                            : GetTarget(depth_info.depth_base, uint32_t(depth_info.depth_format), true, pitch, height);
+  }
+  if (native_swapped_ && !edram_targets_) {
+    MatchSurfaceSizes(colors, color_count, depth);
+    for (uint32_t i = 0; i < color_count; ++i) {
+      if (!colors[i]) {
+        ++stats_.no_target;
+        return true;
+      }
+    }
   }
   if (!color_count && !depth) return Drop("no color or depth", vs, ps);
   // Debug (plume-bind 16): drop depth-only draws - the shadow casters - to
@@ -8096,10 +8332,21 @@ void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
     ++native_bad_;
     return;
   }
-  ExecuteResolve(info);
+  // The source is the surface bound in the slot the resolve names; its
+  // register is RB_COLOR_INFO, _DEPTH_INFO or RB_COLOR1..3_INFO.
+  static constexpr uint32_t kRegisterOfSlot[5] = {1, 3, 4, 5, 2};
+  const uint32_t slot = std::min(w[23], 4u);
+  ResolveSurfaces surfaces;
+  surfaces.source = NativeTarget(slot, w[17 + kRegisterOfSlot[slot]]);
+  surfaces.depth = SurfaceTarget(4);
+  surfaces.x = w[1];
+  surfaces.y = w[2];
+  surfaces.width = w[3] > w[1] ? w[3] - w[1] : 0;
+  surfaces.height = w[4] > w[2] ? w[4] - w[2] : 0;
+  ExecuteResolve(info, edram_targets_ ? nullptr : &surfaces);
 }
 
-bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info) {
+bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces* surfaces) {
   ++stats_.resolves;
   // plume-skip bit 33554432 drops the resolve entirely. Attributing intervals
   // between timestamps proved unreliable on this tiler - the same frame read as
@@ -8107,8 +8354,8 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info) {
   // pass-closing barrier the mark sat. Removing a category of work and
   // measuring the difference does not depend on that.
   if (skip_mask_ & 33554432) return true;
-  const uint32_t width = info.coordinate_info.width_div_8 * 8;
-  const uint32_t height = info.height_div_8 * 8;
+  const uint32_t width = surfaces ? surfaces->width : info.coordinate_info.width_div_8 * 8;
+  const uint32_t height = surfaces ? surfaces->height : info.height_div_8 * 8;
   if (!width || !height) return true;
 
   const bool copying_depth = info.IsCopyingDepth();
@@ -8130,12 +8377,15 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info) {
   tile_size(edram, tile_width, tile_height);
   // EDRAM bases are shared between targets of different pitches (both shadow
   // maps use depth base 0), so prefer the one the resolve's pitch names.
-  Target* source = FindTarget(original, edram.format, copying_depth,
-                              std::max(1u, uint32_t(edram.pitch_tiles)) * tile_width);
+  Target* source = surfaces ? surfaces->source
+                            : FindTarget(original, edram.format, copying_depth,
+                                         std::max(1u, uint32_t(edram.pitch_tiles)) * tile_width);
   const uint32_t tiles = edram.base_tiles - original;
   const uint32_t pitch_tiles = std::max(1u, uint32_t(edram.pitch_tiles));
-  const uint32_t x = (tiles % pitch_tiles) * tile_width + info.coordinate_info.edram_offset_x_div_8 * 8;
-  uint32_t y = (tiles / pitch_tiles) * tile_height + info.coordinate_info.edram_offset_y_div_8 * 8;
+  const uint32_t x = surfaces ? surfaces->x
+                              : (tiles % pitch_tiles) * tile_width + info.coordinate_info.edram_offset_x_div_8 * 8;
+  uint32_t y = surfaces ? surfaces->y
+                        : (tiles / pitch_tiles) * tile_height + info.coordinate_info.edram_offset_y_div_8 * 8;
   // plume-skip bit 134217728 drops every clear, these and Direct3D's. The
   // picture is wrong; it measures what the clear-only passes cost.
   const bool skip_clears = skip_mask_ & 134217728;
@@ -8143,7 +8393,7 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info) {
   // the whole screen, which the upper band now draws, but clear only the band;
   // the lower band's read it from below the upper one.
   uint32_t copy_height = height;
-  if (merge_frame_ && source && pitch_tiles * tile_width == band_pitch_ &&
+  if (!surfaces && merge_frame_ && source && pitch_tiles * tile_width == band_pitch_ &&
       original == (copying_depth ? band_depth_base_ : band_color_base_)) {
     if (band2_) {
       y += band_h_;
@@ -8259,8 +8509,9 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info) {
   if (info.IsClearingDepth() && !skip_clears) {
     uint32_t depth_tile_width, depth_tile_height;
     tile_size(info.depth_edram_info, depth_tile_width, depth_tile_height);
-    Target* depth = FindTarget(info.depth_original_base, info.depth_edram_info.format, true,
-                               std::max(1u, uint32_t(info.depth_edram_info.pitch_tiles)) * depth_tile_width);
+    Target* depth = surfaces ? surfaces->depth
+                             : FindTarget(info.depth_original_base, info.depth_edram_info.format, true,
+                                          std::max(1u, uint32_t(info.depth_edram_info.pitch_tiles)) * depth_tile_width);
     if (depth) {
       Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
       std::array<Target*, 4> none{};
@@ -8591,6 +8842,7 @@ void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
   auto find = [&](uint32_t base, uint32_t format, bool depth) -> Target* {
     Target* best = nullptr;
     for (auto& [key, target] : targets_) {
+      if (key & kSurfaceTargetKey) continue;
       if ((key & 0xFFF) != base || ((key >> 12) & 0xF) != format || bool((key >> 16) & 1) != depth) continue;
       if (target.width != pitch && target.width != 2 * pitch) continue;
       if (!best || target.last_used > best->last_used) best = &target;
@@ -8756,7 +9008,9 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       ++native_bad_;
     }
     RunNative(UINT32_MAX);
-    native_d3d::NativeReport(swaps_, native_draws_, native_ring_draws_dropped_, native_markers_, native_bad_);
+    EvictSurfaceTargets();
+    native_d3d::NativeReport(swaps_, native_draws_, native_ring_draws_dropped_, native_markers_, native_bad_,
+                             [this] { return SurfaceReport(); });
   }
   FlushDeferred();
   if (skin_log_ && swaps_ == 930) LogSkinned();
@@ -9244,6 +9498,11 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
     }
     keep_streams_ = keep_streams;
+    const bool edram_targets = access((root + "/native-d3d-edram").c_str(), F_OK) == 0;
+    if (edram_targets != edram_targets_) {
+      REXLOG_INFO("Renut: native lists' targets by {}", edram_targets ? "EDRAM base" : "surface");
+    }
+    edram_targets_ = edram_targets;
     const bool writeback = REXCVAR_GET(renut_plume_memexport_readback) ||
         access((root + "/plume-writeback").c_str(), F_OK) == 0;
     if (writeback != writeback_) {

@@ -19,6 +19,7 @@
 // PM4 draw against the native one and writes files/native-d3d-verify.txt),
 // 2 native (the lists render, PM4 draws are not issued).
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,9 +45,16 @@ enum Op : uint32_t {
   // RB_SURFACE_INFO, RB_COLOR_INFO of targets 0-3, RB_DEPTH_INFO, present (bits 0-3 targets, 4 depth)
   kOpClear = 9,
   // [op] x0, y0, x1, y1 (resolve-aligned), RB_COPY_CONTROL .. RB_COPY_SURFACE_SLICE
-  // (0x2318-0x2323), RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005)
+  // (0x2318-0x2323), RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005), source slot
+  // (0-3 render target, 4 depth)
   kOpResolve = 10,
+  // [op | slots << 8] for each slot set (bits 0-3 render targets 0-3, 4 depth),
+  // in order: the D3DSurface bound there, its +24 (RB_SURFACE_INFO), +28
+  // (RB_COLOR_INFO / RB_DEPTH_INFO) and +36 (width - 1 << 18 | height - 1 << 3).
+  // Comes with every send of the target registers it stands behind.
+  kOpSurfaces = 11,
 };
+constexpr uint32_t kResolveWords = 24, kClearWords = 18;
 
 enum DrawFlags : uint32_t {
   kDrawPredicated = 1,    // obeys the bin mask, as every Direct3D draw packet does
@@ -103,7 +111,8 @@ void VerifySwap(uint64_t frame);
 constexpr uint32_t kNopMagic = 0x4E415444;  // "NATD"
 // Native mode: the executor's counters, written with the front end's to
 // files/native-d3d-verify-native.txt every 300 frames.
-void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t markers, uint64_t bad);
+void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t markers, uint64_t bad,
+                  const std::function<std::string()>& executor);
 // Where the report goes (the runtime's files directory).
 void SetFilesDirectory(std::string directory);
 
