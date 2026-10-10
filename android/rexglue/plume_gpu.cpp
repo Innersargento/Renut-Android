@@ -98,7 +98,7 @@ REXCVAR_DEFINE_INT32(renut_plume_depth_strip, 1, "reNut/Plume",
 REXCVAR_DEFINE_BOOL(renut_plume_native, true, "reNut/Plume",
                     "Native renderer v0: depth-only draws of rigid meshes use the renderer's own vertex "
                     "shader with the transform in push constants instead of the recompiled guest one");
-REXCVAR_DEFINE_BOOL(renut_plume_native_view, false, "reNut/Plume",
+REXCVAR_DEFINE_BOOL(renut_plume_native_view, true, "reNut/Plume",
                     "Native renderer v1 (test): draw the engine's world draws of rigid meshes entirely with "
                     "the renderer's own shaders - one texture and a simple light, no guest material");
 REXCVAR_DEFINE_INT32(renut_plume_rel_constants, 2, "reNut/Plume",

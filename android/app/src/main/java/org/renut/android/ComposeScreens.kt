@@ -352,8 +352,6 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
-    val nativeRenderer = activity.uiRuntimeOption("renut_plume_native", "true") == "true"
-    val nativeView = activity.uiRuntimeOption("renut_plume_native_view", "false") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Header("RENUT / ANDROID", "Configurações", "Jogo, vídeo, controles e diagnóstico.") }
         item {
@@ -401,12 +399,6 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
                 }
                 ToggleRow("Remover bloom", noBloom, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_bloom", it.toString())
-                }
-                ToggleRow("Renderizador nativo (experimental)", nativeRenderer, !busy) {
-                    activity.uiSetRuntimeOption("renut_plume_native", it.toString())
-                }
-                ToggleRow("Visão nativa do motor (teste)", nativeView, !busy) {
-                    activity.uiSetRuntimeOption("renut_plume_native_view", it.toString())
                 }
             }
         }

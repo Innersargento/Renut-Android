@@ -50,7 +50,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
-REXCVAR_DEFINE_INT32(renut_native_d3d, 0, "reNut",
+REXCVAR_DEFINE_INT32(renut_native_d3d, 2, "reNut",
                      "Native Direct3D front end: 0 off, 1 verify (built next to the PM4 and checked "
                      "draw by draw against it, files/native-d3d-verify.txt), 2 native (renders without "
                      "PM4 draws)");
