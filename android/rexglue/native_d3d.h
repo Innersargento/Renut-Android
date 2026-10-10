@@ -75,6 +75,10 @@ enum Op : uint32_t {
   kOpStreams = 17,
   // [op] the index buffer's GPU address and size in bytes
   kOpIndices = 18,
+  // [op] GPU address, reference, mask: the GPU waits until the dword there,
+  // masked, equals the reference (WAIT_REG_MEM; the swap's wait for its
+  // vertical blank, which paces the game), native sync
+  kOpWaitMemory = 19,
 };
 constexpr uint32_t kResolveWords = 30, kClearWords = 18;
 

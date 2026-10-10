@@ -63,6 +63,7 @@ REX_FUNC(sub_82656DA0);  // D3D_PatchVertexShaderToMatchPixelShader
 REX_FUNC(sub_821E5218);  // D3D_PatchVertexShaderToMatchVertexDeclaration
 REX_FUNC(sub_82210AB0);  // KickOff: more ring space
 void __imp__sub_822052C8(PPCContext& __restrict, uint8_t*);  // InsertCallback, the original
+void __imp__sub_8228A748(PPCContext& __restrict, uint8_t*);  // SynchronizeToPresentationInterval
 }
 
 namespace renut::native_d3d {
@@ -1505,6 +1506,38 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// D3D SynchronizeToPresentationInterval(device, immediate) (sub_8228A748):
+// the swap paced to the vertical blank. Unless immediate it sets scratch
+// register 1 (written back to +10900's block at +4), has the GPU wait for
+// that, queues the swap callback (InsertCallback, recorded by its own hook)
+// and has the GPU wait until the vertical-blank handler clears it again:
+// the command processor stalls there, and so does the game behind its
+// fences, at the presentation interval it chose (30 FPS unless unlocked).
+bool SynchronizeToPresentationInterval(PPCContext& ctx, uint8_t* base) {
+  const uint32_t dev = ctx.r3.u32, immediate = ctx.r4.u32;
+  std::unique_lock lock(g_front.mutex);
+  if (!g_front.sync_recording) return false;
+  const uint32_t block = U32(base, dev + 10900);
+  const bool wait = !immediate && block;
+  if (wait) {
+    List& list = Current(dev);
+    list.words.push_back(kOpCallback | (2u << 8));
+    list.words.push_back(0x00000579u);  // type 0: SCRATCH_REG1
+    list.words.push_back(1);
+  }
+  lock.unlock();
+  __imp__sub_8228A748(ctx, base);
+  if (wait) {
+    lock.lock();
+    List& list = Current(dev);
+    list.words.push_back(kOpWaitMemory);
+    list.words.push_back(Phys(block + 4));
+    list.words.push_back(0);
+    list.words.push_back(0xFFFFFFFFu);
+  }
+  return true;
+}
+
 // The watchdog, in D3D_CBlocker_Check (sub_8264DCD0), which every Direct3D
 // wait calls in its loop: the blocker's device is at +0.
 void CheckWait(PPCContext& ctx, uint8_t* base) {
@@ -1610,6 +1643,8 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       return false;
     case kD3D_InsertCallback:
       return InsertCallback(ctx, base);
+    case kD3D_SynchronizeToPresentationInterval:
+      return SynchronizeToPresentationInterval(ctx, base);
     case kD3D_CBlocker_Check:
       if (REXCVAR_GET(renut_native_sync)) CheckWait(ctx, base);
       return false;

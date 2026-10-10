@@ -1428,6 +1428,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unordered_map<uint32_t, bool> segment_sync_;
   bool native_presenting_ = false;
   uint64_t native_fences_ = 0, native_presents_ = 0, native_callbacks_ = 0;
+  uint64_t native_waits_ = 0, native_wait_timeouts_ = 0, native_wait_us_ = 0;
   uint64_t segments_skipped_ = 0, segments_walked_ = 0, segments_unnamed_ = 0;
   void NativeCallback(const uint32_t* words, uint32_t count);
   // A dword the GPU writes back (big-endian), at a GPU address.
@@ -4504,11 +4505,12 @@ std::string PlumeCommandProcessor::SurfaceReport() {
   std::string out = fmt::format(
       "== surfaces: {} targets now, {} created, {} grown, {} evicted; register/surface mismatches {}, "
       "slots without a surface {}\n== resolves: {} into their texture object, {} by address\n"
-      "== executor: segments {} not walked, {} walked, {} named by no list; fences {}, presents {}, callbacks {}; "
-      "streams kept by buffer {}, by window {}\n",
+      "== executor: segments {} not walked, {} walked, {} named by no list; fences {}, presents {}, callbacks {}, "
+      "vblank waits {} ({} ms, {} timed out); streams kept by buffer {}, by window {}\n",
       count, surface_created_, surface_grown_, surface_evicted_, surface_mismatch_, surface_missing_,
       object_resolves_, address_resolves_count_, segments_skipped_, segments_walked_, segments_unnamed_,
-      native_fences_, native_presents_, native_callbacks_, object_streams_, window_streams_);
+      native_fences_, native_presents_, native_callbacks_, native_waits_, native_wait_us_ / 1000,
+      native_wait_timeouts_, object_streams_, window_streams_);
   for (const auto& [key, t] : targets_) {
     if (!(key & kSurfaceTargetKey)) continue;
     out += fmt::format("   surface {:08X} {} {}x{} base {} format {} last frame {}\n", t.surface,
@@ -5552,6 +5554,30 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
           q += 2;
         }
         f.pos += n;
+        break;
+      }
+      case native_d3d::kOpWaitMemory: {
+        if (f.pos + 4 > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        f.pos += 4;
+        // As the GPU would, until the vertical-blank handler (another thread)
+        // writes the value; never longer than a few frames.
+        const auto* word = memory_->TranslatePhysical<const uint32_t*>(w[1]);
+        const auto start = std::chrono::steady_clock::now();
+        ++native_waits_;
+        while ((__builtin_bswap32(__atomic_load_n(word, __ATOMIC_ACQUIRE)) & w[3]) != w[2]) {
+          if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) {
+            ++native_wait_timeouts_;
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::microseconds(250));
+        }
+        native_wait_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count());
         break;
       }
       case native_d3d::kOpIndices:
