@@ -93,6 +93,9 @@ REXCVAR_DEFINE_INT32(renut_plume_depth_strip, 1, "reNut/Plume",
                      "Draw depth-only draws (no fragment shader: the shadow maps) with a vertex shader "
                      "that has lost its interpolant outputs, which nothing reads: 0 off, 1 on")
     .range(0, 1);
+REXCVAR_DEFINE_BOOL(renut_plume_native, true, "reNut/Plume",
+                    "Native renderer v0: depth-only draws of rigid meshes use the renderer's own vertex "
+                    "shader with the transform in push constants instead of the recompiled guest one");
 REXCVAR_DEFINE_INT32(renut_plume_rel_constants, 2, "reNut/Plume",
                      "How a vertex shader's relative constant reads (a0, aL: skinning matrices) are served: "
                      "0 by the file's four blocks, 1 by the whole file as one block, 2 by that block "
@@ -148,7 +151,31 @@ using namespace rex::graphics;
 #include "shaders/debug_point.frag.inc"
 #include "shaders/debug_trivial.frag.inc"
 #include "shaders/debug_trivial.vert.inc"
+#include "shaders/native_rigid.vert.inc"
 #include "shaders/rect_list.geom.inc"
+
+// Native renderer v0. The guest vertex shaders whose position is a rigid
+// transform of the input position by four float constants
+// (native_vs_table.inc, from tools/native/scan_native_vs.py): a depth-only draw
+// of one of them is drawn with native_rigid.vert, which reads that transform
+// from the push constants instead of the guest's constant blocks.
+struct NativeRigid {
+  uint8_t location, swizzle;
+  uint8_t rows[4];
+};
+const std::unordered_map<uint64_t, NativeRigid>& NativeRigidShaders() {
+  static const std::unordered_map<uint64_t, NativeRigid> table = {
+#define X(hash, location, swizzle, k0, k1, k2, k3) {hash, {location, swizzle, {k0, k1, k2, k3}}},
+#include "native_vs_table.inc"
+#undef X
+  };
+  return table;
+}
+// The push constants: the guest's three block addresses, then (native draws)
+// the four rows, g_ViewportScaleOffset and g_HalfPixelOffset at kNativePushOffset.
+constexpr uint32_t kPushBytes = 128;
+constexpr uint32_t kNativePushOffset = 32;
+constexpr uint32_t kNativeSwizzleSpec = 100;
 
 // Where microcode without a recompiled shader is saved (SetPlumeMissDumpDirectory).
 std::string g_miss_dump_directory;
@@ -1209,6 +1236,7 @@ struct Stats {
   // those windows had in game order against the order they were recorded in.
   uint64_t deferred_draws = 0, defer_windows = 0, defer_binds_before = 0, defer_binds_after = 0;
   uint64_t shadow_culled = 0;  // plume-shadowmin
+  uint64_t native_draws = 0;   // drawn by the native renderer (plume-native)
   uint64_t twin_skipped = 0;   // MSAA off: per-band copies of a draw already drawn
   // New pipelines by how they were made: found in the driver's cache at the
   // draw, found by a worker, or compiled (and of those, how many waited for a
@@ -1681,6 +1709,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // shader. What the GPU still spends is what a draw costs apart from the
   // guest's shaders - the split the per-draw cost has been missing.
   std::unique_ptr<RenderShader> debug_trivial_vs_, debug_trivial_fs_;
+  std::unique_ptr<RenderShader> native_rigid_vs_;  // native renderer v0 (NativeRigidShaders)
   uint32_t trivial_mode_ = 0;
 
   // Keyed by guest base. Never overlapping: a new range swallows the ones it touches.
@@ -1889,6 +1918,11 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     float blend_factor[4] = {};
     uint32_t stencil_ref = 0, stencil_mask = 0, stencil_write_mask = 0;
     uint64_t push[3] = {};
+    // Native renderer v0: the draw's vertex shader is native_rigid.vert, which
+    // reads these (four rows, viewport scale/offset, half-pixel offset) at
+    // kNativePushOffset and no constant block.
+    bool native = false;
+    float native_push[24] = {};
     uint32_t constant_offsets[kConstantBindings] = {};
     RenderViewport viewport;
     RenderRect scissor;
@@ -1992,6 +2026,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // fragment shader with the vertex shader's output-less form. Part of the
   // pipeline key.
   uint32_t depth_strip_mode_ = 1;
+  // files/plume-native (or the cvar): 1 draws the depth-only draws of the
+  // shaders in NativeRigidShaders with native_rigid.vert. Part of the pipeline key.
+  uint32_t native_mode_ = 1;
   // files/plume-patchlevel: percent of the guest's tessellation level the water
   // grid uses (100 = as the game sets it).
   uint32_t patch_level_percent_ = 100;
@@ -2727,7 +2764,7 @@ bool PlumeCommandProcessor::SetupContext() {
       RenderDescriptorSetDesc(&range_cube, 1, true, kMaxTexturesCube),
       RenderDescriptorSetDesc(&range_samplers, 1, true, kMaxSamplers),
   };
-  RenderPushConstantRange push(0, 0, 0, 3 * sizeof(uint64_t),
+  RenderPushConstantRange push(0, 0, 0, kPushBytes,
                                RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::GEOMETRY |
                                    RenderShaderStageFlag::PIXEL);
   layout_ = device_->createPipelineLayout(RenderPipelineLayoutDesc(&push, 1, sets, 4, false, true));
@@ -2808,6 +2845,7 @@ bool PlumeCommandProcessor::SetupContext() {
   defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
   fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
   depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
+  native_mode_ = REXCVAR_GET(renut_plume_native) ? 1u : 0u;
   rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
   no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
   no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
@@ -2836,6 +2874,8 @@ bool PlumeCommandProcessor::SetupContext() {
                                             RenderShaderFormat::SPIRV);
   debug_trivial_fs_ = device_->createShader(k_debug_trivial_frag, sizeof(k_debug_trivial_frag), "main",
                                             RenderShaderFormat::SPIRV);
+  native_rigid_vs_ = device_->createShader(k_native_rigid_vert, sizeof(k_native_rigid_vert), "main",
+                                           RenderShaderFormat::SPIRV);
 
   upload_used_ = 0;
   uint64_t white = Allocate(4 * 6, 256);
@@ -6328,6 +6368,21 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   if (rel_active) spec_constants.emplace_back(RENUT_SPEC_REL_CONSTANTS, rel_variant);
+  // Native renderer v0: a depth-only draw (no colour target, so no pass whose
+  // depth a later colour draw has to match exactly) of a rigid shader, with no
+  // user clip plane and no memory export, is drawn with native_rigid.vert.
+  const NativeRigid* native_rigid = nullptr;
+  if (native_mode_ && native_rigid_vs_ && !ps && !color_count && !ucp_mask && !rect_list && !point_list &&
+      !patch_list && !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
+    const auto& table = NativeRigidShaders();
+    const auto found = table.find(vs->entry->hash);
+    if (found != table.end() && found->second.location == 0 &&
+        std::any_of(input_elements.begin(), input_elements.end(),
+                    [](const RenderInputElement& e) { return e.location == 0; })) {
+      native_rigid = &found->second;
+      spec_constants.emplace_back(kNativeSwizzleSpec, native_rigid->swizzle);
+    }
+  }
   // The pipeline key: the fields laid end to end and hashed once. Hashing
   // each field on its own was a few dozen XXH3 calls a draw.
   KeyBytes key_bytes;
@@ -6384,7 +6439,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     depth_module = fetch_spec ? vertex_compiled->depth_fetch_spec_module.get() : vertex_compiled->depth_module.get();
   }
   const bool depth_strip = depth_module != nullptr;
-  key_bytes.Put(uint8_t(fetch_spec | (depth_strip << 1)));
+  key_bytes.Put(uint8_t(fetch_spec | (depth_strip << 1) | ((native_rigid != nullptr) << 2)));
   // Debug (plume-trivial bit 4): a trivial vertex shader for depth-only draws
   // alone, to price what those draws cost without their vertex work.
   const bool trivial_vs = ((trivial_mode_ & 1) || ((trivial_mode_ & 4) && !ps)) && plain_draw;
@@ -6434,8 +6489,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (!pipeline) {
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = layout_.get();
-    desc.vertexShader = trivial_vs   ? debug_trivial_vs_.get()
-                        : depth_strip ? depth_module
+    desc.vertexShader = trivial_vs     ? debug_trivial_vs_.get()
+                        : native_rigid ? native_rigid_vs_.get()
+                        : depth_strip  ? depth_module
                         : fetch_spec  ? vertex_compiled->fetch_spec_module.get()
                                       : vertex_compiled->module.get();
     desc.geometryShader = rect_list ? rect_list_gs_.get() : point_list ? point_list_gs_.get() : nullptr;
@@ -6473,7 +6529,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.specConstantsCount = uint32_t(spec_constants.size());
     // The pipeline built ahead from the recipe file (StartRecipes), if this
     // start had it; a pipeline not in the file yet is written to it.
-    if (recipes_ && !debug_point && !trivial_vs && !trivial_fs && !pending_pipelines_.count(key) &&
+    if (recipes_ && !debug_point && !trivial_vs && !trivial_fs && !native_rigid && !pending_pipelines_.count(key) &&
         !failed_pipelines_.count(key)) {
       Recipe recipe;
       recipe.vs = (patch_list ? vs->domain_entry : vs->entry)->hash;
@@ -6764,6 +6820,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   pk.push[0] = Address(constant_offsets_[0][0]);
   pk.push[1] = Address(skip_ps_constants ? unused_ps_offset : constant_offsets_[1][0]);
   pk.push[2] = Address(shared_offset_);
+  if (native_rigid) {
+    pk.native = true;
+    for (uint32_t row = 0; row < 4; ++row) {
+      std::memcpy(pk.native_push + row * 4,
+                  &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + native_rigid->rows[row] * 4], 16);
+    }
+    std::memcpy(pk.native_push + 16, scale_offset, sizeof(scale_offset));
+    std::memcpy(pk.native_push + 20, sh + RENUT_SHARED_MISC_OFFSET + 4, 8);
+    ++stats_.native_draws;
+  }
   for (uint32_t stage = 0; stage < 2; ++stage) {
     for (uint32_t chunk = 0; chunk < kConstantChunks; ++chunk) {
       pk.constant_offsets[stage * kConstantChunks + chunk] =
@@ -6966,12 +7032,16 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
   }
   if (pk.blend_constants) L()->setBlendFactor(pk.blend_factor);
   if (pk.stencil) L()->setStencilState(pk.stencil_ref, pk.stencil_mask, pk.stencil_write_mask);
-  if (std::memcmp(pk.push, pushed_constants_, sizeof(pk.push)) != 0 &&
-      !((bind_skip_ & 2) && pushed_constants_[0] != UINT64_MAX)) {
+  // A native draw reads nothing but its own push constants: the guest's
+  // addresses and constant blocks stay as the last guest draw left them.
+  if (pk.native) {
+    L()->setGraphicsPushConstants(0, pk.native_push, kNativePushOffset, sizeof(pk.native_push));
+  } else if (std::memcmp(pk.push, pushed_constants_, sizeof(pk.push)) != 0 &&
+             !((bind_skip_ & 2) && pushed_constants_[0] != UINT64_MAX)) {
     L()->setGraphicsPushConstants(0, pk.push, 0, sizeof(pk.push));
     std::memcpy(pushed_constants_, pk.push, sizeof(pk.push));
   }
-  if (std::memcmp(pk.constant_offsets, bound_constant_offsets_, sizeof(pk.constant_offsets)) != 0 &&
+  if (!pk.native && std::memcmp(pk.constant_offsets, bound_constant_offsets_, sizeof(pk.constant_offsets)) != 0 &&
       !((bind_skip_ & 1) && bound_constant_offsets_[0] != UINT32_MAX)) {
     vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(L())->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             static_cast<VulkanPipelineLayout*>(layout_.get())->vk, 4, 1, &constants_set_,
@@ -8241,6 +8311,18 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       depth_strip_mode_ = uint32_t(depth_strip);
     }
     {
+      int native = REXCVAR_GET(renut_plume_native) ? 1 : 0;
+      if (FILE* file = std::fopen((root + "/plume-native").c_str(), "r")) {
+        int value = native;
+        if (std::fscanf(file, "%d", &value) == 1) native = std::clamp(value, 0, 1);
+        std::fclose(file);
+      }
+      if (uint32_t(native) != native_mode_) {
+        REXLOG_INFO("Renut: Plume native renderer (rigid depth draws) {}", native ? "on" : "off");
+      }
+      native_mode_ = uint32_t(native);
+    }
+    {
       int adaptive = std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1);
       if (FILE* file = std::fopen((root + "/plume-adaptive").c_str(), "r")) {
         int value = adaptive;
@@ -8657,6 +8739,9 @@ void PlumeCommandProcessor::Report() {
     REXLOG_INFO("Renut: Plume deferred draws (mode {}): {} draws in {} windows, pipeline changes {} -> {}",
                 defer_mode_, stats_.deferred_draws, stats_.defer_windows, stats_.defer_binds_before,
                 stats_.defer_binds_after);
+  }
+  if (stats_.native_draws) {
+    REXLOG_INFO("Renut: Plume native renderer: {} rigid depth draws", stats_.native_draws);
   }
   if (shadow_min_indices_) {
     REXLOG_INFO("Renut: Plume shadow casters under {} indices dropped: {}", shadow_min_indices_,
