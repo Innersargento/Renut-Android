@@ -246,6 +246,7 @@ bool g_validate_windows = false;    // files/plume-validate (see ValidateKeptWin
 // presents more often than the game swaps, so the two rates have to be read
 // side by side to know which one the player is actually seeing.
 extern "C" uint64_t renut_guest_swap_count();
+extern "C" void renut_note_guest_swap();
 
 struct UcodeMapEntry {
   uint64_t ucode;
@@ -277,7 +278,6 @@ constexpr uint32_t kMaxPatchLevel = 16;
 // Container hash of Direct3D's Clear vertex shader (microcode 1E6883FCCDE1F688,
 // wrapped by tools/shaders/wrap_raw_ucode.py): position and colour of a
 // rectangle from vertex fetch constant 0.
-constexpr uint64_t kD3DClearVertexShader = 0xBA454DD8A2FCFCBAull;
 
 // Descriptor 0 of the sampler heap, for a fetch whose state cannot be built.
 constexpr uint32_t kSamplerDefault = 0;
@@ -1172,16 +1172,15 @@ struct Target {
   uint32_t width = 0, height = 0;
   bool depth = false;
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
-  // Serial of the last draw that rendered to it (see IssueD3DClear).
+  // Serial of the last draw that rendered to it.
   uint64_t last_used = 0;
-  // Native lists: the D3DSurface it is (0 for a target found by EDRAM base),
-  // its RB_COLOR_INFO / RB_DEPTH_INFO, and the frame it was last used in.
+  // The D3DSurface it is, its RB_COLOR_INFO / RB_DEPTH_INFO, and the frame it
+  // was last used in.
   uint32_t surface = 0, surface_info = 0;
   uint64_t used_frame = 0;
 };
 
-// Keys of the targets made per surface (the others are EDRAM base, format,
-// depth and pitch; see GetTarget).
+// Keys of the render targets: one per surface (see SurfaceTarget).
 constexpr uint64_t kSurfaceTargetKey = 1ull << 63;
 
 // A native resolve's source and the depth its clear goes to, by surface, and
@@ -1382,48 +1381,70 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
       std::fprintf(trace_, "predicated %s op=%X select=%llX mask=%llX\n", pred_pass_all_ ? "passed" : "skip",
                    opcode, (unsigned long long)bin_select_, (unsigned long long)bin_mask_);
     }
-    if (!pred_pass_all_ && (opcode == xenos::PM4_DRAW_INDX || opcode == xenos::PM4_DRAW_INDX_2) &&
-        native_d3d::GetMode() == native_d3d::Mode::kVerify) {
-      native_d3d::VerifySkipped(bin_mask_, bin_select_);
-    }
     return pred_pass_all_;
   }
-  // The native Direct3D front end's NOP markers: in verify mode a draw's
-  // serial or an opaque call's fence; in native mode the opaque calls'
-  // fences, where the native lists hand over to the PM4 and back.
-  void OnTracePacket(uint32_t address, uint32_t packet, uint32_t, uint32_t) override {
-    if (((packet >> 8) & 0x7F) != 0x10 || ((packet >> 16) & 0x3FFF) != 1) return;
-    const native_d3d::Mode mode = native_d3d::GetMode();
-    if (mode == native_d3d::Mode::kOff) return;
-    const uint32_t* words = memory_->TranslatePhysical<const uint32_t*>(address);
-    if (__builtin_bswap32(words[1]) != native_d3d::kNopMagic) return;
-    const uint32_t payload = __builtin_bswap32(words[2]);
-    if (mode == native_d3d::Mode::kNative) {
-      NativeMarker(payload);
-    } else if ((payload >> 24) == 0xFF) {
-      native_d3d::VerifyTag(payload);
-    } else {
-      native_d3d::VerifyMarker(payload);
-    }
-  }
-
-  // ---- Native Direct3D lists (renut_native_d3d = 2) ----
-  // The lists draw with a register file of their own: the PM4 the game still
-  // writes (fences, ring segments, command buffer setup, the window scissor,
-  // GPR allocation) keeps the original one and draws nothing. The calls the
-  // lists do not hold yet (clears, resolves, the tessellated water, memory
-  // export) are fenced by NOP markers: at the opening one the lists have run
-  // up to that call, its PM4 then runs on the lists' state, and at the
-  // closing one the lists go on.
+  // ---- Native Direct3D lists ----
+  // All drawing comes from the front end's lists (native_d3d.cpp), which run
+  // with a register file of their own as the command processor reaches the
+  // ring segments they go with. The ring's own register file is the GPU's as
+  // the CPU sees it (scratch registers, the writeback the callbacks read).
   void OnPacketStart() override {
     if (!native_checked_) {
       native_on_ = native_d3d::GetMode() == native_d3d::Mode::kNative;
       native_checked_ = true;
     }
-    if (native_on_ && !native_opaque_) RunNative(UINT32_MAX);
   }
+  // The ring's segments: the lists recorded with one run as the command
+  // processor reaches it, and one recorded with native sync is not walked -
+  // the list holds what it writes back. A segment no list names is walked.
+  bool OnIndirectBuffer(uint32_t ptr, uint32_t count, bool primary) override {
+    if (!native_on_ || !primary) return false;
+    ExecutorBusy busy;
+    run_to_segment_ = ptr & 0x1FFFFFFF;
+    segment_found_ = false;
+    RunNative(UINT32_MAX);
+    run_to_segment_ = 0;
+    segment_found_ = false;
+    auto it = segment_sync_.find(ptr & 0x1FFFFFFF);
+    if (it == segment_sync_.end()) {
+      ++segments_unnamed_;
+      return false;
+    }
+    const bool skip = it->second;
+    segment_sync_.erase(it);
+    ++(skip ? segments_skipped_ : segments_walked_);
+    if (skip && segments_skipped_ <= 3) {
+      REXLOG_INFO("Renut: native sync: segment {:08X} not walked ({} fences, {} presents, {} callbacks so far)", ptr,
+                  native_fences_, native_presents_, native_callbacks_);
+    }
+    return skip;
+  }
+  struct ExecutorBusy {
+    ExecutorBusy() { native_d3d::SetExecutorBusy(true); }
+    ~ExecutorBusy() { native_d3d::SetExecutorBusy(false); }
+  };
+  uint32_t run_to_segment_ = 0;
+  bool segment_found_ = false;
+  std::unordered_map<uint32_t, bool> segment_sync_;
+  bool native_presenting_ = false;
+  uint64_t native_fences_ = 0, native_presents_ = 0, native_callbacks_ = 0;
+  uint64_t segments_skipped_ = 0, segments_walked_ = 0, segments_unnamed_ = 0;
+  void NativeCallback(const uint32_t* words, uint32_t count);
+  // A dword the GPU writes back (big-endian), at a GPU address.
+  void StoreBig(uint32_t physical, uint32_t value) {
+    const uint32_t big = __builtin_bswap32(value);
+    std::memcpy(memory_->TranslatePhysical<uint8_t*>(physical), &big, 4);
+  }
+  // The vertex buffer behind each stream and the index buffer (kOpStreams,
+  // kOpIndices): a stream inside one is kept as that whole buffer.
+  struct BufferRange {
+    uint32_t base = 0, size = 0;
+  };
+  std::array<BufferRange, 18> native_streams_{};
+  BufferRange native_indices_{};
+  BufferRange stream_object_{};  // the hint GuestStream reads
+  uint64_t object_streams_ = 0, window_streams_ = 0;
   bool native_checked_ = false;
-  void NativeMarker(uint32_t payload);
   // Runs the published records until the end, or until the opaque-call
   // marker `until` (consumed; returns true), never past another marker.
   bool RunNative(uint32_t until);
@@ -1432,12 +1453,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void NativeWrite(uint32_t first, const uint32_t* values, uint32_t count);
   void NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size);
   void NativeClear(const uint32_t* record);
-  void NativeClearEdram(const uint32_t* record);
-  // <files>/native-d3d-edram: targets by EDRAM base again (live, to compare).
-  bool edram_targets_ = false;
   bool native_on_ = false;
   bool native_started_ = false;
-  uint32_t native_opaque_ = 0;     // inside an opaque call's PM4
   bool native_swapped_ = false;    // the lists' state is in register_file_ & co.
   std::unique_ptr<gfx::RegisterFile> native_regs_;
   gfx::RegisterFile* ring_regs_ = nullptr;
@@ -1453,13 +1470,14 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   };
   std::vector<NativeFrame> native_stack_;
   std::deque<std::shared_ptr<const native_d3d::List>> native_queue_;
-  uint64_t native_draws_ = 0, native_ring_draws_dropped_ = 0, native_markers_ = 0, native_bad_ = 0;
+  uint64_t native_draws_ = 0, native_ring_draws_dropped_ = 0, native_bad_ = 0;
   bool pred_pass_all_ = false;
   bool band_fragpos_ = false;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
-  bool IssueCopy() override;
-  bool ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces* surfaces = nullptr);
+  // Resolves come as records (NativeResolve); the ring's copy draws do nothing.
+  bool IssueCopy() override { return true; }
+  bool ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces);
   void NativeResolve(const uint32_t* record);
   // The surfaces bound when the lists last sent the target registers
   // (kOpSurfaces): render targets 0-3 and depth.
@@ -1478,14 +1496,10 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void EvictSurfaceTargets();
   std::string SurfaceReport();
   uint64_t surface_created_ = 0, surface_grown_ = 0, surface_evicted_ = 0, surface_mismatch_ = 0;
-  // Native resolves into their texture object, and the ones still found by
-  // address (other levels, slices, faces). <files>/native-d3d-address-resolves
-  // sends them all by address again (live, to compare).
+  // Native resolves into their texture object, and the ones that go by
+  // address (3D slices).
   uint64_t object_resolves_ = 0, address_resolves_count_ = 0;
-  bool address_resolves_ = false;
   uint64_t surface_missing_ = 0;
-  // Direct3D's own Clear (see IssueDraw).
-  void IssueD3DClear(xenos::EdramMode edram_mode);
   // Copies a rectangle of a depth target's depth into an R32_FLOAT texture, or
   // its depth and stencil into an RG32F one.
   bool CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
@@ -1651,16 +1665,10 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void FlushImagesForNextFrame();
   void Flush();
   void Transition(RenderTexture* texture, RenderTextureLayout& current, RenderTextureLayout layout);
-  Target* GetTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, uint32_t height);
-  Target* FindTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch = 0);
   RenderFramebuffer* GetFramebuffer(const std::array<Target*, 4>& colors, uint32_t color_count,
                                     Target* depth);
   void SetFramebuffer(RenderFramebuffer* framebuffer);
-  Resolved* FindResolvedContaining(uint32_t address, RenderFormat format, uint32_t bytes_per_pixel,
-                                  uint32_t pitch, uint32_t height,
-                                  uint32_t& column, uint32_t& row);
   uint32_t FittedResolved(Resolved& resolved, uint32_t width, uint32_t height);
-  void MergeResolvedTails(uint32_t address, Resolved& dest);
   Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height);
   // Everything LayoutOf works out from a fetch constant, kept per constant.
   struct FetchLayout {
@@ -1742,12 +1750,6 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Off by default: the water then reflects up close instead of in the
   // distance (it reads something per band that the merge does not give back
   // yet). <files>/plume-merge-bands "1" turns it on: ~30 FPS in Showdown Town.
-  bool merge_bands_ = false;
-  bool merge_frame_ = false;  // merging this frame
-  bool band2_ = false;        // the lower band's replay has begun this frame
-  uint32_t band_color_base_ = UINT32_MAX, band_depth_base_ = UINT32_MAX, band_pitch_ = 0;
-  uint32_t band_h_ = 0, band_full_h_ = 0;
-  uint64_t band_seen_frame_ = 0;
   // Debug: <files>/plume-bind, per-draw state the draw path leaves as it was
   // bound, to price each on the GPU (the picture is wrong). 1 constants
   // descriptor set, 2 push constants, 4 vertex buffers, 8 viewport and scissor,
@@ -1788,7 +1790,6 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // front buffer, to see an intermediate pass on screen.
   uint32_t snap_address_ = 0, snap_ordinal_ = 0, snap_seen_ = 0;
   // The tallest a draw has rendered, which bounds what a clear may grow.
-  uint32_t max_draw_height_ = 0;
   std::chrono::steady_clock::time_point frame_start_{};
   uint64_t cpu_at_swap_ = 0;
   uint64_t reported_guest_swaps_ = 0;
@@ -3456,10 +3457,22 @@ bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::
   // mesh names its own stretch of the same index buffer, and one entry per
   // stretch made tens of thousands of kept buffers, each looked up and each
   // checked against every write.
+  // Native lists: a stream inside the vertex or index buffer it comes from is
+  // kept as that whole buffer, which is exactly what the guest allocated -
+  // no window running into pages beyond it.
   constexpr uint32_t kWindow = 16u << 10;
-  const uint32_t window_base = address & ~(kWindow - 1);
-  const uint64_t window_end =
+  uint32_t window_base = address & ~(kWindow - 1);
+  uint64_t window_end =
       std::min<uint64_t>((uint64_t(address) + size + kWindow - 1) & ~uint64_t(kWindow - 1), 0x20000000ull);
+  if (stream_object_.size && address >= stream_object_.base &&
+      uint64_t(address) + size <= uint64_t(stream_object_.base) + stream_object_.size &&
+      uint64_t(stream_object_.base) + stream_object_.size <= 0x20000000ull) {
+    window_base = stream_object_.base;
+    window_end = uint64_t(stream_object_.base) + stream_object_.size;
+    ++object_streams_;
+  } else {
+    ++window_streams_;
+  }
   if (window_end <= address + uint64_t(size) - 1 || window_end - window_base > (32u << 20)) {
     return UploadGuest(address, size, endian, offset);
   }
@@ -4173,8 +4186,6 @@ void PlumeCommandProcessor::EvictIdleTextures() {
 
 void PlumeCommandProcessor::BeginFrame() {
   slot_ = (slot_ + 1) % kPlumeFramesInFlight;
-  merge_frame_ = merge_bands_ && band_h_ && band_full_h_ > band_h_ && swaps_ - band_seen_frame_ <= 2;
-  band2_ = false;
   // The slot's command list, ring slice and retired resources are all still in
   // use until the frame that last held it has finished.
   const auto wait_start = std::chrono::steady_clock::now();
@@ -4322,71 +4333,7 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
   bound_framebuffer_ = nullptr;  // barriers end the render pass
 }
 
-Resolved* PlumeCommandProcessor::FindResolvedContaining(uint32_t address, RenderFormat format,
-                                                        uint32_t bytes_per_pixel, uint32_t pitch,
-                                                        uint32_t height, uint32_t& column, uint32_t& row) {
-  for (auto& [key, resolved] : resolved_) {
-    const uint32_t base = uint32_t(key);
-    if (!resolved.texture || resolved.format != format || address <= base) continue;
-    // Only join bands of the same guest surface. Different guest formats can
-    // share a host format (for example an 8-bit mask stored in RGBA8). Testing
-    // the incoming bpp against an old image's host extent aliases unrelated
-    // allocations, notably Banjo's mask and the adjacent golden aura.
-    if (resolved.guest_bpp != bytes_per_pixel || resolved.guest_pitch != pitch ||
-        resolved.guest_height != height) continue;
-    const uint32_t offset = address - base;
-    if (offset >= pitch * height * bytes_per_pixel) continue;
-    if (resolved.written_frame != swaps_ && resolved.guest_bytes &&
-        ContentHash(memory_->TranslatePhysical<const uint8_t*>(base), resolved.guest_bytes) !=
-            resolved.guest_hash) continue;
-    // Resolve addresses use Xenos tiled memory, not linear scanlines. The
-    // persistent far shadow map is assembled from 512x512 rectangles over
-    // multiple frames; horizontal tiles must land in columns of the same image.
-    const uint32_t bpp_log2 = 31 - __builtin_clz(bytes_per_pixel);
-    for (uint32_t y = 0; y < height; y += 32) {
-      for (uint32_t x = 0; x < pitch; x += 32) {
-        if (uint32_t(gfx::texture_util::GetTiledOffset2D(x, y, pitch, bpp_log2)) == offset) {
-          column = x;
-          row = y;
-          return &resolved;
-        }
-      }
-    }
-  }
-  return nullptr;
-}
 
-void PlumeCommandProcessor::MergeResolvedTails(uint32_t address, Resolved& dest) {
-  // The static shadow atlas is built bottom-to-top. Each row's base points
-  // inside the allocation and its height describes the remaining rows. When
-  // an earlier base arrives, preserve the already-rendered tail in that image.
-  const uint32_t bpp_log2 = 31 - __builtin_clz(dest.guest_bpp);
-  for (auto it = resolved_.begin(); it != resolved_.end();) {
-    auto& tail = it->second;
-    const uint32_t tail_address = uint32_t(it->first);
-    if (&tail == &dest || !tail.texture || tail_address <= address ||
-        tail.format != dest.format || tail.guest_bpp != dest.guest_bpp ||
-        tail.guest_pitch != dest.guest_pitch || !tail.guest_height ||
-        tail.guest_height >= dest.guest_height) { ++it; continue; }
-    const uint32_t y = dest.guest_height - tail.guest_height;
-    if (y % 32 || tail_address - address != uint32_t(gfx::texture_util::GetTiledOffset2D(
-        0, y, dest.guest_pitch, bpp_log2)) || y + tail.height > dest.height ||
-        tail.width > dest.width) { ++it; continue; }
-    if (tail.guest_bytes && ContentHash(memory_->TranslatePhysical<const uint8_t*>(tail_address),
-                                      tail.guest_bytes) != tail.guest_hash) { ++it; continue; }
-    Transition(tail.texture.get(), tail.layout, RenderTextureLayout::COPY_SOURCE);
-    Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
-    RenderBox box(0, 0, int32_t(tail.width), int32_t(tail.height), 0, 1);
-    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
-        RenderTextureCopyLocation::Subresource(tail.texture.get()), 0, y, 0, &box);
-    dest.generation += tail.generation;
-    RetireSwizzled(tail);
-    RetireTexture(tail.texture, tail.descriptor);
-    RetireTexture(tail.fitted, tail.fitted_descriptor);
-    it = resolved_.erase(it);
-    InvalidateResolvedLookups();
-  }
-}
 
 uint32_t PlumeCommandProcessor::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first) {
   RenderTexture* texture = fitted ? r.fitted.get() : r.texture.get();
@@ -4441,49 +4388,7 @@ uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint
   return r.fitted_descriptor;
 }
 
-Target* PlumeCommandProcessor::FindTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch) {
-  Target* best = nullptr;
-  for (auto& [key, target] : targets_) {
-    if (key & kSurfaceTargetKey) continue;
-    if ((key & 0xFFF) == base && ((key >> 12) & 0xF) == format && bool((key >> 16) & 1) == depth) {
-      if (pitch && target.width == pitch) return &target;
-      if (!best || target.width * target.height > best->width * best->height) best = &target;
-    }
-  }
-  return best;
-}
 
-Target* PlumeCommandProcessor::GetTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch,
-                                         uint32_t height) {
-  uint64_t key = uint64_t(base & 0xFFF) | (uint64_t(format & 0xF) << 12) | (uint64_t(depth) << 16) |
-                 (uint64_t(pitch) << 32);
-  Target& target = targets_[key];
-  target.last_used = ++target_serial_;
-  if (target.texture && target.height >= height) return &target;
-  // New, or taller than before: (re)create. Contents are lost on growth.
-  uint32_t new_height = std::max({height, target.height, 64u});
-  RenderFormat rf = depth ? RenderFormat::D32_FLOAT_S8_UINT
-                          : ColorFormat(xenos::ColorRenderTargetFormat(format));
-  RenderTextureDesc desc = depth ? RenderTextureDesc::DepthTarget(pitch, new_height, rf)
-                                 : RenderTextureDesc::ColorTarget(pitch, new_height, rf);
-  if (target.texture) retired_slots_[slot_].push_back(std::move(target.texture));
-  target.texture = device_->createTexture(desc);
-  if (!target.texture) {
-    targets_.erase(key);
-    return nullptr;
-  }
-  target.format = rf;
-  target.width = pitch;
-  target.height = new_height;
-  target.depth = depth;
-  target.layout = RenderTextureLayout::UNKNOWN;
-  // Framebuffers referencing the old texture are stale.
-  for (auto& [key, framebuffer] : framebuffers_)
-    retired_framebuffer_slots_[slot_].push_back(std::move(framebuffer));
-  framebuffers_.clear();
-  bound_framebuffer_ = nullptr;
-  return &target;
-}
 
 // ---------------------------------------------------------------------------
 // Render targets per Direct3D surface (native lists). The surface object and
@@ -4598,9 +4503,12 @@ std::string PlumeCommandProcessor::SurfaceReport() {
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
   std::string out = fmt::format(
       "== surfaces: {} targets now, {} created, {} grown, {} evicted; register/surface mismatches {}, "
-      "slots without a surface {}\n== resolves: {} into their texture object, {} by address\n",
+      "slots without a surface {}\n== resolves: {} into their texture object, {} by address\n"
+      "== executor: segments {} not walked, {} walked, {} named by no list; fences {}, presents {}, callbacks {}; "
+      "streams kept by buffer {}, by window {}\n",
       count, surface_created_, surface_grown_, surface_evicted_, surface_mismatch_, surface_missing_,
-      object_resolves_, address_resolves_count_);
+      object_resolves_, address_resolves_count_, segments_skipped_, segments_walked_, segments_unnamed_,
+      native_fences_, native_presents_, native_callbacks_, object_streams_, window_streams_);
   for (const auto& [key, t] : targets_) {
     if (!(key & kSurfaceTargetKey)) continue;
     out += fmt::format("   surface {:08X} {} {}x{} base {} format {} last frame {}\n", t.surface,
@@ -5375,7 +5283,7 @@ bool PlumeCommandProcessor::Drop(const char* reason, const HostShader* vs, const
 }
 
 // ---------------------------------------------------------------------------
-// Native Direct3D lists (renut_native_d3d = 2; see the declarations).
+// Native Direct3D lists (see the declarations).
 
 void PlumeCommandProcessor::NativeSwapIn() {
   if (native_swapped_) return;
@@ -5479,19 +5387,15 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
     const std::vector<uint32_t>& words = f.list->words;
     if (f.pos >= words.size()) {
       native_stack_.pop_back();
+      if (native_stack_.empty()) native_d3d::NoteListExecuted();
       continue;
+    }
+    if (segment_found_) {
+      // The list that goes with the segment being reached has run.
+      break;
     }
     const uint32_t* w = words.data() + f.pos;
     const uint32_t op = w[0] & 0xFF;
-    if (op == native_d3d::kOpMarker) {
-      // Never past an opaque call the ring has not reached.
-      if (w[1] == until) {
-        f.pos += 2;
-        found = true;
-        ++native_markers_;
-      }
-      break;
-    }
     if (!native_swapped_) {
       NativeSwapIn();
       swapped_here = true;
@@ -5560,6 +5464,105 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
         f.pos += native_d3d::kClearWords;
         NativeClear(w);
         break;
+      case native_d3d::kOpFence:
+        if (f.pos + 4 > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        // The ring position to +4, then the fence to +0, big-endian, as the
+        // two EVENT_WRITE_SHDs land.
+        StoreBig(w[1] + 4, w[2]);
+        StoreBig(w[1], w[3]);
+        ++native_fences_;
+        f.pos += 4;
+        break;
+      case native_d3d::kOpPresent: {
+        if (f.pos + 6 > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        f.pos += 6;
+        // As the ring had it: a history slot stamped with the vblank counter,
+        // the swap, the counter moving on, the second slot.
+        NativeSwapOut();
+        if (w[4]) StoreBig(w[4], counter());
+        native_presenting_ = true;
+        renut_note_guest_swap();
+        IssueSwap(w[1], w[2], w[3]);
+        native_presenting_ = false;
+        increment_counter();
+        if (w[5]) StoreBig(w[5], counter());
+        ++native_presents_;
+        if (native_presents_ <= 3 || native_presents_ % 600 == 0) {
+          REXLOG_INFO("Renut: native present {} ({:08X} {}x{}); segments {} not walked, {} walked, {} unnamed; "
+                      "fences {}, callbacks {}",
+                      native_presents_, w[1], w[2], w[3], segments_skipped_, segments_walked_, segments_unnamed_,
+                      native_fences_, native_callbacks_);
+        }
+        break;
+      }
+      case native_d3d::kOpCallback: {
+        const uint32_t count = w[0] >> 8;
+        if (f.pos + 1 + count > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        f.pos += 1 + count;
+        NativeCallback(w + 1, count);
+        break;
+      }
+      case native_d3d::kOpSegments: {
+        const uint32_t count = w[0] >> 8;
+        if (f.pos + 2 + count > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        if (segment_sync_.size() > 4096) segment_sync_.clear();
+        for (uint32_t i = 0; i < count; ++i) {
+          segment_sync_[w[2 + i]] = (w[1] & 1) != 0;
+          if (run_to_segment_ && w[2 + i] == run_to_segment_) segment_found_ = true;
+        }
+        f.pos += 2 + count;
+        if (segment_found_) {
+          // Close what has run, so the list counts as done now.
+          while (!native_stack_.empty() &&
+                 native_stack_.back().pos >= native_stack_.back().list->words.size()) {
+            native_stack_.pop_back();
+            if (native_stack_.empty()) native_d3d::NoteListExecuted();
+          }
+        }
+        break;
+      }
+      case native_d3d::kOpStreams: {
+        const uint32_t mask = (w[0] >> 8) & 0x3FFFF;
+        const size_t n = 1 + 2 * size_t(__builtin_popcount(mask));
+        if (f.pos + n > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        const uint32_t* q = w + 1;
+        for (uint32_t stream = 0; stream < 18; ++stream) {
+          if (!((mask >> stream) & 1)) continue;
+          native_streams_[stream] = {q[0], q[1]};
+          q += 2;
+        }
+        f.pos += n;
+        break;
+      }
+      case native_d3d::kOpIndices:
+        if (f.pos + 3 > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        native_indices_ = {w[1], w[2]};
+        f.pos += 3;
+        break;
       case native_d3d::kOpSurfaces: {
         const uint32_t slots = (w[0] >> 8) & 0x1F;
         const size_t n = 1 + 4 * size_t(__builtin_popcount(slots));
@@ -5587,11 +5590,49 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
   return found;
 }
 
+// The PM4 InsertCallback wrote (kOpCallback), on the ring's state: register
+// writes - the scratch registers naming the callback, which the command
+// processor writes back to memory - and the interrupt that runs it on the
+// CPUs it names. The waits for the CPU need nothing here: the interrupt runs
+// the callback on this thread before the next record.
+void PlumeCommandProcessor::NativeCallback(const uint32_t* words, uint32_t count) {
+  NativeSwapOut();
+  ++native_callbacks_;
+  for (uint32_t i = 0; i < count;) {
+    const uint32_t header = words[i];
+    switch (header >> 30) {
+      case 0: {
+        const uint32_t first = header & 0x7FFF, n = ((header >> 16) & 0x3FFF) + 1;
+        const bool one = (header >> 15) & 1;
+        for (uint32_t j = 0; j < n && i + 1 + j < count; ++j) WriteRegister(one ? first : first + j, words[i + 1 + j]);
+        i += 1 + n;
+        break;
+      }
+      case 1:
+        i += 3;
+        break;
+      case 2:
+        i += 1;
+        break;
+      default: {
+        const uint32_t opcode = (header >> 8) & 0x7F, n = ((header >> 16) & 0x3FFF) + 1;
+        if (opcode == xenos::PM4_INTERRUPT && i + 1 < count && graphics_system_) {
+          const uint32_t cpus = words[i + 1];
+          for (uint32_t cpu = 0; cpu < 6; ++cpu) {
+            if ((cpus >> cpu) & 1) graphics_system_->DispatchInterruptCallback(1, cpu);
+          }
+        }
+        i += 1 + n;
+        break;
+      }
+    }
+  }
+}
+
 // A clear record: Direct3D's clear of the current targets, without its draw.
 // The targets are the bound surfaces', and only the clear's rectangle is
 // cleared.
 void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
-  if (edram_targets_) return NativeClearEdram(w);
   FlushDeferred();
   if (skip_mask_ & 134217728) return;
   const uint32_t flags = w[0] >> 8, present = w[17];
@@ -5634,124 +5675,18 @@ void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
   }
 }
 
-// <files>/native-d3d-edram: the clear by EDRAM base, as before targets per surface.
-void PlumeCommandProcessor::NativeClearEdram(const uint32_t* w) {
-  FlushDeferred();
-  if (skip_mask_ & 134217728) return;
-  const uint32_t flags = w[0] >> 8, present = w[17];
-  const int32_t x1 = int32_t(w[1]), y1 = int32_t(w[2]), x2 = int32_t(w[3]), y2 = int32_t(w[4]);
-  float color[4], z;
-  std::memcpy(color, w + 5, sizeof(color));
-  std::memcpy(&z, w + 9, sizeof(z));
-  const uint32_t stencil = w[10] & 0xFF;
-  reg::RB_SURFACE_INFO surface;
-  surface.value = w[11];
-  const uint32_t pitch = surface.surface_pitch;
-  ++stats_.clears;
-  uint32_t clear_height = std::clamp<uint32_t>(uint32_t(std::max(y2, 0)), 16, 4096);
-  if (!(skip_mask_ & 2097152)) clear_height = std::min(clear_height, std::max(max_draw_height_, 1024u));
-  auto find = [&](uint32_t base, uint32_t format, bool depth) -> Target* {
-    Target* best = nullptr;
-    for (auto& [key, target] : targets_) {
-      if (key & kSurfaceTargetKey) continue;
-      if ((key & 0xFFF) != base || ((key >> 12) & 0xF) != format || bool((key >> 16) & 1) != depth) continue;
-      if (target.width != pitch && target.width != 2 * pitch) continue;
-      if (!best || target.last_used > best->last_used) best = &target;
-    }
-    return best;
-  };
-  auto clip = [&](const Target& t) {
-    return RenderRect(std::clamp(x1, 0, int32_t(t.width)), std::clamp(y1, 0, int32_t(t.height)),
-                      std::clamp(x2, 0, int32_t(t.width)), std::clamp(y2, 0, int32_t(t.height)));
-  };
-  Trace("native clear flags={:X} present={:X} rect=({},{})-({},{}) pitch={} color=({}, {}, {}, {}) z={} s={}", flags,
-        present, x1, y1, x2, y2, pitch, color[0], color[1], color[2], color[3], z, stencil);
-  std::array<Target*, 4> cleared{};
-  for (uint32_t i = 0; i < 4; ++i) {
-    if (!((flags >> i) & 1) || !((present >> i) & 1)) continue;
-    reg::RB_COLOR_INFO info;
-    info.value = w[12 + i];
-    Target* target = find(info.color_base, uint32_t(info.color_format), false);
-    if ((!target && i == 0) || (target && target->height < clear_height)) {
-      target = GetTarget(info.color_base, uint32_t(info.color_format), false, target ? target->width : pitch,
-                         clear_height);
-    }
-    if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
-    cleared[i] = target;
-    const RenderRect rect = clip(*target);
-    if (rect.right <= rect.left || rect.bottom <= rect.top) continue;
-    Transition(target->texture.get(), target->layout, RenderTextureLayout::COLOR_WRITE);
-    std::array<Target*, 4> colors{target};
-    SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
-    L()->clearColor(0, RenderColor(color[0], color[1], color[2], color[3]), &rect, 1);
-  }
-  const bool clear_depth = flags & 0x10, clear_stencil = flags & 0x20;
-  if ((clear_depth || clear_stencil) && (present & 0x10)) {
-    reg::RB_DEPTH_INFO info;
-    info.value = w[16];
-    Target* depth = find(info.depth_base, uint32_t(info.depth_format), true);
-    if (!depth || depth->height < clear_height) {
-      depth = GetTarget(info.depth_base, uint32_t(info.depth_format), true, depth ? depth->width : pitch,
-                        clear_height);
-    }
-    if (depth) {
-      const RenderRect rect = clip(*depth);
-      if (rect.right > rect.left && rect.bottom > rect.top) {
-        Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
-        std::array<Target*, 4> none{};
-        SetFramebuffer(GetFramebuffer(none, 0, depth));
-        L()->clearDepthStencil(clear_depth, clear_stencil, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
-      }
-    }
-  }
-}
 
-void PlumeCommandProcessor::NativeMarker(uint32_t payload) {
-  const uint32_t serial = payload & 0xFFFF;
-  if (payload & 0x10000) {
-    if (native_opaque_) NativeSwapOut();
-    native_opaque_ = 0;
-    if (!RunNative(serial)) ++native_bad_;
-    // The call's PM4 runs on the lists' state.
-    NativeSwapIn();
-    native_opaque_ = 1;
-  } else if (native_opaque_) {
-    native_opaque_ = 0;
-    NativeSwapOut();
-  }
-}
 
 bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool) {
-  // Native lists: the PM4 draws nothing outside the calls the lists fence.
-  if (native_on_ && !native_swapped_) {
+  // Only the native lists draw: a draw packet in the ring draws nothing.
+  if (!native_swapped_) {
     ++native_ring_draws_dropped_;
     return true;
   }
   const gfx::RegisterFile& regs = *register_file_;
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
-  if (native_d3d::GetMode() == native_d3d::Mode::kVerify) {
-    native_d3d::Pm4Draw check;
-    check.regs = regs.values;
-    if (auto* shader = active_vertex_shader()) {
-      check.vs_hash = shader->ucode_data_hash();
-      check.vs_dwords = uint32_t(shader->ucode_dword_count());
-    }
-    if (auto* shader = active_pixel_shader()) {
-      check.ps_hash = shader->ucode_data_hash();
-      check.ps_dwords = uint32_t(shader->ucode_dword_count());
-    }
-    check.initiator = regs[XE_GPU_REG_VGT_DRAW_INITIATOR];
-    check.indexed = index_buffer_info != nullptr;
-    check.dma_base = regs[XE_GPU_REG_VGT_DMA_BASE];
-    check.dma_size = regs[XE_GPU_REG_VGT_DMA_SIZE];
-    check.bin_mask = bin_mask_;
-    check.bin_select = bin_select_;
-    check.edram_mode = uint32_t(edram_mode);
-    check.frame = swaps_;
-    native_d3d::VerifyDraw(check);
-  }
-  if (edram_mode == xenos::EdramMode::kCopy) return IssueCopy();
+  if (edram_mode == xenos::EdramMode::kCopy) return true;  // resolves are records
   ++stats_.draws;
   const uint32_t draw_index = frame_draw_++;
   if (draw_index >= drawskip_first_ && draw_index < drawskip_end_) return true;
@@ -5787,52 +5722,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                     vs->ucode_data_hash(), ps_hash, uint32_t(edram_mode), uint32_t(prim_type), index_count);
       }
     }
-    return true;
-  }
-  // Predicated tiling (see merge_bands_). A negative window offset is the
-  // replay of a lower band: learn its layout, and while merging drop it.
-  const int32_t band_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset;
-  const uint32_t band_surface_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
-  const uint32_t band_color = regs.Get<reg::RB_COLOR_INFO>().color_base;
-  if (band_offset < 0 && edram_mode == xenos::EdramMode::kColorDepth && band_surface_pitch) {
-    // The band's own height is the scissor's, not the window scissor's (that
-    // one stays at the upper band's 384 rows).
-    draw_util::Scissor band_scissor;
-    draw_util::GetScissor(regs, band_scissor);
-    const uint32_t below = uint32_t(-band_offset) + band_scissor.offset[1] + band_scissor.extent[1];
-    if (band_color != band_color_base_ || band_surface_pitch != band_pitch_ ||
-        uint32_t(-band_offset) != band_h_) {
-      band_color_base_ = band_color;
-      band_depth_base_ = regs.Get<reg::RB_DEPTH_INFO>().depth_base;
-      band_pitch_ = band_surface_pitch;
-      band_h_ = uint32_t(-band_offset);
-      band_full_h_ = below;
-      REXLOG_INFO("Renut: Plume predicated tiling: bands of {} rows over {} (colour {:X}, depth {:X}, pitch {})",
-                  band_h_, band_full_h_, band_color_base_, band_depth_base_, band_pitch_);
-    }
-    band_full_h_ = std::max(band_full_h_, below);
-    band_seen_frame_ = swaps_;
-  }
-  const bool band_surface =
-      merge_frame_ && band_surface_pitch == band_pitch_ && band_color == band_color_base_;
-  if (band_surface && band_offset < 0 && uint32_t(-band_offset) == band_h_) {
-    band2_ = true;
-    ++stats_.band_skipped;
-    return true;
-  }
-  // Upper band: full-screen draws widen to the whole target. Lower band (after
-  // its replay began): the game's own draws move down by the band's height.
-  const bool band_merge = band_surface && band_offset == 0;
-  // Direct3D's Clear draws a rectangle with its own shader, in an EDRAM view
-  // of the targets (half the pitch at 64 bpp, all four colour targets, a
-  // 4096-row surface) that only aliases the real ones on the hardware. Drawn
-  // literally it would clear render targets of its own; clear the real ones.
-  if (vs->entry->hash == kD3DClearVertexShader && prim_type == xenos::PrimitiveType::kRectangleList &&
-      !(skip_mask_ & 2048)) {
-    // A clear that starts the lower band's replay would wipe what the upper
-    // band now draws for the whole screen.
-    if (merge_frame_ && band_offset < 0 && uint32_t(-band_offset) == band_h_) return true;
-    IssueD3DClear(edram_mode);
     return true;
   }
   auto* ps = static_cast<HostShader*>(active_pixel_shader());
@@ -5918,10 +5807,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
   const uint32_t pitch = surface.surface_pitch;
   if (!pitch) return Drop("no pitch", vs, ps);
-  const auto window_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
-  const uint32_t height =
-      std::clamp<uint32_t>(std::max<uint32_t>(window_br.br_y, band_merge ? band_full_h_ : 0u), 16, 4096);
-  max_draw_height_ = std::max(max_draw_height_, height);
+  const uint32_t height = std::clamp<uint32_t>(regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y, 16, 4096);
   const uint32_t color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
   static constexpr gfx::Register kColorInfo[4] = {
       XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_COLOR1_INFO, XE_GPU_REG_RB_COLOR2_INFO,
@@ -5938,8 +5824,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     for (uint32_t i = 0; i < color_count; ++i) {
       reg::RB_COLOR_INFO info;
       info.value = regs[kColorInfo[i]];
-      colors[i] = native_swapped_ && !edram_targets_ ? NativeTarget(i, info.value)
-                                  : GetTarget(info.color_base, uint32_t(info.color_format), false, pitch, height);
+      colors[i] = NativeTarget(i, info.value);
       if (!colors[i]) {
         ++stats_.no_target;
         return true;
@@ -5950,10 +5835,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   Target* depth = nullptr;
   if (depth_control.z_enable || depth_control.stencil_enable) {
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-    depth = native_swapped_ && !edram_targets_ ? NativeTarget(4, depth_info.value)
-                            : GetTarget(depth_info.depth_base, uint32_t(depth_info.depth_format), true, pitch, height);
+    depth = NativeTarget(4, depth_info.value);
   }
-  if (native_swapped_ && !edram_targets_) {
+  {
     MatchSurfaceSizes(colors, color_count, depth);
     for (uint32_t i = 0; i < color_count; ++i) {
       if (!colors[i]) {
@@ -5976,7 +5860,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     ++stats_.shadow_culled;
     return true;
   }
-  // GetTarget may have recreated a texture that an earlier slot also uses.
+  // MatchSurfaceSizes may have recreated a texture that an earlier slot also uses.
   for (uint32_t i = 0; i < color_count; ++i) {
     Transition(colors[i]->texture.get(), colors[i]->layout, RenderTextureLayout::COLOR_WRITE);
   }
@@ -6292,7 +6176,10 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         if (repacked) Trace("  stream{} repacked: {} format 17 element(s)", stream, repack_count);
       }
     }
-    if (repacked || BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset)) {
+    stream_object_ = native_swapped_ && stream < native_streams_.size() ? native_streams_[stream] : BufferRange{};
+    const bool bound = repacked || BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset);
+    stream_object_ = {};
+    if (bound) {
       streams[stream] = buffer == upload_.get() ? Address(offset) : buffer->getDeviceAddress() + offset;
       slot_offsets[stream] = offset;
       slot_buffers[stream] = buffer;
@@ -6706,7 +6593,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     window_x = float(offset.window_x_offset);
     window_y = float(offset.window_y_offset);
   }
-  if (band_merge && band2_) window_y += float(band_h_);
   const bool keep_pixel_center =
       pixel_center_debug_ == 0 ||
       (pixel_center_debug_ == 1 && edram_mode != xenos::EdramMode::kDepthOnly);
@@ -6746,12 +6632,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   const uint32_t draw_bands = band_split_scene && packet_predicated_ ? uint32_t(bin_mask_) & 0xF : 0;
   constexpr float kBandSplit = 384.f;  // 2x MSAA at 720p: bands of 384 and 336 rows
   std::memcpy(sh + RENUT_SHARED_VIEWPORT_OFFSET, scale_offset, sizeof(scale_offset));
-  // Merged predicated tiling: pixels below the upper band read their position
-  // relative to the lower band, as they did when it was drawn on its own
-  // (renutFragPos). The upper band's full-screen draws and the game's own
-  // lower-band draws need it; every other draw gets 0.
-  float band_split =
-      band_merge && (band2_ || std::fabs(viewport.height) >= float(band_full_h_) - 1.f) ? float(band_h_) : 0.f;
+  // Pixels that read their position relative to a band (renutFragPos): none
+  // but with the debug switch below.
+  float band_split = 0.f;
   // Debug (<files>/plume-band-fragpos "1"): with scene MSAA off, pixels below
   // row 384 of the scene read their position relative to the lower band, as
   // the console's lower-band replay gave them.
@@ -6931,15 +6814,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   RenderRect scissor_rect(int32_t(scissor.offset[0]), int32_t(scissor.offset[1]),
                           int32_t(scissor.offset[0] + scissor.extent[0]),
                           int32_t(scissor.offset[1] + scissor.extent[1]));
-  if (band_merge && band2_) {
-    scissor_rect.top += int32_t(band_h_);
-    scissor_rect.bottom = std::min(scissor_rect.bottom + int32_t(band_h_), int32_t(band_full_h_));
-    ++stats_.band_moved;
-  } else if (band_merge && scissor_rect.bottom == int32_t(band_h_) &&
-             std::fabs(viewport.height) >= float(band_full_h_) - 1.f) {
-    scissor_rect.bottom = int32_t(band_full_h_);
-    ++stats_.band_widened;
-  }
   // Split mode 5 only (see draw_bands): keep a band-predicated packet inside
   // its band.
   if (scissor_rect.bottom >= 720) {
@@ -7607,10 +7481,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     const uint32_t size = index_count * (is32 ? 4 : 2);
     // A quad list's indices are read back here to be split into triangles,
     // so they stay in the ring.
+    if (native_swapped_) stream_object_ = native_indices_;
     const bool uploaded =
         quad_list ? UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)
                   : GuestStream(index_buffer_info->guest_base, size, index_buffer_info->endianness,
                                 index_buffer, index_offset);
+    stream_object_ = {};
     if (!uploaded) return Drop("index upload", vs, ps);
     if (validate_windows_ && !quad_list) {
       ValidateRange("index", vs->entry->hash, index_buffer, index_offset, index_buffer_info->guest_base, size,
@@ -7871,7 +7747,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   bool defer = false;
   uint64_t window_signature = 0;
   if (defer_mode_ && !sync_draws_ && !trace_ && !skip_mask_ && !bind_skip_ && !trivial_mode_ && !debug_draw && !patch_list &&
-      !merge_frame_ && !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && depth_write) {
+      !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && depth_write) {
     const xenos::CompareFunction zf = depth_control.zfunc;
     const bool strict = zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual ||
                         zf == xenos::CompareFunction::kGreater || zf == xenos::CompareFunction::kGreaterEqual;
@@ -8323,12 +8199,6 @@ void PlumeCommandProcessor::FlushDeferred() {
   flushing_slots_.clear();
 }
 
-bool PlumeCommandProcessor::IssueCopy() {
-  FlushDeferred();
-  draw_util::ResolveInfo info;
-  if (!draw_util::GetResolveInfo(*register_file_, *memory_, 1, 1, false, false, info)) return true;
-  return ExecuteResolve(info);
-}
 
 // A resolve record: the copy registers Direct3D worked out, and the
 // rectangle its copy draw would have covered.
@@ -8353,19 +8223,17 @@ void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
   surfaces.y = w[2];
   surfaces.width = w[3] > w[1] ? w[3] - w[1] : 0;
   surfaces.height = w[4] > w[2] ? w[4] - w[2] : 0;
-  if (!address_resolves_) {
-    surfaces.object_base = w[24];
-    surfaces.object_width = w[25];
-    surfaces.object_height = w[26];
-    surfaces.dest_dx = int32_t(w[27]);
-    surfaces.dest_dy = int32_t(w[28]);
-    surfaces.object_pitch = w[29];
-  }
+  surfaces.object_base = w[24];
+  surfaces.object_width = w[25];
+  surfaces.object_height = w[26];
+  surfaces.dest_dx = int32_t(w[27]);
+  surfaces.dest_dy = int32_t(w[28]);
+  surfaces.object_pitch = w[29];
   ++(surfaces.object_base ? object_resolves_ : address_resolves_count_);
-  ExecuteResolve(info, edram_targets_ ? nullptr : &surfaces);
+  ExecuteResolve(info, surfaces);
 }
 
-bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces* surfaces) {
+bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces) {
   ++stats_.resolves;
   // plume-skip bit 33554432 drops the resolve entirely. Attributing intervals
   // between timestamps proved unreliable on this tiler - the same frame read as
@@ -8373,56 +8241,18 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
   // pass-closing barrier the mark sat. Removing a category of work and
   // measuring the difference does not depend on that.
   if (skip_mask_ & 33554432) return true;
-  const uint32_t width = surfaces ? surfaces->width : info.coordinate_info.width_div_8 * 8;
-  const uint32_t height = surfaces ? surfaces->height : info.height_div_8 * 8;
+  const uint32_t width = surfaces.width, height = surfaces.height;
   if (!width || !height) return true;
-
   const bool copying_depth = info.IsCopyingDepth();
-  const draw_util::ResolveEdramInfo& edram = copying_depth ? info.depth_edram_info : info.color_edram_info;
-  const uint32_t original = copying_depth ? info.depth_original_base : info.color_original_base;
-  // Source rectangle in pixels: whole tiles from the render target's base,
-  // plus the offset within the first tile.
-  // A tile is 80x16 samples. Targets here hold one texel per pixel whatever
-  // the guest's sample count, so a 4x tile is 40 pixels wide and a 2x or 4x
-  // one 8 tall. Counting samples as pixels found the dialogue portraits (96x96
-  // at 4x, pitch 120) and the blueprint (256x256 at 4x, pitch 280) in the
-  // twice-as-wide 1x target sharing their EDRAM base: no portrait, and a
-  // quarter of the vehicle.
-  auto tile_size = [](const draw_util::ResolveEdramInfo& e, uint32_t& tw, uint32_t& th) {
-    tw = (e.format_is_64bpp ? 40 : 80) >> (e.msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0);
-    th = 16 >> (e.msaa_samples >= xenos::MsaaSamples::k2X ? 1 : 0);
-  };
-  uint32_t tile_width, tile_height;
-  tile_size(edram, tile_width, tile_height);
-  // EDRAM bases are shared between targets of different pitches (both shadow
-  // maps use depth base 0), so prefer the one the resolve's pitch names.
-  Target* source = surfaces ? surfaces->source
-                            : FindTarget(original, edram.format, copying_depth,
-                                         std::max(1u, uint32_t(edram.pitch_tiles)) * tile_width);
-  const uint32_t tiles = edram.base_tiles - original;
-  const uint32_t pitch_tiles = std::max(1u, uint32_t(edram.pitch_tiles));
-  const uint32_t x = surfaces ? surfaces->x
-                              : (tiles % pitch_tiles) * tile_width + info.coordinate_info.edram_offset_x_div_8 * 8;
-  uint32_t y = surfaces ? surfaces->y
-                        : (tiles / pitch_tiles) * tile_height + info.coordinate_info.edram_offset_y_div_8 * 8;
+  // The source is the surface the resolve names, the rectangle in its pixels.
+  Target* source = surfaces.source;
+  const uint32_t x = surfaces.x, y = surfaces.y;
   // plume-skip bit 134217728 drops every clear, these and Direct3D's. The
   // picture is wrong; it measures what the clear-only passes cost.
   const bool skip_clears = skip_mask_ & 134217728;
-  // Predicated tiling done once (merge_bands_): the upper band's resolves copy
-  // the whole screen, which the upper band now draws, but clear only the band;
-  // the lower band's read it from below the upper one.
-  uint32_t copy_height = height;
-  if (!surfaces && merge_frame_ && source && pitch_tiles * tile_width == band_pitch_ &&
-      original == (copying_depth ? band_depth_base_ : band_color_base_)) {
-    if (band2_) {
-      y += band_h_;
-    } else if (y == 0 && height == band_h_) {
-      copy_height = band_full_h_;
-    }
-  }
-
-  Trace("resolve {} base={:X} fmt={} src=({},{}) {}x{} found={} -> {:08X} dfmt={} ({},{}) pitch={} h={} clear={}{}",
-        copying_depth ? "depth" : "color", original, uint32_t(edram.format), x, y, width, height,
+  const uint32_t copy_height = height;
+  Trace("resolve {} src=({},{}) {}x{} found={} -> {:08X} dfmt={} ({},{}) pitch={} h={} clear={}{}",
+        copying_depth ? "depth" : "color", x, y, width, height,
         source != nullptr, uint32_t(info.copy_dest_base), uint32_t(info.copy_dest_info.copy_dest_format),
         info.copy_dest_coordinate_info.offset_x_div_8 * 8, info.copy_dest_coordinate_info.offset_y_div_8 * 8,
         info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32,
@@ -8436,7 +8266,6 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
     const uint32_t dest_h = std::max(uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) * 32u, h);
     const uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8;
     const uint32_t dy = info.copy_dest_coordinate_info.offset_y_div_8 * 8;
-    uint32_t column = 0, row = 0;
     const auto* dest_info = rex::graphics::FormatInfo::Get(
         xenos::TextureFormat(uint32_t(info.copy_dest_info.copy_dest_format)));
     const uint32_t dest_bpp = dest_info ? std::max(1u, dest_info->bits_per_pixel / 8) : 4;
@@ -8450,19 +8279,16 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
                              uint32_t(xenos::TextureFormat::k_24_8_FLOAT);
     const RenderFormat dest_format =
         copying_depth ? (with_stencil ? RenderFormat::R32G32_FLOAT : RenderFormat::R32_FLOAT) : source->format;
-    // Native lists: the copy goes into the D3DTexture the resolve names, at
-    // its own size, the source corner landing on the point Direct3D was given.
-    // Sampled through its fetch constant, which addresses its level 0, as
-    // every texture here. Otherwise the destination is recovered from the
-    // copy's address: screen bands and shadow tiles resolve to addresses inside
-    // one tiled guest texture, and both coordinates are found, including
-    // across frames.
-    const bool to_object = surfaces && surfaces->object_base;
-    Resolved* inside = nullptr;
+    // The copy goes into the D3DTexture the resolve names - the level, slice
+    // or face Direct3D's own lookup found - at its own size, the source corner
+    // landing on the point Direct3D was given; sampled through its fetch
+    // constant. A 3D texture's slices interleave: those go by the copy's
+    // address and offset.
+    const bool to_object = surfaces.object_base != 0;
     Resolved* chosen = nullptr;
     uint32_t dest_x = 0, dest_y = 0;
     if (to_object) {
-      int32_t ox = int32_t(sx) + surfaces->dest_dx, oy = int32_t(sy) + surfaces->dest_dy;
+      int32_t ox = int32_t(sx) + surfaces.dest_dx, oy = int32_t(sy) + surfaces.dest_dy;
       if (ox < 0) {
         const uint32_t cut = std::min(w, uint32_t(-ox));
         sx += cut, w -= cut, ox = 0;
@@ -8471,19 +8297,16 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
         const uint32_t cut = std::min(h, uint32_t(-oy));
         sy += cut, h -= cut, oy = 0;
       }
-      chosen = &GetResolved(surfaces->object_base, dest_format, std::max(surfaces->object_width, 1u),
-                            std::max(surfaces->object_height, 1u));
+      chosen = &GetResolved(surfaces.object_base, dest_format, std::max(surfaces.object_width, 1u),
+                            std::max(surfaces.object_height, 1u));
       dest_x = uint32_t(ox);
       dest_y = uint32_t(oy);
       w = dest_x < chosen->width ? std::min(w, chosen->width - dest_x) : 0;
       h = dest_y < chosen->height ? std::min(h, chosen->height - dest_y) : 0;
     } else {
-      inside = FindResolvedContaining(info.copy_dest_base, dest_format, dest_bpp, dest_w, dest_h, column, row);
-      chosen = inside && inside->width >= column + dx + w && inside->height >= row + dy + h
-                   ? inside
-                   : &GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
-      dest_y = chosen == inside ? dy + row : dy;
-      dest_x = chosen == inside ? dx + column : dx;
+      chosen = &GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
+      dest_x = dx;
+      dest_y = dy;
     }
     Resolved& dest = *chosen;
     ++dest.generation;
@@ -8491,15 +8314,12 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
     dest.written = ++resolve_serial_;
     InvalidateResolvedLookups();
     dest.written_frame = swaps_;
-    dest.guest_pitch = to_object ? std::max(surfaces->object_pitch, 32u) : dest_w;
-    dest.guest_height = to_object ? (std::max(surfaces->object_height, 1u) + 31) & ~31u : dest_h;
+    dest.guest_pitch = to_object ? std::max(surfaces.object_pitch, 32u) : dest_w;
+    dest.guest_height = to_object ? (std::max(surfaces.object_height, 1u) + 31) & ~31u : dest_h;
     dest.guest_bpp = dest_bpp;
-    if (!to_object && &dest != inside) MergeResolvedTails(info.copy_dest_base, dest);
     // Snapshot of the guest memory under the whole resolved texture.
     {
-      uint32_t base_address = to_object ? surfaces->object_base : info.copy_dest_base;
-      if (&dest == inside) base_address -= uint32_t(gfx::texture_util::GetTiledOffset2D(
-          column, row, dest.guest_pitch, 31 - __builtin_clz(dest_bpp)));
+      const uint32_t base_address = to_object ? surfaces.object_base : info.copy_dest_base;
       dest.guest_bytes = dest.guest_pitch * dest.guest_height * dest_bpp;
       dest.guest_hash = ContentHash(memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
       dest.checked_frame = swaps_;
@@ -8554,11 +8374,7 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
     ++stats_.clears;
   }
   if (info.IsClearingDepth() && !skip_clears) {
-    uint32_t depth_tile_width, depth_tile_height;
-    tile_size(info.depth_edram_info, depth_tile_width, depth_tile_height);
-    Target* depth = surfaces ? surfaces->depth
-                             : FindTarget(info.depth_original_base, info.depth_edram_info.format, true,
-                                          std::max(1u, uint32_t(info.depth_edram_info.pitch_tiles)) * depth_tile_width);
+    Target* depth = surfaces.depth;
     if (depth) {
       Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
       std::array<Target*, 4> none{};
@@ -8844,111 +8660,6 @@ void PlumeCommandProcessor::SnapshotResolved(Resolved& dest) {
   }
 }
 
-void PlumeCommandProcessor::IssueD3DClear(xenos::EdramMode edram_mode) {
-  FlushDeferred();
-  const gfx::RegisterFile& regs = *register_file_;
-  // The rectangle's first vertex: float3 position (z is the clear depth) and
-  // float4 colour, 28 bytes, through vertex fetch constant 0.
-  const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
-  if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.address || (fetch.size << 2) < 28) return;
-  uint8_t vertex[28];
-  CopySwapped(vertex, memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), sizeof(vertex),
-              fetch.endian);
-  float v[7];
-  std::memcpy(v, vertex, sizeof(v));
-  if (skip_mask_ & 134217728) return;  // clears dropped, see IssueCopy
-  ++stats_.clears;
-  Trace("clear mode={} pitch={} depth={} color=({}, {}, {}, {}) colormask={:X}", uint32_t(edram_mode),
-        uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch), v[2], v[3], v[4], v[5], v[6],
-        regs[XE_GPU_REG_RB_COLOR_MASK]);
-
-  // The whole target: Direct3D clears the current viewport, which for
-  // N&B's predicated-tiling bands is the band - the target itself.
-  static constexpr gfx::Register kColorInfo[4] = {XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_COLOR1_INFO,
-                                                  XE_GPU_REG_RB_COLOR2_INFO, XE_GPU_REG_RB_COLOR3_INFO};
-  // The clear's pitch is the target's, or half of it when Direct3D clears a
-  // 32 bpp target as a 64 bpp one; EDRAM bases are shared between targets of
-  // other pitches (the shadow maps), so match the pitch, not just the base.
-  const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
-  // Direct3D's Clear scissors the EDRAM view, which is 4096 rows tall, while
-  // the game renders into a few hundred. GetTarget never shrinks a target, so
-  // letting that height through grew every real target to 4096 rows and made a
-  // tiler reload and resolve 21 MB of attachment at each of the hundred render
-  // passes in a frame. Cap it by the tallest height a draw has actually asked
-  // for; a draw that needs more still grows the target itself.
-  uint32_t clear_height = std::clamp<uint32_t>(
-      regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y, 16, 4096);
-  if (!(skip_mask_ & 2097152)) {
-    // The floor covers the clears that land before the first draw of a target,
-    // among them the static shadow map's 512-row tiles.
-    clear_height = std::min(clear_height, std::max(max_draw_height_, 1024u));
-  }
-  // Several targets can match (a pitch-640 target from another phase next to
-  // the 1280-wide scene target that a 64 bpp clear also names): the one last
-  // rendered to is the one the game is about to use.
-  auto find = [&](uint32_t base, uint32_t format, bool depth) -> Target* {
-    Target* best = nullptr;
-    for (auto& [key, target] : targets_) {
-      if (key & kSurfaceTargetKey) continue;
-      if ((key & 0xFFF) != base || ((key >> 12) & 0xF) != format || bool((key >> 16) & 1) != depth) continue;
-      if (target.width != pitch && target.width != 2 * pitch) continue;
-      if (!best || target.last_used > best->last_used) best = &target;
-    }
-    return best;
-  };
-  const uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
-  if (edram_mode == xenos::EdramMode::kColorDepth) {
-    std::array<Target*, 4> cleared{};
-    for (uint32_t i = 0; i < 4; ++i) {
-      if (!((color_mask >> (4 * i)) & 0xF)) continue;
-      reg::RB_COLOR_INFO info;
-      info.value = regs[kColorInfo[i]];
-      Target* target = find(info.color_base, uint32_t(info.color_format), false);
-      // A target nothing has drawn to yet (N&B fills a 320x184 buffer with
-      // point lists only, which are not drawn yet): create it, so the clear
-      // lands and its resolve copies the clear colour instead of leaving the
-      // texture to be decoded from memory the resolve never wrote.
-      if ((!target && i == 0) || (target && target->height < clear_height)) {
-        target = GetTarget(info.color_base, uint32_t(info.color_format), false,
-                           target ? target->width : pitch, clear_height);
-      }
-      if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
-      cleared[i] = target;
-      Trace("  clear colour rt{} base={:X} -> target {}x{}", i, uint32_t(info.color_base), target->width,
-            target->height);
-      Transition(target->texture.get(), target->layout, RenderTextureLayout::COLOR_WRITE);
-      std::array<Target*, 4> colors{target};
-      SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
-      const RenderRect rect(0, 0, int32_t(target->width), int32_t(target->height));
-      L()->clearColor(0, RenderColor(v[3], v[4], v[5], v[6]), &rect, 1);
-    }
-  }
-  const auto depth_control = draw_util::GetNormalizedDepthControl(regs);
-  const bool clear_depth = depth_control.z_enable && depth_control.z_write_enable;
-  const bool clear_stencil = depth_control.stencil_enable;
-  if (clear_depth || clear_stencil) {
-    const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-    Target* depth = find(depth_info.depth_base, uint32_t(depth_info.depth_format), true);
-    // Allocate the full scissor height before clearing. Growing a 256-row
-    // placeholder on the first draw discarded the clear and blanked the first
-    // 512x512 tile of the static shadow map.
-    if (!depth || depth->height < clear_height)
-      depth = GetTarget(depth_info.depth_base, uint32_t(depth_info.depth_format), true,
-                        depth ? depth->width : pitch, clear_height);
-    Trace("  clear depth={} stencil={} ref={:X} depthcontrol={:08X}", clear_depth, clear_stencil,
-          regs.Get<reg::RB_STENCILREFMASK>().stencilref, regs[XE_GPU_REG_RB_DEPTHCONTROL]);
-    Trace("  clear depth base={:X} -> {}", uint32_t(depth_info.depth_base),
-          depth ? fmt::format("target {}x{}", depth->width, depth->height) : std::string("none"));
-    if (depth) {
-      Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
-      std::array<Target*, 4> none{};
-      SetFramebuffer(GetFramebuffer(none, 0, depth));
-      const RenderRect rect(0, 0, int32_t(depth->width), int32_t(depth->height));
-      L()->clearDepthStencil(clear_depth, clear_stencil, std::clamp(v[2], 0.f, 1.f),
-                               regs.Get<reg::RB_STENCILREFMASK>().stencilref, &rect, 1);
-    }
-  }
-}
 
 // Puts every image a frame wrote into one known layout before the frame ends.
 //
@@ -9046,17 +8757,13 @@ void PlumeCommandProcessor::ValidateKeptWindows() {
 void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
-  if (native_d3d::GetMode() == native_d3d::Mode::kVerify) native_d3d::VerifySwap(swaps_);
+  ExecutorBusy busy;
   if (native_on_) {
-    // Everything the lists hold for this frame, before it is shown.
-    if (native_opaque_) {
-      native_opaque_ = 0;
-      NativeSwapOut();
-      ++native_bad_;
-    }
-    RunNative(UINT32_MAX);
+    // Everything the lists hold for this frame, before it is shown (from the
+    // ring's swap; a present the lists hold has run what came before it).
+    if (!native_presenting_) RunNative(UINT32_MAX);
     EvictSurfaceTargets();
-    native_d3d::NativeReport(swaps_, native_draws_, native_ring_draws_dropped_, native_markers_, native_bad_,
+    native_d3d::NativeReport(swaps_, native_draws_, native_ring_draws_dropped_, native_bad_,
                              [this] { return SurfaceReport(); });
   }
   FlushDeferred();
@@ -9455,14 +9162,6 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         REXLOG_INFO("Renut: Plume pair profile: mode {}, {} frames", pairprof_mode_, pairprof_frames_left_);
       }
     }
-    bool merge_bands = false;
-    if (FILE* file = std::fopen((root + "/plume-merge-bands").c_str(), "r")) {
-      int value = 0;
-      if (std::fscanf(file, "%d", &value) == 1) merge_bands = value != 0;
-      std::fclose(file);
-    }
-    if (merge_bands != merge_bands_) REXLOG_INFO("Renut: Plume band merging {}", merge_bands ? "on" : "off");
-    merge_bands_ = merge_bands;
     {
       bool pass_all = false;
       if (FILE* file = std::fopen((root + "/plume-pred-all").c_str(), "r")) {
@@ -9545,16 +9244,6 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
     }
     keep_streams_ = keep_streams;
-    const bool address_resolves = access((root + "/native-d3d-address-resolves").c_str(), F_OK) == 0;
-    if (address_resolves != address_resolves_) {
-      REXLOG_INFO("Renut: native resolves by {}", address_resolves ? "address" : "texture object");
-    }
-    address_resolves_ = address_resolves;
-    const bool edram_targets = access((root + "/native-d3d-edram").c_str(), F_OK) == 0;
-    if (edram_targets != edram_targets_) {
-      REXLOG_INFO("Renut: native lists' targets by {}", edram_targets ? "EDRAM base" : "surface");
-    }
-    edram_targets_ = edram_targets;
     const bool writeback = REXCVAR_GET(renut_plume_memexport_readback) ||
         access((root + "/plume-writeback").c_str(), F_OK) == 0;
     if (writeback != writeback_) {
@@ -9927,6 +9616,15 @@ class PlumeGraphicsSystem final : public gfx::GraphicsSystem {
   void CreateProvider(bool) override {}
   std::unique_ptr<gfx::CommandProcessor> CreateCommandProcessor() override {
     return std::make_unique<PlumeCommandProcessor>(this, kernel_state_);
+  }
+
+ public:
+  // VdSwap: with native sync the frame goes into the swapping device's list
+  // and the ring gets no swap packet.
+  bool PresentFrontBuffer(const uint32_t* fetch_words, uint32_t width, uint32_t height) override {
+    xenos::xe_gpu_texture_fetch_t fetch;
+    std::memcpy(&fetch, fetch_words, sizeof(fetch));
+    return native_d3d::RecordPresent(fetch.base_address << 12, width, height);
   }
 };
 

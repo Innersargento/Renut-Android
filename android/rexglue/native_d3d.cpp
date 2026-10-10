@@ -50,10 +50,11 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
-REXCVAR_DEFINE_INT32(renut_native_d3d, 2, "reNut",
-                     "Native Direct3D front end: 0 off, 1 verify (built next to the PM4 and checked "
-                     "draw by draw against it, files/native-d3d-verify.txt), 2 native (renders without "
-                     "PM4 draws)");
+
+REXCVAR_DEFINE_BOOL(renut_native_sync, true, "reNut",
+                    "Native Direct3D lists: they also carry the fences, "
+                    "swaps and callbacks, and the command processor no longer walks the game's "
+                    "command segments");
 
 // Guest functions the front end calls, as the Direct3D it replaces does.
 extern "C" {
@@ -61,6 +62,7 @@ REX_FUNC(sub_822127F8);  // vertex shader binding check / rebind to the declarat
 REX_FUNC(sub_82656DA0);  // D3D_PatchVertexShaderToMatchPixelShader
 REX_FUNC(sub_821E5218);  // D3D_PatchVertexShaderToMatchVertexDeclaration
 REX_FUNC(sub_82210AB0);  // KickOff: more ring space
+void __imp__sub_822052C8(PPCContext& __restrict, uint8_t*);  // InsertCallback, the original
 }
 
 namespace renut::native_d3d {
@@ -115,13 +117,9 @@ constexpr uint32_t kIndexBuffer = 12436, kRecording = 13516;
 // divisor and the overlap of a strip continued in a second draw).
 constexpr uint32_t kPrimitiveSplit = 0x82004EB8;
 
-std::atomic<int32_t> g_mode{-1};
 
-// Every native draw's serial. In verify mode it also goes into the PM4, in a
-// NOP just ahead of the draw's packets, so the command processor finds the
-// native draw each PM4 draw is.
+// Every native draw's serial (the draw record's last word, for traces).
 std::atomic<uint32_t> g_draw_serial{0};
-constexpr uint32_t kTagPayload = 0xFF000000u;
 
 // Calls per Direct3D function, for the report.
 std::array<std::atomic<uint64_t>, renut::d3d::kFunctionCount> g_calls{};
@@ -140,7 +138,15 @@ struct Counters {
   std::atomic<uint64_t> begin_vertices{0}, markers{0}, runs{0}, recordings{0}, publishes{0};
   std::atomic<uint64_t> no_scratch{0}, hiz_events{0}, unknown_runs{0}, nested_recordings{0};
   std::atomic<uint64_t> surface_clips{0}, tiled_surface_clips{0}, foreign_immediate{0}, devices{0};
+  std::atomic<uint64_t> fences{0}, presents{0}, callbacks{0}, doorbells{0}, native_doorbells{0};
+  std::atomic<uint64_t> stuck_waits{0}, lists_published{0}, lists_executed{0}, indexed_up{0};
 } g_counts;
+
+// Native sync. The watchdog: a Direct3D wait that has not moved for a while
+// although the command processor has run every published list means a GPU
+// write the lists do not hold; it is then completed and the ring walked again.
+std::atomic<bool> g_sync_fallback{false};
+std::atomic<int32_t> g_executor_busy{0};
 
 // ---------------------------------------------------------------------------
 // Lists.
@@ -190,10 +196,6 @@ class Builder {
     list_.words.push_back(uint32_t(list_.runs.size()));
     list_.runs.push_back(std::move(child));
   }
-  void Marker(uint32_t kind, uint32_t serial) {
-    list_.words.push_back(kOpMarker | (kind << 8));
-    list_.words.push_back(serial);
-  }
   void Swap(uint32_t frontbuffer, uint32_t width, uint32_t height) {
     list_.words.push_back(kOpSwap);
     list_.words.push_back(frontbuffer);
@@ -220,6 +222,13 @@ struct FrontEnd {
   std::deque<std::shared_ptr<const List>> published;
   std::mutex published_mutex;
   uint32_t marker_serial = 0;
+  // The content recorded since the last doorbell carries its sync records
+  // (decided at each doorbell, so a list is all one or the other).
+  bool sync_recording = false;
+  // Swaps seen: native sync starts once the device is up and has shown a few
+  // frames through the ring (its start-up writes scratch registers the CPU
+  // waits on, as plain register writes in segments).
+  uint32_t swaps_seen = 0;
 } g_front;
 
 List& Current(uint32_t dev) {
@@ -240,7 +249,10 @@ void Publish() {
     g_front.published.push_back(std::move(done));
   }
   g_counts.publishes.fetch_add(1, std::memory_order_relaxed);
+  g_counts.lists_published.fetch_add(1, std::memory_order_relaxed);
 }
+
+bool SyncWanted();
 
 // ---------------------------------------------------------------------------
 // Scratch guest memory for what Direct3D would put in the ring: vertex data
@@ -290,7 +302,6 @@ struct Device {
   uint32_t dev;
   PPCContext& ctx;
   Builder out;
-  bool verify;
 };
 
 // SetPending_RenderStates (sub_8222CB90): bit i from the top -> register
@@ -350,17 +361,58 @@ void AluConstants(Device& d, uint64_t mask, uint32_t first, uint32_t shadow) {
 // SetPending_FetchConstants (sub_8222AB88): six registers a slot from +1152.
 // (It then invalidates the texture cache, registers 0x5000-0x5002: nothing
 // to do on the host.)
+void Streams(Device& d, uint32_t slots);
 void FetchConstants(Device& d, uint64_t mask) {
-  uint32_t slot = 0;
+  uint32_t slot = 0, sent = 0;
   while (mask) {
     const uint32_t skip = uint32_t(__builtin_clzll(mask));
     mask <<= skip;
     slot += skip;
     const uint32_t run = ~mask ? uint32_t(__builtin_clzll(~mask)) : 64;
     d.out.RegsFromGuest(d.base, 0x4800 + slot * 6, d.dev + kFetchShadow + slot * 24, run * 6);
+    for (uint32_t i = slot; i < slot + run && i < 32; ++i) sent |= 1u << i;
     slot += run;
     mask = run >= 64 ? 0 : mask << run;
   }
+  if (sent >> 26) Streams(d, sent);
+}
+
+// The vertex buffers behind the vertex fetch constants just sent: stream s
+// is constant 95 - s (fetch slot (95 - s) / 3), set by SetStreamSource from
+// the object it keeps at +12460 + 4s (sub_8222A408). Its range is the
+// buffer's own (XGSetVertexBufferHeader: +24 the address | 3, +28 the size in
+// bytes | endian), which the command processor keeps as one buffer.
+void Streams(Device& d, uint32_t slots) {
+  uint32_t mask = 0;
+  for (uint32_t s = 0; s < 18; ++s) {
+    if ((slots >> ((95 - s) / 3)) & 1) mask |= 1u << s;
+  }
+  if (!mask) return;
+  List& list = d.out.list();
+  list.words.push_back(kOpStreams | (mask << 8));
+  for (uint32_t s = 0; s < 18; ++s) {
+    if (!((mask >> s) & 1)) continue;
+    const uint32_t vb = U32(d.base, d.dev + 12460 + s * 4);
+    const uint32_t address = vb ? U32(d.base, vb + 24) & ~3u : 0;
+    list.words.push_back(address ? Phys(address) : 0);
+    list.words.push_back(address ? U32(d.base, vb + 28) & 0x03FFFFFCu : 0);
+  }
+}
+
+// The index buffer an indexed draw reads (SetIndices keeps it at +12436;
+// XGSetIndexBufferHeader: +24 the address, +28 the size in bytes), named
+// when it changes.
+void Indices(Device& d, uint32_t ib) {
+  List& list = d.out.list();
+  const uint32_t address = ib ? U32(d.base, ib + 24) : 0;
+  const uint32_t base = address ? Phys(address) : 0, size = address ? U32(d.base, ib + 28) : 0;
+  if (list.indices_named && list.indices_base == base && list.indices_size == size) return;
+  list.indices_named = true;
+  list.indices_base = base;
+  list.indices_size = size;
+  list.words.push_back(kOpIndices);
+  list.words.push_back(base);
+  list.words.push_back(size);
 }
 
 // SetPending_ClipPlanes (sub_8220E2B0): register 0x2007 again, a coherency
@@ -398,11 +450,6 @@ void LiteralConstants(Device& d, uint32_t header, uint32_t physical) {
     d.out.RegsFromGuest(d.base, 0x4000 + constant * 4, Cpu(Phys(source)), dwords);
     g_counts.literal_blocks.fetch_add(1, std::memory_order_relaxed);
   }
-}
-
-uint64_t Hash(Device& d, uint32_t physical, uint32_t dwords) {
-  if (!d.verify) return 0;
-  return XXH3_64bits(d.base + Cpu(physical), size_t(dwords) * 4);
 }
 
 // sub_822127F8(device, shader, declaration, binding): whether vertex shader
@@ -446,7 +493,7 @@ void PatchAndLoad(Device& d, uint32_t match_ps, uint32_t shader, uint32_t progra
   sub_821E5218(d.ctx, d.base);
   S64(d.base, d.dev + 11840, U64(d.base, d.dev + 12536));
   S64(d.base, d.dev + 11832, U64(d.base, d.dev + 12528));
-  d.out.Shader(0, Phys(copy), dwords, Hash(d, Phys(copy), dwords));
+  d.out.Shader(0, Phys(copy), dwords, 0);
   g_counts.patched_loads.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -557,7 +604,7 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
       r20 |= 0x4000;
       const uint32_t address = Phys(U32(base, info + 40) + U32(base, ps + 24));
       const uint32_t dwords = U32(base, info + 44) >> 2;
-      d.out.Shader(1, address, dwords, Hash(d, address, dwords));
+      d.out.Shader(1, address, dwords, 0);
       g_counts.shader_loads.fetch_add(1, std::memory_order_relaxed);
       uint32_t mc = U32(base, dev + 10580);
       S32(base, dev + 10536, U32(base, r28 + 24));
@@ -635,7 +682,7 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
     const uint32_t info = U32(base, vs + (uint32_t(binding) + 112) * 8) + vs;
     const uint32_t address = Phys(U32(base, info + 872) + U32(base, vs + 32));
     const uint32_t dwords = U32(base, info + 876) >> 2;
-    d.out.Shader(0, address, dwords, Hash(d, address, dwords));
+    d.out.Shader(0, address, dwords, 0);
     S32(base, vs + uint32_t(binding) * 416 + 64, U32(base, dev + 10908));
     g_counts.shader_loads.fetch_add(1, std::memory_order_relaxed);
   };
@@ -780,59 +827,14 @@ uint32_t SplitCount(const uint8_t* base, uint32_t primitive, uint32_t count) {
   return ((65535 / divisor) & ~1u) * divisor;
 }
 
-// Verify mode: the device fields the native flush may change are put back
-// before the game's own Direct3D runs, so it flushes exactly as it would.
-struct Snapshot {
-  static constexpr std::array<std::pair<uint32_t, uint32_t>, 5> kRanges{
-      {{0, 64}, {10100, 10960}, {11800, 11900}, {12500, 12760}, {13440, 13520}}};
-  std::array<uint8_t, 64 + 860 + 100 + 260 + 80> bytes;
-  void Save(const uint8_t* base, uint32_t dev) {
-    size_t at = 0;
-    for (auto [b, e] : kRanges) {
-      std::memcpy(bytes.data() + at, base + dev + b, e - b);
-      at += e - b;
-    }
-  }
-  void Restore(uint8_t* base, uint32_t dev) const {
-    size_t at = 0;
-    for (auto [b, e] : kRanges) {
-      std::memcpy(base + dev + b, bytes.data() + at, e - b);
-      at += e - b;
-    }
-  }
-};
-
-// Runs `fill` on the device's current list, restoring the device in verify
-// mode (where the game's Direct3D still runs after) and the PPC registers
-// the guest calls inside used.
+// Runs `fill` on the device's current list, restoring the PPC registers the
+// guest calls inside used.
 template <typename Fill>
-void Capture(PPCContext& ctx, uint8_t* base, uint32_t dev, Fill&& fill, List* target = nullptr) {
-  const bool verify = GetMode() == Mode::kVerify;
-  Snapshot snapshot;
-  if (verify) snapshot.Save(base, dev);
+void Capture(PPCContext& ctx, uint8_t* base, uint32_t dev, Fill&& fill) {
   PPCContext saved = ctx;
-  Device d{base, dev, ctx, Builder(target ? *target : Current(dev)), verify};
+  Device d{base, dev, ctx, Builder(Current(dev))};
   fill(d);
   ctx = saved;
-  if (verify) snapshot.Restore(base, dev);
-}
-
-// Verify mode: a type-3 NOP the command processor recognises, around a
-// Direct3D call whose PM4 draws the native lists do not hold. Written the
-// way Direct3D writes a packet (more ring first if past the end).
-void EmitNopMarker(PPCContext& ctx, uint8_t* base, uint32_t dev, uint32_t payload) {
-  uint32_t p = U32(base, dev + kRingWrite);
-  if (p > U32(base, dev + kRingEnd)) {
-    PPCContext saved = ctx;
-    ctx.r3.u64 = dev;
-    sub_82210AB0(ctx, base);
-    p = ctx.r3.u32;
-    ctx = saved;
-  }
-  S32(base, p + 4, 0xC0011000u);  // type 3, NOP, two dwords
-  S32(base, p + 8, kNopMagic);
-  S32(base, p + 12, payload);
-  S32(base, dev + kRingWrite, p + 12);
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +849,7 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
   Capture(ctx, base, dev, [&](Device& d) {
     FlushAll(d);
     const uint32_t ib = U32(base, dev + kIndexBuffer);
+    Indices(d, ib);
     const uint32_t ib_flags = U32(base, ib + 0), ib_base = U32(base, ib + 24);
     const bool wide = (ib_flags & 0x80000000u) != 0;
     const uint32_t endian = (ib_flags << 1) & 0xC0000000u;
@@ -876,10 +879,7 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
       count = left + overlap;
     }
   });
-  lock.unlock();
-  if (GetMode() == Mode::kNative) return true;
-  EmitNopMarker(ctx, base, dev, kTagPayload | (serial & 0xFFFFFF));
-  return false;
+  return true;
 }
 
 // D3DDevice_DrawVertices(device, primitive, start vertex, count)
@@ -928,6 +928,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
     }
     S64(base, dev + 24, U64(base, dev + 24) | (0x7Full << 39));
     FlushAll(d);
+    Indices(d, ib);
     const uint32_t ib_flags = U32(base, ib + 0), ib_base = U32(base, ib + 24);
     const uint32_t endian = ((ib_flags >> 29) & 3) << 30;
     const uint32_t viz = VizToken(base, dev);
@@ -965,10 +966,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
       count = left + overlap;
     }
   });
-  lock.unlock();
-  if (GetMode() == Mode::kNative) return true;
-  EmitNopMarker(ctx, base, dev, kTagPayload | (serial & 0xFFFFFF));
-  return false;
+  return true;
 }
 
 bool DrawVertices(PPCContext& ctx, uint8_t* base) {
@@ -993,22 +991,8 @@ bool DrawVertices(PPCContext& ctx, uint8_t* base) {
       count = left + overlap;
     }
   });
-  lock.unlock();
-  if (GetMode() == Mode::kNative) return true;
-  EmitNopMarker(ctx, base, dev, kTagPayload | (serial & 0xFFFFFF));
-  return false;
+  return true;
 }
-
-// Verify mode: the BeginVertices record waiting for the data address the
-// game's Direct3D picks.
-// Its records wait in a list of their own until the game's BeginVertices
-// returned, then join the current list: a kick-off inside it may publish
-// the current list, which the command processor then owns.
-struct PendingBegin {
-  List records;
-  size_t fetch_at = 0;
-  bool waiting = false;
-} g_pending_begin;
 
 // D3DDevice_BeginVertices(device, primitive, vertex count, stride) -> data.
 // The vertices go to vertex fetch constant 95 (fetch slot 31), the slot's
@@ -1019,15 +1003,11 @@ bool BeginVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
   std::unique_lock lock(g_front.mutex);
   g_counts.begin_vertices.fetch_add(1, std::memory_order_relaxed);
-  const bool native = GetMode() == Mode::kNative;
   const uint32_t dwords = (count * stride) >> 2;
-  uint32_t data = 0;
-  if (native) {
-    data = ScratchAlloc(dwords * 4);
-    if (!data) {
-      ctx.r3.u64 = 0;
-      return true;
-    }
+  const uint32_t data = ScratchAlloc(dwords * 4);
+  if (!data) {
+    ctx.r3.u64 = 0;
+    return true;
   }
   Capture(ctx, base, dev, [&](Device& d) {
     const uint32_t stride_dwords = (stride >> 2) & 0xFF;
@@ -1041,20 +1021,10 @@ bool BeginVertices(PPCContext& ctx, uint8_t* base) {
     S8(base, dev + 12528, old_stride);
     d.out.Reg(0x2102, 0);
     const uint32_t fetch[6] = {1, 0, 1, 0, Phys(data) | 3, 0x10000002u | ((dwords << 2) & 0x03FFFFFCu)};
-    const size_t fetch_at = d.out.list().words.size();
     d.out.Regs(0x4800 + 31 * 6, fetch, 6);
     d.out.Draw(kDrawPredicated, VizToken(base, dev), (count << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
     g_counts.draws.fetch_add(1, std::memory_order_relaxed);
-    if (!native) {
-      g_pending_begin.fetch_at = fetch_at;
-      g_pending_begin.waiting = true;
-    }
-  }, native ? nullptr : &g_pending_begin.records);
-  if (!native) {
-    lock.unlock();
-    EmitNopMarker(ctx, base, dev, kTagPayload | (serial & 0xFFFFFF));
-    return false;
-  }
+  });
   S64(base, dev + 24, U64(base, dev + 24) | 1);
   S32(base, dev + 13444, U32(base, dev + kRingWrite));
   S32(base, dev + 13448, data);
@@ -1063,49 +1033,59 @@ bool BeginVertices(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-// Verify mode: patch in the data address the game's BeginVertices chose.
-void AfterBeginVertices(PPCContext& ctx, uint32_t dev) {
-  std::lock_guard lock(g_front.mutex);
-  if (!g_pending_begin.waiting) return;
-  List& records = g_pending_begin.records;
-  if (const uint32_t data = ctx.r3.u32) {
-    // [op, first, v0..v5]: v4 holds the address.
-    records.words[g_pending_begin.fetch_at + 2 + 4] = Phys(data) | 3;
-    List& list = Current(dev);
-    list.words.insert(list.words.end(), records.words.begin(), records.words.end());
-    list.draws += records.draws;
+// D3DDevice_BeginIndexedVertices(device, primitive, base vertex, vertex count,
+// index count, index format, stride, &indices, &vertices) (sub_82656208), in
+// native mode: the flush, then both buffers from the scratch instead of the
+// ring, the vertices on vertex fetch constant 95 and the indices fetched by
+// DMA, and the fields EndIndexedVertices and the next draw use.
+bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
+  const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, base_vertex = ctx.r5.u32;
+  const uint32_t vertices = ctx.r6.u32, indices = ctx.r7.u32, format = ctx.r8.u32, stride = ctx.r9.u32;
+  const uint32_t index_out = ctx.r10.u32, vertex_out = U32(base, ctx.r1.u32 + 84);
+  const bool wide = format & 4;
+  const uint32_t vertex_dwords = (vertices * stride) >> 2;
+  const uint32_t index_dwords = wide ? indices : (indices + 1) >> 1;
+  const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+  std::unique_lock lock(g_front.mutex);
+  g_counts.indexed_up.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t vertex_data = ScratchAlloc(vertex_dwords * 4), index_data = ScratchAlloc(index_dwords * 4);
+  if (!vertex_data || !index_data) {
+    if (index_out) S32(base, index_out, 0);
+    if (vertex_out) S32(base, vertex_out, 0);
+    ctx.r3.u64 = 0x8007000Eu;
+    return true;
   }
-  records.words.clear();
-  records.draws = 0;
-  g_pending_begin.waiting = false;
-}
-
-// Calls whose PM4 draws the native lists do not hold yet. The state left
-// pending before them is flushed into the list when they flush it
-// themselves; in verify mode their PM4 is fenced by NOP markers.
-thread_local uint32_t t_opaque_depth = 0;
-thread_local uint32_t t_opaque_serial = 0;
-
-enum OpaqueFlush { kFlushNone, kFlushAll, kFlushRenderStates };
-void OpaqueBegin(PPCContext& ctx, uint8_t* base, uint32_t kind, OpaqueFlush flush) {
-  const uint32_t dev = ctx.r3.u32;
-  if (t_opaque_depth++) return;
-  uint32_t serial;
-  {
-    std::lock_guard lock(g_front.mutex);
-    g_counts.markers.fetch_add(1, std::memory_order_relaxed);
-    serial = ++g_front.marker_serial & 0xFFFF;
-    if (flush == kFlushAll) Capture(ctx, base, dev, [&](Device& d) { FlushAll(d); });
-    if (flush == kFlushRenderStates) Capture(ctx, base, dev, [&](Device& d) { FlushRenderStates(d); });
-    Builder(Current(dev)).Marker(kind, serial);
-  }
-  t_opaque_serial = serial;
-  EmitNopMarker(ctx, base, dev, (kind << 24) | 0x10000 | serial);
-}
-
-void OpaqueEnd(PPCContext& ctx, uint8_t* base, uint32_t dev, uint32_t kind) {
-  if (!t_opaque_depth || --t_opaque_depth) return;
-  EmitNopMarker(ctx, base, dev, (kind << 24) | t_opaque_serial);
+  Capture(ctx, base, dev, [&](Device& d) {
+    const uint8_t old_stride = U8(base, dev + 12528);
+    const uint32_t stride_dwords = (stride >> 2) & 0xFF;
+    S8(base, dev + 12528, uint8_t(stride_dwords));
+    if (stride_dwords != U8(base, dev + 11832) && U32(base, dev + kVertexShader)) {
+      S64(base, dev + 16, U64(base, dev + 16) | 0x80000);
+    }
+    FlushAll(d);
+    S8(base, dev + 12528, old_stride);
+    d.out.Reg(0x2102, base_vertex);
+    const uint32_t fetch[6] = {0, 0, 0, 0, Phys(vertex_data) | 3,
+                               0x10000002u | ((vertex_dwords << 2) & 0x03FFFFFCu)};
+    d.out.Regs(0x4800 + 31 * 6, fetch, 6);
+    const uint32_t endian = (format << 30) & 0xC0000000u;
+    const uint32_t initiator = (indices << 16) | (primitive & 0x3F) | (wide ? 0x800 : 0);
+    const uint32_t size = (wide ? ((indices << 1) & 0x00FFFFFEu) : (indices & 0x00FFFFFFu)) | endian;
+    List& list = d.out.list();
+    list.indices_named = false;  // the next indexed draw names its buffer again
+    d.out.Draw(kDrawPredicated, VizToken(base, dev), initiator, Phys(index_data), size, serial);
+    g_counts.draws.fetch_add(1, std::memory_order_relaxed);
+  });
+  S64(base, dev + 24, U64(base, dev + 24) | 1);
+  if (index_out) S32(base, index_out, index_data);
+  if (vertex_out) S32(base, vertex_out, vertex_data);
+  S32(base, dev + 13444, U32(base, dev + kRingWrite));
+  S32(base, dev + 13448, vertex_data);
+  S32(base, dev + 13452, index_data);
+  S32(base, dev + 13456, vertex_dwords);
+  S32(base, dev + 13460, index_dwords);
+  ctx.r3.u64 = 0;
+  return true;
 }
 
 // D3D_ClearF(device, flags, rect, colour, z, stencil) (sub_82223560), in
@@ -1226,7 +1206,6 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     depth_step = 8;
   }
   uint32_t address = d1 & 0xFFFFF000u;
-  const uint32_t level0 = address;
   const uint32_t format = d1 & 0x3F;
   uint32_t pitch = __builtin_rotateleft32(d0, 15) & 0x3FE0;
   const uint32_t block_bytes = (U16(base, 0x820052F8 + format * 2) >> 3) & 0x1F;
@@ -1343,9 +1322,10 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     for (uint32_t r = 0x2318; r <= 0x2323; ++r) list.words.push_back(U32(base, dev + kRegs2300 + (r - 0x2300) * 4));
     for (uint32_t r = 0; r < 6; ++r) list.words.push_back(U32(base, dev + kRegs2000 + r * 4));
     list.words.push_back(source);
-    // The destination object, for a copy into a 2D texture's level 0.
-    const bool to_object = !level && !slice && dimension == 1;
-    list.words.push_back(to_object ? Phys(level0) : 0);
+    // The destination object: the level, slice or face the copy goes to, as
+    // Direct3D's own lookup found it (3D slices interleave and stay by address).
+    const bool to_object = dimension != 2;
+    list.words.push_back(to_object ? Phys(address) : 0);
     list.words.push_back(width);
     list.words.push_back(height);
     list.words.push_back(uint32_t(px - rx1));
@@ -1446,8 +1426,123 @@ void SetSurfaceClip(PPCContext& ctx, uint8_t* base) {
 void Swap(PPCContext& ctx) {
   std::lock_guard lock(g_front.mutex);
   g_front.main_device = ctx.r3.u32;
+  ++g_front.swaps_seen;
   Builder(*g_front.immediate).Swap(ctx.r4.u32, 0, 0);
   Publish();
+}
+
+// ---------------------------------------------------------------------------
+// Native sync: what the GPU writes back for the CPU, recorded where Direct3D
+// asks for it, so the command processor need not walk the game's segments.
+
+bool SyncWanted() {
+  return GetMode() == Mode::kNative && REXCVAR_GET(renut_native_sync) && g_front.swaps_seen >= 3 &&
+         !g_sync_fallback.load(std::memory_order_relaxed);
+}
+
+// D3D::CDevice::SetFence(device, ring) (sub_82278528): two EVENT_WRITE_SHDs
+// into the writeback block at +10896, the ring position (+14920 low bits |
+// the write pointer) to +4 and the fence (+10908, which then moves on by 2)
+// to +0. The original still runs: its packets are never read.
+void SetFence(PPCContext& ctx, uint8_t* base) {
+  const uint32_t dev = ctx.r3.u32;
+  std::lock_guard lock(g_front.mutex);
+  if (!g_front.sync_recording) return;
+  const uint32_t block = U32(base, dev + 10896);
+  if (!block) return;
+  List& list = Current(dev);
+  list.words.push_back(kOpFence);
+  list.words.push_back(Phys(block));
+  list.words.push_back((U32(base, dev + 14920) & 3) | U32(base, dev + kRingWrite));
+  list.words.push_back(U32(base, dev + 10908));
+  g_counts.fences.fetch_add(1, std::memory_order_relaxed);
+}
+
+// D3D::CDevice::AddCallsToPrimaryBuffer(device, calls, count) (sub_82210408):
+// the doorbell. Each call is (size, address) and becomes an INDIRECT_BUFFER in
+// the primary ring; everything recorded so far goes with these segments, named
+// in the list so the command processor knows which list is which segment.
+// Whether the next content carries its sync records is decided here.
+void AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t* base) {
+  if (GetMode() != Mode::kNative) return;
+  const uint32_t calls = ctx.r4.u32, count = ctx.r5.u32;
+  std::lock_guard lock(g_front.mutex);
+  List& list = *g_front.immediate;
+  list.words.push_back(kOpSegments | (std::min(count, 0xFFFFu) << 8));
+  list.words.push_back(g_front.sync_recording ? 1u : 0u);
+  for (uint32_t i = 0; i < std::min(count, 0xFFFFu); ++i) {
+    list.words.push_back(U32(base, calls + i * 8 + 4) & 0x1FFFFFFFu);
+  }
+  g_counts.doorbells.fetch_add(1, std::memory_order_relaxed);
+  if (g_front.sync_recording) g_counts.native_doorbells.fetch_add(1, std::memory_order_relaxed);
+  Publish();
+  const bool was = g_front.sync_recording;
+  g_front.sync_recording = SyncWanted();
+  if (g_front.sync_recording != was) {
+    REXLOG_INFO("Renut: native sync {} at doorbell {} (swap {})", g_front.sync_recording ? "on" : "off",
+                g_counts.doorbells.load(std::memory_order_relaxed), g_front.swaps_seen);
+  }
+}
+
+// D3D InsertCallback(device, ring, flags, function, context) (sub_822052C8):
+// scratch register writes naming the callback, waits for the CPU and the
+// interrupt that runs it, as PM4 at `ring`; the packets it wrote go into the
+// list as they are.
+bool InsertCallback(PPCContext& ctx, uint8_t* base) {
+  const uint32_t dev = ctx.r3.u32, ring = ctx.r4.u32;
+  std::unique_lock lock(g_front.mutex);
+  if (!g_front.sync_recording) return false;
+  lock.unlock();
+  __imp__sub_822052C8(ctx, base);
+  const uint32_t end = ctx.r3.u32;
+  if (end <= ring || end - ring > 4096) return true;
+  lock.lock();
+  List& list = Current(dev);
+  const uint32_t words = (end - ring) / 4;
+  list.words.push_back(kOpCallback | (words << 8));
+  for (uint32_t i = 1; i <= words; ++i) list.words.push_back(U32(base, ring + i * 4));
+  g_counts.callbacks.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+// The watchdog, in D3D_CBlocker_Check (sub_8264DCD0), which every Direct3D
+// wait calls in its loop: the blocker's device is at +0.
+void CheckWait(PPCContext& ctx, uint8_t* base) {
+  struct Wait {
+    uint32_t blocker = 0, done = 0, calls = 0;
+    std::chrono::steady_clock::time_point since;
+    bool fired = false;
+  };
+  thread_local Wait wait;
+  if (++wait.calls & 1023) return;
+  const uint32_t blocker = ctx.r3.u32, dev = U32(base, blocker);
+  const uint32_t block = dev ? U32(base, dev + 10896) : 0;
+  if (!block) return;
+  const uint32_t done = U32(base, block);
+  const auto now = std::chrono::steady_clock::now();
+  if (blocker != wait.blocker || done != wait.done) {
+    wait = Wait{blocker, done, wait.calls, now, false};
+    return;
+  }
+  if (wait.fired || now - wait.since < std::chrono::milliseconds(1500)) return;
+  // Only a wait nothing will end: every published list has run and the
+  // command processor is idle.
+  if (g_executor_busy.load(std::memory_order_relaxed) > 0 ||
+      g_counts.lists_executed.load(std::memory_order_relaxed) <
+          g_counts.lists_published.load(std::memory_order_relaxed)) {
+    wait.since = now;
+    return;
+  }
+  wait.fired = true;
+  g_counts.stuck_waits.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t issued = U32(base, dev + 10908) - 2;
+  const uint32_t position = (U32(base, dev + 13244) & 3) | U32(base, dev + 13240);
+  REXLOG_WARN("Renut: native sync: a wait (kind {}) stood still 1.5 s with every list run: fence {:X} of {:X}, "
+              "position {:X} of {:X}; completing it and walking the ring again",
+              U32(base, blocker + 4), done, issued, U32(base, block + 4), position);
+  g_sync_fallback.store(true, std::memory_order_relaxed);
+  S32(base, block + 4, position);
+  S32(base, block, issued);
 }
 
 }  // namespace
@@ -1455,57 +1550,31 @@ void Swap(PPCContext& ctx) {
 // ---------------------------------------------------------------------------
 // Public entry points.
 
-Mode GetMode() {
-  int32_t mode = g_mode.load(std::memory_order_relaxed);
-  if (mode < 0) {
-    mode = std::clamp(REXCVAR_GET(renut_native_d3d), 0, 2);
-    g_mode.store(mode, std::memory_order_relaxed);
-    if (mode) REXLOG_INFO("Renut: native Direct3D front end, mode {}", mode);
-  }
-  return Mode(mode);
-}
+Mode GetMode() { return Mode::kNative; }
 
 bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
   using namespace renut::d3d;
-  if (function < g_calls.size()) g_calls[function].fetch_add(1, std::memory_order_relaxed);
+  if (function < g_calls.size() && function != renut::d3d::kD3D_CBlocker_Check) {
+    g_calls[function].fetch_add(1, std::memory_order_relaxed);
+  }
   switch (Function(function)) {
     case kD3DDevice_DrawIndexedVertices:
-      if (t_opaque_depth) return false;
       return DrawIndexedVertices(ctx, base);
     case kD3DDevice_DrawVertices:
-      if (t_opaque_depth) return false;
       return DrawVertices(ctx, base);
     case kD3DDevice_BeginVertices:
-      if (t_opaque_depth) return false;
       return BeginVertices(ctx, base);
     case kD3DDevice_BeginIndexedVertices:
-      OpaqueBegin(ctx, base, kMarkIndexedUP, kFlushAll);
-      return false;
+      return BeginIndexedVertices(ctx, base);
     case kD3DDevice_DrawIndexedTessellatedVertices:
-      if (t_opaque_depth) return false;
       return DrawIndexedTessellatedVertices(ctx, base);
-    case kD3DDevice_Clear:
-    case kD3DDevice_ClearF:
-      if (GetMode() == Mode::kVerify) OpaqueBegin(ctx, base, kMarkClear, kFlushRenderStates);
-      return false;
     case kD3D_ClearF:
-      if (GetMode() == Mode::kNative) return t_opaque_depth ? false : ClearNative(ctx, base);
-      OpaqueBegin(ctx, base, kMarkClear, kFlushRenderStates);
-      return false;
+      return ClearNative(ctx, base);
     case kD3DDevice_Resolve:
-      if (GetMode() == Mode::kNative) return t_opaque_depth ? false : ResolveNative(ctx, base);
-      OpaqueBegin(ctx, base, kMarkResolve, kFlushRenderStates);
-      return false;
+      return ResolveNative(ctx, base);
     // Memory export and GPR allocation change nothing the lists draw with
     // (the export address is a coherency base; the dummy draws drain the
-    // console's pipeline): in native mode their PM4 stays with the ring.
-    case kD3DDevice_BeginExport:
-    case kD3DDevice_EndExport:
-      if (GetMode() == Mode::kVerify) OpaqueBegin(ctx, base, kMarkExport, kFlushNone);
-      return false;
-    case kD3DDevice_SetShaderGPRAllocation:
-      if (GetMode() == Mode::kVerify) OpaqueBegin(ctx, base, kMarkGprAllocation, kFlushNone);
-      return false;
+    // console's pipeline): their PM4 goes to segments nobody walks.
     case kD3DDevice_BeginCommandBuffer:
       BeginCommandBuffer(ctx);
       return false;
@@ -1522,7 +1591,6 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       SetCommandBufferPredication(ctx);
       return false;
     case kD3D_SetSurfaceClip:
-      if (t_opaque_depth) return false;
       SetSurfaceClip(ctx, base);
       return false;
     case kD3DDevice_Swap:
@@ -1534,39 +1602,23 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       Publish();
       return false;
     }
+    case kD3D_CDevice_SetFence:
+      SetFence(ctx, base);
+      return false;
+    case kD3D_CDevice_AddCallsToPrimaryBuffer:
+      AddCallsToPrimaryBuffer(ctx, base);
+      return false;
+    case kD3D_InsertCallback:
+      return InsertCallback(ctx, base);
+    case kD3D_CBlocker_Check:
+      if (REXCVAR_GET(renut_native_sync)) CheckWait(ctx, base);
+      return false;
     default:
       return false;
   }
 }
 
-void OnLeave(uint32_t function, uint32_t r3, PPCContext& ctx, uint8_t* base) {
-  using namespace renut::d3d;
-  switch (Function(function)) {
-    case kD3DDevice_BeginVertices:
-      if (!t_opaque_depth) AfterBeginVertices(ctx, r3);
-      break;
-    case kD3DDevice_BeginIndexedVertices:
-      OpaqueEnd(ctx, base, r3, kMarkIndexedUP);
-      break;
-    case kD3DDevice_Clear:
-    case kD3DDevice_ClearF:
-    case kD3D_ClearF:
-      if (GetMode() == Mode::kVerify) OpaqueEnd(ctx, base, r3, kMarkClear);
-      break;
-    case kD3DDevice_Resolve:
-      if (GetMode() == Mode::kVerify) OpaqueEnd(ctx, base, r3, kMarkResolve);
-      break;
-    case kD3DDevice_BeginExport:
-    case kD3DDevice_EndExport:
-      if (GetMode() == Mode::kVerify) OpaqueEnd(ctx, base, r3, kMarkExport);
-      break;
-    case kD3DDevice_SetShaderGPRAllocation:
-      if (GetMode() == Mode::kVerify) OpaqueEnd(ctx, base, r3, kMarkGprAllocation);
-      break;
-    default:
-      break;
-  }
-}
+void OnLeave(uint32_t, uint32_t, PPCContext&, uint8_t*) {}
 
 void TakePublished(std::vector<std::shared_ptr<const List>>& out) {
   std::lock_guard lock(g_front.published_mutex);
@@ -1577,227 +1629,46 @@ void TakePublished(std::vector<std::shared_ptr<const List>>& out) {
 }
 
 // ---------------------------------------------------------------------------
-// Verifier: walks the published lists as the command processor walks the
-// PM4, keeping the registers the lists set, and at every PM4 draw compares
-// the draw the list holds with the one the PM4 holds.
+// The report.
 
 namespace {
+std::mutex g_report_mutex;
+std::string g_report_path;
+}  // namespace
 
-struct Verifier {
-  std::vector<uint32_t> regs = std::vector<uint32_t>(0x5003, 0);
-  std::bitset<0x5003> known;
-  uint64_t vs_hash = 0, ps_hash = 0;
-  uint32_t vs_dwords = 0, ps_dwords = 0;
-  bool vs_known = false, ps_known = false;
-  uint64_t bin_mask = 0xFFFFFFFFull, bin_select = 0xFFFFFFFFull;
-  struct Frame {
-    std::shared_ptr<const List> list;
-    size_t pos = 0;
-  };
-  std::vector<Frame> stack;
-  std::deque<std::shared_ptr<const List>> queue;
-  uint32_t opaque = 0;
-  uint32_t tag = 0;
-  bool tag_valid = false;
-  uint64_t untagged = 0, behind = 0, markers_passed = 0;
-  uint32_t opaque_kind = 0;
-
-  // Window statistics.
-  uint64_t first_frame = 0, frames = 0, pm4_draws = 0, compared = 0, clean = 0, dirty = 0;
-  uint64_t skipped = 0, skipped_agree = 0, opaque_draws = 0, missing = 0, native_extra = 0;
-  uint64_t unexpected_markers = 0, marker_searches = 0, marker_lost = 0, bad_records = 0;
-  uint64_t f_initiator = 0, f_dma = 0, f_vs = 0, f_ps = 0, f_bin = 0, f_vs_unknown = 0;
-  std::array<uint64_t, 8> opaque_by_kind{};
-  std::unordered_map<uint32_t, uint64_t> reg_mismatch;
-  std::string details;
-  uint32_t detail_lines = 0;
-  std::string unmatched;
-  uint32_t unmatched_lines = 0;
-  uint64_t reports = 0;
-  std::string path;
-} g_verify;
-
-std::mutex g_verify_path_mutex;
-
-const uint32_t* Peek(Verifier& v) {
-  for (int guard = 0; guard < 1000000; ++guard) {
-    if (v.stack.empty()) {
-      if (v.queue.empty()) {
-        std::vector<std::shared_ptr<const List>> more;
-        TakePublished(more);
-        for (auto& l : more) v.queue.push_back(std::move(l));
-        if (v.queue.empty()) return nullptr;
-      }
-      v.stack.push_back({std::move(v.queue.front()), 0});
-      v.queue.pop_front();
-    }
-    Verifier::Frame& f = v.stack.back();
-    const std::vector<uint32_t>& words = f.list->words;
-    if (f.pos >= words.size()) {
-      v.stack.pop_back();
-      continue;
-    }
-    const uint32_t* w = words.data() + f.pos;
-    const uint32_t op = w[0] & 0xFF;
-    switch (op) {
-      case kOpRegs: {
-        const uint32_t count = w[0] >> 8, first = w[1];
-        if (f.pos + 2 + count > words.size() || first + count > 0x5003) {
-          ++v.bad_records;
-          f.pos = words.size();
-          break;
-        }
-        for (uint32_t i = 0; i < count; ++i) {
-          v.regs[first + i] = w[2 + i];
-          v.known.set(first + i);
-        }
-        f.pos += 2 + count;
-        break;
-      }
-      case kOpShader: {
-        const uint32_t type = w[1] & 3;
-        const uint64_t hash = uint64_t(w[3]) | (uint64_t(w[4]) << 32);
-        if (type == 0) {
-          v.vs_hash = hash;
-          v.vs_dwords = w[2];
-          v.vs_known = true;
-        } else {
-          v.ps_hash = hash;
-          v.ps_dwords = w[2];
-          v.ps_known = true;
-        }
-        f.pos += 5;
-        break;
-      }
-      case kOpBin: {
-        const uint32_t which = w[0] >> 8, value = w[1];
-        if (which == 0) v.bin_mask = (v.bin_mask & 0xFFFFFFFF00000000ull) | value;
-        if (which == 1) v.bin_mask = (v.bin_mask & 0xFFFFFFFFull) | (uint64_t(value) << 32);
-        if (which == 2) v.bin_select = (v.bin_select & 0xFFFFFFFF00000000ull) | value;
-        if (which == 3) v.bin_select = (v.bin_select & 0xFFFFFFFFull) | (uint64_t(value) << 32);
-        f.pos += 2;
-        break;
-      }
-      case kOpRun: {
-        std::shared_ptr<const List> child = w[1] < f.list->runs.size() ? f.list->runs[w[1]] : nullptr;
-        f.pos += 2;
-        if (child) v.stack.push_back({std::move(child), 0});
-        break;
-      }
-      case kOpSurfaces:
-        f.pos += 1 + 4 * uint32_t(__builtin_popcount(w[0] >> 8));
-        break;
-      case kOpDraw:
-      case kOpMarker:
-      case kOpSwap:
-        return w;
-      default:
-        ++v.bad_records;
-        f.pos = words.size();
-        break;
-    }
-  }
-  return nullptr;
-}
-
-void Consume(Verifier& v) {
-  if (v.stack.empty()) return;
-  Verifier::Frame& f = v.stack.back();
-  const uint32_t op = f.list->words[f.pos] & 0xFF;
-  f.pos += op == kOpDraw ? 6 : op == kOpMarker ? 2 : op == kOpSwap ? 4 : 1;
-}
-
-// A PM4 draw may reach the command processor before the list holding it was
-// published only if the kick-off publishing missed a kick; wait a moment.
-// Never waited for: the command processor stalling here stalls the game's
-// fences (the first verify run sat at 0 FPS).
-const uint32_t* PeekWaiting(Verifier& v) { return Peek(v); }
-
-void Detail(Verifier& v, const std::string& line) {
-  if (v.detail_lines >= 60) return;
-  ++v.detail_lines;
-  v.details += line;
-  v.details += '\n';
-}
-
-// The registers the lists are responsible for.
-constexpr std::array<std::pair<uint32_t, uint32_t>, 4> kCompared{{
-    {0x2000, 0x2400},   // render states (the D3D shadow blocks, the window scissor, ...)
-    {0x4000, 0x4800},   // ALU constants
-    {0x4800, 0x48C0},   // fetch constants
-    {0x4900, 0x4928},   // booleans, loops
-}};
-// Registers the command processor writes for a draw itself.
-// And the copy registers (RB_COPY_*, 0x2318-0x2327), which the game's
-// Resolve sets for its own copy draw (the lists hold no resolves yet), and
-// the cache coherency bases (COHER_DEST_BASE_*), which the host has no use for.
-bool CpOwned(uint32_t reg) {
-  return reg == 0x21F9 || reg == 0x21FA || reg == 0x21FB || reg == 0x21FC || reg == 0x21FD ||
-         (reg >= 0x2318 && reg <= 0x2327) || (reg >= 0x2006 && reg <= 0x200D);
-}
-
-void WriteReport(Verifier& v, uint64_t frame) {
-  std::string out = fmt::format("native-d3d verify report {} - frames {}..{} ({} frames)\n\n", v.reports++,
-                                v.first_frame, frame, v.frames);
-  const double f = double(v.frames ? v.frames : 1);
-  out += fmt::format(
-      "== PM4 draws/frame {:.1f}: compared {:.1f}, clean {:.1f}, with mismatches {:.1f}; predicated skips {:.1f} "
-      "(native agreed {:.1f}); inside opaque calls {:.1f}\n",
-      v.pm4_draws / f, v.compared / f, v.clean / f, v.dirty / f, v.skipped / f, v.skipped_agree / f,
-      v.opaque_draws / f);
-  out += fmt::format(
-      "== alignment: untagged PM4 draws {}, tagged without native draw {}, behind {}, native extra {}, markers "
-      "passed {}, unexpected markers {}, marker searches {}, markers "
-      "lost {}, bad records {}\n",
-      v.untagged, v.missing, v.behind, v.native_extra, v.markers_passed, v.unexpected_markers, v.marker_searches,
-      v.marker_lost, v.bad_records);
-  out += fmt::format("== field mismatches: initiator {}, index dma {}, vertex shader {} (unknown {}), pixel shader {}, "
-                     "bin mask {}\n",
-                     v.f_initiator, v.f_dma, v.f_vs, v.f_vs_unknown, v.f_ps, v.f_bin);
-  out += fmt::format("== opaque calls by kind: clear {}, resolve {}, tessellated {}, export {}, indexed UP {}, "
-                     "GPR allocation {}\n",
-                     v.opaque_by_kind[kMarkClear], v.opaque_by_kind[kMarkResolve],
-                     v.opaque_by_kind[kMarkTessellated], v.opaque_by_kind[kMarkExport],
-                     v.opaque_by_kind[kMarkIndexedUP], v.opaque_by_kind[kMarkGprAllocation]);
+void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t bad,
+                  const std::function<std::string()>& executor) {
+  static uint64_t last_frame = 0, last_draws = 0, last_dropped = 0;
+  if (frame < last_frame + 300) return;
+  const double f = double(frame - last_frame);
   auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
+  std::string out = fmt::format(
+      "native Direct3D lists - frames {}..{}\n\n== per frame: draws {:.1f}, ring draw packets ignored {:.1f}; "
+      "problems so far {}\n",
+      last_frame, frame, (draws - last_draws) / f, (ring_draws_dropped - last_dropped) / f, bad);
   out += fmt::format(
-      "== front end (total): draws {}, flushes {}, shader loads {}, patched loads {}, literal blocks {}, "
-      "begin vertices {}, markers {}, runs {} (unknown {}), recordings {} (nested {}), recording devices {}, immediate "
-      "calls on another device {}, publishes {}, surface clips {} (tiled {}), screen extent {}, predicated tiling {}, SetPending_Predicated {}, HiZ events {}, no scratch "
-      "{}\n",
+      "== front end (total): draws {}, flushes {}, shader loads {}, patched loads {}, begin vertices {}, "
+      "runs {} (unknown {}), recordings {}, recording devices {}, immediate calls on another device {}, publishes {}, "
+      "screen extent {}, predicated tiling {}, SetPending_Predicated {}, no scratch {}\n",
       c(g_counts.draws), c(g_counts.flushes), c(g_counts.shader_loads), c(g_counts.patched_loads),
-      c(g_counts.literal_blocks), c(g_counts.begin_vertices), c(g_counts.markers), c(g_counts.runs),
-      c(g_counts.unknown_runs), c(g_counts.recordings), c(g_counts.nested_recordings), c(g_counts.devices),
-      c(g_counts.foreign_immediate), c(g_counts.publishes),
-      c(g_counts.surface_clips), c(g_counts.tiled_surface_clips), c(g_counts.screen_extent),
-      c(g_counts.predicated_tiling), c(g_counts.set_pending_predicated), c(g_counts.hiz_events),
+      c(g_counts.begin_vertices), c(g_counts.runs), c(g_counts.unknown_runs),
+      c(g_counts.recordings), c(g_counts.devices), c(g_counts.foreign_immediate), c(g_counts.publishes),
+      c(g_counts.screen_extent), c(g_counts.predicated_tiling), c(g_counts.set_pending_predicated),
       c(g_counts.no_scratch));
-  std::vector<std::pair<uint64_t, uint32_t>> sorted;
-  for (auto& [reg, n] : v.reg_mismatch) sorted.emplace_back(n, reg);
-  std::sort(sorted.rbegin(), sorted.rend());
-  out += fmt::format("\n== registers that differed ({} distinct)\n", sorted.size());
-  for (size_t i = 0; i < std::min<size_t>(sorted.size(), 60); ++i) {
-    out += fmt::format("   {:04X} {}\n", sorted[i].second, sorted[i].first);
-  }
-  out += "\n== first mismatches\n";
-  out += v.details;
-  out += "\n== first PM4 draws without a native draw\n";
-  out += v.unmatched;
-  {
-    std::vector<std::pair<uint64_t, uint32_t>> calls;
-    for (uint32_t i = 0; i < g_calls.size(); ++i) {
-      if (const uint64_t n = g_calls[i].exchange(0, std::memory_order_relaxed)) calls.emplace_back(n, i);
-    }
-    std::sort(calls.rbegin(), calls.rend());
-    out += "\n== Direct3D calls per frame\n";
-    for (size_t i = 0; i < std::min<size_t>(calls.size(), 60); ++i) {
-      out += fmt::format("   {:10.1f} {}\n", calls[i].first / f, kFunctionNames[calls[i].second]);
-    }
-  }
+  out += fmt::format(
+      "== sync (total): {} doorbells ({} with native sync), fences {}, presents {}, callbacks {}, lists {} "
+      "published / {} run, stuck waits {}{}; BeginIndexedVertices {}\n",
+      c(g_counts.doorbells), c(g_counts.native_doorbells), c(g_counts.fences), c(g_counts.presents),
+      c(g_counts.callbacks), c(g_counts.lists_published), c(g_counts.lists_executed), c(g_counts.stuck_waits),
+      g_sync_fallback.load() ? " (fell back to the ring)" : "", c(g_counts.indexed_up));
+  if (executor) out += executor();
+  last_frame = frame;
+  last_draws = draws;
+  last_dropped = ring_draws_dropped;
   std::string path;
   {
-    std::lock_guard lock(g_verify_path_mutex);
-    path = v.path;
+    std::lock_guard lock(g_report_mutex);
+    path = g_report_path;
   }
   if (!path.empty()) {
     if (FILE* file = std::fopen(path.c_str(), "w")) {
@@ -1805,264 +1676,39 @@ void WriteReport(Verifier& v, uint64_t frame) {
       std::fclose(file);
     }
   }
-  // Next window.
-  v.first_frame = frame;
-  v.frames = v.pm4_draws = v.compared = v.clean = v.dirty = 0;
-  v.skipped = v.skipped_agree = v.opaque_draws = 0;
-  v.reg_mismatch.clear();
-  v.details.clear();
-  v.detail_lines = 0;
-  v.unmatched.clear();
-  v.unmatched_lines = 0;
-  v.opaque_by_kind.fill(0);
-  v.missing = v.native_extra = v.unexpected_markers = v.marker_searches = v.marker_lost = v.bad_records = 0;
-  v.untagged = v.behind = v.markers_passed = 0;
-  v.f_initiator = v.f_dma = v.f_vs = v.f_ps = v.f_bin = v.f_vs_unknown = 0;
 }
 
-}  // namespace
-
-namespace {
-
-// The native draw a PM4 draw's tag names, with the lists' state applied up
-// to it. Native draws passed over are the native side's extra; a native draw
-// newer than the tag means the PM4 draw's own record is gone.
-const uint32_t* AdvanceTo(Verifier& v, uint32_t tag) {
-  for (int i = 0; i < 1000000; ++i) {
-    const uint32_t* w = Peek(v);
-    if (!w) return nullptr;
-    const uint32_t op = w[0] & 0xFF;
-    if (op == kOpSwap) return nullptr;
-    if (op == kOpMarker) {
-      ++v.markers_passed;
-      Consume(v);
-      continue;
-    }
-    const uint32_t ahead = (tag - w[5]) & 0xFFFFFF;
-    if (ahead == 0) return w;
-    if (ahead < 0x800000) {
-      ++v.native_extra;
-      Consume(v);
-      continue;
-    }
-    ++v.behind;
-    return nullptr;
-  }
-  return nullptr;
+bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height) {
+  std::lock_guard lock(g_front.mutex);
+  if (!g_front.sync_recording || !g_front.main_device) return false;
+  uint8_t* base = rex::system::kernel_memory() ? rex::system::kernel_memory()->virtual_membase() : nullptr;
+  if (!base) return false;
+  const uint32_t dev = g_front.main_device, block = U32(base, dev + 10896);
+  if (!block) return false;
+  // D3DDevice_Swap stamps two slots of its eight-entry history (+21628 the
+  // next, +21624 the oldest the vertical blank has not taken) with the GPU's
+  // vblank counter, one just before VdSwap and one after, while fewer than
+  // six are outstanding.
+  const uint32_t next = U32(base, dev + 21628);
+  const bool stamped = next - U32(base, dev + 21624) < 6;
+  List& list = *g_front.immediate;
+  list.words.push_back(kOpPresent);
+  list.words.push_back(frontbuffer);
+  list.words.push_back(width);
+  list.words.push_back(height);
+  list.words.push_back(stamped ? Phys(block + (16 + (next & 7)) * 4) : 0);
+  list.words.push_back(stamped ? Phys(block + (16 + ((next + 1) & 7)) * 4) : 0);
+  g_counts.presents.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
-// After a native draw is used up: its tag still names the next PM4 draw only
-// when that is the next part of the same split draw.
-void AfterMatch(Verifier& v) {
-  Consume(v);
-  const uint32_t* w = Peek(v);
-  v.tag_valid = w && (w[0] & 0xFF) == kOpDraw && ((w[5] ^ v.tag) & 0xFFFFFF) == 0;
-}
+void NoteListExecuted() { g_counts.lists_executed.fetch_add(1, std::memory_order_relaxed); }
 
-void Unmatched(Verifier& v, const Pm4Draw& pm4, const char* why) {
-  if (v.unmatched_lines >= 40) return;
-  ++v.unmatched_lines;
-  v.unmatched += fmt::format("frame {} vs {:016X} ps {:016X} prim {} n {} mode {} {}\n", pm4.frame, pm4.vs_hash,
-                             pm4.ps_hash, pm4.initiator & 0x3F, pm4.initiator >> 16, pm4.edram_mode, why);
-}
-
-}  // namespace
-
-void VerifyTag(uint32_t serial) {
-  g_verify.tag = serial & 0xFFFFFF;
-  g_verify.tag_valid = true;
-}
-
-void VerifyDraw(const Pm4Draw& pm4) {
-  Verifier& v = g_verify;
-  ++v.pm4_draws;
-  if (v.opaque) {
-    ++v.opaque_draws;
-    return;
-  }
-  if (!v.tag_valid) {
-    ++v.untagged;  // drawn by something the front end does not replace
-    Unmatched(v, pm4, "untagged");
-    return;
-  }
-  const uint32_t* w = AdvanceTo(v, v.tag);
-  if (!w) {
-    ++v.missing;
-    v.tag_valid = false;
-    Unmatched(v, pm4, "tagged, no native draw");
-    return;
-  }
-  ++v.compared;
-  bool bad = false;
-  std::string why;
-  if (w[2] != pm4.initiator) {
-    ++v.f_initiator;
-    bad = true;
-    why += fmt::format(" initiator {:08X}/{:08X}", pm4.initiator, w[2]);
-  }
-  if (pm4.indexed && (w[3] != pm4.dma_base || w[4] != pm4.dma_size)) {
-    ++v.f_dma;
-    bad = true;
-    why += fmt::format(" dma {:08X}:{:08X}/{:08X}:{:08X}", pm4.dma_base, pm4.dma_size, w[3], w[4]);
-  }
-  if (!v.vs_known) {
-    ++v.f_vs_unknown;
-  } else if (v.vs_hash != pm4.vs_hash || v.vs_dwords != pm4.vs_dwords) {
-    ++v.f_vs;
-    bad = true;
-    why += fmt::format(" vs {:016X}({})/{:016X}({})", pm4.vs_hash, pm4.vs_dwords, v.vs_hash, v.vs_dwords);
-    v.vs_hash = pm4.vs_hash;
-    v.vs_dwords = pm4.vs_dwords;
-  }
-  // Plume runs a pixel shader only in colour passes (EDRAM mode 4).
-  if (pm4.edram_mode == 4 && pm4.ps_hash && v.ps_known &&
-      (v.ps_hash != pm4.ps_hash || v.ps_dwords != pm4.ps_dwords)) {
-    ++v.f_ps;
-    bad = true;
-    why += fmt::format(" ps {:016X}/{:016X}", pm4.ps_hash, v.ps_hash);
-    v.ps_hash = pm4.ps_hash;
-    v.ps_dwords = pm4.ps_dwords;
-  }
-  if ((v.bin_mask & 0xFFFFFFFFull) != (pm4.bin_mask & 0xFFFFFFFFull)) {
-    ++v.f_bin;
-    bad = true;
-    why += fmt::format(" bin {:X}/{:X}", pm4.bin_mask, v.bin_mask);
-    v.bin_mask = pm4.bin_mask;
-  }
-  uint32_t reg_bad = 0;
-  for (auto [b, e] : kCompared) {
-    if (std::memcmp(v.regs.data() + b, pm4.regs + b, (e - b) * 4) == 0) continue;
-    for (uint32_t r = b; r < e; ++r) {
-      if (v.regs[r] == pm4.regs[r] || CpOwned(r)) continue;
-      if (!v.known.test(r)) {
-        v.regs[r] = pm4.regs[r];  // never set by a list: take the PM4's
-        continue;
-      }
-      ++v.reg_mismatch[r];
-      if (reg_bad++ < 4) why += fmt::format(" r{:04X} {:08X}/{:08X}", r, pm4.regs[r], v.regs[r]);
-      v.regs[r] = pm4.regs[r];
-    }
-  }
-  if (reg_bad) bad = true;
-  if (bad) {
-    ++v.dirty;
-    Detail(v, fmt::format("frame {} vs {:016X} ps {:016X} prim {}:{}", pm4.frame, pm4.vs_hash, pm4.ps_hash,
-                          pm4.initiator & 0x3F, pm4.initiator >> 16) +
-                  why + (reg_bad > 4 ? fmt::format(" (+{} registers)", reg_bad - 4) : std::string()));
-  } else {
-    ++v.clean;
-  }
-  AfterMatch(v);
-}
-
-void VerifySkipped(uint64_t bin_mask, uint64_t bin_select) {
-  Verifier& v = g_verify;
-  ++v.skipped;
-  if (v.opaque || !v.tag_valid) return;
-  const uint32_t* w = AdvanceTo(v, v.tag);
-  if (!w) {
-    ++v.missing;
-    v.tag_valid = false;
-    return;
-  }
-  if ((v.bin_mask & v.bin_select) == 0) ++v.skipped_agree;
-  v.bin_mask = bin_mask;
-  v.bin_select = bin_select;
-  AfterMatch(v);
-}
-
-void VerifyMarker(uint32_t payload) {
-  Verifier& v = g_verify;
-  const uint32_t kind = payload >> 24, serial = payload & 0xFFFF;
-  if (!(payload & 0x10000)) {
-    if (v.opaque) --v.opaque;
-    return;
-  }
-  ++v.opaque;
-  if (kind < v.opaque_by_kind.size()) ++v.opaque_by_kind[kind];
-  // The matching marker record, applying state on the way. Draw records
-  // passed over are the native side's extra.
-  for (int i = 0; i < 100000; ++i) {
-    const uint32_t* w = PeekWaiting(v);
-    if (!w) {
-      ++v.marker_lost;
-      return;
-    }
-    const uint32_t op = w[0] & 0xFF;
-    if (op == kOpMarker && w[1] == serial) {
-      Consume(v);
-      return;
-    }
-    if (op == kOpSwap) {
-      ++v.marker_lost;
-      return;
-    }
-    if (op == kOpDraw) ++v.native_extra;
-    if (op == kOpMarker) ++v.marker_searches;
-    Consume(v);
-  }
-}
-
-void VerifySwap(uint64_t frame) {
-  Verifier& v = g_verify;
-  ++v.frames;
-  v.opaque = 0;
-  for (int i = 0; i < 100000; ++i) {
-    const uint32_t* w = PeekWaiting(v);
-    if (!w) {
-      ++v.missing;
-      break;
-    }
-    const uint32_t op = w[0] & 0xFF;
-    Consume(v);
-    if (op == kOpSwap) break;
-    if (op == kOpDraw) ++v.native_extra;
-  }
-  if (v.frames >= 300) WriteReport(v, frame);
-}
-
-void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t markers, uint64_t bad,
-                  const std::function<std::string()>& executor) {
-  static uint64_t last_frame = 0, last_draws = 0, last_dropped = 0, last_markers = 0;
-  if (frame < last_frame + 300) return;
-  const double f = double(frame - last_frame);
-  auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
-  std::string out = fmt::format(
-      "native-d3d native mode - frames {}..{}\n\n== per frame: native draws issued {:.1f}, PM4 draws dropped {:.1f}, "
-      "opaque calls handed to the PM4 {:.1f}; problems so far {}\n",
-      last_frame, frame, (draws - last_draws) / f, (ring_draws_dropped - last_dropped) / f, (markers - last_markers) / f,
-      bad);
-  out += fmt::format(
-      "== front end (total): draws {}, flushes {}, shader loads {}, patched loads {}, begin vertices {}, markers {}, "
-      "runs {} (unknown {}), recordings {}, recording devices {}, immediate calls on another device {}, publishes {}, "
-      "screen extent {}, predicated tiling {}, SetPending_Predicated {}, no scratch {}\n",
-      c(g_counts.draws), c(g_counts.flushes), c(g_counts.shader_loads), c(g_counts.patched_loads),
-      c(g_counts.begin_vertices), c(g_counts.markers), c(g_counts.runs), c(g_counts.unknown_runs),
-      c(g_counts.recordings), c(g_counts.devices), c(g_counts.foreign_immediate), c(g_counts.publishes),
-      c(g_counts.screen_extent), c(g_counts.predicated_tiling), c(g_counts.set_pending_predicated),
-      c(g_counts.no_scratch));
-  if (executor) out += executor();
-  last_frame = frame;
-  last_draws = draws;
-  last_dropped = ring_draws_dropped;
-  last_markers = markers;
-  std::string path;
-  {
-    std::lock_guard lock(g_verify_path_mutex);
-    path = g_verify.path;
-  }
-  if (path.size() > 4) {
-    path = path.substr(0, path.size() - 4) + "-native.txt";
-    if (FILE* file = std::fopen(path.c_str(), "w")) {
-      std::fwrite(out.data(), 1, out.size(), file);
-      std::fclose(file);
-    }
-  }
-}
+void SetExecutorBusy(bool busy) { g_executor_busy.fetch_add(busy ? 1 : -1, std::memory_order_relaxed); }
 
 void SetFilesDirectory(std::string directory) {
-  std::lock_guard lock(g_verify_path_mutex);
-  g_verify.path = directory + "/native-d3d-verify.txt";
+  std::lock_guard lock(g_report_mutex);
+  g_report_path = directory + "/native-d3d.txt";
 }
 
 }  // namespace renut::native_d3d

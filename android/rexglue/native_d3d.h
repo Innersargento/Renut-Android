@@ -10,14 +10,13 @@
 // their state flush is done again from the device, following the PowerPC
 // (sub_826567C8, sub_8222BF10, ...), into records of a host list, and the
 // draw itself becomes a record. Command buffers get a list of their own,
-// which a run appends to the list being recorded. Control flow (fences, ring
-// segments, swaps, the command buffers' own memory) stays with the game's
-// Direct3D: the PM4 it still writes carries no rendering.
-//
-// renut_native_d3d: 0 off, 1 verify (the native lists are built next to the
-// game's PM4, which still renders; the Plume command processor checks every
-// PM4 draw against the native one and writes files/native-d3d-verify.txt),
-// 2 native (the lists render, PM4 draws are not issued).
+// which a run appends to the list being recorded. Render targets are the
+// bound D3DSurfaces, resolves copy into the D3DTexture they name, vertex and
+// index buffers are kept per object. With renut_native_sync the lists also
+// carry what the GPU writes back for the CPU (fences, the swap history,
+// callbacks), and the command processor does not walk the game's segments;
+// the ring is left with the doorbell and its read pointer. The report goes to
+// files/native-d3d.txt.
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -28,19 +27,19 @@
 
 namespace renut::native_d3d {
 
-enum class Mode : uint32_t { kOff = 0, kVerify = 1, kNative = 2 };
+// The front end is always on: the lists are the only way anything is drawn.
+enum class Mode : uint32_t { kOff = 0, kNative = 2 };
 Mode GetMode();
 
 // Record opcodes, in the low 8 bits of a record's first word; the upper 24
 // bits hold a count or flags.
 enum Op : uint32_t {
   kOpRegs = 1,     // [op | count << 8] first register, count values
-  kOpShader = 2,   // [op] type | physical address, dwords, hash lo, hash hi (verify only)
+  kOpShader = 2,   // [op] type | physical address, dwords, two words unused
   kOpDraw = 3,     // [op | flags << 8] viz token, initiator, dma base, dma size, serial
   kOpBin = 4,      // [op | which << 8] value: 0 mask lo, 1 mask hi, 2 select lo, 3 select hi
   kOpRun = 5,      // [op] index into List::runs
-  kOpMarker = 6,   // [op | kind << 8] serial: a Direct3D call whose draws the list does not hold
-  kOpSwap = 7,     // [op] frontbuffer, width, height
+  kOpSwap = 7,     // [op] frontbuffer, width, height: D3DDevice_Swap (presenting is kOpPresent)
   // [op | flags << 8] x1, y1, x2, y2, red, green, blue, alpha, z (float bits), stencil,
   // RB_SURFACE_INFO, RB_COLOR_INFO of targets 0-3, RB_DEPTH_INFO, present (bits 0-3 targets, 4 depth)
   kOpClear = 9,
@@ -56,6 +55,26 @@ enum Op : uint32_t {
   // (RB_COLOR_INFO / RB_DEPTH_INFO) and +36 (width - 1 << 18 | height - 1 << 3).
   // Comes with every send of the target registers it stands behind.
   kOpSurfaces = 11,
+  // [op] GPU address of the device's writeback block, position, fence: SetFence's
+  // two EVENT_WRITE_SHDs (+4 the ring position, +0 the fence), native sync
+  kOpFence = 13,
+  // [op] frontbuffer GPU address, width, height, then the two swap-history slots the
+  // GPU stamps with its vblank counter around the swap (GPU addresses, 0 for none):
+  // VdSwap, native sync
+  kOpPresent = 14,
+  // [op | count << 8] the PM4 InsertCallback wrote: scratch register writes, waits
+  // for the CPU (not needed on the host) and the interrupt, native sync
+  kOpCallback = 15,
+  // [op | count << 8] flags, then the GPU addresses of the segments the ring is
+  // handed with this list (AddCallsToPrimaryBuffer). Flag 1: the list holds their
+  // fences, swaps and callbacks, and the command processor does not walk them
+  kOpSegments = 16,
+  // [op | mask << 8] for each stream in the mask (bits 0-17), its vertex buffer's
+  // GPU address and size in bytes (0, 0 for none): the vertex fetch constants
+  // 95 - stream sent just before
+  kOpStreams = 17,
+  // [op] the index buffer's GPU address and size in bytes
+  kOpIndices = 18,
 };
 constexpr uint32_t kResolveWords = 30, kClearWords = 18;
 
@@ -64,20 +83,14 @@ enum DrawFlags : uint32_t {
   kDrawScreenExtent = 2,  // took Direct3D's screen extent path (not reproduced)
 };
 
-enum MarkerKind : uint32_t {
-  kMarkClear = 1,
-  kMarkResolve = 2,
-  kMarkTessellated = 3,
-  kMarkExport = 4,
-  kMarkIndexedUP = 5,
-  kMarkGprAllocation = 6,  // SetShaderGPRAllocation: 24 one-point draws that drain the GPU
-};
-
 struct List {
   std::vector<uint32_t> words;
   std::vector<std::shared_ptr<const List>> runs;
   uint32_t draws = 0;
   uint32_t command_buffer = 0;  // guest object, 0 for the immediate list
+  // The index buffer last named in this list (kOpIndices).
+  uint32_t indices_base = 0, indices_size = 0;
+  bool indices_named = false;
 };
 
 // Called by the Direct3D interception layer (d3d_layer.cpp) for every
@@ -90,33 +103,19 @@ void OnLeave(uint32_t function, uint32_t r3, PPCContext& ctx, uint8_t* base);
 // order (each holds what the game recorded up to a ring kick-off).
 void TakePublished(std::vector<std::shared_ptr<const List>>& out);
 
-// Verify mode, called by the Plume command processor.
-struct Pm4Draw {
-  const uint32_t* regs = nullptr;  // the register file
-  uint64_t vs_hash = 0, ps_hash = 0;
-  uint32_t vs_dwords = 0, ps_dwords = 0;
-  uint32_t initiator = 0, dma_base = 0, dma_size = 0;
-  bool indexed = false;
-  uint64_t bin_mask = 0, bin_select = 0;
-  uint32_t edram_mode = 0;
-  uint64_t frame = 0;
-};
-void VerifyDraw(const Pm4Draw& draw);
-// A predicated PM4 draw the bin check skipped.
-void VerifySkipped(uint64_t bin_mask, uint64_t bin_select);
-// A NOP marker the front end wrote around an opaque call (payload word).
-void VerifyMarker(uint32_t payload);
-// The serial in the NOP ahead of a PM4 draw (payload 0xFF000000 | serial).
-void VerifyTag(uint32_t serial);
-// A PM4 swap: the native lists must be at their swap too.
-void VerifySwap(uint64_t frame);
-// The magic word of the front end's NOP markers (verify mode).
-constexpr uint32_t kNopMagic = 0x4E415444;  // "NATD"
-// Native mode: the executor's counters, written with the front end's to
-// files/native-d3d-verify-native.txt every 300 frames.
-void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t markers, uint64_t bad,
+// The executor's counters, written with the front end's to files/native-d3d.txt
+// every 300 frames.
+void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t bad,
                   const std::function<std::string()>& executor);
 // Where the report goes (the runtime's files directory).
 void SetFilesDirectory(std::string directory);
+// Native sync: VdSwap's frame (frontbuffer GPU address and size) as a record of
+// the swapping device's list; false when the swap goes through the ring.
+bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height);
+// Native sync: the command processor finished a published list.
+void NoteListExecuted();
+// Native sync: the command processor is running lists or presenting (a wait
+// meanwhile is no sign of a missing record).
+void SetExecutorBusy(bool busy);
 
 }  // namespace renut::native_d3d
