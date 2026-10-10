@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cfloat>
 #include <cmath>
 #include <chrono>
@@ -113,6 +114,10 @@ REXCVAR_DEFINE_INT32(renut_plume_low_memory, -1, "reNut/Plume",
 REXCVAR_DEFINE_INT32(renut_plume_texture_max_dim, 0, "reNut/Plume",
                      "Largest side a guest texture keeps on the host; the top mips of a larger one are dropped. "
                      "0 follows low-memory mode (512 there, no limit otherwise).");
+REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
+                    "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
+                    "next start; a scene load waits until they are built. Not in low-memory mode, which only "
+                    "records.");
 
 // game_fixes.cpp: how the MSAA-off path treats the scene's band split
 // (<files>/plume-keep-split: 0 clear, 1 leave, 2 whole-screen projection).
@@ -421,12 +426,27 @@ class ShaderStore {
   CompiledShader* Build(RenderDevice* device, const ShaderCacheEntry* entry, bool vertex, bool fetch_spec = false) {
     CompiledShader& compiled = compiled_[entry];
     if (compiled.module || compiled.failed) return compiled.failed ? nullptr : &compiled;
+    return BuildModules(device, entry, vertex, fetch_spec, compiled) ? &compiled : nullptr;
+  }
+
+  // The entry of a container hash (ShaderCacheEntry::hash), domain forms included.
+  const ShaderCacheEntry* FindContainer(uint64_t hash) const {
+    auto entry = by_container_.find(hash);
+    return entry == by_container_.end() ? nullptr : entry->second;
+  }
+
+  // Makes a shader's modules into `compiled`. Also used on their own by the
+  // pipeline precompilation, whose threads must not touch the store: the
+  // driver keys its cache by the SPIR-V, so the same transformations give
+  // pipelines the draws find there.
+  static bool BuildModules(RenderDevice* device, const ShaderCacheEntry* entry, bool vertex, bool fetch_spec,
+                           CompiledShader& compiled) {
     const uint8_t* data = g_spirvCache + entry->spirvOffset;
     size_t size = smolv::GetDecodedBufferSize(data, entry->spirvSize);
     std::vector<uint32_t> spirv((size + 3) / 4);
     if (!size || !smolv::Decode(data, entry->spirvSize, spirv.data(), size)) {
       compiled.failed = true;
-      return nullptr;
+      return false;
     }
     // Debug: <files>/plume-spv/<container hash>.spv stands in for the cached
     // SPIR-V of that shader, to try a changed shader without rebuilding the cache.
@@ -464,7 +484,7 @@ class ShaderStore {
     compiled.module = device->createShader(spirv.data(), size, "main", RenderShaderFormat::SPIRV);
     if (!compiled.module) {
       compiled.failed = true;
-      return nullptr;
+      return false;
     }
     if (vertex) compiled.inputs = ReflectInputs(spirv);
     std::vector<uint32_t> specialized;
@@ -493,7 +513,7 @@ class ShaderStore {
         }
       }
     }
-    return &compiled;
+    return true;
   }
 
  private:
@@ -515,6 +535,236 @@ class ShaderStore {
   std::unordered_map<uint64_t, uint64_t> by_loose_;
   std::unordered_map<const ShaderCacheEntry*, CompiledShader> compiled_;
 };
+
+// ---------------------------------------------------------------------------
+// Pipeline recipes
+// ---------------------------------------------------------------------------
+
+// Every pipeline a draw asks for is appended to <files>/plume-recipes.bin, its
+// shaders named by container hash, and the next start builds them all before a
+// scene may load - UnleashedRecomp's method: it holds its loading screen until
+// the pipelines it predicted are compiled, so a scene is never seen before they
+// exist. N&B's engine is not known well enough to predict them, so what the
+// game used before stands in for the prediction. The file is not part of the
+// driver's cache, which "Apagar cache de shaders" deletes; this list survives it.
+
+// Bump when what a recipe holds changes: the file is then started again.
+constexpr uint32_t kRecipeVersion = 1;
+constexpr uint32_t kRecipeMagic = 0x52504E52;  // "RNPR"
+
+struct RecipeHeader {
+  uint32_t magic = kRecipeMagic;
+  uint32_t version = kRecipeVersion;
+};
+
+// Which of a vertex shader's modules (CompiledShader) the pipeline was made with.
+enum : uint8_t { kRecipeModule, kRecipeFetchSpec, kRecipeDepth, kRecipeDepthFetchSpec };
+
+struct Recipe {
+  uint64_t vs = 0;     // container hash of the vertex shader, or of its domain form
+  uint64_t ps = 0;     // 0: no fragment shader
+  uint8_t domain = 0;  // vs is a domain form (built without vertex inputs)
+  uint8_t form = kRecipeModule;
+  uint8_t gs = 0;      // 0 none, 1 rectangle list, 2 point list
+  RenderGraphicsPipelineDesc desc;  // shader, layout and array pointers unset
+  std::vector<RenderInputElement> elements;
+  std::vector<RenderInputSlot> slots;
+  std::vector<RenderSpecConstant> constants;
+};
+
+struct RecipeWriter {
+  static constexpr bool kReading = false;
+  std::string& out;
+  template <typename T>
+  void operator()(T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    out.append(reinterpret_cast<const char*>(&value), sizeof(T));
+  }
+};
+
+struct RecipeReader {
+  static constexpr bool kReading = true;
+  const uint8_t* at;
+  const uint8_t* end;
+  bool ok = true;
+  template <typename T>
+  void operator()(T& value) {
+    if (size_t(end - at) < sizeof(T)) {
+      ok = false;
+      return;
+    }
+    std::memcpy(&value, at, sizeof(T));
+    at += sizeof(T);
+  }
+};
+
+// Field by field rather than the desc's bytes: its padding is not zeroed, and
+// the bytes written are also the key a draw finds its built pipeline by.
+template <typename Io>
+bool VisitRecipe(Io& io, Recipe& r) {
+  io(r.vs);
+  io(r.ps);
+  io(r.domain);
+  io(r.form);
+  io(r.gs);
+  RenderGraphicsPipelineDesc& d = r.desc;
+  io(d.depthFunction);
+  io(d.depthClipEnabled);
+  io(d.depthBias);
+  io(d.depthBiasClamp);
+  io(d.slopeScaledDepthBias);
+  io(d.dynamicDepthBiasEnabled);
+  io(d.dynamicStencilEnabled);
+  io(d.dynamicBlendFactorEnabled);
+  io(d.depthEnabled);
+  io(d.depthWriteEnabled);
+  io(d.stencilEnabled);
+  io(d.stencilReadMask);
+  io(d.stencilWriteMask);
+  io(d.stencilReference);
+  for (RenderStencilFaceDesc* face : {&d.stencilFrontFace, &d.stencilBackFace}) {
+    io(face->passOp);
+    io(face->failOp);
+    io(face->depthFailOp);
+    io(face->compareFunction);
+  }
+  io(d.multisampling.sampleCount);
+  io(d.multisampling.sampleLocationsEnabled);
+  for (RenderMultisamplingLocation& location : d.multisampling.sampleLocations) {
+    io(location.x);
+    io(location.y);
+  }
+  io(d.alphaToCoverageEnabled);
+  io(d.primitiveTopology);
+  io(d.cullMode);
+  io(d.frontFace);
+  io(d.renderTargetCount);
+  if (d.renderTargetCount > RenderGraphicsPipelineDesc::MaxRenderTargets) return false;
+  for (uint32_t i = 0; i < d.renderTargetCount; ++i) {
+    io(d.renderTargetFormat[i]);
+    RenderBlendDesc& b = d.renderTargetBlend[i];
+    io(b.blendEnabled);
+    io(b.srcBlend);
+    io(b.dstBlend);
+    io(b.blendOp);
+    io(b.srcBlendAlpha);
+    io(b.dstBlendAlpha);
+    io(b.blendOpAlpha);
+    io(b.renderTargetWriteMask);
+  }
+  io(d.logicOpEnabled);
+  io(d.logicOp);
+  io(d.depthTargetFormat);
+  auto array = [&](auto& items, uint32_t limit, auto&& each) {
+    uint32_t count = uint32_t(items.size());
+    io(count);
+    if constexpr (Io::kReading) {
+      if (!io.ok || count > limit) return false;
+      items.resize(count);
+    }
+    for (auto& item : items) each(item);
+    return true;
+  };
+  if (!array(r.elements, 64, [&](RenderInputElement& e) {
+        io(e.semanticIndex);
+        io(e.location);
+        io(e.format);
+        io(e.slotIndex);
+        io(e.alignedByteOffset);
+      })) {
+    return false;
+  }
+  if (!array(r.slots, 64, [&](RenderInputSlot& s) {
+        io(s.index);
+        io(s.stride);
+        io(s.classification);
+      })) {
+    return false;
+  }
+  if (!array(r.constants, 1024, [&](RenderSpecConstant& c) {
+        io(c.index);
+        io(c.value);
+      })) {
+    return false;
+  }
+  if constexpr (Io::kReading) return io.ok;
+  return true;
+}
+
+// What the driver compiles for a recipe: recipes that share it differ only in
+// state it links (Turnip's cache is keyed by shaders and specialization), so
+// one compile serves them all and the rest are found in the cache.
+uint64_t RecipeProgram(const Recipe& r) {
+  KeyBytes bytes;
+  bytes.Put(r.vs);
+  bytes.Put(r.ps);
+  bytes.Put(r.domain);
+  bytes.Put(r.form);
+  bytes.Put(r.gs);
+  uint64_t hash = bytes.Hash();
+  for (const RenderSpecConstant& c : r.constants) {
+    HashCombine(hash, c.index);
+    HashCombine(hash, c.value);
+  }
+  return hash;
+}
+
+// A scene tag in the file: a record whose size has this bit set holds the
+// recipe's key (64 bits) and the scene it was drawn in (32) instead of a recipe.
+constexpr uint32_t kRecipeTagBit = 0x80000000u;
+constexpr uint32_t kRecipeTagSize = 12;
+
+uint64_t SceneTagKey(uint64_t recipe, uint32_t scene) {
+  uint64_t key = recipe;
+  HashCombine(key, scene);
+  return key;
+}
+
+// The precompilation, shared by its threads, the scene-load hold
+// (PlumeSceneRequested) and the progress note over the game (runtime_jni.cpp).
+// A group is the recipes of one program; a scene's groups are those its
+// pipelines are in.
+struct PrecompileState {
+  enum : uint8_t { kPending, kTaken, kDone };
+  std::mutex mutex;
+  std::condition_variable changed;
+  // Under mutex: each group's state and size in recipes, the groups a scene
+  // load asked for first, the next group in file order, and each scene's groups.
+  std::vector<uint8_t> state;
+  std::vector<uint32_t> group_size;
+  std::deque<uint32_t> urgent;
+  size_t next = 0;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> scene_groups;
+  // Recipes built of all, and of the scene a load is waiting for.
+  std::atomic<uint32_t> done{0}, total{0};
+  std::atomic<uint32_t> scene_done{0}, scene_total{0};
+  std::atomic<bool> running{false};
+  std::atomic<int> waiting{0};
+  // The scene the game asked for last (0 before the first: the boot); the
+  // pipelines drawn are tagged with it.
+  std::atomic<uint32_t> scene{0};
+
+  // Under mutex. UINT32_MAX when every group is taken.
+  uint32_t TakeGroup() {
+    while (!urgent.empty()) {
+      const uint32_t g = urgent.front();
+      urgent.pop_front();
+      if (state[g] == kPending) {
+        state[g] = kTaken;
+        return g;
+      }
+    }
+    while (next < state.size()) {
+      const uint32_t g = uint32_t(next++);
+      if (state[g] == kPending) {
+        state[g] = kTaken;
+        return g;
+      }
+    }
+    return UINT32_MAX;
+  }
+};
+PrecompileState g_precompile;
 
 // Decodes the vertex layout a bound vertex shader really fetches. Direct3D
 // Which texture fetch constants a shader reads, as a bit per slot. The draw
@@ -958,6 +1208,8 @@ struct Stats {
   // missed; and the time spent on lookups at the draw and on compiles.
   uint64_t pipelines_found_here = 0, pipelines_found_ahead = 0, pipelines_compiled = 0, pipelines_waited = 0,
            lookups_missed = 0, lookup_us = 0, compile_us = 0;
+  // New pipelines the precompilation had built before their draw came.
+  uint64_t pipelines_prebuilt = 0;
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -1811,6 +2063,32 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void StopPipelineWorker();
   // Moves every finished job into pipelines_, whether or not its draw came back.
   void ReapPipelines();
+  // Pipeline recipes (see Recipe): whether they are kept, the keys already in
+  // the file and the file being appended to; the pipelines the precompilation
+  // built, each taken by the first draw that asks for it; and its threads.
+  bool recipes_ = false;
+  std::unordered_set<uint64_t> recorded_recipes_;
+  FILE* recipe_file_ = nullptr;
+  std::mutex prebuilt_mutex_;
+  std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> prebuilt_;
+  std::vector<std::thread> precompile_threads_;
+  std::atomic<bool> stop_precompile_{false};
+  void StartRecipes();
+  void StopRecipes();
+  // The pipeline built ahead for this recipe, if there is one; a recipe that
+  // is not in the file yet is written to it. `key` is the draw's pipeline key.
+  std::unique_ptr<RenderPipeline> TakeRecipe(Recipe& recipe, uint64_t key);
+  // Scene tags: which scenes each recipe is drawn in, so a scene load waits
+  // for its own pipelines only (PlumeSceneRequested). In the file, a hash of
+  // recipe and scene per tag; this run's recipe of each draw key; and the
+  // draw keys already seen in the current scene, by their low bits (a
+  // collision only misses a tag), so the check per draw is one bit.
+  std::unordered_set<uint64_t> scene_tags_;
+  std::unordered_map<uint64_t, uint64_t> recipe_of_;
+  uint32_t tag_scene_ = 0;
+  std::bitset<65536> scene_seen_;
+  void NoteSceneUse(uint64_t key);
+  void WriteRecord(uint32_t size, const void* data);
   // Keyed by guest address and host format: N&B reuses an address within a
   // frame for different things (a 768x768 shadow map, then the bloom chain),
   // and draws recorded earlier must keep the texture they sampled.
@@ -2135,6 +2413,258 @@ void PlumeCommandProcessor::ReapPipelines() {
   }
 }
 
+void PlumeCommandProcessor::StartRecipes() {
+  recipes_ = REXCVAR_GET(renut_plume_precompile) && !g_miss_dump_directory.empty();
+  if (!recipes_) return;
+  const std::string path =
+      g_miss_dump_directory.substr(0, g_miss_dump_directory.rfind('/')) + "/plume-recipes.bin";
+  std::vector<uint8_t> bytes;
+  if (FILE* file = std::fopen(path.c_str(), "rb")) {
+    std::fseek(file, 0, SEEK_END);
+    const long size = std::ftell(file);
+    std::fseek(file, 0, SEEK_SET);
+    if (size > 0) {
+      bytes.resize(size_t(size));
+      if (std::fread(bytes.data(), 1, bytes.size(), file) != bytes.size()) bytes.clear();
+    }
+    std::fclose(file);
+  }
+  // Records are a 32-bit size and a recipe's bytes, or a scene tag (the size
+  // with kRecipeTagBit). One cut short by the app being killed mid-write ends
+  // the list and is cut off the file.
+  auto recipes = std::make_shared<std::vector<std::pair<uint64_t, Recipe>>>();
+  std::vector<std::pair<uint64_t, uint32_t>> tags;
+  RecipeHeader header;
+  const bool valid = bytes.size() >= sizeof(header) && std::memcmp(bytes.data(), &header, sizeof(header)) == 0;
+  size_t good_end = valid ? sizeof(header) : 0;
+  while (valid && bytes.size() - good_end >= sizeof(uint32_t)) {
+    uint32_t size = 0;
+    std::memcpy(&size, bytes.data() + good_end, sizeof(size));
+    const uint8_t* at = bytes.data() + good_end + sizeof(size);
+    const uint32_t length = size & ~kRecipeTagBit;
+    if (size_t(bytes.data() + bytes.size() - at) < length) break;
+    if (size & kRecipeTagBit) {
+      if (length != kRecipeTagSize) break;
+      uint64_t recipe = 0;
+      uint32_t scene = 0;
+      std::memcpy(&recipe, at, sizeof(recipe));
+      std::memcpy(&scene, at + sizeof(recipe), sizeof(scene));
+      if (scene_tags_.insert(SceneTagKey(recipe, scene)).second) tags.emplace_back(recipe, scene);
+    } else {
+      Recipe recipe;
+      RecipeReader reader{at, at + length};
+      const uint64_t key = XXH3_64bits(at, length);
+      if (VisitRecipe(reader, recipe) && recorded_recipes_.insert(key).second) {
+        recipes->emplace_back(key, std::move(recipe));
+      }
+    }
+    good_end += sizeof(size) + length;
+  }
+  if (!valid) {
+    if ((recipe_file_ = std::fopen(path.c_str(), "wb"))) {
+      std::fwrite(&header, sizeof(header), 1, recipe_file_);
+      std::fflush(recipe_file_);
+    }
+  } else {
+    if (good_end != bytes.size()) truncate(path.c_str(), off_t(good_end));
+    recipe_file_ = std::fopen(path.c_str(), "ab");
+  }
+  if (!recipe_file_) REXLOG_WARN("Renut: Plume pipeline recipes cannot be written to {}", path);
+  if (recipes->empty() || low_memory_) {
+    REXLOG_INFO("Renut: Plume pipeline recipes: {} in {}{}", recipes->size(), path,
+                recipes->empty() ? "" : "; not built ahead in low-memory mode");
+    return;
+  }
+
+  // One group per program, built by one thread: its first recipe compiles
+  // and the others find the program in the cache.
+  auto groups = std::make_shared<std::vector<std::vector<uint32_t>>>();
+  std::unordered_map<uint64_t, uint32_t> group_of_recipe;
+  {
+    std::unordered_map<uint64_t, uint32_t> group_of;
+    for (uint32_t i = 0; i < recipes->size(); ++i) {
+      auto [it, added] = group_of.try_emplace(RecipeProgram((*recipes)[i].second), uint32_t(groups->size()));
+      if (added) groups->emplace_back();
+      (*groups)[it->second].push_back(i);
+      group_of_recipe.emplace((*recipes)[i].first, it->second);
+    }
+  }
+  {
+    std::lock_guard lock(g_precompile.mutex);
+    PrecompileState& p = g_precompile;
+    p.state.assign(groups->size(), PrecompileState::kPending);
+    p.group_size.clear();
+    for (const auto& group : *groups) p.group_size.push_back(uint32_t(group.size()));
+    p.urgent.clear();
+    p.next = 0;
+    p.scene_groups.clear();
+    for (const auto& [recipe, scene] : tags) {
+      auto group = group_of_recipe.find(recipe);
+      if (group == group_of_recipe.end()) continue;
+      std::vector<uint32_t>& list = p.scene_groups[scene];
+      if (std::find(list.begin(), list.end(), group->second) == list.end()) list.push_back(group->second);
+    }
+    // The boot's own first; then the rest in the order they were first drawn.
+    if (auto boot = p.scene_groups.find(0); boot != p.scene_groups.end()) {
+      p.urgent.assign(boot->second.begin(), boot->second.end());
+    }
+    // Running before the total: the app stops watching once it sees a total
+    // with nothing running.
+    p.running = true;
+    p.done = 0;
+    p.total = uint32_t(recipes->size());
+  }
+  stop_precompile_ = false;
+  const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
+  const uint32_t count = std::clamp(cores * 2 / 3, 2u, 6u);
+  REXLOG_INFO("Renut: Plume building {} pipelines ({} programs, {} tags over {} scenes) from {} on {} threads",
+              recipes->size(), groups->size(), tags.size(), g_precompile.scene_groups.size(), path, count);
+  auto left = std::make_shared<std::atomic<uint32_t>>(count);
+  auto failed = std::make_shared<std::atomic<uint32_t>>(0);
+  const auto start = std::chrono::steady_clock::now();
+  for (uint32_t t = 0; t < count; ++t) {
+    precompile_threads_.emplace_back([=, this] {
+      pthread_setname_np(pthread_self(), fmt::format("PlumePrebuild{}", t).c_str());
+      int nice = INT32_MIN;
+      for (;;) {
+        if (stop_precompile_.load(std::memory_order_relaxed)) break;
+        uint32_t g;
+        {
+          std::lock_guard lock(g_precompile.mutex);
+          g = g_precompile.TakeGroup();
+        }
+        if (g == UINT32_MAX) break;
+        // Behind the game while it plays; at full speed while a scene load
+        // waits for these.
+        const int wanted = g_precompile.waiting.load(std::memory_order_relaxed) ? 0 : 10;
+        if (wanted != nice) {
+          setpriority(PRIO_PROCESS, uint32_t(gettid()), wanted);
+          nice = wanted;
+        }
+        const std::vector<uint32_t>& group = (*groups)[g];
+        const Recipe& first = (*recipes)[group[0]].second;
+        CompiledShader vs, ps;
+        const ShaderCacheEntry* vs_entry = store_->FindContainer(first.vs);
+        const ShaderCacheEntry* ps_entry = first.ps ? store_->FindContainer(first.ps) : nullptr;
+        bool ok = vs_entry && ShaderStore::BuildModules(device_, vs_entry, !first.domain, true, vs) &&
+                  (!first.ps || (ps_entry && ShaderStore::BuildModules(device_, ps_entry, false, false, ps)));
+        const RenderShader* vs_module = !ok                                   ? nullptr
+                                        : first.form == kRecipeFetchSpec      ? vs.fetch_spec_module.get()
+                                        : first.form == kRecipeDepth          ? vs.depth_module.get()
+                                        : first.form == kRecipeDepthFetchSpec ? vs.depth_fetch_spec_module.get()
+                                                                              : vs.module.get();
+        for (const uint32_t index : group) {
+          auto& [key, recipe] = (*recipes)[index];
+          std::unique_ptr<RenderPipeline> pipeline;
+          if (vs_module && !stop_precompile_.load(std::memory_order_relaxed)) {
+            RenderGraphicsPipelineDesc desc = recipe.desc;
+            desc.pipelineLayout = layout_.get();
+            desc.vertexShader = vs_module;
+            desc.geometryShader = recipe.gs == 1 ? rect_list_gs_.get() : recipe.gs == 2 ? point_list_gs_.get() : nullptr;
+            desc.pixelShader = recipe.ps ? ps.module.get() : nullptr;
+            desc.inputElements = recipe.elements.data();
+            desc.inputElementsCount = uint32_t(recipe.elements.size());
+            desc.inputSlots = recipe.slots.data();
+            desc.inputSlotsCount = uint32_t(recipe.slots.size());
+            desc.specConstants = recipe.constants.data();
+            desc.specConstantsCount = uint32_t(recipe.constants.size());
+            try { pipeline = device_->createGraphicsPipeline(desc); } catch (const std::exception&) {}
+          }
+          if (pipeline) {
+            std::lock_guard lock(prebuilt_mutex_);
+            prebuilt_.emplace(key, std::move(pipeline));
+          } else {
+            failed->fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+        {
+          std::lock_guard lock(g_precompile.mutex);
+          g_precompile.state[g] = PrecompileState::kDone;
+        }
+        g_precompile.done.fetch_add(uint32_t(group.size()), std::memory_order_relaxed);
+        g_precompile.changed.notify_all();
+      }
+      if (left->fetch_sub(1) == 1) {
+        REXLOG_INFO("Renut: Plume built {} of {} pipelines ahead in {} ms{}", g_precompile.done.load() - failed->load(),
+                    g_precompile.total.load(),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count(),
+                    stop_precompile_.load() ? " (stopped)" : "");
+        {
+          std::lock_guard lock(g_precompile.mutex);
+          g_precompile.running = false;
+        }
+        g_precompile.changed.notify_all();
+      }
+    });
+  }
+}
+
+void PlumeCommandProcessor::StopRecipes() {
+  stop_precompile_ = true;
+  for (std::thread& thread : precompile_threads_) thread.join();
+  precompile_threads_.clear();
+  {
+    std::lock_guard lock(g_precompile.mutex);
+    g_precompile.running = false;
+  }
+  g_precompile.changed.notify_all();
+  {
+    std::lock_guard lock(prebuilt_mutex_);
+    prebuilt_.clear();
+  }
+  recorded_recipes_.clear();
+  scene_tags_.clear();
+  recipe_of_.clear();
+  if (recipe_file_) std::fclose(recipe_file_);
+  recipe_file_ = nullptr;
+}
+
+// Flushed at once: a game closed by swiping it away never runs the shutdown
+// that would close the file.
+void PlumeCommandProcessor::WriteRecord(uint32_t size, const void* data) {
+  if (!recipe_file_) return;
+  std::fwrite(&size, sizeof(size), 1, recipe_file_);
+  std::fwrite(data, 1, size & ~kRecipeTagBit, recipe_file_);
+  std::fflush(recipe_file_);
+}
+
+std::unique_ptr<RenderPipeline> PlumeCommandProcessor::TakeRecipe(Recipe& recipe, uint64_t key) {
+  std::string bytes;
+  RecipeWriter writer{bytes};
+  VisitRecipe(writer, recipe);
+  const uint64_t recipe_key = XXH3_64bits(bytes.data(), bytes.size());
+  recipe_of_[key] = recipe_key;
+  {
+    std::lock_guard lock(prebuilt_mutex_);
+    auto found = prebuilt_.find(recipe_key);
+    if (found != prebuilt_.end()) {
+      std::unique_ptr<RenderPipeline> pipeline = std::move(found->second);
+      prebuilt_.erase(found);
+      return pipeline;
+    }
+  }
+  if (recorded_recipes_.insert(recipe_key).second) WriteRecord(uint32_t(bytes.size()), bytes.data());
+  return nullptr;
+}
+
+void PlumeCommandProcessor::NoteSceneUse(uint64_t key) {
+  const uint32_t scene = g_precompile.scene.load(std::memory_order_relaxed);
+  if (scene != tag_scene_) {
+    tag_scene_ = scene;
+    scene_seen_.reset();
+  }
+  const size_t bit = size_t(key) & (scene_seen_.size() - 1);
+  if (scene_seen_.test(bit)) return;
+  scene_seen_.set(bit);
+  auto recipe = recipe_of_.find(key);
+  if (recipe == recipe_of_.end()) return;
+  if (!scene_tags_.insert(SceneTagKey(recipe->second, scene)).second) return;
+  uint8_t tag[kRecipeTagSize];
+  std::memcpy(tag, &recipe->second, sizeof(uint64_t));
+  std::memcpy(tag + sizeof(uint64_t), &scene, sizeof(scene));
+  WriteRecord(kRecipeTagBit | kRecipeTagSize, tag);
+}
+
 bool PlumeCommandProcessor::SetupContext() {
   if (!CommandProcessor::SetupContext()) return false;
   auto* renderer = PlumeRenderer::Get();
@@ -2324,6 +2854,7 @@ bool PlumeCommandProcessor::SetupContext() {
   BeginFrame();
   REXLOG_INFO("Renut: Plume command processor ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);
+  StartRecipes();
   device_watch_stop_ = false;
   device_watch_.thread = std::thread([this] {
     while (!device_watch_stop_.load()) {
@@ -2341,6 +2872,7 @@ void PlumeCommandProcessor::ShutdownContext() {
   device_watch_stop_ = true;
   if (device_watch_.thread.joinable()) device_watch_.thread.join();
   StopPipelineWorker();
+  StopRecipes();
   if (list_open_) {
     L()->end();
     list_open_ = false;
@@ -5889,9 +6421,30 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.inputSlotsCount = uint32_t(input_slots.size());
     desc.specConstants = spec_constants.data();
     desc.specConstantsCount = uint32_t(spec_constants.size());
+    // The pipeline built ahead from the recipe file (StartRecipes), if this
+    // start had it; a pipeline not in the file yet is written to it.
+    if (recipes_ && !debug_point && !trivial_vs && !trivial_fs && !pending_pipelines_.count(key) &&
+        !failed_pipelines_.count(key)) {
+      Recipe recipe;
+      recipe.vs = (patch_list ? vs->domain_entry : vs->entry)->hash;
+      recipe.ps = ps ? ps->entry->hash : 0;
+      recipe.domain = patch_list;
+      recipe.form = depth_strip ? (fetch_spec ? kRecipeDepthFetchSpec : kRecipeDepth)
+                                : (fetch_spec ? kRecipeFetchSpec : kRecipeModule);
+      recipe.gs = rect_list ? 1 : point_list ? 2 : 0;
+      recipe.desc = desc;
+      recipe.elements = input_elements;
+      recipe.slots = input_slots;
+      recipe.constants = spec_constants;
+      pipeline = TakeRecipe(recipe, key);
+      if (pipeline) {
+        ++stats_.pipelines;
+        ++stats_.pipelines_prebuilt;
+      }
+    }
     // Exporting shaders feed later draws and sometimes the guest CPU. Never
     // skip those draws merely because their first pipeline is still compiling.
-    if (REXCVAR_GET(renut_plume_async_pipelines) &&
+    if (!pipeline && REXCVAR_GET(renut_plume_async_pipelines) &&
         !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
       // A draw whose pipeline is still compiling is drawn with a ready sibling
       // (same shaders, targets, blending and vertex layout; other boolean
@@ -6021,6 +6574,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     ++stats_.bad_shader;
     return true;
   }
+  if (recipes_ && pipeline) NoteSceneUse(key);
 
   // Indices.
   uint32_t vertex_count = index_count;
@@ -7894,10 +8448,10 @@ void PlumeCommandProcessor::Report() {
   if (stats_.pipelines || stats_.lookups_missed) {
     uint64_t found = 0, compiled = 0;
     PlumePipelineCacheCounts(&found, &compiled);
-    REXLOG_INFO("Renut: Plume new pipelines: {} found in the cache at the draw ({} us per lookup, {} missed), "
-                "{} found by a worker, {} compiled ({} ms each, {} after waiting for a sibling's compile); "
-                "since launch the driver's cache had {} and compiled {}",
-                stats_.pipelines_found_here,
+    REXLOG_INFO("Renut: Plume new pipelines: {} built ahead, {} found in the cache at the draw ({} us per lookup, "
+                "{} missed), {} found by a worker, {} compiled ({} ms each, {} after waiting for a sibling's "
+                "compile); since launch the driver's cache had {} and compiled {}",
+                stats_.pipelines_prebuilt, stats_.pipelines_found_here,
                 stats_.lookup_us / std::max<uint64_t>(1, stats_.pipelines_found_here + stats_.lookups_missed),
                 stats_.lookups_missed, stats_.pipelines_found_ahead, stats_.pipelines_compiled,
                 stats_.compile_us / 1000 / std::max<uint64_t>(1, stats_.pipelines_compiled),
@@ -7970,6 +8524,73 @@ void ArmPlumeMemoryTrace(const std::string& root) {
   g_dedupe_descriptors = access((root + "/plume-dedupe-desc").c_str(), F_OK) == 0;
   if (access((root + "/plume-nocompress").c_str(), F_OK) == 0) plume::g_plumeNoCompression.store(true);
   g_validate_windows = access((root + "/plume-validate").c_str(), F_OK) == 0;
+}
+
+PlumePrecompileProgress GetPlumePrecompileProgress() {
+  const bool waiting = g_precompile.waiting.load(std::memory_order_relaxed) > 0;
+  PlumePrecompileProgress progress;
+  progress.done = waiting ? g_precompile.scene_done.load(std::memory_order_relaxed)
+                          : g_precompile.done.load(std::memory_order_relaxed);
+  progress.total = waiting ? g_precompile.scene_total.load(std::memory_order_relaxed)
+                           : g_precompile.total.load(std::memory_order_relaxed);
+  progress.running = g_precompile.running.load(std::memory_order_relaxed);
+  progress.waiting = waiting;
+  return progress;
+}
+
+void PlumeSceneRequested(uint32_t scene, uint32_t asset, uint32_t ref) {
+  PrecompileState& p = g_precompile;
+  p.scene.store(scene, std::memory_order_relaxed);
+  const auto start = std::chrono::steady_clock::now();
+  std::unique_lock lock(p.mutex);
+  // The scene's groups that are not built yet go to the front of the queue.
+  std::vector<uint32_t> missing;
+  uint32_t total = 0, done = 0;
+  if (auto groups = p.scene_groups.find(scene); groups != p.scene_groups.end() && p.running) {
+    for (const uint32_t g : groups->second) {
+      total += p.group_size[g];
+      if (p.state[g] == PrecompileState::kDone) {
+        done += p.group_size[g];
+        continue;
+      }
+      missing.push_back(g);
+      if (p.state[g] == PrecompileState::kPending) p.urgent.push_front(g);
+    }
+  }
+  if (missing.empty()) {
+    REXLOG_INFO("Renut: scene {:08X} (asset {:08X}, ref {:08X}) requested; {} of its pipelines known, none to wait for",
+                scene, asset, ref, total);
+    return;
+  }
+  REXLOG_INFO("Renut: scene {:08X} (asset {:08X}, ref {:08X}) waits for {} of its {} pipelines", scene, asset, ref,
+              total - done, total);
+  p.scene_total = total;
+  p.scene_done = done;
+  p.waiting.fetch_add(1);
+  // Gives up only if the building stops moving: a stuck driver must not hold
+  // the game for ever.
+  auto moved = std::chrono::steady_clock::now();
+  while (!missing.empty() && p.running) {
+    p.changed.wait_for(lock, std::chrono::milliseconds(250));
+    const size_t before = missing.size();
+    std::erase_if(missing, [&](uint32_t g) {
+      if (p.state[g] != PrecompileState::kDone) return false;
+      done += p.group_size[g];
+      return true;
+    });
+    p.scene_done = done;
+    const auto now = std::chrono::steady_clock::now();
+    if (missing.size() != before) {
+      moved = now;
+    } else if (now - moved > std::chrono::seconds(60)) {
+      REXLOG_WARN("Renut: scene {:08X}: its pipelines stopped at {} of {}; it loads without them", scene, done, total);
+      break;
+    }
+  }
+  p.waiting.fetch_sub(1);
+  REXLOG_INFO("Renut: scene {:08X} waited {} ms for {} pipelines", scene,
+              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count(),
+              total);
 }
 
 }  // namespace renut

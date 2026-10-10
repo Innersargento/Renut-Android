@@ -10,6 +10,8 @@
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 
+#include "plume_gpu.h"
+
 REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut",
                     "Keep the game's MSAA scene surfaces, which the Xbox 360 renders in two "
                     "or four bands (predicated tiling) with every draw sent once per band. "
@@ -62,6 +64,48 @@ REX_EXTERN(rex_setParamInterval) {
     ctx.r3.u32 = 0;
   }
   __imp__rex_setParamInterval(ctx, base);
+}
+
+// Scene changes, held until the new scene's pipelines exist - as
+// UnleashedRecomp holds its loading screen - so it is never drawn without
+// them (plume_gpu.cpp: PlumeSceneRequested). The app shows the progress over
+// the game meanwhile.
+//
+// sub_822BC0D8 replaces the running scene: it saves, pops the scene stack and
+// pushes (appScenePush) the scene whose asset id r3 points at. Every scene
+// change goes through it, supportGameLoadNewScene (LoadShowdownTown too) among
+// its callers; that one also passes, in r4, the game ref of what the scene
+// loads, whose first word is its asset id, so a world entered through the same
+// scene is a scene of its own.
+namespace {
+
+thread_local uint32_t pending_scene_ref = 0;
+
+uint32_t GuestWord(uint8_t* base, uint32_t address) {
+  if (!address) return 0;
+  uint32_t value;
+  std::memcpy(&value, base + address, sizeof(value));
+  return __builtin_bswap32(value);
+}
+
+}  // namespace
+
+extern "C" void __imp__supportGameLoadNewScene(PPCContext& __restrict, uint8_t*);
+REX_EXTERN(supportGameLoadNewScene) {
+  pending_scene_ref = GuestWord(base, ctx.r4.u32);
+  __imp__supportGameLoadNewScene(ctx, base);
+  pending_scene_ref = 0;
+}
+
+extern "C" void __imp__sub_822BC0D8(PPCContext& __restrict, uint8_t*);
+REX_EXTERN(sub_822BC0D8) {
+  const uint32_t asset = GuestWord(base, ctx.r3.u32);
+  const uint32_t ref = pending_scene_ref;
+  // 0 is the boot's; a scene that hashes to it takes 1.
+  uint32_t scene = asset * 0x9E3779B1u ^ ref;
+  if (!scene) scene = 1;
+  renut::PlumeSceneRequested(scene, asset, ref);
+  __imp__sub_822BC0D8(ctx, base);
 }
 
 // These are the two shadow-map jobs identified in config/renut_hooks.toml. The

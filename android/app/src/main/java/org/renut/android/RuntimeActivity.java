@@ -40,6 +40,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native void nativeExternalStick(int stick,float x,float y);
     private static native void nativeExternalTrigger(int trigger,float value);
     private static native long nativeFrameCount();
+    private static native long nativePrecompileProgress();
     private TextView fps;
     private AchievementToast achievementToast;
     // The one game screen that is open: the native side reports unlocks through a static method.
@@ -138,6 +139,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             root.addView(gameMenu,new FrameLayout.LayoutParams(-1,-1));
             achievementToast=new AchievementToast(this);
             root.addView(achievementToast,AchievementToast.params(this));
+            addPrecompileNote(root);
             current=new java.lang.ref.WeakReference<>(this);
             setContentView(root);
             return;
@@ -152,6 +154,44 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         Button close=new Button(this);close.setText("Voltar");close.setOnClickListener(v->finish());body.addView(close);
         ComposeScreens.showRuntime(this);
         if(!graphics)startValidation(null);
+    }
+    /**
+     * While a scene load waits for the pipelines built at start (plume-recipes.bin), the game stands
+     * still; this card says why and how far along they are. It takes no touches and polls until the
+     * building has finished.
+     */
+    private void addPrecompileNote(FrameLayout root){
+        float density=getResources().getDisplayMetrics().density;
+        LinearLayout card=new LinearLayout(this);card.setOrientation(LinearLayout.VERTICAL);
+        int pad=Math.round(18*density);card.setPadding(pad,pad,pad,pad);
+        android.graphics.drawable.GradientDrawable background=new android.graphics.drawable.GradientDrawable();
+        background.setColor(Color.argb(230,28,30,33));background.setCornerRadius(18*density);
+        card.setBackground(background);card.setClickable(false);card.setVisibility(View.GONE);
+        TextView heading=new TextView(this);heading.setText("Preparando shaders");
+        heading.setTextColor(Color.rgb(244,240,235));heading.setTextSize(16);heading.setTypeface(null,android.graphics.Typeface.BOLD);
+        card.addView(heading);
+        TextView detail=new TextView(this);detail.setTextColor(Color.rgb(168,162,156));detail.setTextSize(13);
+        card.addView(detail);
+        ProgressBar bar=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);
+        bar.setMax(1000);
+        LinearLayout.LayoutParams barAt=new LinearLayout.LayoutParams(Math.round(260*density),-2);
+        barAt.topMargin=Math.round(10*density);card.addView(bar,barAt);
+        root.addView(card,new FrameLayout.LayoutParams(-2,-2,Gravity.CENTER));
+        card.postDelayed(new Runnable(){@Override public void run(){
+            if(isFinishing())return;
+            if(loaded){
+                long p=nativePrecompileProgress();
+                int done=(int)(p&0xFFFFFF),total=(int)((p>>24)&0xFFFFFF);
+                boolean running=(p>>48&1)!=0,waiting=(p>>49&1)!=0;
+                if(waiting&&total>0){
+                    detail.setText(String.format(java.util.Locale.ROOT,"%d de %d pipelines · %d%%",done,total,done*100/total));
+                    bar.setProgress((int)(done*1000L/total));
+                    card.setVisibility(View.VISIBLE);
+                }else card.setVisibility(View.GONE);
+                if(total>0&&!running){card.setVisibility(View.GONE);return;}
+            }
+            card.postDelayed(this,250);
+        }},250);
     }
     public boolean uiGraphics(){return graphics;}
     public String uiStatus(){return status.getText().toString();}
