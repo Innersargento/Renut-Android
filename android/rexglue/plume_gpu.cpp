@@ -1411,6 +1411,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void NativeSwapOut();
   void NativeWrite(uint32_t first, const uint32_t* values, uint32_t count);
   void NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size);
+  void NativeClear(const uint32_t* record);
   bool native_on_ = false;
   bool native_started_ = false;
   uint32_t native_opaque_ = 0;     // inside an opaque call's PM4
@@ -1435,6 +1436,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  bool ExecuteResolve(const draw_util::ResolveInfo& info);
+  void NativeResolve(const uint32_t* record);
   // Direct3D's own Clear (see IssueDraw).
   void IssueD3DClear(xenos::EdramMode edram_mode);
   // Copies a rectangle of a depth target's depth into an R32_FLOAT texture, or
@@ -5367,6 +5370,24 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
       case native_d3d::kOpSwap:
         f.pos += 4;
         break;
+      case native_d3d::kOpResolve:
+        if (f.pos + 23 > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        f.pos += 23;
+        NativeResolve(w);
+        break;
+      case native_d3d::kOpClear:
+        if (f.pos + 18 > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        f.pos += 18;
+        NativeClear(w);
+        break;
       default:
         ++native_bad_;
         f.pos = words.size();
@@ -5375,6 +5396,79 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
   }
   if (swapped_here) NativeSwapOut();
   return found;
+}
+
+// A clear record: Direct3D's clear of the current targets, without its draw.
+// Targets are found as IssueD3DClear finds them (EDRAM base, format, the
+// surface pitch), and only the clear's rectangle is cleared.
+void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
+  FlushDeferred();
+  if (skip_mask_ & 134217728) return;
+  const uint32_t flags = w[0] >> 8, present = w[17];
+  const int32_t x1 = int32_t(w[1]), y1 = int32_t(w[2]), x2 = int32_t(w[3]), y2 = int32_t(w[4]);
+  float color[4], z;
+  std::memcpy(color, w + 5, sizeof(color));
+  std::memcpy(&z, w + 9, sizeof(z));
+  const uint32_t stencil = w[10] & 0xFF;
+  reg::RB_SURFACE_INFO surface;
+  surface.value = w[11];
+  const uint32_t pitch = surface.surface_pitch;
+  ++stats_.clears;
+  uint32_t clear_height = std::clamp<uint32_t>(uint32_t(std::max(y2, 0)), 16, 4096);
+  if (!(skip_mask_ & 2097152)) clear_height = std::min(clear_height, std::max(max_draw_height_, 1024u));
+  auto find = [&](uint32_t base, uint32_t format, bool depth) -> Target* {
+    Target* best = nullptr;
+    for (auto& [key, target] : targets_) {
+      if ((key & 0xFFF) != base || ((key >> 12) & 0xF) != format || bool((key >> 16) & 1) != depth) continue;
+      if (target.width != pitch && target.width != 2 * pitch) continue;
+      if (!best || target.last_used > best->last_used) best = &target;
+    }
+    return best;
+  };
+  auto clip = [&](const Target& t) {
+    return RenderRect(std::clamp(x1, 0, int32_t(t.width)), std::clamp(y1, 0, int32_t(t.height)),
+                      std::clamp(x2, 0, int32_t(t.width)), std::clamp(y2, 0, int32_t(t.height)));
+  };
+  Trace("native clear flags={:X} present={:X} rect=({},{})-({},{}) pitch={} color=({}, {}, {}, {}) z={} s={}", flags,
+        present, x1, y1, x2, y2, pitch, color[0], color[1], color[2], color[3], z, stencil);
+  std::array<Target*, 4> cleared{};
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!((flags >> i) & 1) || !((present >> i) & 1)) continue;
+    reg::RB_COLOR_INFO info;
+    info.value = w[12 + i];
+    Target* target = find(info.color_base, uint32_t(info.color_format), false);
+    if ((!target && i == 0) || (target && target->height < clear_height)) {
+      target = GetTarget(info.color_base, uint32_t(info.color_format), false, target ? target->width : pitch,
+                         clear_height);
+    }
+    if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
+    cleared[i] = target;
+    const RenderRect rect = clip(*target);
+    if (rect.right <= rect.left || rect.bottom <= rect.top) continue;
+    Transition(target->texture.get(), target->layout, RenderTextureLayout::COLOR_WRITE);
+    std::array<Target*, 4> colors{target};
+    SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
+    L()->clearColor(0, RenderColor(color[0], color[1], color[2], color[3]), &rect, 1);
+  }
+  const bool clear_depth = flags & 0x10, clear_stencil = flags & 0x20;
+  if ((clear_depth || clear_stencil) && (present & 0x10)) {
+    reg::RB_DEPTH_INFO info;
+    info.value = w[16];
+    Target* depth = find(info.depth_base, uint32_t(info.depth_format), true);
+    if (!depth || depth->height < clear_height) {
+      depth = GetTarget(info.depth_base, uint32_t(info.depth_format), true, depth ? depth->width : pitch,
+                        clear_height);
+    }
+    if (depth) {
+      const RenderRect rect = clip(*depth);
+      if (rect.right > rect.left && rect.bottom > rect.top) {
+        Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+        std::array<Target*, 4> none{};
+        SetFramebuffer(GetFramebuffer(none, 0, depth));
+        L()->clearDepthStencil(clear_depth, clear_stencil, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
+      }
+    }
+  }
 }
 
 void PlumeCommandProcessor::NativeMarker(uint32_t payload) {
@@ -7985,9 +8079,27 @@ void PlumeCommandProcessor::FlushDeferred() {
 
 bool PlumeCommandProcessor::IssueCopy() {
   FlushDeferred();
-  const gfx::RegisterFile& regs = *register_file_;
   draw_util::ResolveInfo info;
-  if (!draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, info)) return true;
+  if (!draw_util::GetResolveInfo(*register_file_, *memory_, 1, 1, false, false, info)) return true;
+  return ExecuteResolve(info);
+}
+
+// A resolve record: the copy registers Direct3D worked out, and the
+// rectangle its copy draw would have covered.
+void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
+  FlushDeferred();
+  for (uint32_t i = 0; i < 12; ++i) WriteRegister(0x2318 + i, w[5 + i]);
+  for (uint32_t i = 0; i < 6; ++i) WriteRegister(0x2000 + i, w[17 + i]);
+  draw_util::ResolveInfo info;
+  if (!draw_util::GetResolveInfoFromRect(*register_file_, *memory_, int32_t(w[1]), int32_t(w[2]), int32_t(w[3]),
+                                         int32_t(w[4]), 1, 1, false, false, info)) {
+    ++native_bad_;
+    return;
+  }
+  ExecuteResolve(info);
+}
+
+bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info) {
   ++stats_.resolves;
   // plume-skip bit 33554432 drops the resolve entirely. Attributing intervals
   // between timestamps proved unreliable on this tiler - the same frame read as

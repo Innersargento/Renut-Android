@@ -40,6 +40,12 @@ enum Op : uint32_t {
   kOpRun = 5,      // [op] index into List::runs
   kOpMarker = 6,   // [op | kind << 8] serial: a Direct3D call whose draws the list does not hold
   kOpSwap = 7,     // [op] frontbuffer, width, height
+  // [op | flags << 8] x1, y1, x2, y2, red, green, blue, alpha, z (float bits), stencil,
+  // RB_SURFACE_INFO, RB_COLOR_INFO of targets 0-3, RB_DEPTH_INFO, present (bits 0-3 targets, 4 depth)
+  kOpClear = 9,
+  // [op] x0, y0, x1, y1 (resolve-aligned), RB_COPY_CONTROL .. RB_COPY_SURFACE_SLICE
+  // (0x2318-0x2323), RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005)
+  kOpResolve = 10,
 };
 
 enum DrawFlags : uint32_t {

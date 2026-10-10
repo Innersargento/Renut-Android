@@ -118,6 +118,24 @@ index 36e07dd..56d5d9d 100644
  
    static constexpr size_t kRegisterCount = 0x5003;
    uint32_t values[kRegisterCount];
+diff --git a/include/rex/graphics/util/draw.h b/include/rex/graphics/util/draw.h
+index 3da182d..1849a33 100644
+--- a/include/rex/graphics/util/draw.h
++++ b/include/rex/graphics/util/draw.h
+@@ -586,4 +586,13 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+                     bool fixed_rg16_truncated_to_minus_1_to_1,
+                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out);
+ 
++// GetResolveInfo for a rectangle already known (inclusive x0/y0, exclusive
++// x1/y1, aligned to the resolve alignment) instead of the one drawn through
++// vertex fetch constant 0 - for a resolve that comes as an API call.
++bool GetResolveInfoFromRect(const RegisterFile& regs, const memory::Memory& memory, int32_t x0,
++                            int32_t y0, int32_t x1, int32_t y1, uint32_t draw_resolution_scale_x,
++                            uint32_t draw_resolution_scale_y,
++                            bool fixed_rg16_truncated_to_minus_1_to_1,
++                            bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out);
++
+ }  // namespace rex::graphics::draw_util
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
 index 696ff48..f9d441d 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
@@ -1300,6 +1318,36 @@ index 03ce18c..df21990 100644
 +}
 +
  }  // namespace rex::graphics
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 305380e..abadef1 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -852,6 +852,25 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   x1 = rex::align(x1, int32_t(xenos::kResolveAlignmentPixels));
+   y1 = rex::align(y1, int32_t(xenos::kResolveAlignmentPixels));
+ 
++  return GetResolveInfoFromRect(regs, memory, x0, y0, x1, y1, draw_resolution_scale_x,
++                                draw_resolution_scale_y, fixed_rg16_truncated_to_minus_1_to_1,
++                                fixed_rgba16_truncated_to_minus_1_to_1, info_out);
++}
++
++bool GetResolveInfoFromRect(const RegisterFile& regs, const memory::Memory& memory, int32_t x0,
++                            int32_t y0, int32_t x1, int32_t y1, uint32_t draw_resolution_scale_x,
++                            uint32_t draw_resolution_scale_y,
++                            bool fixed_rg16_truncated_to_minus_1_to_1,
++                            bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out) {
++  info_out.coordinate_info.packed = 0;
++  info_out.height_div_8 = 0;
++  auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
++  info_out.rb_copy_control = rb_copy_control;
++  if (rb_copy_control.copy_command != xenos::CopyCommand::kRaw &&
++      rb_copy_control.copy_command != xenos::CopyCommand::kConvert) {
++    return false;
++  }
++
+   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+   if (rb_surface_info.msaa_samples > xenos::MsaaSamples::k4X) {
+     // Safety check because a lot of code assumes up to 4x.
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index 001f36b..5230772 100644
 --- a/src/graphics/vulkan/command_processor.cpp
