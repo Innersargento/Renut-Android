@@ -1190,6 +1190,10 @@ struct ResolveSurfaces {
   Target* source = nullptr;
   Target* depth = nullptr;
   uint32_t x = 0, y = 0, width = 0, height = 0;
+  // The destination texture object's level 0 (GPU address, 0 if the copy goes
+  // elsewhere), its size and pitch, and where the source corner lands in it.
+  uint32_t object_base = 0, object_width = 0, object_height = 0, object_pitch = 0;
+  int32_t dest_dx = 0, dest_dy = 0;
 };
 
 struct Resolved {
@@ -1474,6 +1478,11 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void EvictSurfaceTargets();
   std::string SurfaceReport();
   uint64_t surface_created_ = 0, surface_grown_ = 0, surface_evicted_ = 0, surface_mismatch_ = 0;
+  // Native resolves into their texture object, and the ones still found by
+  // address (other levels, slices, faces). <files>/native-d3d-address-resolves
+  // sends them all by address again (live, to compare).
+  uint64_t object_resolves_ = 0, address_resolves_count_ = 0;
+  bool address_resolves_ = false;
   uint64_t surface_missing_ = 0;
   // Direct3D's own Clear (see IssueDraw).
   void IssueD3DClear(xenos::EdramMode edram_mode);
@@ -4589,8 +4598,9 @@ std::string PlumeCommandProcessor::SurfaceReport() {
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
   std::string out = fmt::format(
       "== surfaces: {} targets now, {} created, {} grown, {} evicted; register/surface mismatches {}, "
-      "slots without a surface {}\n",
-      count, surface_created_, surface_grown_, surface_evicted_, surface_mismatch_, surface_missing_);
+      "slots without a surface {}\n== resolves: {} into their texture object, {} by address\n",
+      count, surface_created_, surface_grown_, surface_evicted_, surface_mismatch_, surface_missing_,
+      object_resolves_, address_resolves_count_);
   for (const auto& [key, t] : targets_) {
     if (!(key & kSurfaceTargetKey)) continue;
     out += fmt::format("   surface {:08X} {} {}x{} base {} format {} last frame {}\n", t.surface,
@@ -8343,6 +8353,15 @@ void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
   surfaces.y = w[2];
   surfaces.width = w[3] > w[1] ? w[3] - w[1] : 0;
   surfaces.height = w[4] > w[2] ? w[4] - w[2] : 0;
+  if (!address_resolves_) {
+    surfaces.object_base = w[24];
+    surfaces.object_width = w[25];
+    surfaces.object_height = w[26];
+    surfaces.dest_dx = int32_t(w[27]);
+    surfaces.dest_dy = int32_t(w[28]);
+    surfaces.object_pitch = w[29];
+  }
+  ++(surfaces.object_base ? object_resolves_ : address_resolves_count_);
   ExecuteResolve(info, edram_targets_ ? nullptr : &surfaces);
 }
 
@@ -8411,13 +8430,12 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
         info.IsClearingDepth() ? "d" : "");
   if (source && x < source->width && y < source->height &&
       info.rb_copy_control.copy_command != xenos::CopyCommand::kNull) {
-    const uint32_t w = std::min(width, source->width - x), h = std::min(copy_height, source->height - y);
+    uint32_t sx = x, sy = y;
+    uint32_t w = std::min(width, source->width - x), h = std::min(copy_height, source->height - y);
     const uint32_t dest_w = std::max(uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32u, w);
     const uint32_t dest_h = std::max(uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) * 32u, h);
     const uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8;
     const uint32_t dy = info.copy_dest_coordinate_info.offset_y_div_8 * 8;
-    // Screen bands and shadow tiles resolve to addresses inside one tiled
-    // guest texture. Recover both coordinates, including across frames.
     uint32_t column = 0, row = 0;
     const auto* dest_info = rex::graphics::FormatInfo::Get(
         xenos::TextureFormat(uint32_t(info.copy_dest_info.copy_dest_format)));
@@ -8432,41 +8450,70 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
                              uint32_t(xenos::TextureFormat::k_24_8_FLOAT);
     const RenderFormat dest_format =
         copying_depth ? (with_stencil ? RenderFormat::R32G32_FLOAT : RenderFormat::R32_FLOAT) : source->format;
-    Resolved* inside = FindResolvedContaining(info.copy_dest_base, dest_format, dest_bpp,
-                                              dest_w, dest_h, column, row);
-    Resolved& dest = inside && inside->width >= column + dx + w && inside->height >= row + dy + h
-                         ? *inside
-                         : GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
-    const uint32_t dest_y = &dest == inside ? dy + row : dy;
-    const uint32_t dest_x = &dest == inside ? dx + column : dx;
+    // Native lists: the copy goes into the D3DTexture the resolve names, at
+    // its own size, the source corner landing on the point Direct3D was given.
+    // Sampled through its fetch constant, which addresses its level 0, as
+    // every texture here. Otherwise the destination is recovered from the
+    // copy's address: screen bands and shadow tiles resolve to addresses inside
+    // one tiled guest texture, and both coordinates are found, including
+    // across frames.
+    const bool to_object = surfaces && surfaces->object_base;
+    Resolved* inside = nullptr;
+    Resolved* chosen = nullptr;
+    uint32_t dest_x = 0, dest_y = 0;
+    if (to_object) {
+      int32_t ox = int32_t(sx) + surfaces->dest_dx, oy = int32_t(sy) + surfaces->dest_dy;
+      if (ox < 0) {
+        const uint32_t cut = std::min(w, uint32_t(-ox));
+        sx += cut, w -= cut, ox = 0;
+      }
+      if (oy < 0) {
+        const uint32_t cut = std::min(h, uint32_t(-oy));
+        sy += cut, h -= cut, oy = 0;
+      }
+      chosen = &GetResolved(surfaces->object_base, dest_format, std::max(surfaces->object_width, 1u),
+                            std::max(surfaces->object_height, 1u));
+      dest_x = uint32_t(ox);
+      dest_y = uint32_t(oy);
+      w = dest_x < chosen->width ? std::min(w, chosen->width - dest_x) : 0;
+      h = dest_y < chosen->height ? std::min(h, chosen->height - dest_y) : 0;
+    } else {
+      inside = FindResolvedContaining(info.copy_dest_base, dest_format, dest_bpp, dest_w, dest_h, column, row);
+      chosen = inside && inside->width >= column + dx + w && inside->height >= row + dy + h
+                   ? inside
+                   : &GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
+      dest_y = chosen == inside ? dy + row : dy;
+      dest_x = chosen == inside ? dx + column : dx;
+    }
+    Resolved& dest = *chosen;
     ++dest.generation;
     dest.depth = copying_depth;
     dest.written = ++resolve_serial_;
     InvalidateResolvedLookups();
     dest.written_frame = swaps_;
-    dest.guest_pitch = dest_w;
-    dest.guest_height = dest_h;
+    dest.guest_pitch = to_object ? std::max(surfaces->object_pitch, 32u) : dest_w;
+    dest.guest_height = to_object ? (std::max(surfaces->object_height, 1u) + 31) & ~31u : dest_h;
     dest.guest_bpp = dest_bpp;
-    if (&dest != inside) MergeResolvedTails(info.copy_dest_base, dest);
+    if (!to_object && &dest != inside) MergeResolvedTails(info.copy_dest_base, dest);
     // Snapshot of the guest memory under the whole resolved texture.
     {
-      uint32_t base_address = info.copy_dest_base;
+      uint32_t base_address = to_object ? surfaces->object_base : info.copy_dest_base;
       if (&dest == inside) base_address -= uint32_t(gfx::texture_util::GetTiledOffset2D(
           column, row, dest.guest_pitch, 31 - __builtin_clz(dest_bpp)));
       dest.guest_bytes = dest.guest_pitch * dest.guest_height * dest_bpp;
       dest.guest_hash = ContentHash(memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
       dest.checked_frame = swaps_;
     }
-    if (dest.texture && copying_depth) {
+    if (dest.texture && copying_depth && w && h) {
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
-      CopyDepth(*source, x, y, w, h, dest.texture.get(), dest_x, dest_y, with_stencil && dest.format == dest_format);
-    } else if (dest.texture) {
+      CopyDepth(*source, sx, sy, w, h, dest.texture.get(), dest_x, dest_y, with_stencil && dest.format == dest_format);
+    } else if (dest.texture && w && h) {
       Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
       // plume-skip bit 268435456 keeps the resolve's barriers and pass breaks
       // but drops the copies themselves, colour and depth (see CopyDepth).
       if (!(skip_mask_ & 268435456)) {
-        RenderBox box(int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h), 0, 1);
+        RenderBox box(int32_t(sx), int32_t(sy), int32_t(sx + w), int32_t(sy + h), 0, 1);
         L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
                                  RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
                                  dest_y, 0, &box);
@@ -9498,6 +9545,11 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
     }
     keep_streams_ = keep_streams;
+    const bool address_resolves = access((root + "/native-d3d-address-resolves").c_str(), F_OK) == 0;
+    if (address_resolves != address_resolves_) {
+      REXLOG_INFO("Renut: native resolves by {}", address_resolves ? "address" : "texture object");
+    }
+    address_resolves_ = address_resolves;
     const bool edram_targets = access((root + "/native-d3d-edram").c_str(), F_OK) == 0;
     if (edram_targets != edram_targets_) {
       REXLOG_INFO("Renut: native lists' targets by {}", edram_targets ? "EDRAM base" : "surface");

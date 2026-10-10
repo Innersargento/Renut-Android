@@ -1226,6 +1226,7 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     depth_step = 8;
   }
   uint32_t address = d1 & 0xFFFFF000u;
+  const uint32_t level0 = address;
   const uint32_t format = d1 & 0x3F;
   uint32_t pitch = __builtin_rotateleft32(d0, 15) & 0x3FE0;
   const uint32_t block_bytes = (U16(base, 0x820052F8 + format * 2) >> 3) & 0x1F;
@@ -1342,6 +1343,14 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     for (uint32_t r = 0x2318; r <= 0x2323; ++r) list.words.push_back(U32(base, dev + kRegs2300 + (r - 0x2300) * 4));
     for (uint32_t r = 0; r < 6; ++r) list.words.push_back(U32(base, dev + kRegs2000 + r * 4));
     list.words.push_back(source);
+    // The destination object, for a copy into a 2D texture's level 0.
+    const bool to_object = !level && !slice && dimension == 1;
+    list.words.push_back(to_object ? Phys(level0) : 0);
+    list.words.push_back(width);
+    list.words.push_back(height);
+    list.words.push_back(uint32_t(px - rx1));
+    list.words.push_back(uint32_t(py - ry1));
+    list.words.push_back(pitch);
   });
   // What the copy leaves in the device: the texture's fence, and the state it
   // would have clobbered marked for the next draw (harmless on the host).

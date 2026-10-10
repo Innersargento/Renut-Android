@@ -46,7 +46,10 @@ enum Op : uint32_t {
   kOpClear = 9,
   // [op] x0, y0, x1, y1 (resolve-aligned), RB_COPY_CONTROL .. RB_COPY_SURFACE_SLICE
   // (0x2318-0x2323), RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005), source slot
-  // (0-3 render target, 4 depth)
+  // (0-3 render target, 4 depth), then the destination D3DTexture: its level 0's
+  // GPU address (0 when the copy goes to another level, slice or face), width,
+  // height, where the source rectangle's corner lands relative to it (dest point
+  // minus source corner, x and y) and its pitch in texels
   kOpResolve = 10,
   // [op | slots << 8] for each slot set (bits 0-3 render targets 0-3, 4 depth),
   // in order: the D3DSurface bound there, its +24 (RB_SURFACE_INFO), +28
@@ -54,7 +57,7 @@ enum Op : uint32_t {
   // Comes with every send of the target registers it stands behind.
   kOpSurfaces = 11,
 };
-constexpr uint32_t kResolveWords = 24, kClearWords = 18;
+constexpr uint32_t kResolveWords = 30, kClearWords = 18;
 
 enum DrawFlags : uint32_t {
   kDrawPredicated = 1,    // obeys the bin mask, as every Direct3D draw packet does
