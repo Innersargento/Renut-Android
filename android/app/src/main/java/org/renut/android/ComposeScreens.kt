@@ -346,6 +346,7 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     val oneUiEnabled = activity.uiOneUiEnabled()
     val tuMode = activity.uiTuMode()
     val ir3Mode = activity.uiIr3Mode()
+    val turnip = remember(driver) { activity.uiDriverIsTurnip() }
     val logLevel = activity.uiRuntimeOption("log_level", "info")
     val shaderAsync = activity.uiRuntimeOption("renut_plume_async_pipelines", "true") == "true"
     val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
@@ -373,9 +374,13 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
                 SingleChoiceSelector("Driver", driver, activity.uiDriverChoices(), !busy) { activity.uiSelectDriver(it) }
                 ActionButton("Importar driver Adreno (.zip)", !busy, outlined = true) { activity.uiAction("Importar driver Adreno (.zip)") }
                 if (activity.uiDriverStored()) ActionButton("Apagar driver selecionado", !busy, outlined = true) { confirmDeleteDriver = true }
-                ToggleRow("One UI fix", oneUiEnabled, !busy) { activity.uiSetOneUi(it) }
-                MultiModeSelector("TU_DEBUG", tuMode, listOf("perf", "sysmem", "gmem")) { activity.uiSetTuMode(it) }
-                MultiModeSelector("IR3_SHADER_DEBUG", ir3Mode, listOf("nopreamble", "noearlypreamble", "nouboopt", "nodescprefetch")) { activity.uiSetIr3Mode(it) }
+                if (turnip) {
+                    ToggleRow("One UI fix", oneUiEnabled, !busy) { activity.uiSetOneUi(it) }
+                    MultiModeSelector("TU_DEBUG", tuMode, listOf("perf", "sysmem", "gmem")) { activity.uiSetTuMode(it) }
+                    MultiModeSelector("IR3_SHADER_DEBUG", ir3Mode, listOf("nopreamble", "noearlypreamble", "nouboopt", "nodescprefetch")) { activity.uiSetIr3Mode(it) }
+                } else {
+                    Text("Opções do Adreno (One UI fix, TU_DEBUG, IR3_SHADER_DEBUG) aparecem ao selecionar um driver Turnip.", color = Muted, fontSize = 12.sp)
+                }
                 ActionButton("Apagar cache de shaders", !busy, outlined = true) { activity.uiAction("Apagar cache de shaders") }
             }
         }
@@ -389,14 +394,12 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
                 ToggleRow("Compilação assíncrona de shaders e pipelines", shaderAsync, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_async_pipelines", it.toString())
                 }
-                Text("Compila pipelines novos em segundo plano. O que o driver já tem em cache aparece na hora; o resto usa um pipeline parecido ou falta por alguns quadros até ficar pronto. Desenhos de memexport continuam síncronos.", color = Muted, fontSize = 12.sp)
                 ToggleRow("Remover sombras", noShadows, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
                 }
                 ToggleRow("Remover bloom", noBloom, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_bloom", it.toString())
                 }
-                Text("Também podem ser definidos no renut.toml (renut_plume_no_shadows, renut_plume_no_bloom). Reduzem o custo de GPU.", color = Muted, fontSize = 12.sp)
             }
         }
         item { Text("reNut · prévia de desenvolvimento", color = Muted, fontSize = 12.sp) }

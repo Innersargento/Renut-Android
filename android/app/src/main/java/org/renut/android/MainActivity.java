@@ -158,10 +158,11 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
         i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
         i.putExtra("showControls",getPreferences(0).getBoolean("showControls",true));
-        i.putExtra("oneUiFix",getPreferences(0).getBoolean("oneui",true));
+        boolean turnip=uiDriverIsTurnip();
+        i.putExtra("oneUiFix",turnip&&getPreferences(0).getBoolean("oneui",true));
         i.putExtra("sceneMsaa",false);
-        i.putExtra("tuDebug",getPreferences(0).getString("tuDebug",""));
-        i.putExtra("ir3Debug",getPreferences(0).getString("ir3Debug",""));
+        i.putExtra("tuDebug",turnip?getPreferences(0).getString("tuDebug",""):"");
+        i.putExtra("ir3Debug",turnip?getPreferences(0).getString("ir3Debug",""):"");
         startActivity(i);
     }
     private int dp(int n){return (int)(getResources().getDisplayMetrics().density*n);}
@@ -233,6 +234,31 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         }
         if(!found)edit.remove("driverDir").remove("driverLib");
         edit.apply();refresh();
+    }
+    private final java.util.Map<String,Boolean> turnipCache=new java.util.HashMap<>();
+    /** True only when the selected driver is Turnip: its library carries the TU_DEBUG option table, which no other driver has. */
+    public boolean uiDriverIsTurnip(){
+        String dir=getPreferences(0).getString("driverDir",""),lib=getPreferences(0).getString("driverLib","");
+        if(dir.isEmpty()||lib.isEmpty())return false;
+        File so=new File(dir,lib);
+        if(!so.isFile())return false;
+        String key=so.getAbsolutePath()+":"+so.length()+":"+so.lastModified();
+        Boolean known=turnipCache.get(key);
+        if(known!=null)return known;
+        boolean found=containsAscii(so,"TU_DEBUG");
+        turnipCache.put(key,found);
+        return found;
+    }
+    private static boolean containsAscii(File file,String needle){
+        byte[] pattern=needle.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        try(java.io.InputStream in=new java.io.BufferedInputStream(new java.io.FileInputStream(file),1<<16)){
+            int matched=0,b;
+            while((b=in.read())!=-1){
+                if(b==pattern[matched]){if(++matched==pattern.length)return true;}
+                else matched=b==pattern[0]?1:0;
+            }
+        }catch(IOException ignored){}
+        return false;
     }
     public boolean uiDriverStored(){return !getPreferences(0).getString("driverDir","").isEmpty();}
     /** Removes the selected stored driver from the device and falls back to the system one. */
