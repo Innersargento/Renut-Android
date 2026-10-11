@@ -69,8 +69,22 @@ std::string renutCheatsSummary() {
 
 // Hooks are declared by the generated code with C++ linkage, exactly as below.
 
+// <files>/renut-cao, polled by Plume once a second: 1 or 0 overrides the option, -1 keeps it.
+std::atomic<int> g_renut_cao_override{-1};
+
 // A graphics option, not a cheat: true jumps past the draw of one contact patch.
-bool renut_disable_cao() { return REXCVAR_GET(renut_disable_cao); }
+// Counted per call so the log can say whether the game ever reaches the per-blob draw:
+// calls = contact patches the pass walked, skipped = the ones this option removed.
+std::atomic<uint64_t> g_renut_cao_calls{0};
+std::atomic<uint64_t> g_renut_cao_skipped{0};
+
+bool renut_disable_cao() {
+  g_renut_cao_calls.fetch_add(1, std::memory_order_relaxed);
+  const int forced = g_renut_cao_override.load(std::memory_order_relaxed);
+  const bool skip = forced >= 0 ? forced != 0 : REXCVAR_GET(renut_disable_cao);
+  if (skip) g_renut_cao_skipped.fetch_add(1, std::memory_order_relaxed);
+  return skip;
+}
 
 bool renut_cheat_infinite_health() { return RENUT_CHEAT_ON(renut_cheat_infinite_health); }
 

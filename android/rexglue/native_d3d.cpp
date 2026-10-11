@@ -154,7 +154,21 @@ struct Counters {
   std::atomic<uint64_t> surface_clips{0}, tiled_surface_clips{0}, foreign_immediate{0}, devices{0};
   std::atomic<uint64_t> fences{0}, presents{0}, callbacks{0}, doorbells{0}, native_doorbells{0};
   std::atomic<uint64_t> stuck_waits{0}, lists_published{0}, lists_executed{0}, indexed_up{0};
+  std::atomic<uint64_t> effects_checked{0}, effect_mismatches{0}, effect_records{0}, doorbells_skipped{0};
+  std::atomic<uint64_t> worker_runs{0};
 } g_counts;
+
+// PM4-less sync, live switches (files/renut-pm4-callbacks, files/renut-pm4-doorbell, read every
+// 30 frames; no file = the default, 1 and 1): callbacks 0 = the PM4 words InsertCallback wrote go
+// into the lists, 1 = the lists carry its effects (kOpEffects), 2 = words executed and the
+// effects checked against them. doorbell 0 = AddCallsToPrimaryBuffer writes the ring as ever,
+// 1 = it does not, and a publish wakes the worker instead of the ring doing it.
+std::atomic<int> g_pm4_callbacks{1};
+std::atomic<int> g_pm4_doorbell{1};
+std::atomic<bool> g_work_pending{false};
+std::mutex g_wake_mutex;
+std::shared_ptr<std::function<void()>> g_wake;
+std::string g_first_mismatch;
 
 // Native sync. The watchdog: a Direct3D wait that has not moved for a while
 // although the command processor has run every published list means a GPU
@@ -332,6 +346,15 @@ void Publish() {
   }
   g_counts.publishes.fetch_add(1, std::memory_order_relaxed);
   g_counts.lists_published.fetch_add(1, std::memory_order_relaxed);
+  if (g_pm4_doorbell.load(std::memory_order_relaxed) == 1 && g_front.sync_recording) {
+    g_work_pending.store(true, std::memory_order_release);
+    std::shared_ptr<std::function<void()>> wake;
+    {
+      std::lock_guard lock(g_wake_mutex);
+      wake = g_wake;
+    }
+    if (wake && *wake) (*wake)();
+  }
 }
 
 bool SyncWanted();
@@ -1567,6 +1590,84 @@ bool SyncWanted() {
          !g_sync_fallback.load(std::memory_order_relaxed);
 }
 
+// PM4-less callbacks. What InsertCallback (sub_822052C8) writes is a pure function of its
+// arguments - it stores packets from registers and changes nothing in the device - so the
+// lists can carry its effects instead of its words: the register writes in order and the
+// interrupt (the waits it also writes are not needed on the host). Flags: bit 1 the callback
+// itself, bit 2 the reset of the callback address (both set when neither is), bit 0 leaves
+// out the wait-until write, bits 24-29 the CPUs (4 when none).
+using Effects = std::vector<std::pair<uint32_t, uint32_t>>;
+constexpr uint32_t kEffectInterrupt = 0xFFFFFFFFu;
+constexpr uint32_t kRegCallbackAck = 0x045E, kRegScratch0 = 0x0578, kRegScratch1 = 0x0579,
+                   kRegCallbackAddress = 0x057C, kRegCallbackContext = 0x057D, kRegWaitUntil = 0x05C8;
+
+Effects CallbackEffects(uint32_t flags, uint32_t function, uint32_t context) {
+  Effects out;
+  uint32_t mask = (flags >> 24) & 0x3F;
+  if (!mask) mask = 4;
+  if (!(flags & 6)) flags |= 6;
+  if (flags & 2) {
+    if (!(flags & 1)) out.push_back({kRegWaitUntil, 0x20000u});
+    out.push_back({kRegCallbackAddress, function});
+    out.push_back({kRegCallbackContext, context});
+    out.push_back({kRegScratch0, mask});
+    out.push_back({kEffectInterrupt, mask});
+    out.push_back({kRegCallbackAck, mask});
+  }
+  if (flags & 4) out.push_back({kRegCallbackAddress, 0x0BADF00Du});
+  return out;
+}
+
+// The same effects read back from the words the original wrote at ring+4 .. ring+4*words:
+// type-0 register writes and the INTERRUPT packet, as the executor's NativeCallback decodes them.
+Effects DecodeEffects(uint8_t* base, uint32_t ring, uint32_t words) {
+  Effects out;
+  for (uint32_t i = 1; i <= words;) {
+    const uint32_t header = U32(base, ring + i * 4);
+    switch (header >> 30) {
+      case 0: {
+        const uint32_t first = header & 0x7FFF, n = ((header >> 16) & 0x3FFF) + 1;
+        const bool one = (header >> 15) & 1;
+        for (uint32_t j = 0; j < n && i + 1 + j <= words; ++j) {
+          out.push_back({one ? first : first + j, U32(base, ring + (i + 1 + j) * 4)});
+        }
+        i += 1 + n;
+        break;
+      }
+      case 1:
+        i += 3;
+        break;
+      case 2:
+        i += 1;
+        break;
+      default: {
+        const uint32_t opcode = (header >> 8) & 0x7F, n = ((header >> 16) & 0x3FFF) + 1;
+        if (opcode == 0x54 && i + 1 <= words) out.push_back({kEffectInterrupt, U32(base, ring + (i + 1) * 4)});
+        i += 1 + n;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+void PushEffects(List& list, const Effects& effects) {
+  list.words.push_back(kOpEffects | (uint32_t(effects.size()) << 8));
+  for (const auto& [reg, value] : effects) {
+    list.words.push_back(reg);
+    list.words.push_back(value);
+  }
+  g_counts.effect_records.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string EffectsText(const Effects& effects) {
+  std::string out;
+  for (const auto& [reg, value] : effects) {
+    out += reg == kEffectInterrupt ? fmt::format(" int:{:X}", value) : fmt::format(" {:X}={:X}", reg, value);
+  }
+  return out.empty() ? std::string(" (none)") : out;
+}
+
 // D3D::CDevice::SetFence(device, ring) (sub_82278528): two EVENT_WRITE_SHDs
 // into the writeback block at +10896, the ring position (+14920 low bits |
 // the write pointer) to +4 and the fence (+10908, which then moves on by 2)
@@ -1590,10 +1691,13 @@ void SetFence(PPCContext& ctx, uint8_t* base) {
 // the primary ring; everything recorded so far goes with these segments, named
 // in the list so the command processor knows which list is which segment.
 // Whether the next content carries its sync records is decided here.
-void AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t* base) {
-  if (GetMode() != Mode::kNative) return;
+bool AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t* base) {
+  if (GetMode() != Mode::kNative) return false;
   const uint32_t calls = ctx.r4.u32, count = ctx.r5.u32;
   std::lock_guard lock(g_front.mutex);
+  // A segment recorded with its sync records is one the command processor would not walk
+  // either, so for it the IB packet (and the write pointer it moves) need not exist.
+  const bool carried = g_front.sync_recording;
   if (g_front.main_device && ctx.r3.u32 != g_front.main_device) g_foreign_doorbells.fetch_add(1, std::memory_order_relaxed);
   List& list = *g_front.immediate;
   list.words.push_back(kOpSegments | (std::min(count, 0xFFFFu) << 8));
@@ -1610,6 +1714,10 @@ void AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t* base) {
     REXLOG_INFO("Renut: native sync {} at doorbell {} (swap {})", g_front.sync_recording ? "on" : "off",
                 g_counts.doorbells.load(std::memory_order_relaxed), g_front.swaps_seen);
   }
+  const bool skip = carried && g_pm4_doorbell.load(std::memory_order_relaxed) == 1 &&
+                    ctx.r3.u32 == g_front.main_device && !g_sync_fallback.load(std::memory_order_relaxed);
+  if (skip) g_counts.doorbells_skipped.fetch_add(1, std::memory_order_relaxed);
+  return skip;
 }
 
 // D3D InsertCallback(device, ring, flags, function, context) (sub_822052C8):
@@ -1618,6 +1726,7 @@ void AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t* base) {
 // list as they are.
 bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, ring = ctx.r4.u32;
+  const uint32_t flags = ctx.r5.u32, function = ctx.r6.u32, context = ctx.r7.u32;
   std::unique_lock lock(g_front.mutex);
   if (!g_front.sync_recording) return false;
   lock.unlock();
@@ -1627,9 +1736,25 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   lock.lock();
   List& list = Current(dev);
   const uint32_t words = (end - ring) / 4;
+  g_counts.callbacks.fetch_add(1, std::memory_order_relaxed);
+  const int mode = g_pm4_callbacks.load(std::memory_order_relaxed);
+  if (mode >= 1) {
+    const Effects want = CallbackEffects(flags, function, context);
+    if (mode == 2) {
+      const Effects got = DecodeEffects(base, ring, words);
+      g_counts.effects_checked.fetch_add(1, std::memory_order_relaxed);
+      if (got != want && g_counts.effect_mismatches.fetch_add(1, std::memory_order_relaxed) < 3) {
+        g_first_mismatch += fmt::format("   mismatch: flags {:08X} function {:08X} context {:08X}\n      words:{}\n"
+                                        "      args :{}\n",
+                                        flags, function, context, EffectsText(got), EffectsText(want));
+      }
+    } else {
+      PushEffects(list, want);
+      return true;
+    }
+  }
   list.words.push_back(kOpCallback | (words << 8));
   for (uint32_t i = 1; i <= words; ++i) list.words.push_back(U32(base, ring + i * 4));
-  g_counts.callbacks.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -1648,9 +1773,13 @@ bool SynchronizeToPresentationInterval(PPCContext& ctx, uint8_t* base) {
   const bool wait = !immediate && block;
   if (wait) {
     List& list = Current(dev);
-    list.words.push_back(kOpCallback | (2u << 8));
-    list.words.push_back(0x00000579u);  // type 0: SCRATCH_REG1
-    list.words.push_back(1);
+    if (g_pm4_callbacks.load(std::memory_order_relaxed) == 1) {
+      PushEffects(list, {{kRegScratch1, 1}});  // the present interval, written back
+    } else {
+      list.words.push_back(kOpCallback | (2u << 8));
+      list.words.push_back(0x00000579u);  // type 0: SCRATCH_REG1
+      list.words.push_back(1);
+    }
   }
   lock.unlock();
   __imp__sub_8228A748(ctx, base);
@@ -1767,8 +1896,7 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       SetFence(ctx, base);
       return false;
     case kD3D_CDevice_AddCallsToPrimaryBuffer:
-      AddCallsToPrimaryBuffer(ctx, base);
-      return false;
+      return AddCallsToPrimaryBuffer(ctx, base);
     case kD3D_InsertCallback:
       return InsertCallback(ctx, base);
     case kD3D_SynchronizeToPresentationInterval:
@@ -1819,6 +1947,30 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
       std::fclose(file);
     }
   }
+  if (frame % 30 == 0) {
+    // The PM4-less switches (see g_pm4_callbacks), read again every 30 frames.
+    std::string dir;
+    {
+      std::lock_guard lock(g_report_mutex);
+      dir = g_report_path;
+    }
+    dir = dir.substr(0, dir.rfind('/') + 1);
+    auto read_switch = [&](const char* name, std::atomic<int>& target, int fallback, int top) {
+      int value = fallback;
+      if (FILE* file = std::fopen((dir + name).c_str(), "r")) {
+        int parsed = 0;
+        if (std::fscanf(file, "%d", &parsed) == 1) value = std::clamp(parsed, 0, top);
+        std::fclose(file);
+      }
+      if (target.exchange(value, std::memory_order_relaxed) != value) {
+        REXLOG_INFO("Renut: {} = {}", name, value);
+      }
+    };
+    if (!dir.empty()) {
+      read_switch("renut-pm4-callbacks", g_pm4_callbacks, 1, 2);
+      read_switch("renut-pm4-doorbell", g_pm4_doorbell, 1, 1);
+    }
+  }
   if (frame < last_frame + 300) return;
   const double f = double(frame - last_frame);
   auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
@@ -1855,6 +2007,19 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
       last[i] = n;
     }
     out += "\n";
+  }
+  {
+    std::string mismatch;
+    {
+      std::lock_guard lock(g_front.mutex);
+      mismatch = g_first_mismatch;
+    }
+    out += fmt::format(
+        "== pm4less: callbacks mode {} ({} checked against their words, {} mismatches, {} structured records), "
+        "doorbell mode {} ({} of {} doorbells without a ring packet), worker runs {}\n{}",
+        g_pm4_callbacks.load(), c(g_counts.effects_checked), c(g_counts.effect_mismatches),
+        c(g_counts.effect_records), g_pm4_doorbell.load(), c(g_counts.doorbells_skipped), c(g_counts.doorbells),
+        c(g_counts.worker_runs), mismatch);
   }
   if (executor) out += executor();
   last_frame = frame;
@@ -1900,6 +2065,18 @@ bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height) {
 void NoteListExecuted() { g_counts.lists_executed.fetch_add(1, std::memory_order_relaxed); }
 
 void SetExecutorBusy(bool busy) { g_executor_busy.fetch_add(busy ? 1 : -1, std::memory_order_relaxed); }
+
+void SetWake(std::function<void()> wake) {
+  std::lock_guard lock(g_wake_mutex);
+  g_wake = wake ? std::make_shared<std::function<void()>>(std::move(wake)) : nullptr;
+}
+
+bool WorkPending() { return g_work_pending.load(std::memory_order_acquire); }
+
+void TakeWorkPending() {
+  g_work_pending.store(false, std::memory_order_release);
+  g_counts.worker_runs.fetch_add(1, std::memory_order_relaxed);
+}
 
 void SetFilesDirectory(std::string directory) {
   std::lock_guard lock(g_report_mutex);

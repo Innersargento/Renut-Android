@@ -80,6 +80,10 @@ enum Op : uint32_t {
   // masked, equals the reference (WAIT_REG_MEM; the swap's wait for its
   // vertical blank, which paces the game), native sync
   kOpWaitMemory = 19,
+  // [op | count << 8] then count pairs (register, value): what a callback or the swap's pacing
+  // does to the GPU's registers, in order, without PM4 words. A register of 0xFFFFFFFF is the
+  // interrupt, its value the mask of CPUs. Native sync with renut-pm4-callbacks 1
+  kOpEffects = 20,
 };
 constexpr uint32_t kResolveWords = 30, kClearWords = 18;
 
@@ -125,5 +129,10 @@ void NoteListExecuted();
 // Native sync: the command processor is running lists or presenting (a wait
 // meanwhile is no sign of a missing record).
 void SetExecutorBusy(bool busy);
+// Ring-less runs (files/renut-pm4-doorbell 1): the doorbell writes nothing to the ring, so a
+// publish wakes the command processor's worker, which then runs the lists itself.
+void SetWake(std::function<void()> wake);
+bool WorkPending();
+void TakeWorkPending();
 
 }  // namespace renut::native_d3d

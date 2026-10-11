@@ -138,6 +138,10 @@ REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
 // game_fixes.cpp: how the MSAA-off path treats the scene's band split
 // (<files>/plume-keep-split: 0 clear, 1 leave, 2 whole-screen projection).
 extern std::atomic<int> g_renut_scene_split_mode;
+// cheats.cpp: <files>/renut-cao overrides the contact-shadow option live (-1 = use the cvar).
+extern std::atomic<int> g_renut_cao_override;
+extern std::atomic<uint64_t> g_renut_cao_calls;
+extern std::atomic<uint64_t> g_renut_cao_skipped;
 REXCVAR_DECLARE(bool, renut_scene_msaa);
 
 // The native renderer mode, for the reconnaissance report (native_probe.cpp).
@@ -1396,6 +1400,10 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
       native_on_ = native_d3d::GetMode() == native_d3d::Mode::kNative;
       native_checked_ = true;
     }
+    if (!wake_registered_) {
+      wake_registered_ = true;
+      native_d3d::SetWake([this] { WakeWorker(); });
+    }
   }
   // The ring's segments: the lists recorded with one run as the command
   // processor reaches it, and one recorded with native sync is not walked -
@@ -1434,6 +1442,57 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint64_t native_waits_ = 0, native_wait_timeouts_ = 0, native_wait_us_ = 0;
   uint64_t segments_skipped_ = 0, segments_walked_ = 0, segments_unnamed_ = 0;
   void NativeCallback(const uint32_t* words, uint32_t count);
+  // ---- PM4 census: what is still read as PM4 (reported in native-d3d.txt) ----
+  // [phase: 0 boot, before the 4th swap; 1 steady][origin: 0 ring, 1 walked segment, 2 callback words]
+  struct Pm4Census {
+    uint64_t type3[2][3][128] = {};
+    uint64_t type0[2][3] = {}, type12[2][3] = {}, padding[2][3] = {};
+    std::map<uint32_t, uint64_t> regs[2][3];  // type-0 base register -> packets
+    uint64_t steady_first_swap = 0;
+  } census_;
+  void CensusCount(uint32_t packet, uint32_t origin) {
+    const uint32_t phase = swaps_ >= 4 ? 1 : 0;
+    if (phase && !census_.steady_first_swap) census_.steady_first_swap = swaps_;
+    if (packet == 0) {
+      ++census_.padding[phase][origin];
+      return;
+    }
+    switch (packet >> 30) {
+      case 0:
+        ++census_.type0[phase][origin];
+        ++census_.regs[phase][origin][packet & 0x7FFF];
+        break;
+      case 3:
+        ++census_.type3[phase][origin][(packet >> 8) & 127];
+        break;
+      default:
+        ++census_.type12[phase][origin];
+        break;
+    }
+  }
+  void OnPacketCensus(uint32_t packet, uint32_t depth) override {
+    CensusCount(packet, depth ? 1 : 0);
+    if (swaps_ < 4) CensusBootPacket(packet, depth);
+  }
+
+  void CensusBootPacket(uint32_t packet, uint32_t depth) {
+    if (boot_log_.size() > (1u << 20)) return;
+    const uint32_t* at = memory_->TranslatePhysical<const uint32_t*>(cur_packet_address_);
+    uint32_t n = 0;
+    switch (packet >> 30) {
+      case 0:
+      case 3:
+        n = ((packet >> 16) & 0x3FFF) + 1;
+        break;
+      default:
+        break;
+    }
+    boot_log_ += fmt::format("{} {:08X} {:08X}", depth ? "seg" : "ring", cur_packet_address_, packet);
+    for (uint32_t i = 0; i < n && i < 6; ++i) boot_log_ += fmt::format(" {:08X}", __builtin_bswap32(at[1 + i]));
+    if (n > 6) boot_log_ += fmt::format(" ...+{}", n - 6);
+    boot_log_ += "\n";
+  }
+  std::string Pm4CensusReport();
   // A dword the GPU writes back (big-endian), at a GPU address.
   void StoreBig(uint32_t physical, uint32_t value) {
     const uint32_t big = __builtin_bswap32(value);
@@ -1449,6 +1508,26 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   BufferRange stream_object_{};  // the hint GuestStream reads
   uint64_t object_streams_ = 0, window_streams_ = 0;
   bool native_checked_ = false;
+  // ---- PM4-less: work that does not come through the ring ----
+  // Lists published while renut-pm4-doorbell is 1 are run by the worker itself.
+  bool NativeWorkPending() override { return native_d3d::WorkPending(); }
+  void RunNativeWork() override {
+    native_d3d::TakeWorkPending();
+    if (!native_checked_) {
+      native_on_ = native_d3d::GetMode() == native_d3d::Mode::kNative;
+      native_checked_ = true;
+    }
+    if (!native_on_) return;
+    ExecutorBusy busy;
+    RunNative(UINT32_MAX);
+  }
+  void NativeEffects(const uint32_t* pairs, uint32_t count);
+  uint64_t native_effects_applied_ = 0;
+  bool wake_registered_ = false;
+  // The first boot packets (before swap 4) as read, with their payloads, for the walk that
+  // PM4-less boot has to replace: written once to <files>/pm4-boot.txt.
+  std::string boot_log_;
+  bool boot_log_written_ = false;
   // Runs the published records until the end, or until the opaque-call
   // marker `until` (consumed; returns true), never past another marker.
   bool RunNative(uint32_t until);
@@ -3192,6 +3271,7 @@ bool PlumeCommandProcessor::SetupContext() {
 }
 
 void PlumeCommandProcessor::ShutdownContext() {
+  native_d3d::SetWake({});
   device_watch_stop_ = true;
   if (device_watch_.thread.joinable()) device_watch_.thread.join();
   StopPipelineWorker();
@@ -4504,6 +4584,87 @@ void PlumeCommandProcessor::EvictSurfaceTargets() {
   if (evicted) RetireFramebuffers();
 }
 
+static const char* Pm4OpcodeName(uint32_t op) {
+  switch (op) {
+    case xenos::PM4_NOP: return "NOP";
+    case xenos::PM4_ME_INIT: return "ME_INIT";
+    case xenos::PM4_INDIRECT_BUFFER: return "INDIRECT_BUFFER";
+    case xenos::PM4_INDIRECT_BUFFER_PFD: return "INDIRECT_BUFFER_PFD";
+    case xenos::PM4_WAIT_REG_MEM: return "WAIT_REG_MEM";
+    case xenos::PM4_WAIT_FOR_IDLE: return "WAIT_FOR_IDLE";
+    case xenos::PM4_REG_RMW: return "REG_RMW";
+    case xenos::PM4_MEM_WRITE: return "MEM_WRITE";
+    case xenos::PM4_COND_WRITE: return "COND_WRITE";
+    case xenos::PM4_COND_EXEC: return "COND_EXEC";
+    case xenos::PM4_EVENT_WRITE: return "EVENT_WRITE";
+    case xenos::PM4_EVENT_WRITE_SHD: return "EVENT_WRITE_SHD";
+    case xenos::PM4_EVENT_WRITE_EXT: return "EVENT_WRITE_EXT";
+    case xenos::PM4_EVENT_WRITE_ZPD: return "EVENT_WRITE_ZPD";
+    case xenos::PM4_DRAW_INDX: return "DRAW_INDX";
+    case xenos::PM4_DRAW_INDX_2: return "DRAW_INDX_2";
+    case xenos::PM4_SET_CONSTANT: return "SET_CONSTANT";
+    case xenos::PM4_SET_CONSTANT2: return "SET_CONSTANT2";
+    case xenos::PM4_SET_SHADER_CONSTANTS: return "SET_SHADER_CONSTANTS";
+    case xenos::PM4_LOAD_ALU_CONSTANT: return "LOAD_ALU_CONSTANT";
+    case xenos::PM4_IM_LOAD: return "IM_LOAD";
+    case xenos::PM4_IM_LOAD_IMMEDIATE: return "IM_LOAD_IMMEDIATE";
+    case xenos::PM4_INVALIDATE_STATE: return "INVALIDATE_STATE";
+    case xenos::PM4_INTERRUPT: return "INTERRUPT";
+    case xenos::PM4_XE_SWAP: return "XE_SWAP";
+    case xenos::PM4_VIZ_QUERY: return "VIZ_QUERY";
+    case xenos::PM4_SET_BIN_MASK_LO:
+    case xenos::PM4_SET_BIN_MASK_HI:
+    case xenos::PM4_SET_BIN_SELECT_LO:
+    case xenos::PM4_SET_BIN_SELECT_HI: return "SET_BIN_*";
+    default: return "";
+  }
+}
+
+std::string PlumeCommandProcessor::Pm4CensusReport() {
+  if (!boot_log_written_ && swaps_ >= 4 && !miss_dump_directory_.empty()) {
+    boot_log_written_ = true;
+    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    if (FILE* file = std::fopen((root + "/pm4-boot.txt").c_str(), "w")) {
+      std::fwrite(boot_log_.data(), 1, boot_log_.size(), file);
+      std::fclose(file);
+    }
+  }
+  static const char* kPhase[2] = {"boot", "steady"};
+  static const char* kOrigin[3] = {"primary ring", "walked segments", "callback words copied into lists"};
+  const uint64_t frames =
+      census_.steady_first_swap && swaps_ >= census_.steady_first_swap ? swaps_ - census_.steady_first_swap + 1 : 0;
+  std::string out = fmt::format("== pm4 still read as PM4 (boot = before swap 4; steady = {} frames since; "
+                                "{} structured effect records applied instead of words)\n",
+                                frames, native_effects_applied_);
+  bool any = false;
+  for (uint32_t phase = 0; phase < 2; ++phase) {
+    for (uint32_t origin = 0; origin < 3; ++origin) {
+      uint64_t t3 = 0;
+      for (uint32_t op = 0; op < 128; ++op) t3 += census_.type3[phase][origin][op];
+      const uint64_t t0 = census_.type0[phase][origin], t12 = census_.type12[phase][origin];
+      const uint64_t pad = census_.padding[phase][origin], total = t3 + t0 + t12 + pad;
+      if (!total) continue;
+      any = true;
+      const double per = phase && frames ? double(total) / double(frames) : 0.0;
+      out += fmt::format("   {} / {}: {} packets{} (type-3 {}, type-0 {}, type-1/2 {}, zero {})\n", kPhase[phase],
+                         kOrigin[origin], total, phase && frames ? fmt::format(", {:.1f} a frame", per) : std::string(),
+                         t3, t0, t12, pad);
+      for (uint32_t op = 0; op < 128; ++op) {
+        const uint64_t n = census_.type3[phase][origin][op];
+        if (n) out += fmt::format("      type-3 0x{:02X} {}: {}\n", op, Pm4OpcodeName(op), n);
+      }
+      std::vector<std::pair<uint64_t, uint32_t>> regs;
+      for (const auto& [reg, n] : census_.regs[phase][origin]) regs.push_back({n, reg});
+      std::sort(regs.rbegin(), regs.rend());
+      for (size_t i = 0; i < regs.size() && i < 12; ++i) {
+        out += fmt::format("      type-0 base register 0x{:04X}: {}\n", regs[i].second, regs[i].first);
+      }
+    }
+  }
+  if (!any) out += "   none\n";
+  return out;
+}
+
 std::string PlumeCommandProcessor::SurfaceReport() {
   size_t count = 0;
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
@@ -4516,6 +4677,7 @@ std::string PlumeCommandProcessor::SurfaceReport() {
       object_resolves_, address_resolves_count_, segments_skipped_, segments_walked_, segments_unnamed_,
       native_fences_, native_presents_, native_callbacks_, native_waits_, native_wait_us_ / 1000,
       native_wait_timeouts_, object_streams_, window_streams_);
+  out += Pm4CensusReport();
   for (const auto& [key, t] : targets_) {
     if (!(key & kSurfaceTargetKey)) continue;
     out += fmt::format("   surface {:08X} {} {}x{} base {} format {} last frame {}\n", t.surface,
@@ -5510,6 +5672,17 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
         }
         break;
       }
+      case native_d3d::kOpEffects: {
+        const uint32_t count = w[0] >> 8;
+        if (f.pos + 1 + 2 * size_t(count) > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        f.pos += 1 + 2 * size_t(count);
+        NativeEffects(w + 1, count);
+        break;
+      }
       case native_d3d::kOpCallback: {
         const uint32_t count = w[0] >> 8;
         if (f.pos + 1 + count > words.size()) {
@@ -5626,11 +5799,31 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
 // processor writes back to memory - and the interrupt that runs it on the
 // CPUs it names. The waits for the CPU need nothing here: the interrupt runs
 // the callback on this thread before the next record.
+// A record of register writes and interrupts, in order (what a callback does without its
+// PM4 words, see native_d3d.cpp): the same effects NativeCallback takes from the packets.
+void PlumeCommandProcessor::NativeEffects(const uint32_t* pairs, uint32_t count) {
+  NativeSwapOut();
+  ++native_callbacks_;
+  ++native_effects_applied_;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t reg = pairs[2 * i], value = pairs[2 * i + 1];
+    if (reg == 0xFFFFFFFFu) {
+      if (!graphics_system_) continue;
+      for (uint32_t cpu = 0; cpu < 6; ++cpu) {
+        if ((value >> cpu) & 1) graphics_system_->DispatchInterruptCallback(1, cpu);
+      }
+    } else {
+      WriteRegister(reg, value);
+    }
+  }
+}
+
 void PlumeCommandProcessor::NativeCallback(const uint32_t* words, uint32_t count) {
   NativeSwapOut();
   ++native_callbacks_;
   for (uint32_t i = 0; i < count;) {
     const uint32_t header = words[i];
+    CensusCount(header, 2);
     switch (header >> 30) {
       case 0: {
         const uint32_t first = header & 0x7FFF, n = ((header >> 16) & 0x3FFF) + 1;
@@ -9032,6 +9225,30 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    {
+      // Live switch of the contact-shadow (CAO) skip: 1 removes the patches, 0 draws them,
+      // no file = the cvar / Configurações option as set at start.
+      int cao = -1;
+      if (FILE* file = std::fopen((root + "/renut-cao").c_str(), "r")) {
+        int value = 0;
+        if (std::fscanf(file, "%d", &value) == 1) cao = value != 0 ? 1 : 0;
+        std::fclose(file);
+      }
+      if (g_renut_cao_override.exchange(cao) != cao) {
+        REXLOG_INFO("Renut: contact shadows (CAO) {}",
+                    cao < 0 ? "as configured" : (cao ? "removed (live)" : "drawn (live)"));
+      }
+      // What the game's fxCAO pass did since the last look (every 30 swaps): the patches it
+      // walked and how many the option skipped. All zero means the pass has nothing to draw.
+      static uint64_t cao_calls_seen = 0, cao_skipped_seen = 0, cao_swaps_seen = 0;
+      const uint64_t calls = g_renut_cao_calls.load(std::memory_order_relaxed);
+      const uint64_t skipped = g_renut_cao_skipped.load(std::memory_order_relaxed);
+      REXLOG_INFO("Renut: CAO pass reached {} contact patches in {} frames, {} skipped (total {} / {})",
+                  calls - cao_calls_seen, swaps_ - cao_swaps_seen, skipped - cao_skipped_seen, calls, skipped);
+      cao_calls_seen = calls;
+      cao_skipped_seen = skipped;
+      cao_swaps_seen = swaps_;
+    }
     uint32_t mask = 0;
     uint32_t bind_skip = 0;
     bool shadow_native_constants = true;
