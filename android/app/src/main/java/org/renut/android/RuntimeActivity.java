@@ -16,6 +16,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private SurfaceView surface;
     private GamepadOverlay overlay;
     private GameMenu gameMenu;
+    private TextPrompt textPrompt;
     private boolean controlsVisible;
     private float gameRefreshRate=60f;
     private ExternalController.Player controller;
@@ -42,6 +43,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native void nativeExternalTrigger(int trigger,float value);
     private static native long nativeFrameCount();
     private static native long nativePrecompileProgress();
+    private static native void nativeTextInputResult(String text,boolean cancelled);
     private TextView fps;
     private AchievementToast achievementToast;
     // The one game screen that is open: the native side reports unlocks through a static method.
@@ -56,6 +58,21 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             if(item!=null)activity.achievementToast.push(item);
         });
     }
+    /**
+     * The game asked for the Xbox keyboard (naming a blueprint, for instance). Called from the
+     * kernel's dispatch thread, which then waits for nativeTextInputResult; whatever happens here,
+     * exactly one answer must go back or that thread stays blocked.
+     */
+    public static void requestTextInput(String title,String description,String text,int maxLength,int flags){
+        RuntimeActivity activity=current==null?null:current.get();
+        if(activity==null||activity.textPrompt==null){nativeTextInputResult("",true);return;}
+        activity.runOnUiThread(()->{
+            if(activity.isFinishing()||activity.textPrompt==null){nativeTextInputResult("",true);return;}
+            if(activity.overlay!=null)activity.overlay.cancelTouches();
+            activity.textPrompt.show(title,description,text,maxLength);
+        });
+    }
+    private boolean textPromptShowing(){return textPrompt!=null&&textPrompt.isShowing();}
     public int openContentFd(String uri, String mode) throws java.io.IOException {
         android.os.ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(android.net.Uri.parse(uri),mode);
         if(descriptor==null)throw new java.io.IOException("Arquivo indisponível.");
@@ -94,9 +111,9 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         results=new ScrollView(this);results.addView(status);
         if(launch){
             // Full screen game surface with optional on-screen controls.
-            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
-                |View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                |View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN|View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+            applyImmersive();
+            // The soft keyboard of the text box must not resize (or move) the game surface.
+            getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
             if(android.os.Build.VERSION.SDK_INT>=28)getWindow().getAttributes().layoutInDisplayCutoutMode=
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             WindowManager.LayoutParams windowParams=getWindow().getAttributes();
@@ -140,6 +157,11 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             achievementToast=new AchievementToast(this);
             root.addView(achievementToast,AchievementToast.params(this));
             addPrecompileNote(root);
+            textPrompt=new TextPrompt(this,(text,cancelled)->{
+                applyImmersive();  // the keyboard may have brought the system bars back
+                nativeTextInputResult(text,cancelled);
+            });
+            root.addView(textPrompt,new FrameLayout.LayoutParams(-1,-1));
             current=new java.lang.ref.WeakReference<>(this);
             setContentView(root);
             return;
@@ -193,6 +215,11 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             card.postDelayed(this,250);
         }},250);
     }
+    private void applyImmersive(){
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+            |View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            |View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN|View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+    }
     public boolean uiGraphics(){return graphics;}
     public String uiStatus(){return status.getText().toString();}
     public void attachComposeSurface(SurfaceView view){surface=view;surface.getHolder().addCallback(this);}
@@ -220,6 +247,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         gameMenu.open();
     }
     @Override public void onBackPressed(){
+        if(textPromptShowing()){textPrompt.cancel();return;}
         if(launch&&gameMenu!=null&&gameMenu.back())return;
         if(launch&&results.getVisibility()!=View.VISIBLE){showGameMenu();return;}
         super.onBackPressed();
@@ -244,12 +272,12 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             if(event.getAction()==KeyEvent.ACTION_UP)onBackPressed();
             return true;
         }
-        if(launch&&gameMenu!=null&&gameMenu.isOpen())return super.dispatchKeyEvent(event);
+        if(launch&&(textPromptShowing()||gameMenu!=null&&gameMenu.isOpen()))return super.dispatchKeyEvent(event);
         if(launch){setupController();if(controller!=null&&controller.key(event))return true;}
         return super.dispatchKeyEvent(event);
     }
     @Override public boolean dispatchGenericMotionEvent(MotionEvent event){
-        if(launch){setupController();if(controller!=null&&controller.motion(event))return true;}
+        if(launch&&!textPromptShowing()){setupController();if(controller!=null&&controller.motion(event))return true;}
         return super.dispatchGenericMotionEvent(event);
     }
     private void startValidation(Surface target){

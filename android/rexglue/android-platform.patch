@@ -177,6 +177,43 @@ index 696ff48..f9d441d 100644
  class VulkanCommandProcessor : public CommandProcessor {
   public:
    // Single-descriptor layouts for use within a single frame.
+diff --git a/include/rex/kernel/xam/private.h b/include/rex/kernel/xam/private.h
+index 3df4776..958d58c 100644
+--- a/include/rex/kernel/xam/private.h
++++ b/include/rex/kernel/xam/private.h
+@@ -13,12 +13,32 @@
+ #include <rex/system/export_resolver.h>
+ #include <rex/system/kernel_state.h>
+ 
++#include <cstdint>
++#include <string>
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+ 
+ bool xeXamIsUIActive();
+ 
++// What a title asks of XamShowKeyboardUI. The strings are already host-endian UTF-16.
++struct TextInputRequest {
++  std::u16string title;
++  std::u16string description;
++  std::u16string default_text;
++  uint32_t max_length = 0;  // characters the result may hold, terminator excluded
++  uint32_t flags = 0;       // the title's VKBD_* flags, untouched
++};
++
++// Asks the player for text. Called from a kernel dispatch thread and free to block until the
++// player answers. Returns false when the player cancelled; `result` is only read on true.
++using TextInputHandler = bool (*)(const TextInputRequest& request, std::u16string& result);
++
++// Installs (or, with nullptr, removes) the host's text entry. Without one the keyboard call
++// falls back to handing the title its default text back.
++void SetTextInputHandler(TextInputHandler handler);
++
+ rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
+ 
+ // Registration functions, one per file.
 diff --git a/include/rex/system/gpu_plugin.h b/include/rex/system/gpu_plugin.h
 index 453c210..16efbfb 100644
 --- a/include/rex/system/gpu_plugin.h
@@ -1768,6 +1805,124 @@ index 1fda053..baced12 100644
  
    return X_ERROR_SUCCESS;
  }
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index 5a572ce..9725eef 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <string>
++
+ #include <rex/logging.h>
+ #include <rex/runtime.h>
+ #include <rex/string.h>
+@@ -417,6 +420,34 @@ class KeyboardInputDialog : public XamDialog {
+   bool cancelled_ = true;
+ };
+ 
++namespace {
++
++std::atomic<TextInputHandler> text_input_handler{nullptr};
++
++// The guest's UTF-16 is big-endian; it is read through load_and_swap, never by value().
++std::u16string ReadGuestString(const mapped_wstring& text) {
++  if (!text) {
++    return {};
++  }
++  return rex::memory::load_and_swap<std::u16string>(text.host_address());
++}
++
++// No keyboard UI: the title gets its default text back (or an empty string), as the
++// buffer it owns and nothing else is touched.
++void StoreDefaultText(const mapped_wstring& default_text, const mapped_wstring& buffer,
++                      uint32_t buffer_length) {
++  if (!buffer_length) {
++    return;
++  }
++  rex::string::copy_and_swap_truncating(buffer, ReadGuestString(default_text), buffer_length);
++}
++
++}  // namespace
++
++void SetTextInputHandler(TextInputHandler handler) {
++  text_input_handler.store(handler);
++}
++
+ // https://www.se7ensins.com/forums/threads/release-how-to-use-xshowkeyboardui-release.906568/
+ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_text,
+                             mapped_wstring title, mapped_wstring description, mapped_wstring buffer,
+@@ -431,17 +462,45 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+ 
+   assert_true(overlapped.guest_address() != 0);
+ 
+-  auto buffer_size = static_cast<size_t>(buffer_length) * 2;
+-
+   X_RESULT result;
++  TextInputHandler text_handler = text_input_handler.load();
++  if (text_handler && !REXCVAR_GET(headless)) {
++    // The host has its own text box. The request is copied out of guest memory now: the
++    // guest may reuse its strings while the player is typing.
++    TextInputRequest request;
++    request.title = ReadGuestString(title);
++    request.description = ReadGuestString(description);
++    request.default_text = ReadGuestString(default_text);
++    request.flags = flags;
++    request.max_length = buffer_length ? buffer_length - 1 : 0;
++    if (request.default_text.size() > request.max_length) {
++      request.default_text.resize(request.max_length);
++    }
++    REXKRNL_INFO("XamShowKeyboardUI: flags {:08X}, up to {} characters, title \"{}\"",
++                 uint32_t(flags), request.max_length, rex::string::to_utf8(request.title));
++    auto run = [text_handler, request = std::move(request), buffer, buffer_length](
++                   uint32_t& extended_error, uint32_t& length) -> X_RESULT {
++      length = 0;
++      std::u16string text;
++      if (!request.max_length || !text_handler(request, text)) {
++        // Cancelled: the title reads ERROR_CANCELLED from the overlapped and must not find
++        // anything but an empty string in its buffer.
++        if (buffer_length) {
++          rex::string::copy_and_swap_truncating(buffer, std::u16string_view(), buffer_length);
++        }
++        extended_error = X_ERROR_CANCELLED;
++        return X_ERROR_SUCCESS;
++      }
++      rex::string::copy_and_swap_truncating(buffer, text, buffer_length);
++      extended_error = X_ERROR_SUCCESS;
++      return X_ERROR_SUCCESS;
++    };
++    return xeXamDispatchHeadlessEx(run, overlapped.guest_address());
++  }
+   if (REXCVAR_GET(headless)) {
+-    auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
++    auto run = [default_text, buffer, buffer_length]() -> X_RESULT {
+       // Redirect default_text back into the buffer.
+-      if (!default_text) {
+-        std::memset(buffer, 0, buffer_size);
+-      } else {
+-        rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+-      }
++      StoreDefaultText(default_text, buffer, buffer_length);
+       return X_ERROR_SUCCESS;
+     };
+     result = xeXamDispatchHeadless(run, overlapped.guest_address());
+@@ -486,12 +545,8 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+           close, overlapped.guest_address());
+     } else {
+       // Fallback to headless
+-      auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+-        if (!default_text) {
+-          std::memset(buffer, 0, buffer_size);
+-        } else {
+-          rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+-        }
++      auto run = [default_text, buffer, buffer_length]() -> X_RESULT {
++        StoreDefaultText(default_text, buffer, buffer_length);
+         return X_ERROR_SUCCESS;
+       };
+       result = xeXamDispatchHeadless(run, overlapped.guest_address());
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_audio.cpp b/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
 index 86e7888..a9ca7d2 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_audio.cpp

@@ -38,6 +38,8 @@ std::string renutCheatsSummary();
 namespace renut {
 void AchievementsStart(JNIEnv*, jobject, rex::Runtime&, const std::filesystem::path&);
 void AchievementsStop(rex::Runtime&);
+void TextInputStart(JNIEnv*, jobject);
+void TextInputStop();
 }
 void renutConfigureXenosDriver(const std::string&,const std::string&,const std::string&,bool,const std::string&);
 // Own this entry point so the loader cannot resolve SDL's JNI_OnLoad through
@@ -404,6 +406,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     if (status != X_STATUS_SUCCESS) throw std::runtime_error(fmt::format("Carregamento XEX falhou: {:08X}", status));
     note("XEX carregado na memória do runtime.");
     renut::AchievementsStart(env,activity,runtime,root);
+    renut::TextInputStart(env,activity);
     // Actual recompiled leaf: copies the byte at r3+61 to r4 and returns zero.
     // Scratch storage isolates the test from the loaded game image and saves.
     alignas(32) uint8_t scratch[128]{};
@@ -439,6 +442,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       game_context->ExecutePendingFunctionsFromUIThread();
     }
     if(graphics){validateSwap(runtime,*graphics);note(graphics->report());}
+    renut::TextInputStop();
     renut::AchievementsStop(runtime);
     ReleasePause();
     {
