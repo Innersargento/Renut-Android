@@ -17,6 +17,7 @@
 
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
+#include <rex/system/xthread.h>
 
 namespace renut::d3d {
 namespace {
@@ -128,6 +129,8 @@ bool ClearF(PPCContext& ctx, uint8_t* base) {
 bool BlockerCheck(PPCContext& ctx, uint8_t* base) {
   // One game thread drives this loop; thread_local keeps a second one honest.
   static thread_local uint32_t idle_checks = 0;
+  // The player's pause: this loop calls no kernel wait, so it parks here.
+  rex::system::XThread::WaitIfTitlePaused();
   const uint32_t sleep_us = in_background.load(std::memory_order_relaxed)
       ? kBackgroundSleepMicroseconds : BlockerSleepMicroseconds();
   if (!sleep_us) {

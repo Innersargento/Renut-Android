@@ -26,7 +26,9 @@
 #include "plume_gpu.h"
 #include <rex/chrono/clock.h>
 #include <rex/ui/presenter.h>
+#include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
+#include <rex/system/xthread.h>
 #include <rex/input/input_system.h>
 #include "renut_android_init.h"
 using rex::X_STATUS;
@@ -71,8 +73,31 @@ static std::atomic<bool> render_stopped{false};
 // The window the game loop pumps, reachable from the UI thread for surface changes.
 static std::mutex game_window_mutex;
 static renut::GameWindow* live_game_window = nullptr;
+// The player's pause reaches everything the game runs. Guest threads park at their
+// next kernel wait (rex XThread::SetTitlePaused), the renderer parks at its next
+// present, the guest clock stops crawling, and the audio mixer and the XMA decoder
+// stop. The audio part can wait on a worker that is inside a title callback, so
+// it runs on its own thread and never on the UI thread; `pause_wanted` is what the
+// player last asked, so a quick pause-resume-pause settles on the last one.
+static std::mutex audio_mutex;                 // keeps g_audio valid against Shutdown
+static rex::audio::AudioSystem* g_audio = nullptr;
+static std::mutex pause_op_mutex;
+static std::atomic<bool> pause_wanted{false};
+static void ApplyAudioPause() {
+  std::lock_guard<std::mutex> op(pause_op_mutex);
+  std::lock_guard<std::mutex> lock(audio_mutex);
+  if (!g_audio) return;
+  if (pause_wanted.load()) g_audio->Pause(); else g_audio->Resume();
+}
+// Releases every pause before the game stops, so no thread is left parked.
+static void ReleasePause() {
+  pause_wanted = false;
+  rex::system::XThread::SetTitlePaused(false);
+  if(auto* plume=renut::PlumeRenderer::Get())plume->SetPaused(false);
+}
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeStop(JNIEnv*,jclass) {
   render_stopped=true;
+  ReleasePause();
   // A game paused in the background is parked in the renderer: wake it to shut down.
   if(auto* plume=renut::PlumeRenderer::Get())plume->ReleaseForShutdown();
 }
@@ -104,6 +129,20 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nat
     renut::d3d::SetBackground(false);
   }
   return attached?JNI_TRUE:JNI_FALSE;
+}
+// The pause the player asks for from the game menu. The surface stays, so the last
+// frame is still shown. False while there is no renderer yet (the game has not
+// started drawing): nothing was paused.
+extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nativeSetPaused(JNIEnv*,jclass,jboolean paused) {
+  auto* plume=renut::PlumeRenderer::Get();
+  if(!plume)return JNI_FALSE;
+  pause_wanted=paused;
+  rex::system::XThread::SetTitlePaused(paused);
+  plume->SetPaused(paused);
+  renut::d3d::SetBackground(paused);
+  rex::chrono::Clock::set_guest_time_scalar(paused?0.02:1.0);
+  std::thread(ApplyAudioPause).detach();
+  return JNI_TRUE;
 }
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeButton(JNIEnv*,jclass,jint button,jboolean down) {
   renut::SetTouchButton(uint16_t(button),down);
@@ -352,6 +391,10 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     auto status = runtime.Setup(PPCImageConfig, std::move(config));
     if (status != X_STATUS_SUCCESS) throw std::runtime_error(fmt::format("Setup falhou: {:08X}", status));
     note("Runtime inicializado.");
+    {
+      std::lock_guard<std::mutex> lock(audio_mutex);
+      g_audio=static_cast<rex::audio::AudioSystem*>(runtime.audio_system());
+    }
     for (size_t i = 0; i < mappings; ++i) {
       if (runtime.function_dispatcher()->GetFunction(uint32_t(PPCFuncMappings[i].guest)) != PPCFuncMappings[i].host)
         throw std::runtime_error("Tabela de funções inconsistente.");
@@ -386,6 +429,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
       }
       note("Encerrando a sessão do jogo.");
+      ReleasePause();
       {
         std::lock_guard<std::mutex> lock(game_window_mutex);
         live_game_window=nullptr;
@@ -396,6 +440,11 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     }
     if(graphics){validateSwap(runtime,*graphics);note(graphics->report());}
     renut::AchievementsStop(runtime);
+    ReleasePause();
+    {
+      std::lock_guard<std::mutex> lock(audio_mutex);
+      g_audio=nullptr;
+    }
     runtime.Shutdown();
     if(auto* plume=renut::PlumeRenderer::Get()){note(plume->report());renut::PlumeRenderer::Stop();}
     note(launch?"Sessão experimental encerrada; consulte o log para verificar a renderização.":surface?"Ponte VdSwap → Plume validada com framebuffer de teste. As cenas e os shaders do jogo ainda não são renderizados.":

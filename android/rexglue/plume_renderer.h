@@ -85,6 +85,9 @@ class PlumeRenderer {
   // replaces the swapchain and lets the loop run. ReleaseForShutdown wakes a
   // parked thread so the runtime can stop while paused.
   void PauseForBackground();
+  // The player's own pause: the same parking at the next present, but the surface
+  // is alive, so the last frame stays on screen and nothing is saved or replaced.
+  void SetPaused(bool paused);
   bool AttachWindow(ANativeWindow* window);
   void ReleaseForShutdown();
 

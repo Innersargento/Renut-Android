@@ -15,7 +15,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private TextView status;
     private SurfaceView surface;
     private GamepadOverlay overlay;
-    private View gameMenu;
+    private GameMenu gameMenu;
     private boolean controlsVisible;
     private float gameRefreshRate=60f;
     private ExternalController.Player controller;
@@ -32,6 +32,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,boolean launch,boolean oneUiFix,boolean sceneMsaa,String tuDebug,String ir3Debug);
     private static native void nativeStop();
     private static native void nativeBackground();
+    private static native boolean nativeSetPaused(boolean paused);
     private static native boolean nativeForeground(Surface surface);
     private static native void nativeButton(int button,boolean down);
     private static native void nativeStick(int stick,float x,float y);
@@ -113,30 +114,29 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             controlsVisible=getIntent().getBooleanExtra("showControls",true);
             overlay.setVisibility(controlsVisible?View.VISIBLE:View.GONE);
             root.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
-            if(getIntent().getBooleanExtra("fps",false)){
-                // Frames the game presented (D3DDevice_Swap) per second, sampled every 0.5 s.
-                fps=new TextView(this);fps.setTextColor(Color.rgb(120,255,120));fps.setTextSize(14);
-                fps.setTypeface(android.graphics.Typeface.MONOSPACE,android.graphics.Typeface.BOLD);
-                fps.setShadowLayer(3,1,1,Color.BLACK);fps.setText("FPS --");
-                FrameLayout.LayoutParams at=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
-                at.bottomMargin=(int)(8*getResources().getDisplayMetrics().density);
-                root.addView(fps,at);
-                final long[] last={-1,0};
-                fps.postDelayed(new Runnable(){@Override public void run(){
-                    if(isFinishing())return;
-                    if(loaded){
-                        long frames=nativeFrameCount(),now=android.os.SystemClock.elapsedRealtime();
-                        if(last[0]>=0&&now>last[1])fps.setText(String.format(java.util.Locale.ROOT,"FPS %.1f",(frames-last[0])*1000.0/(now-last[1])));
-                        last[0]=frames;last[1]=now;
-                    }
-                    fps.postDelayed(this,500);
-                }},500);
-            }
+            // Frames the game presented (D3DDevice_Swap) per second, sampled every 0.5 s. Always built:
+            // the game menu switches it on and off.
+            fps=new TextView(this);fps.setTextColor(Color.rgb(120,255,120));fps.setTextSize(14);
+            fps.setTypeface(android.graphics.Typeface.MONOSPACE,android.graphics.Typeface.BOLD);
+            fps.setShadowLayer(3,1,1,Color.BLACK);fps.setText("FPS --");
+            fps.setVisibility(getIntent().getBooleanExtra("fps",false)?View.VISIBLE:View.GONE);
+            FrameLayout.LayoutParams at=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
+            at.bottomMargin=(int)(8*getResources().getDisplayMetrics().density);
+            root.addView(fps,at);
+            final long[] last={-1,0};
+            fps.postDelayed(new Runnable(){@Override public void run(){
+                if(isFinishing())return;
+                if(loaded&&fps.getVisibility()==View.VISIBLE){
+                    long frames=nativeFrameCount(),now=android.os.SystemClock.elapsedRealtime();
+                    if(last[0]>=0&&now>last[1])fps.setText(String.format(java.util.Locale.ROOT,"FPS %.1f",(frames-last[0])*1000.0/(now-last[1])));
+                    last[0]=frames;last[1]=now;
+                }else last[0]=-1;  // hidden or not loaded: the first reading after it is not an average
+                fps.postDelayed(this,500);
+            }},500);
             results.setVisibility(View.GONE);results.setBackgroundColor(Color.rgb(12,23,28));
             root.addView(results,new FrameLayout.LayoutParams(-1,-1));
             gameMenu=ComposeScreens.createGameMenu(this);
-            gameMenu.setVisibility(View.GONE);
-            root.addView(gameMenu,new FrameLayout.LayoutParams(-1,-1));
+            root.addView(gameMenu.getView(),new FrameLayout.LayoutParams(-1,-1));
             achievementToast=new AchievementToast(this);
             root.addView(achievementToast,AchievementToast.params(this));
             addPrecompileNote(root);
@@ -203,14 +203,24 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         overlay.setVisibility(visible?View.VISIBLE:View.GONE);
         getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("showControls",visible).apply();
     }
-    public void uiCloseGameMenu(){gameMenu.setVisibility(View.GONE);}
+    public boolean uiFpsVisible(){return fps!=null&&fps.getVisibility()==View.VISIBLE;}
+    public void uiSetFpsVisible(boolean visible){
+        if(fps==null)return;
+        fps.setVisibility(visible?View.VISIBLE:View.GONE);
+        getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("fps",visible).apply();
+    }
+    /** The player's pause. False when the game could not take it (not drawing yet), so the menu shows the truth. */
+    public boolean uiSetGamePaused(boolean paused){
+        if(!launch||!loaded)return false;
+        return nativeSetPaused(paused);
+    }
     private void showGameMenu(){
         if(!launch||gameMenu==null||results.getVisibility()==View.VISIBLE)return;
         overlay.cancelTouches();
-        gameMenu.setVisibility(View.VISIBLE);
+        gameMenu.open();
     }
     @Override public void onBackPressed(){
-        if(launch&&gameMenu!=null&&gameMenu.getVisibility()==View.VISIBLE){gameMenu.setVisibility(View.GONE);return;}
+        if(launch&&gameMenu!=null&&gameMenu.back())return;
         if(launch&&results.getVisibility()!=View.VISIBLE){showGameMenu();return;}
         super.onBackPressed();
     }
@@ -234,7 +244,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             if(event.getAction()==KeyEvent.ACTION_UP)onBackPressed();
             return true;
         }
-        if(launch&&gameMenu!=null&&gameMenu.getVisibility()==View.VISIBLE)return super.dispatchKeyEvent(event);
+        if(launch&&gameMenu!=null&&gameMenu.isOpen())return super.dispatchKeyEvent(event);
         if(launch){setupController();if(controller!=null&&controller.key(event))return true;}
         return super.dispatchKeyEvent(event);
     }
@@ -261,7 +271,8 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             }
             final String message=report;
             runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
-                if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
+                if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);
+                    if(gameMenu!=null)gameMenu.getView().setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
                 else results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
         },"renut-runtime-validation").start();
     }
@@ -275,7 +286,10 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         }
         if(launch&&started&&loaded&&inBackground){
             // Back on screen with a new surface: the game was kept alive, give it the window.
-            if(nativeForeground(h.getSurface()))inBackground=false;
+            if(nativeForeground(h.getSurface())){
+                inBackground=false;
+                if(gameMenu!=null&&gameMenu.isPaused())nativeSetPaused(true);  // coming back must not undo the pause
+            }
             return;
         }
         startValidation(h.getSurface());

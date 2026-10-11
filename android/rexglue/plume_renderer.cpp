@@ -565,6 +565,14 @@ void PlumeRenderer::PauseForBackground() {
   SavePlumePipelineCache(true);
 }
 
+void PlumeRenderer::SetPaused(bool paused) {
+  {
+    std::lock_guard lock(state_->pause_mutex);
+    state_->paused = paused;
+  }
+  if (!paused) state_->pause_cv.notify_all();
+}
+
 void PlumeRenderer::ReleaseForShutdown() {
   {
     std::lock_guard lock(state_->pause_mutex);

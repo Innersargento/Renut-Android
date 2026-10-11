@@ -8,22 +8,39 @@ import androidx.activity.ComponentActivity
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.Speed
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ColorFilter
@@ -61,8 +78,38 @@ object ComposeScreens {
     @JvmStatic fun showRuntime(activity: RuntimeActivity) {
         activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { RuntimeScreen(activity) } } })
     }
-    @JvmStatic fun createGameMenu(activity: RuntimeActivity): View = ComposeView(activity).apply {
-        setContent { RenutTheme { GameMenuScreen(activity) } }
+    @JvmStatic fun createGameMenu(activity: RuntimeActivity): GameMenu = GameMenu(activity)
+}
+
+/**
+ * The in-game sidebar. The view stays on screen for the whole game and only draws what is
+ * open (a small tab, the sidebar, or the paused chip), so touches elsewhere reach the game.
+ * RuntimeActivity (Java) drives it; Compose observes the state below.
+ */
+class GameMenu internal constructor(private val activity: RuntimeActivity) {
+    internal enum class Page { Main, Achievements }
+
+    var isOpen by mutableStateOf(false); private set
+    var isPaused by mutableStateOf(false); private set
+    internal var page by mutableStateOf(Page.Main)
+
+    val view: View = ComposeView(activity).apply {
+        setContent { RenutTheme { GameMenuScreen(activity, this@GameMenu) } }
+    }
+
+    fun open() { page = Page.Main; isOpen = true }
+    fun close() { isOpen = false }
+
+    /** Back inside the sidebar: from a sub-page to the list, then closes. True if it was open. */
+    fun back(): Boolean {
+        if (!isOpen) return false
+        if (page != Page.Main) page = Page.Main else close()
+        return true
+    }
+
+    /** Asks the game to stop (or go on); the state only changes if the game took it. */
+    fun requestPaused(paused: Boolean) {
+        if (activity.uiSetGamePaused(paused)) isPaused = paused
     }
 }
 
@@ -309,23 +356,27 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     }
 }
 
-@Composable private fun AchievementRow(item: Achievements.Item) {
+@Composable private fun AchievementRow(item: Achievements.Item, compact: Boolean = false) {
     val unlocked = item.unlocked()
     val icon = remember(item.icon) { item.icon?.let { runCatching { BitmapFactory.decodeFile(it.path)?.asImageBitmap() }.getOrNull() } }
     val gray = remember { ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(0f) }) }
-    Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
-        Row(Modifier.padding(14.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(56.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFF34363A)).alpha(if (unlocked) 1f else 0.45f)) {
+    val pad = if (compact) 10.dp else 14.dp
+    Card(colors = CardDefaults.cardColors(containerColor = if (compact) Color(0xFF26282B) else Surface),
+        shape = RoundedCornerShape(if (compact) 12.dp else 16.dp), modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(pad), horizontalArrangement = Arrangement.spacedBy(pad), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(if (compact) 42.dp else 56.dp).clip(RoundedCornerShape(if (compact) 9.dp else 12.dp))
+                .background(Color(0xFF34363A)).alpha(if (unlocked) 1f else 0.45f)) {
                 if (icon != null) Image(icon, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, colorFilter = if (unlocked) null else gray)
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(item.label, color = if (unlocked) Text else Muted, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Text(item.shownDescription(), color = Muted, fontSize = 13.sp)
+                Text(item.label, color = if (unlocked) Text else Muted, fontWeight = FontWeight.Bold, fontSize = if (compact) 14.sp else 16.sp)
+                Text(item.shownDescription(), color = Muted, fontSize = if (compact) 12.sp else 13.sp)
                 if (unlocked) Text(
                     "Desbloqueada em " + DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(item.unlockedAt)),
-                    color = Accent, fontSize = 12.sp)
+                    color = Accent, fontSize = if (compact) 11.sp else 12.sp)
             }
-            if (item.gamerscore > 0) Text("${item.gamerscore} G", color = if (unlocked) Accent else Muted, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            if (item.gamerscore > 0) Text("${item.gamerscore} G", color = if (unlocked) Accent else Muted,
+                fontWeight = FontWeight.Bold, fontSize = if (compact) 13.sp else 14.sp)
         }
     }
 }
@@ -484,20 +535,194 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     else Button(onClick, Modifier.fillMaxWidth(), enabled = enabled, shape = RoundedCornerShape(12.dp)) { Text(label) }
 }
 
-@Composable private fun GameMenuScreen(activity: RuntimeActivity) {
+private val SidebarWidth = 360.dp
+
+@Composable private fun GameMenuScreen(activity: RuntimeActivity, menu: GameMenu) {
+    val noRipple = remember { MutableInteractionSource() }
+    Box(Modifier.fillMaxSize()) {
+        // Closed: only a small tab, or the paused chip, sits over the game.
+        if (!menu.isOpen) {
+            if (menu.isPaused) PausedChip(menu, Modifier.align(Alignment.TopCenter))
+            else MenuTab(menu, Modifier.align(Alignment.TopCenter))
+        }
+        AnimatedVisibility(visible = menu.isOpen, enter = fadeIn(), exit = fadeOut()) {
+            Box(Modifier.fillMaxSize().background(Color(0x99000000))
+                .clickable(interactionSource = noRipple, indication = null) { menu.close() })
+        }
+        AnimatedVisibility(
+            visible = menu.isOpen, modifier = Modifier.align(Alignment.CenterStart),
+            enter = slideInHorizontally { -it }, exit = slideOutHorizontally { -it }
+        ) {
+            // Flush with the left edge and as tall as the screen; the camera cutout only
+            // pushes the content in, the panel itself still reaches the edge.
+            Sidebar(activity, menu, Modifier.fillMaxHeight().width(SidebarWidth + cutoutStart())
+                .background(Color(0xF21C1E21))
+                // The sidebar swallows taps on its empty areas so they do not reach the scrim.
+                .clickable(interactionSource = noRipple, indication = null) { }
+                .windowInsetsPadding(WindowInsets.displayCutout))
+        }
+    }
+}
+
+/** The way in for touch players; Back (system) opens it as well. Low contrast on purpose. */
+/** Width of the camera cutout on the left edge, so the panel keeps its width past it. */
+@Composable private fun cutoutStart(): androidx.compose.ui.unit.Dp =
+    WindowInsets.displayCutout.asPaddingValues().calculateLeftPadding(androidx.compose.ui.unit.LayoutDirection.Ltr)
+
+@Composable private fun MenuTab(menu: GameMenu, modifier: Modifier) {
+    Box(
+        modifier.size(width = 64.dp, height = 26.dp)
+            .clip(RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp))
+            .background(Color(0x66000000)).clickable { menu.open() },
+        contentAlignment = Alignment.Center
+    ) { Icon(Icons.Default.Menu, "Abrir menu", tint = Color(0xB3FFFFFF), modifier = Modifier.size(18.dp)) }
+}
+
+@Composable private fun PausedChip(menu: GameMenu, modifier: Modifier) {
+    Row(
+        modifier.clip(RoundedCornerShape(bottomStart = 18.dp, bottomEnd = 18.dp)).background(Color(0xE61C1E21))
+            .padding(horizontal = 14.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Default.Pause, null, tint = Accent, modifier = Modifier.size(18.dp))
+        Text("Pausado", color = Text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+        Button(onClick = { menu.requestPaused(false) }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+            modifier = Modifier.height(32.dp), shape = RoundedCornerShape(10.dp)) {
+            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("Retomar", fontSize = 13.sp)
+        }
+        IconButton(onClick = { menu.open() }, modifier = Modifier.size(32.dp)) {
+            Icon(Icons.Default.Menu, "Abrir menu", tint = Muted, modifier = Modifier.size(20.dp))
+        }
+    }
+}
+
+@Composable private fun Sidebar(activity: RuntimeActivity, menu: GameMenu, modifier: Modifier) {
+    Column(modifier.padding(horizontal = 14.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        when (menu.page) {
+            GameMenu.Page.Main -> SidebarMain(activity, menu)
+            GameMenu.Page.Achievements -> SidebarAchievements(activity, menu)
+        }
+    }
+}
+
+@Composable private fun ColumnScope.SidebarMain(activity: RuntimeActivity, menu: GameMenu) {
     var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
-    Box(Modifier.fillMaxSize().background(Color(0xBF000000)).clickable { }, contentAlignment = Alignment.Center) {
-        Column(Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(20.dp)) {
-            Panel(null) {
-                Header("RENUT / JOGO", "Menu do jogo", "Ajuste os controles ou volte à biblioteca.")
-                ToggleRow("Mostrar controles na tela", controlsVisible, true) {
-                    controlsVisible = it
-                    activity.uiSetGameControlsVisible(it)
+    var fpsVisible by remember { mutableStateOf(activity.uiFpsVisible()) }
+    // The summary line is read from the files the runtime keeps, off the main thread.
+    val summary by produceState<String?>(null) {
+        value = withContext(Dispatchers.IO) {
+            Achievements.load(activity.filesDir)?.let { "${it.unlocked.size} de ${it.count()} · ${it.earnedGamerscore} G" }
+        }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("RENUT / JOGO", color = Accent, fontWeight = FontWeight.Bold, fontSize = 11.sp, letterSpacing = 1.sp)
+            Text("Menu do jogo", color = Text, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+        }
+        IconButton(onClick = { menu.close() }, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Close, "Fechar menu", tint = Muted) }
+    }
+    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SidebarItem(Icons.Default.PlayArrow, "Continuar", highlighted = true) { menu.close() }
+        if (menu.isPaused) SidebarItem(Icons.Default.PlayArrow, "Retomar jogo", "O jogo está pausado") {
+            menu.requestPaused(false); menu.close()
+        } else SidebarItem(Icons.Default.Pause, "Pausar jogo", "Congela o jogo até você retomar") {
+            menu.requestPaused(true); menu.close()
+        }
+        SidebarItem(Icons.Default.EmojiEvents, "Conquistas", summary ?: "Ver a lista do jogo", chevron = true) {
+            menu.page = GameMenu.Page.Achievements
+        }
+        SidebarToggle(Icons.Default.SportsEsports, "Controles na tela", controlsVisible) {
+            controlsVisible = it
+            activity.uiSetGameControlsVisible(it)
+        }
+        SidebarToggle(Icons.Default.Speed, "Contador de FPS", fpsVisible) {
+            fpsVisible = it
+            activity.uiSetFpsVisible(it)
+        }
+        SidebarItem(Icons.AutoMirrored.Filled.ExitToApp, "Sair do jogo") { activity.finish() }
+    }
+}
+
+@Composable private fun ColumnScope.SidebarAchievements(activity: RuntimeActivity, menu: GameMenu) {
+    // The game keeps writing these while it runs; the stamp is cheap, the load only follows a change.
+    var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) { while (true) { delay(1000); tick++ } }
+    @Suppress("UNUSED_VARIABLE") val update = tick
+    val stamp = Achievements.stamp(activity.filesDir)
+    val loaded = remember { mutableStateOf(false) }
+    val snapshot by produceState<Achievements.Snapshot?>(null, stamp) {
+        value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
+        loaded.value = true
+    }
+    val data = snapshot
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = { menu.page = GameMenu.Page.Main }) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar ao menu", tint = Text)
+        }
+        Text("Conquistas", Modifier.weight(1f), color = Text, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+        IconButton(onClick = { menu.close() }) { Icon(Icons.Default.Close, "Fechar menu", tint = Muted) }
+    }
+    if (data == null) {
+        if (loaded.value) Text(
+            "A lista é lida do seu jogo na primeira vez em que ele inicia. Ela aparece aqui depois dessa primeira partida.",
+            color = Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 4.dp))
+        return
+    }
+    LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        item {
+            Column(Modifier.padding(horizontal = 4.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row {
+                    Text("${data.unlocked.size} de ${data.count()} desbloqueadas", Modifier.weight(1f), color = Text,
+                        fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    Text("${data.earnedGamerscore} de ${data.gamerscore} G", color = Accent, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
-                ActionButton("Continuar", true) { activity.uiCloseGameMenu() }
-                ActionButton("Sair para o menu principal", true, outlined = true) { activity.finish() }
+                LinearProgressIndicator(
+                    progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
+                    modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                    color = Accent, trackColor = Color(0xFF3A3B3D))
             }
         }
+        if (data.unlocked.isNotEmpty()) {
+            item { Text("Desbloqueadas", color = Accent, fontWeight = FontWeight.Bold, fontSize = 14.sp) }
+            items(data.unlocked, key = { it.id }) { AchievementRow(it, compact = true) }
+        }
+        if (data.locked.isNotEmpty()) {
+            item { Text("Bloqueadas", color = Accent, fontWeight = FontWeight.Bold, fontSize = 14.sp) }
+            items(data.locked, key = { it.id }) { AchievementRow(it, compact = true) }
+        }
+    }
+}
+
+@Composable private fun SidebarItem(
+    icon: ImageVector, title: String, subtitle: String? = null, highlighted: Boolean = false,
+    chevron: Boolean = false, onClick: () -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+            .background(if (highlighted) Color(0xFF4B301F) else Color(0xFF26282B))
+            .clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = if (highlighted) Accent else Text, modifier = Modifier.size(24.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, color = if (highlighted) Accent else Text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+            if (subtitle != null) Text(subtitle, color = Muted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        if (chevron) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = Muted)
+    }
+}
+
+@Composable private fun SidebarToggle(icon: ImageVector, title: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF26282B))
+            .clickable { onCheckedChange(!checked) }.padding(start = 12.dp, end = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = Text, modifier = Modifier.size(24.dp))
+        Text(title, Modifier.weight(1f), color = Text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+        Switch(checked = checked, onCheckedChange = null, modifier = Modifier.scale(0.8f))
     }
 }
 
