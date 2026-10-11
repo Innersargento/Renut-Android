@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Speed
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -157,11 +158,15 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
 @Composable private fun RenutTheme(content: @Composable () -> Unit) {
     // Every stringResource below reads this context, so choosing another language re-renders in place.
     val host = LocalContext.current
+    val live = LocalConfiguration.current  // read before it is replaced below: this one follows rotation
     val language = Language.code.ifEmpty { Language.OPTIONS[0].code }
-    val localized = remember(host, language) { Language.derive(host, language) }
+    // The context only has to carry the locale for stringResource; it is not rebuilt on rotation.
+    val localized = remember(host, language) { Language.derive(host, live, language) }
+    // The configuration screens read (orientation, size) is copied fresh from the live one.
+    val configuration = Language.configuration(live, language)
     CompositionLocalProvider(
         LocalContext provides localized,
-        LocalConfiguration provides localized.resources.configuration
+        LocalConfiguration provides configuration
     ) { RenutMaterial(content) }
 }
 
@@ -177,36 +182,94 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
     )
 }
 
-@Composable private fun MainScreen(activity: MainActivity) {
-    var page by remember { mutableIntStateOf(0) }
-    var tick by remember { mutableIntStateOf(0) }
-    LaunchedEffect(Unit) { while (true) { delay(700); tick++ } }
-    Scaffold(
-        containerColor = Background,
-        bottomBar = {
-            NavigationBar(containerColor = Surface) {
-                NavigationBarItem(selected = page == 0, onClick = { page = 0 },
-                    icon = { Icon(Icons.Default.PlayArrow, null) }, label = { Text(stringResource(R.string.nav_play)) })
-                NavigationBarItem(selected = page == 1, onClick = { page = 1 },
-                    icon = { Icon(Icons.Default.Folder, null) }, label = { Text(stringResource(R.string.nav_saves)) })
-                NavigationBarItem(selected = page == 2, onClick = { page = 2 },
-                    icon = { Icon(Icons.Default.EmojiEvents, null) }, label = { Text(stringResource(R.string.nav_achievements)) })
-                NavigationBarItem(selected = page == 3, onClick = { page = 3 },
-                    icon = { Icon(Icons.Default.Settings, null) }, label = { Text(stringResource(R.string.nav_settings)) })
+private class NavEntry(val icon: ImageVector, val label: Int)
+
+private val NAV_ENTRIES = listOf(
+    NavEntry(Icons.Default.PlayArrow, R.string.nav_play),
+    NavEntry(Icons.Default.Folder, R.string.nav_saves),
+    NavEntry(Icons.Default.EmojiEvents, R.string.nav_achievements),
+    NavEntry(Icons.Default.Settings, R.string.nav_settings))
+
+/**
+ * The landscape navigation: one column on the left edge whose items share its whole height, so
+ * each target is a large block (icon and label) rather than a small icon in the middle.
+ */
+@Composable private fun LauncherRail(selected: Int, onSelect: (Int) -> Unit) {
+    Column(
+        Modifier.fillMaxHeight().width(108.dp).background(Surface)
+            .windowInsetsPadding(WindowInsets.systemBars.only(WindowInsetsSides.Vertical + WindowInsetsSides.Start))
+            .padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        NAV_ENTRIES.forEachIndexed { index, entry ->
+            val active = index == selected
+            Column(
+                Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(20.dp))
+                    .background(if (active) Color(0xFF4B301F) else Color.Transparent)
+                    .clickable { onSelect(index) },
+                verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(entry.icon, null, tint = if (active) Accent else Muted, modifier = Modifier.size(36.dp))
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    stringResource(entry.label), color = if (active) Text else Muted, fontSize = 12.sp,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal, maxLines = 1, softWrap = false)
             }
         }
-    ) { padding ->
+    }
+}
+
+@Composable private fun MainScreen(activity: MainActivity) {
+    // Saved, so the page in focus survives a rotation or the system recreating the screen.
+    var page by rememberSaveable { mutableIntStateOf(0) }
+    var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) { while (true) { delay(700); tick++ } }
+
+    @Composable fun Pages(modifier: Modifier) {
         AnimatedContent(
-            targetState = page, label = "launcher-page",
+            targetState = page, label = "launcher-page", modifier = modifier,
             transitionSpec = { pageTransition(targetState > initialState) }
         ) { shown ->
             when (shown) {
-                0 -> PlayScreen(activity, Modifier.padding(padding), tick) { page = 2 }
-                1 -> SaveScreen(activity, Modifier.padding(padding), tick)
-                2 -> AchievementsScreen(activity, Modifier.padding(padding), tick)
-                else -> SettingsScreen(activity, Modifier.padding(padding), tick)
+                0 -> PlayScreen(activity, Modifier, tick) { page = 2 }
+                1 -> SaveScreen(activity, Modifier, tick)
+                2 -> AchievementsScreen(activity, Modifier, tick)
+                else -> SettingsScreen(activity, Modifier, tick)
             }
         }
+    }
+
+    // Decided by the size the screen really has, not by a configuration value: this activity is not
+    // recreated on rotation, and the size is what the layout has to fit anyway.
+    BoxWithConstraints(Modifier.fillMaxSize().background(Background)) {
+    val landscape = maxWidth > maxHeight
+    if (landscape) {
+        // Wide and short: the icons stand in a column on the left, the page takes the rest.
+        Row(Modifier.fillMaxSize().background(Background)) {
+            LauncherRail(page) { page = it }
+            // A page does not need the whole width of a landscape screen.
+            // Scaffold keeps the page clear of the bars in portrait; here it is done by hand.
+            Box(
+                Modifier.weight(1f).fillMaxHeight()
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Vertical + WindowInsetsSides.End)),
+                contentAlignment = Alignment.TopCenter
+            ) {
+                Pages(Modifier.widthIn(max = 840.dp).fillMaxSize())
+            }
+        }
+    } else {
+        Scaffold(
+            containerColor = Background,
+            bottomBar = {
+                NavigationBar(containerColor = Surface) {
+                    NAV_ENTRIES.forEachIndexed { index, entry ->
+                        NavigationBarItem(selected = page == index, onClick = { page = index },
+                            icon = { Icon(entry.icon, null) }, label = { Text(stringResource(entry.label)) })
+                    }
+                }
+            }
+        ) { padding -> Pages(Modifier.padding(padding).fillMaxSize()) }
+    }
     }
 }
 

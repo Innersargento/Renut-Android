@@ -71,11 +71,26 @@ object Language {
         }
     }
 
-    /** Resources in [language] that keep [context]'s own configuration (screen size, density, theme). */
-    @JvmStatic fun derive(context: Context, language: String): Context {
-        val configuration = Configuration(context.resources.configuration)
+    /**
+     * Resources in [language] with [live] as their configuration. A context made by
+     * createConfigurationContext keeps the configuration it was made with, so a screen that
+     * is not recreated on rotation has to be given the current one here.
+     */
+    @JvmStatic fun derive(context: Context, live: Configuration, language: String): Context {
+        val configuration = Configuration(live)
         configuration.setLocale(Locale.forLanguageTag(language))
         return context.createConfigurationContext(configuration)
+    }
+
+    /**
+     * A copy of [live] with the language's locale. The system changes the configuration of the
+     * resources in place when the screen rotates, so a copy is taken at every use: a cached one
+     * (or the same instance used as a cache key) would keep the orientation it was taken at.
+     */
+    @JvmStatic fun configuration(live: Configuration, language: String): Configuration {
+        val configuration = Configuration(live)
+        configuration.setLocale(Locale.forLanguageTag(language))
+        return configuration
     }
 
     /** For attachBaseContext: remembers the app context and returns the base in the chosen language. */
