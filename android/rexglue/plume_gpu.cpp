@@ -95,12 +95,15 @@ REXCVAR_DEFINE_INT32(renut_plume_depth_strip, 1, "reNut/Plume",
                      "Draw depth-only draws (no fragment shader: the shadow maps) with a vertex shader "
                      "that has lost its interpolant outputs, which nothing reads: 0 off, 1 on")
     .range(0, 1);
-REXCVAR_DEFINE_BOOL(renut_plume_native, true, "reNut/Plume",
+REXCVAR_DEFINE_BOOL(renut_plume_native, false, "reNut/Plume",
                     "Native renderer v0: depth-only draws of rigid meshes use the renderer's own vertex "
                     "shader with the transform in push constants instead of the recompiled guest one");
-REXCVAR_DEFINE_BOOL(renut_plume_native_view, true, "reNut/Plume",
+REXCVAR_DEFINE_BOOL(renut_plume_native_view, false, "reNut/Plume",
                     "Native renderer v1 (test): draw the engine's world draws of rigid meshes entirely with "
                     "the renderer's own shaders - one texture and a simple light, no guest material");
+REXCVAR_DEFINE_BOOL(renut_plume_native_lit, false, "reNut/Plume",
+                    "Native renderer v1: the lit world material's guest pixel shaders replaced by "
+                    "native_lit.frag, a hand-written port (files/plume-native-lit overrides it live)");
 REXCVAR_DEFINE_INT32(renut_plume_rel_constants, 2, "reNut/Plume",
                      "How a vertex shader's relative constant reads (a0, aL: skinning matrices) are served: "
                      "0 by the file's four blocks, 1 by the whole file as one block, 2 by that block "
@@ -2236,9 +2239,10 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unique_ptr<RenderShader> native_view_vs_[4];  // [has texcoord | has normal << 1]
   std::unique_ptr<RenderShader> native_view_fs_;
   std::unique_ptr<RenderShader> native_surface_fs_[4];  // by the interpolant the texture coordinates come in
-  // files/plume-native-lit (0/1): the guest pixel shaders in NativeLitShaders
-  // are replaced by native_lit.frag, the hand-written lit world material.
-  uint32_t native_lit_mode_ = 1;
+  // files/plume-native-lit (0/1, or the cvar): the guest pixel shaders in
+  // NativeLitShaders are replaced by native_lit.frag, the hand-written lit
+  // world material.
+  uint32_t native_lit_mode_ = 0;
   std::unique_ptr<RenderShader> native_lit_fs_;
   // files/plume-patchlevel: percent of the guest's tessellation level the water
   // grid uses (100 = as the game sets it).
@@ -3058,6 +3062,7 @@ bool PlumeCommandProcessor::SetupContext() {
   depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
   native_mode_ = uint32_t(NativeModeFromCvars());
   g_renut_native_mode.store(native_mode_, std::memory_order_relaxed);
+  native_lit_mode_ = REXCVAR_GET(renut_plume_native_lit) ? 1 : 0;
   rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
   no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
   no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
@@ -9126,9 +9131,10 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         REXLOG_INFO("Renut: Plume shadow caster instancing {}", instancing ? "on" : "off");
       }
       shadow_instancing_ = instancing != 0;
-      int lit = 1;
+      const int lit_default = REXCVAR_GET(renut_plume_native_lit) ? 1 : 0;
+      int lit = lit_default;
       if (FILE* file = std::fopen((root + "/plume-native-lit").c_str(), "r")) {
-        if (std::fscanf(file, "%d", &lit) != 1) lit = 1;
+        if (std::fscanf(file, "%d", &lit) != 1) lit = lit_default;
         std::fclose(file);
       }
       if (uint32_t(lit != 0) != native_lit_mode_) {

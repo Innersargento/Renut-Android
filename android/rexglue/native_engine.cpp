@@ -33,9 +33,10 @@
 
 #include "native_probe.h"
 
-REXCVAR_DEFINE_BOOL(renut_native_engine_tags, true, "reNut",
+REXCVAR_DEFINE_BOOL(renut_native_engine_tags, false, "reNut",
                     "Native renderer v1: tag each engine world draw (sub_823A9C38) so that the Plume "
-                    "renderer knows which engine draw record it is drawing");
+                    "renderer knows which engine draw record it is drawing (needed by renut_plume_native's "
+                    "view and surfaces)");
 
 namespace renut::native_engine {
 namespace {
