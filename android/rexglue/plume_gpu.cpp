@@ -139,10 +139,6 @@ REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
 // game_fixes.cpp: how the MSAA-off path treats the scene's band split
 // (<files>/plume-keep-split: 0 clear, 1 leave, 2 whole-screen projection).
 extern std::atomic<int> g_renut_scene_split_mode;
-// cheats.cpp: <files>/renut-cao overrides the contact-shadow option live (-1 = use the cvar).
-extern std::atomic<int> g_renut_cao_override;
-extern std::atomic<uint64_t> g_renut_cao_calls;
-extern std::atomic<uint64_t> g_renut_cao_skipped;
 REXCVAR_DECLARE(bool, renut_scene_msaa);
 
 // The native renderer mode, for the reconnaissance report (native_probe.cpp).
@@ -1241,6 +1237,9 @@ struct Resolved {
   std::map<uint32_t, SwizzledView> swizzled;
   // Last written by a depth resolve.
   bool depth = false;
+  // A draw has fetched this resolve (or it was presented). One that nothing ever samples is a
+  // copy the CPU reads, like Photo Mode's picture (see ReadbackResolve).
+  bool sampled = false;
 };
 
 struct GuestTexture {
@@ -1562,6 +1561,21 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Resolves come as records (NativeResolve); the ring's copy draws do nothing.
   bool IssueCopy() override { return true; }
   bool ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces);
+  // A colour resolve whose pixels the CPU reads straight from guest memory (the game's
+  // Photo Mode encodes its picture from them): the GPU copy is run and waited for, then
+  // written into the resolve's tiled destination. See ReadbackResolve.
+  void ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info, uint32_t base_address, uint32_t dest_x,
+                       uint32_t dest_y, uint32_t w, uint32_t h, uint32_t pitch, uint32_t bpp);
+  // Debug: appends a line to <files>/plume-resolve.log while <files>/plume-resolve-log exists.
+  void LogResolveLine(const std::string& line);
+  // <files>/plume-readback: absent or "auto" = full-screen colour copies into a texture no draw
+  // fetches (Photo Mode's picture); "off"; "big" = every full-screen copy into a texture; "mid" =
+  // anything of 256x128 or more; a hex address = copies into that address.
+  int readback_mode_ = 1;
+  uint32_t readback_address_ = 0;
+  uint32_t readback_done_ = 0;
+  std::unordered_map<uint32_t, uint64_t> readback_last_;
+  bool resolve_log_ = false;
   void NativeResolve(const uint32_t* record);
   // The surfaces bound when the lists last sent the target registers
   // (kOpSurfaces): render targets 0-3 and depth.
@@ -2583,7 +2597,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
         return nullptr;
       }
     }
+    if (latest) latest->sampled = true;
     resolved_lookup_.emplace(address, latest);
+    if (resolve_log_ && latest) LogResolveLine(fmt::format("f={} sampled {:08X}", swaps_, address));
     return latest;
   }
   void InvalidateResolvedLookups() { resolved_lookup_.clear(); }
@@ -8572,6 +8588,32 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
       if (dest.descriptor) {
         SetTexture2D(dest.descriptor, dest.texture.get());
       }
+      const uint32_t base_address = to_object ? surfaces.object_base : info.copy_dest_base;
+      if (resolve_log_ && !copying_depth && w >= 64 && h >= 64) {
+        LogResolveLine(fmt::format(
+            "f={} resolve {}x{} at ({},{}) -> {:08X} {} obj={}x{} pitch={} dfmt={} endian={} swap={} host_fmt={}",
+            swaps_, w, h, dest_x, dest_y, base_address, to_object ? "object" : "address", surfaces.object_width,
+            surfaces.object_height, dest.guest_pitch, uint32_t(info.copy_dest_info.copy_dest_format),
+            uint32_t(info.copy_dest_info.copy_dest_endian), uint32_t(info.copy_dest_info.copy_dest_swap),
+            uint32_t(dest.format)));
+      }
+      if (readback_mode_ && !copying_depth && w && h) {
+        const bool big = to_object && w >= 1000 && h >= 500;
+        // Auto: a full-screen copy into a texture that no draw has fetched. Everything the scene
+        // resolves for post-processing is fetched the same frame; Photo Mode's picture never is.
+        if ((readback_mode_ == 1 && big && !dest.sampled) || (readback_mode_ == 2 && big) ||
+            (readback_mode_ == 3 && w >= 256 && h >= 128) ||
+            (readback_mode_ == 4 && base_address == readback_address_)) {
+          // The forced modes at most once every 90 frames per address, so a scene resolve into the same
+          // texture every frame does not stall it; auto only has to keep one that is never fetched
+          // (and so would be read back every frame) from doing that.
+          auto last = readback_last_.find(base_address);
+          if (last == readback_last_.end() || swaps_ - last->second >= (readback_mode_ == 1 ? 8u : 90u)) {
+            readback_last_[base_address] = swaps_;
+              ReadbackResolve(dest, info, base_address, dest_x, dest_y, w, h, dest.guest_pitch, dest_bpp);
+          }
+        }
+      }
     }
   }
 
@@ -8610,6 +8652,88 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
     }
   }
   return true;
+}
+
+void PlumeCommandProcessor::LogResolveLine(const std::string& line) {
+  if (miss_dump_directory_.empty()) return;
+  const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+  if (FILE* file = std::fopen((root + "/plume-resolve.log").c_str(), "a")) {
+    std::fputs(line.c_str(), file);
+    std::fputc('\n', file);
+    std::fclose(file);
+  }
+}
+
+// The CPU reads a few resolves directly: Photo Mode copies the screen into a texture,
+// waits for the copy and encodes a JPEG (and the 90x50 thumbnail) from the texels. Plume
+// keeps resolves on the GPU, so that read saw whatever the memory held - black. This runs
+// the frame so far, waits for it, and writes the pixels into guest memory the way the
+// hardware would have: 32x32 tiled, the resolve's endianness and red/blue order.
+// The fence the game waits on is recorded in the same list after the resolve, so it is
+// not signalled before this returns.
+void PlumeCommandProcessor::ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info,
+                                            uint32_t base_address, uint32_t dest_x, uint32_t dest_y, uint32_t w,
+                                            uint32_t h, uint32_t pitch, uint32_t bpp) {
+  if (bpp != 4 || !dest.texture || !w || !h || !base_address) return;
+  const bool rgba8 = dest.format == RenderFormat::R8G8B8A8_UNORM;
+  const bool half = dest.format == RenderFormat::R16G16B16A16_FLOAT;
+  if (!rgba8 && !half) {
+    REXLOG_INFO("Renut: Plume resolve readback skipped: host format {}", uint32_t(dest.format));
+    return;
+  }
+  const uint32_t texel = rgba8 ? 4 : 8;
+  const uint32_t row_texels = (w + 63) & ~63u;
+  auto buffer = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(row_texels) * h * texel));
+  if (!buffer) return;
+  Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_SOURCE);
+  RenderBox box(int32_t(dest_x), int32_t(dest_y), int32_t(dest_x + w), int32_t(dest_y + h), 0, 1);
+  L()->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(buffer.get(), dest.format, w, h, 1, row_texels),
+                         RenderTextureCopyLocation::Subresource(dest.texture.get()), 0, 0, 0, &box);
+  Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
+  Flush();
+  const auto* pixels = static_cast<const uint8_t*>(buffer->map());
+  if (!pixels) return;
+  uint8_t* guest = memory_->TranslatePhysical<uint8_t*>(base_address);
+  const bool swap_rb = info.copy_dest_info.copy_dest_swap != 0;
+  const uint32_t endian_value = uint32_t(info.copy_dest_info.copy_dest_endian);
+  const xenos::Endian endian = endian_value <= 3 ? xenos::Endian(endian_value) : xenos::Endian::k8in32;
+  auto to8 = [](uint16_t bits) -> uint32_t {
+    const uint32_t exp = (bits >> 10) & 0x1F, mant = bits & 0x3FF;
+    if (bits & 0x8000) return 0;
+    float v = exp ? std::ldexp(1.f + mant / 1024.f, int(exp) - 15) : std::ldexp(mant / 1024.f, -14);
+    if (exp == 31) v = 1.f;
+    return uint32_t(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
+  };
+  uint32_t written = 0;
+  const uint32_t limit = dest.guest_bytes;
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint8_t* src = pixels + size_t(y) * row_texels * texel;
+    for (uint32_t x = 0; x < w; ++x) {
+      uint32_t r, g, b, a;
+      if (rgba8) {
+        r = src[x * 4], g = src[x * 4 + 1], b = src[x * 4 + 2], a = src[x * 4 + 3];
+      } else {
+        const auto* t = reinterpret_cast<const uint16_t*>(src + x * 8);
+        r = to8(t[0]), g = to8(t[1]), b = to8(t[2]), a = to8(t[3]);
+      }
+      if (swap_rb) std::swap(r, b);
+      const uint32_t native = r | (g << 8) | (b << 16) | (a << 24);
+      const uint32_t value = xenos::GpuSwap(native, endian);
+      const uint32_t at = uint32_t(gfx::texture_util::GetTiledOffset2D(int32_t(dest_x + x), int32_t(dest_y + y),
+                                                                         pitch, 2));
+      if (at + 4 > limit) continue;
+      std::memcpy(guest + at, &value, 4);
+      ++written;
+    }
+  }
+  buffer->unmap();
+  // Without this the next lookup would take the changed bytes for another texture
+  // streamed into the same memory and drop the resolve.
+  dest.guest_hash = ContentHash(memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
+  if (readback_done_++ < 12) {
+    REXLOG_INFO("Renut: Plume resolve {}x{} read back into {:08X} (pitch {}, endian {}, swap {}, {} texels)", w, h,
+                base_address, pitch, endian_value, swap_rb ? 1 : 0, written);
+  }
 }
 
 bool PlumeCommandProcessor::CreatePackPipeline() {
@@ -9001,6 +9125,10 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   FlushImagesForNextFrame();
   RenderTexture* source = nullptr;
   Resolved* found = FindResolved(frontbuffer_ptr);
+  if (resolve_log_) {
+    LogResolveLine(fmt::format("f={} swap front={:08X} {}x{} found={}", swaps_, frontbuffer_ptr, frontbuffer_width,
+                               frontbuffer_height, found != nullptr));
+  }
   if (found && found->texture) {
     Resolved& r = *found;
     Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
@@ -9226,30 +9354,6 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
-    {
-      // Live switch of the contact-shadow (CAO) skip: 1 removes the patches, 0 draws them,
-      // no file = the cvar / Configurações option as set at start.
-      int cao = -1;
-      if (FILE* file = std::fopen((root + "/renut-cao").c_str(), "r")) {
-        int value = 0;
-        if (std::fscanf(file, "%d", &value) == 1) cao = value != 0 ? 1 : 0;
-        std::fclose(file);
-      }
-      if (g_renut_cao_override.exchange(cao) != cao) {
-        REXLOG_INFO("Renut: contact shadows (CAO) {}",
-                    cao < 0 ? "as configured" : (cao ? "removed (live)" : "drawn (live)"));
-      }
-      // What the game's fxCAO pass did since the last look (every 30 swaps): the patches it
-      // walked and how many the option skipped. All zero means the pass has nothing to draw.
-      static uint64_t cao_calls_seen = 0, cao_skipped_seen = 0, cao_swaps_seen = 0;
-      const uint64_t calls = g_renut_cao_calls.load(std::memory_order_relaxed);
-      const uint64_t skipped = g_renut_cao_skipped.load(std::memory_order_relaxed);
-      REXLOG_INFO("Renut: CAO pass reached {} contact patches in {} frames, {} skipped (total {} / {})",
-                  calls - cao_calls_seen, swaps_ - cao_swaps_seen, skipped - cao_skipped_seen, calls, skipped);
-      cao_calls_seen = calls;
-      cao_skipped_seen = skipped;
-      cao_swaps_seen = swaps_;
-    }
     uint32_t mask = 0;
     uint32_t bind_skip = 0;
     bool shadow_native_constants = true;
@@ -9520,6 +9624,26 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       REXLOG_INFO("Renut: Plume snapshot of the first resolve shader {:016X} samples", snap_shader);
     }
     snap_shader_ = snap_shader;
+    {
+      int mode = 1;
+      unsigned address = 0;
+      if (FILE* file = std::fopen((root + "/plume-readback").c_str(), "r")) {
+        char word[16] = {};
+        if (std::fscanf(file, "%15s", word) == 1) {
+          if (!std::strcmp(word, "off")) mode = 0;
+          else if (!std::strcmp(word, "big")) mode = 2;
+          else if (!std::strcmp(word, "mid")) mode = 3;
+          else if (std::strcmp(word, "auto") && std::sscanf(word, "%x", &address) == 1) mode = 4;
+        }
+        std::fclose(file);
+      }
+      if (mode != readback_mode_ || address != readback_address_) {
+        REXLOG_INFO("Renut: Plume resolve readback mode {} address {:08X}", mode, address);
+      }
+      readback_mode_ = mode;
+      readback_address_ = address;
+      resolve_log_ = access((root + "/plume-resolve-log").c_str(), F_OK) == 0;
+    }
     {
       std::vector<ConstOverride> overrides;
       if (FILE* file = std::fopen((root + "/plume-const").c_str(), "r")) {

@@ -43,6 +43,18 @@
     <string name="play_experimental">实验性版本：性能和兼容性仍在开发中。</string>
     <string name="play_cheats_on">本局已启用作弊</string>
     <string name="play_ach_progress">%1$d / %2$d 项成就</string>
+    <string name="play_photos_card">游戏照片</string>
+    <string name="play_photos_count">在拍照模式下拍摄的 %1$d 张照片</string>
+    <string name="play_photos_none">还没有照片</string>
+    <string name="photos_eyebrow">相册</string>
+    <string name="photos_title">游戏照片</string>
+    <string name="photos_subtitle">你用游戏拍照模式拍摄的照片。</string>
+    <string name="photos_empty">还没有照片。在游戏中用拍照模式拍一张，它就会出现在这里。</string>
+    <string name="photos_untitled">照片</string>
+    <string name="photos_counter">%1$d / %2$d</string>
+    <string name="photos_save">保存到相册</string>
+    <string name="photos_saved">照片已保存到 Pictures/reNut。</string>
+    <string name="photos_save_failed">无法保存照片。</string>
     <string name="play_panel_open">打开应用时</string>
     <string name="play_autostart">直接进入游戏</string>
     <string name="play_autostart_note">游戏将跳过此界面直接开始。要回到这里，请通过游戏菜单退出游戏。</string>
@@ -102,7 +114,6 @@
     <string name="settings_no_shadows">移除阴影</string>
     <string name="settings_no_bloom">移除泛光</string>
     <string name="settings_adpf">持续性能 (ADPF)</string>
-    <string name="settings_no_cao">移除接触阴影（CAO）</string>
     <string name="settings_temp">温度</string>
     <string name="layout_title">编辑布局</string>
     <string name="layout_edit_button">编辑布局…</string>

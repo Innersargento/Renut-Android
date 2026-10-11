@@ -73,6 +73,26 @@ add("play_cheats_on", "Cheats ligados nesta partida", "Cheats are on for this se
     "Trucos activados en esta partida")
 add("play_ach_progress", "%1$d de %2$d conquistas", "%1$d of %2$d achievements", "%1$d / %2$d 项成就",
     "%1$d de %2$d logros")
+add("play_photos_card", "Fotos do jogo", "Game photos", "游戏照片", "Fotos del juego")
+add("play_photos_count", "%1$d fotos tiradas no Modo Foto", "%1$d photos taken in Photo Mode",
+    "在拍照模式下拍摄的 %1$d 张照片", "%1$d fotos tomadas en el Modo Foto")
+add("play_photos_none", "Nenhuma foto ainda", "No photos yet", "还没有照片", "Aún no hay fotos")
+add("photos_eyebrow", "ÁLBUM", "ALBUM", "相册", "ÁLBUM")
+add("photos_title", "Fotos do jogo", "Game photos", "游戏照片", "Fotos del juego")
+add("photos_subtitle", "As fotos que você tirou com o Modo Foto do jogo.",
+    "The pictures you took with the game's Photo Mode.", "你用游戏拍照模式拍摄的照片。",
+    "Las fotos que hiciste con el Modo Foto del juego.")
+add("photos_empty", "Nenhuma foto ainda. Tire uma no jogo, com o Modo Foto, e ela aparece aqui.",
+    "No photos yet. Take one in the game with Photo Mode and it shows up here.",
+    "还没有照片。在游戏中用拍照模式拍一张，它就会出现在这里。",
+    "Aún no hay fotos. Haz una en el juego con el Modo Foto y aparecerá aquí.")
+add("photos_untitled", "Foto", "Photo", "照片", "Foto")
+add("photos_counter", "%1$d de %2$d", "%1$d of %2$d", "%1$d / %2$d", "%1$d de %2$d")
+add("photos_save", "Salvar na galeria", "Save to gallery", "保存到相册", "Guardar en la galería")
+add("photos_saved", "Foto salva em Imagens/reNut.", "Photo saved to Pictures/reNut.",
+    "照片已保存到 Pictures/reNut。", "Foto guardada en Imágenes/reNut.")
+add("photos_save_failed", "Não foi possível salvar a foto.", "The photo could not be saved.",
+    "无法保存照片。", "No se pudo guardar la foto.")
 add("play_panel_open", "Ao abrir o app", "When opening the app", "打开应用时", "Al abrir la aplicación")
 add("play_autostart", "Iniciar direto no jogo", "Start straight into the game", "直接进入游戏", "Iniciar directamente el juego")
 add("play_autostart_note", "O jogo começa sem passar por esta tela. Para voltar aqui, saia do jogo pelo menu.",
@@ -171,8 +191,6 @@ add("settings_no_shadows", "Remover sombras", "Remove shadows", "移除阴影", 
 add("settings_no_bloom", "Remover bloom", "Remove bloom", "移除泛光", "Quitar bloom")
 add("settings_adpf", "Desempenho sustentado (ADPF)", "Sustained performance (ADPF)", "持续性能 (ADPF)",
     "Rendimiento sostenido (ADPF)")
-add("settings_no_cao", "Remover sombras de contato (CAO)", "Remove contact shadows (CAO)", "移除接触阴影（CAO）",
-    "Quitar sombras de contacto (CAO)")
 # ---- screen layout editor ---------------------------------------------------------------------
 add("settings_temp", "Temperatura", "Temperature", "温度", "Temperatura")
 add("layout_title", "Editar layout", "Edit layout", "编辑布局", "Editar diseño")

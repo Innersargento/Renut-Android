@@ -43,6 +43,18 @@
     <string name="play_experimental">Experimental: o desempenho e a compatibilidade ainda estão em desenvolvimento.</string>
     <string name="play_cheats_on">Cheats ligados nesta partida</string>
     <string name="play_ach_progress">%1$d de %2$d conquistas</string>
+    <string name="play_photos_card">Fotos do jogo</string>
+    <string name="play_photos_count">%1$d fotos tiradas no Modo Foto</string>
+    <string name="play_photos_none">Nenhuma foto ainda</string>
+    <string name="photos_eyebrow">ÁLBUM</string>
+    <string name="photos_title">Fotos do jogo</string>
+    <string name="photos_subtitle">As fotos que você tirou com o Modo Foto do jogo.</string>
+    <string name="photos_empty">Nenhuma foto ainda. Tire uma no jogo, com o Modo Foto, e ela aparece aqui.</string>
+    <string name="photos_untitled">Foto</string>
+    <string name="photos_counter">%1$d de %2$d</string>
+    <string name="photos_save">Salvar na galeria</string>
+    <string name="photos_saved">Foto salva em Imagens/reNut.</string>
+    <string name="photos_save_failed">Não foi possível salvar a foto.</string>
     <string name="play_panel_open">Ao abrir o app</string>
     <string name="play_autostart">Iniciar direto no jogo</string>
     <string name="play_autostart_note">O jogo começa sem passar por esta tela. Para voltar aqui, saia do jogo pelo menu.</string>
@@ -102,7 +114,6 @@
     <string name="settings_no_shadows">Remover sombras</string>
     <string name="settings_no_bloom">Remover bloom</string>
     <string name="settings_adpf">Desempenho sustentado (ADPF)</string>
-    <string name="settings_no_cao">Remover sombras de contato (CAO)</string>
     <string name="settings_temp">Temperatura</string>
     <string name="layout_title">Editar layout</string>
     <string name="layout_edit_button">Editar layout…</string>

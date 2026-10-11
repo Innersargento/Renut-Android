@@ -23,6 +23,18 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import android.widget.Toast
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -79,6 +91,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
@@ -241,16 +254,23 @@ private val NAV_ENTRIES = listOf(
 @Composable private fun MainScreen(activity: MainActivity) {
     // Saved, so the page in focus survives a rotation or the system recreating the screen.
     var page by rememberSaveable { mutableIntStateOf(0) }
+    // The photo album opens over the Play page and closes when another page is chosen.
+    var photosOpen by rememberSaveable { mutableStateOf(false) }
     var tick by remember { mutableIntStateOf(0) }
+    BackHandler(photosOpen) { photosOpen = false }
     LaunchedEffect(Unit) { while (true) { delay(700); tick++ } }
 
     @Composable fun Pages(modifier: Modifier) {
+        if (photosOpen) {
+            PhotosScreen(activity, modifier, tick) { photosOpen = false }
+            return
+        }
         AnimatedContent(
             targetState = page, label = "launcher-page", modifier = modifier,
             transitionSpec = { pageTransition(targetState > initialState) }
         ) { shown ->
             when (shown) {
-                0 -> PlayScreen(activity, Modifier, tick) { page = 2 }
+                0 -> PlayScreen(activity, Modifier, tick, { page = 2 }) { photosOpen = true }
                 1 -> SaveScreen(activity, Modifier, tick)
                 2 -> AchievementsScreen(activity, Modifier, tick)
                 else -> SettingsScreen(activity, Modifier, tick)
@@ -265,7 +285,7 @@ private val NAV_ENTRIES = listOf(
     if (landscape) {
         // Wide and short: the icons stand in a column on the left, the page takes the rest.
         Row(Modifier.fillMaxSize().background(Background)) {
-            LauncherRail(page) { page = it }
+            LauncherRail(page) { photosOpen = false; page = it }
             // A page does not need the whole width of a landscape screen.
             // Scaffold keeps the page clear of the bars in portrait; here it is done by hand.
             Box(
@@ -282,7 +302,7 @@ private val NAV_ENTRIES = listOf(
             bottomBar = {
                 NavigationBar(containerColor = Surface) {
                     NAV_ENTRIES.forEachIndexed { index, entry ->
-                        NavigationBarItem(selected = page == index, onClick = { page = index },
+                        NavigationBarItem(selected = page == index, onClick = { photosOpen = false; page = index },
                             icon = { Icon(entry.icon, null) }, label = { Text(stringResource(entry.label)) })
                     }
                 }
@@ -295,7 +315,8 @@ private val NAV_ENTRIES = listOf(
 @Composable private fun SaveScreen(activity: MainActivity, modifier: Modifier, tick: Int) {
     @Suppress("UNUSED_VARIABLE") val update = tick
     val saves = rememberUpdatedState(runCatching { activity.uiSaves() }.getOrDefault(emptyList()))
-    val visibleSaves = saves.value.filterNot { it.contains("/Headers/") }.ifEmpty { saves.value }
+    // The Headers and each package's __thumbnail.png are the game's own bookkeeping, not saves of their own.
+    val visibleSaves = saves.value.filterNot { it.contains("/Headers/") || it.endsWith("/__thumbnail.png") }.ifEmpty { saves.value }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Header(stringResource(R.string.saves_eyebrow), stringResource(R.string.saves_title), stringResource(R.string.saves_subtitle)) }
         item {
@@ -321,7 +342,7 @@ private val NAV_ENTRIES = listOf(
     }
 }
 
-@Composable private fun PlayScreen(activity: MainActivity, modifier: Modifier, tick: Int, openAchievements: () -> Unit) {
+@Composable private fun PlayScreen(activity: MainActivity, modifier: Modifier, tick: Int, openAchievements: () -> Unit, openPhotos: () -> Unit) {
     @Suppress("UNUSED_VARIABLE") val update = tick
     val state = activity.uiGameState()
     val busy = activity.uiBusy()
@@ -393,11 +414,126 @@ private val NAV_ENTRIES = listOf(
                 }
             }
         }
+        item { PhotosCard(activity, openPhotos) }
         item { CheatsPanel(activity, !busy) }
         item {
             Panel(stringResource(R.string.play_panel_open)) {
                 ToggleRow(stringResource(R.string.play_autostart), autoStart, !busy) { activity.uiSetAutoStart(it) }
                 Text(stringResource(R.string.play_autostart_note), color = Muted, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+/** The entry to the photo album, on the Play page: how many photos the game has saved. */
+@Composable private fun PhotosCard(activity: MainActivity, open: () -> Unit) {
+    val stamp = PhotoAlbum.stamp(activity.filesDir)
+    val count by produceState(-1, stamp) {
+        value = withContext(Dispatchers.IO) { PhotoAlbum.load(activity.filesDir).size }
+    }
+    Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(20.dp),
+        modifier = Modifier.fillMaxWidth().clickable { open() }) {
+        Row(Modifier.padding(18.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.PhotoLibrary, null, tint = Accent, modifier = Modifier.size(32.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(stringResource(R.string.play_photos_card), color = Text, fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (count > 0) stringResource(R.string.play_photos_count, count) else stringResource(R.string.play_photos_none),
+                    color = Muted, fontSize = 13.sp)
+            }
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = Muted)
+        }
+    }
+}
+
+/** The pictures of the game's Photo Mode: a grid, and a full-screen viewer to swipe through. */
+@Composable private fun PhotosScreen(activity: MainActivity, modifier: Modifier, tick: Int, onBack: () -> Unit) {
+    @Suppress("UNUSED_VARIABLE") val update = tick
+    val stamp = PhotoAlbum.stamp(activity.filesDir)
+    val loaded = remember { mutableStateOf(false) }
+    val photos by produceState(emptyList<PhotoAlbum.Photo>(), stamp) {
+        value = withContext(Dispatchers.IO) { PhotoAlbum.load(activity.filesDir) }
+        loaded.value = true
+    }
+    var viewing by rememberSaveable { mutableIntStateOf(-1) }
+    LazyVerticalGrid(
+        GridCells.Adaptive(170.dp), modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    Modifier.clip(RoundedCornerShape(12.dp)).clickable { onBack() }.padding(end = 12.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Accent)
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.common_back), color = Accent, fontWeight = FontWeight.SemiBold)
+                }
+                Header(stringResource(R.string.photos_eyebrow), stringResource(R.string.photos_title), stringResource(R.string.photos_subtitle))
+            }
+        }
+        if (photos.isEmpty() && loaded.value) {
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                Panel(null) { Text(stringResource(R.string.photos_empty), color = Muted, fontSize = 14.sp) }
+            }
+        }
+        itemsIndexed(photos, key = { _, photo -> photo.id() }) { index, photo ->
+            val thumb by produceState<ImageBitmap?>(null, photo.id()) {
+                value = withContext(Dispatchers.IO) { PhotoAlbum.decode(photo, 480)?.asImageBitmap() }
+            }
+            Box(
+                Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF34363A)).clickable { viewing = index }
+            ) {
+                thumb?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
+            }
+        }
+    }
+    if (viewing in photos.indices) PhotoViewer(photos, viewing) { viewing = -1 }
+    else if (viewing >= 0 && loaded.value) viewing = -1
+}
+
+@Composable private fun PhotoViewer(photos: List<PhotoAlbum.Photo>, start: Int, onClose: () -> Unit) {
+    val pager = rememberPagerState(initialPage = start) { photos.size }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val untitled = stringResource(R.string.photos_untitled)
+    val saved = stringResource(R.string.photos_saved)
+    val failed = stringResource(R.string.photos_save_failed)
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            HorizontalPager(pager, Modifier.fillMaxSize(), key = { photos[it].id() }) { page ->
+                val photo = photos[page]
+                val bitmap by produceState<ImageBitmap?>(null, photo.id()) {
+                    value = withContext(Dispatchers.IO) { PhotoAlbum.decode(photo, 2048)?.asImageBitmap() }
+                }
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    bitmap?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
+                }
+            }
+            val photo = photos[pager.currentPage.coerceIn(photos.indices)]
+            Row(
+                Modifier.align(Alignment.TopCenter).fillMaxWidth().background(Color(0x99000000))
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onClose) { Icon(Icons.Default.Close, stringResource(R.string.common_close), tint = Color.White) }
+                Column(Modifier.weight(1f)) {
+                    Text(photo.title.ifBlank { untitled }, color = Color.White, fontWeight = FontWeight.SemiBold, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis)
+                    Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT, Language.locale(context))
+                        .format(Date(photo.takenAt)), color = Color(0xFFCCCCCC), fontSize = 12.sp)
+                }
+                Text(stringResource(R.string.photos_counter, pager.currentPage + 1, photos.size), color = Color(0xFFCCCCCC), fontSize = 13.sp)
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = {
+                    scope.launch {
+                        val ok = withContext(Dispatchers.IO) { PhotoAlbum.saveToGallery(context.contentResolver, photo) }
+                        Toast.makeText(context, if (ok) saved else failed, Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text(stringResource(R.string.photos_save)) }
             }
         }
     }
@@ -537,7 +673,6 @@ private val SKIN_LABELS = listOf(
     val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
-    val noContactShadows = activity.uiRuntimeOption("renut_disable_cao", "false") == "true"
     val sustained = activity.uiRuntimeOption("renut_adpf", "true") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
@@ -607,9 +742,6 @@ private val SKIN_LABELS = listOf(
                 }
                 ToggleRow(stringResource(R.string.settings_adpf), sustained, !busy) {
                     activity.uiSetRuntimeOption("renut_adpf", it.toString())
-                }
-                ToggleRow(stringResource(R.string.settings_no_cao), noContactShadows, !busy) {
-                    activity.uiSetRuntimeOption("renut_disable_cao", it.toString())
                 }
                 ToggleRow(stringResource(R.string.settings_no_bloom), noBloom, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_bloom", it.toString())

@@ -43,6 +43,18 @@
     <string name="play_experimental">Experimental: performance and compatibility are still in development.</string>
     <string name="play_cheats_on">Cheats are on for this session</string>
     <string name="play_ach_progress">%1$d of %2$d achievements</string>
+    <string name="play_photos_card">Game photos</string>
+    <string name="play_photos_count">%1$d photos taken in Photo Mode</string>
+    <string name="play_photos_none">No photos yet</string>
+    <string name="photos_eyebrow">ALBUM</string>
+    <string name="photos_title">Game photos</string>
+    <string name="photos_subtitle">The pictures you took with the game\'s Photo Mode.</string>
+    <string name="photos_empty">No photos yet. Take one in the game with Photo Mode and it shows up here.</string>
+    <string name="photos_untitled">Photo</string>
+    <string name="photos_counter">%1$d of %2$d</string>
+    <string name="photos_save">Save to gallery</string>
+    <string name="photos_saved">Photo saved to Pictures/reNut.</string>
+    <string name="photos_save_failed">The photo could not be saved.</string>
     <string name="play_panel_open">When opening the app</string>
     <string name="play_autostart">Start straight into the game</string>
     <string name="play_autostart_note">The game starts without going through this screen. To come back here, leave the game from its menu.</string>
@@ -102,7 +114,6 @@
     <string name="settings_no_shadows">Remove shadows</string>
     <string name="settings_no_bloom">Remove bloom</string>
     <string name="settings_adpf">Sustained performance (ADPF)</string>
-    <string name="settings_no_cao">Remove contact shadows (CAO)</string>
     <string name="settings_temp">Temperature</string>
     <string name="layout_title">Edit layout</string>
     <string name="layout_edit_button">Edit layout…</string>
