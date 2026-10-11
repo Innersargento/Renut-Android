@@ -169,6 +169,8 @@ add("settings_async", "Compilação assíncrona de shaders e pipelines", "Asynch
     "异步编译着色器和管线", "Compilación asíncrona de shaders y pipelines")
 add("settings_no_shadows", "Remover sombras", "Remove shadows", "移除阴影", "Quitar sombras")
 add("settings_no_bloom", "Remover bloom", "Remove bloom", "移除泛光", "Quitar bloom")
+add("settings_no_cao", "Remover sombras de contato (CAO)", "Remove contact shadows (CAO)", "移除接触阴影（CAO）",
+    "Quitar sombras de contacto (CAO)")
 add("settings_footer", "reNut · prévia de desenvolvimento", "reNut · development preview", "reNut · 开发预览版",
     "reNut · versión preliminar de desarrollo")
 add("driver_delete_title", "Apagar driver?", "Delete driver?", "删除驱动程序？", "¿Eliminar el controlador?")

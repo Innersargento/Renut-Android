@@ -101,6 +101,7 @@
     <string name="settings_async">异步编译着色器和管线</string>
     <string name="settings_no_shadows">移除阴影</string>
     <string name="settings_no_bloom">移除泛光</string>
+    <string name="settings_no_cao">移除接触阴影（CAO）</string>
     <string name="settings_footer">reNut · 开发预览版</string>
     <string name="driver_delete_title">删除驱动程序？</string>
     <string name="driver_delete_message">“%1$s”将从设备中移除，并改用系统驱动程序。你可以再次导入。</string>

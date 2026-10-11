@@ -101,6 +101,7 @@
     <string name="settings_async">Compilação assíncrona de shaders e pipelines</string>
     <string name="settings_no_shadows">Remover sombras</string>
     <string name="settings_no_bloom">Remover bloom</string>
+    <string name="settings_no_cao">Remover sombras de contato (CAO)</string>
     <string name="settings_footer">reNut · prévia de desenvolvimento</string>
     <string name="driver_delete_title">Apagar driver?</string>
     <string name="driver_delete_message">\"%1$s\" será removido do aparelho e o driver do sistema passará a ser usado. Você poderá importá-lo de novo.</string>

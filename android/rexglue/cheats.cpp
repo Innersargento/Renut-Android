@@ -25,6 +25,8 @@ REXCVAR_DEFINE_BOOL(renut_cheat_vehicles_anywhere, false, "reNut/Cheats",
                     "Change and build vehicles from the pause menu outside Showdown Town");
 REXCVAR_DEFINE_BOOL(renut_cheat_extended_build_range, false, "reNut/Cheats",
                     "A larger area to build in at Mumbo's Motors");
+REXCVAR_DEFINE_BOOL(renut_disable_cao, false, "reNut/Graphics",
+                    "Do not draw the dark contact patches under characters (the game's CAO pass)");
 REXCVAR_DEFINE_STRING(renut_cheat_banjo_skin, "default", "reNut/Cheats", "Banjo's outfit")
     .allowed({"default", "robot", "tuxedo"});
 
@@ -66,6 +68,10 @@ std::string renutCheatsSummary() {
 }
 
 // Hooks are declared by the generated code with C++ linkage, exactly as below.
+
+// A graphics option, not a cheat: true jumps past the draw of one contact patch.
+bool renut_disable_cao() { return REXCVAR_GET(renut_disable_cao); }
+
 bool renut_cheat_infinite_health() { return RENUT_CHEAT_ON(renut_cheat_infinite_health); }
 
 bool renut_cheat_infinite_fuel_ammo() { return RENUT_CHEAT_ON(renut_cheat_infinite_fuel_ammo); }

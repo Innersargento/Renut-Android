@@ -517,6 +517,7 @@ private val SKIN_LABELS = listOf(
     val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
+    val noContactShadows = activity.uiRuntimeOption("renut_disable_cao", "false") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
             Row(verticalAlignment = Alignment.Top) {
@@ -580,6 +581,9 @@ private val SKIN_LABELS = listOf(
                 }
                 ToggleRow(stringResource(R.string.settings_no_shadows), noShadows, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
+                }
+                ToggleRow(stringResource(R.string.settings_no_cao), noContactShadows, !busy) {
+                    activity.uiSetRuntimeOption("renut_disable_cao", it.toString())
                 }
                 ToggleRow(stringResource(R.string.settings_no_bloom), noBloom, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_bloom", it.toString())

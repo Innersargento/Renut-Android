@@ -73,3 +73,16 @@ name = "renut_cheat_banjo_skin"
 registers = ["r3", "r5"]
 after_instruction = true
 jump_address_on_false = 0x8251CABC
+
+# Contact shadows (CAO), Configuracoes > "Remover sombras de contato": skips the
+# per-blob draw of the fxCAO pass (sub_82330088, the dark patches under
+# characters), exactly as the desktop build's disable_cao hook does. 0x823302AC
+# is `bl sub_82330388`; 0x823302B0 is the list advance, already the target of
+# the loop's own "skip this blob" branch, and the pass still restores the blend
+# and depth-bias state it saved. Not a cheat: it does not need the cheats switch.
+[[midasm_hook]]
+address = 0x823302AC
+name = "renut_disable_cao"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x823302B0
