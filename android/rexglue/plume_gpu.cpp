@@ -82,10 +82,11 @@ REXCVAR_DEFINE_INT32(renut_plume_bool_spec, 0, "reNut/Plume",
                      "(about a quarter of the pipelines to compile), 1 as specialization constants (a "
                      "pipeline per combination of the bits a pair of shaders tests)")
     .range(0, 1);
-REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 1, "reNut/Plume",
+REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
                      "Record draws in windows grouped by pipeline: 0 off, 1 depth-only draws (the shadow "
                      "maps), 2 also opaque colour draws that test and write depth (reordering them is "
-                     "exact except for depth ties)")
+                     "exact except for depth ties; measured 11/10: -37% pipeline binds, -3% GPU cycles, "
+                     "image unchanged)")
     .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_plume_fetch_spec, 1, "reNut/Plume",
                      "Give each vertex shader's live vertex fetch table to the driver as specialization "

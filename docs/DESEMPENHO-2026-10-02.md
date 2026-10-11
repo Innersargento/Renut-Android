@@ -254,3 +254,28 @@ leituras) e todos passam no `spirv-val`. `files/plume-fetchspec` 0/1 ou a cvar
 Não verificado: a imagem com o interruptor ligado em todas as áreas do jogo
 (personagens com esqueleto, água, sombras). O resultado deveria ser idêntico pixel a
 pixel; o padrão é 1 (ligado) a pedido, e `files/plume-fetchspec` = 0 desliga.
+
+## Modo 2 vira o padrão (11/10/2026)
+
+`renut_plume_defer_draws` passa de 1 para 2: os desenhos opacos de cor com teste e
+escrita de profundidade estritos também são reordenados por pipeline.
+
+Medido no aparelho com cooler, modo desempenho e FPS liberado (Showdown à noite,
+personagem parado, `tools/quick-fps.py --file plume-defer --states 0,1,2 --rounds 4`,
+a ordem dos modos se inverte a cada rodada):
+
+| modo | trocas de pipeline por quadro | FPS | GPU, Mcycles por quadro |
+| --- | --- | --- | --- |
+| 0 | ~4.160 | 32,42 | 14,70 |
+| 1 | ~3.420 (-18%) | 32,06 | 14,75 (+0,3%) |
+| 2 | ~2.640 (-37%) | 32,56 | 14,26 (-3,0%) |
+
+- O modo 2 ficou abaixo do 0 em Mcycles nas quatro rodadas (-2,6, -2,5, -0,4, -6,1%).
+  O FPS sobe 0,4%, dentro do ruído: o ganho é de ~3% de GPU, não de 30%. Os ~30% da
+  análise de 02/10 eram de trocas de pipeline, não de tempo de quadro.
+- Imagem: capturas 0/2/0/2/0 na mesma cena. Diferença 0×2 de 2,1-2,8% dos pixels
+  (limiar de 3 níveis), a mesma faixa de 0×0 (2,2-3,0%) e 2×2 (2,1%). Nenhuma região
+  nova. Com limiar de 16 níveis a diferença é de 0,02%; a cena é escura, então o
+  limiar baixo é o que vale.
+- `plume-defer` = 0/1/2 continua valendo ao vivo. `quick-fps.py` escreve 0 no
+  arquivo ao terminar, o que força o modo 0: apague o arquivo depois de cada rodada.
