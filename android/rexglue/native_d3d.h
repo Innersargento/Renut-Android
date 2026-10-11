@@ -17,6 +17,7 @@
 // callbacks), and the command processor does not walk the game's segments;
 // the ring is left with the doorbell and its read pointer. The report goes to
 // files/native-d3d.txt.
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -95,6 +96,9 @@ struct List {
   // The index buffer last named in this list (kOpIndices).
   uint32_t indices_base = 0, indices_size = 0;
   bool indices_named = false;
+  // A command buffer's list from BeginCommandBuffer to EndCommandBuffer: the
+  // thread that began it writes it without the front end's lock.
+  std::atomic<bool> open{false};
 };
 
 // Called by the Direct3D interception layer (d3d_layer.cpp) for every

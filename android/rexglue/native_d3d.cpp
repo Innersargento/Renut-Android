@@ -124,6 +124,19 @@ std::atomic<uint32_t> g_draw_serial{0};
 
 // Calls per Direct3D function, for the report.
 std::array<std::atomic<uint64_t>, renut::d3d::kFunctionCount> g_calls{};
+thread_local uint32_t t_function = 0;  // the Direct3D function this thread is in
+
+// Calls of a device other than the one that swaps, made while it records
+// nothing, go into the immediate list; the report names them. On the console
+// they go into that device's own ring, so what they set (the window scissor
+// above all: SetSurfaceClip writes it straight into the ring) never reaches
+// the swapping device's draws. <files>/native-d3d-foreign: 0 as they come,
+// 1 each device's window scissor put back before its calls (default), 2
+// dropped.
+std::array<std::atomic<uint64_t>, renut::d3d::kFunctionCount> g_foreign{};
+std::atomic<uint32_t> g_foreign_device{0};
+std::atomic<uint64_t> g_foreign_clip{0}, g_foreign_doorbells{0};
+std::atomic<int> g_foreign_mode{1};
 constexpr const char* kFunctionNames[] = {
 #define X(symbol, name) #name,
 #include "d3d_functions.inc"
@@ -157,34 +170,44 @@ class Builder {
   explicit Builder(List& list) : list_(list) {}
   void Regs(uint32_t first, const uint32_t* values, uint32_t count) {
     if (!count) return;
-    list_.words.push_back(kOpRegs | (count << 8));
-    list_.words.push_back(first);
-    list_.words.insert(list_.words.end(), values, values + count);
+    uint32_t* p = Grow(2 + size_t(count));
+    p[0] = kOpRegs | (count << 8);
+    p[1] = first;
+    std::memcpy(p + 2, values, size_t(count) * 4);
   }
   void Reg(uint32_t index, uint32_t value) { Regs(index, &value, 1); }
-  // `count` big-endian dwords of guest memory, read now.
+  // `count` big-endian dwords of guest memory, read now. (The constant blocks
+  // are most of a list: one resize, not a push_back a dword.)
   void RegsFromGuest(const uint8_t* base, uint32_t first, uint32_t address, uint32_t count) {
     if (!count) return;
-    list_.words.push_back(kOpRegs | (count << 8));
-    list_.words.push_back(first);
-    for (uint32_t i = 0; i < count; ++i) list_.words.push_back(U32(base, address + i * 4));
+    uint32_t* p = Grow(2 + size_t(count));
+    p[0] = kOpRegs | (count << 8);
+    p[1] = first;
+    const uint8_t* source = base + address;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t v;
+      std::memcpy(&v, source + size_t(i) * 4, 4);
+      p[2 + i] = __builtin_bswap32(v);
+    }
   }
   void Shader(uint32_t type, uint32_t physical, uint32_t dwords, uint64_t hash) {
-    list_.words.push_back(kOpShader);
-    list_.words.push_back((physical & ~3u) | (type & 3));
-    list_.words.push_back(dwords);
-    list_.words.push_back(uint32_t(hash));
-    list_.words.push_back(uint32_t(hash >> 32));
+    uint32_t* p = Grow(5);
+    p[0] = kOpShader;
+    p[1] = (physical & ~3u) | (type & 3);
+    p[2] = dwords;
+    p[3] = uint32_t(hash);
+    p[4] = uint32_t(hash >> 32);
   }
   size_t Draw(uint32_t flags, uint32_t viz, uint32_t initiator, uint32_t dma_base, uint32_t dma_size,
               uint32_t serial) {
     const size_t at = list_.words.size();
-    list_.words.push_back(kOpDraw | (flags << 8));
-    list_.words.push_back(viz);
-    list_.words.push_back(initiator);
-    list_.words.push_back(dma_base);
-    list_.words.push_back(dma_size);
-    list_.words.push_back(serial);
+    uint32_t* p = Grow(6);
+    p[0] = kOpDraw | (flags << 8);
+    p[1] = viz;
+    p[2] = initiator;
+    p[3] = dma_base;
+    p[4] = dma_size;
+    p[5] = serial;
     ++list_.draws;
     return at;
   }
@@ -206,11 +229,21 @@ class Builder {
   List& list() { return list_; }
 
  private:
+  // `n` more words at the end of the list, for the caller to fill.
+  uint32_t* Grow(size_t n) {
+    const size_t at = list_.words.size();
+    list_.words.resize(at + n);
+    return list_.words.data() + at;
+  }
+
   List& list_;
 };
 
 // The front end's state. Direct3D is driven from one thread at a time (the
 // device's thread ownership); the lock keeps the kick-off publishing honest.
+// A command buffer's list is written by the thread that began it without the
+// lock (OwnRecording): the render jobs record side by side, and taking it for
+// every draw had them queue on each other.
 struct FrontEnd {
   std::recursive_mutex mutex;
   std::shared_ptr<List> immediate = std::make_shared<List>();
@@ -220,6 +253,17 @@ struct FrontEnd {
   std::unordered_map<uint32_t, std::shared_ptr<List>> recording;
   uint32_t main_device = 0;
   std::unordered_map<uint32_t, std::shared_ptr<const List>> command_buffers;
+  // Words each command buffer took last time, reserved when it is recorded
+  // again (most are recorded every frame).
+  std::unordered_map<uint32_t, size_t> command_buffer_words;
+  // The window scissor each device set last outside a recording, and the one
+  // the immediate list leaves the command processor with (unknown after a
+  // command buffer runs: it sets its own).
+  std::unordered_map<uint32_t, std::array<uint32_t, 3>> window_clip;
+  std::array<uint32_t, 3> immediate_clip{};
+  bool immediate_clip_known = false;
+  // Where another device's calls go when they are dropped (mode 2).
+  List discard;
   std::deque<std::shared_ptr<const List>> published;
   std::mutex published_mutex;
   uint32_t marker_serial = 0;
@@ -232,12 +276,48 @@ struct FrontEnd {
   uint32_t swaps_seen = 0;
 } g_front;
 
+// The command buffer this thread began on a device, while it is open.
+thread_local uint32_t t_recording_dev = 0;
+thread_local std::shared_ptr<List> t_recording;
+
+List* OwnRecording(uint32_t dev) {
+  if (dev != t_recording_dev || !t_recording || !t_recording->open.load(std::memory_order_acquire)) return nullptr;
+  return t_recording.get();
+}
+
+// The front end's lock, unless the call goes into this thread's own command
+// buffer.
+std::unique_lock<std::recursive_mutex> LockUnlessOwn(uint32_t dev) {
+  if (OwnRecording(dev)) return {};
+  return std::unique_lock<std::recursive_mutex>(g_front.mutex);
+}
+
+// Before a call of `dev` goes into the immediate list: the window scissor it
+// set last, when the list leaves the command processor with another.
+void PutBackClip(uint32_t dev, List& list) {
+  auto it = g_front.window_clip.find(dev);
+  if (it == g_front.window_clip.end()) return;
+  if (g_front.immediate_clip_known && g_front.immediate_clip == it->second) return;
+  Builder(list).Regs(0x2080, it->second.data(), 3);
+  g_front.immediate_clip = it->second;
+  g_front.immediate_clip_known = true;
+}
+
 List& Current(uint32_t dev) {
+  if (List* own = OwnRecording(dev)) return *own;
   auto it = g_front.recording.find(dev);
   if (it != g_front.recording.end() && it->second) return *it->second;
+  const int mode = g_foreign_mode.load(std::memory_order_relaxed);
   if (g_front.main_device && dev != g_front.main_device) {
     g_counts.foreign_immediate.fetch_add(1, std::memory_order_relaxed);
+    if (t_function < g_foreign.size()) g_foreign[t_function].fetch_add(1, std::memory_order_relaxed);
+    g_foreign_device.store(dev, std::memory_order_relaxed);
+    if (mode == 2) {
+      if (g_front.discard.words.size() > (1u << 20)) g_front.discard.words.clear();
+      return g_front.discard;
+    }
   }
+  if (mode == 1) PutBackClip(dev, *g_front.immediate);
   return *g_front.immediate;
 }
 
@@ -245,6 +325,7 @@ void Publish() {
   if (g_front.immediate->words.empty()) return;
   std::shared_ptr<const List> done = std::move(g_front.immediate);
   g_front.immediate = std::make_shared<List>();
+  g_front.immediate->words.reserve(done->words.size());
   {
     std::lock_guard lock(g_front.published_mutex);
     g_front.published.push_back(std::move(done));
@@ -259,36 +340,42 @@ bool SyncWanted();
 // Scratch guest memory for what Direct3D would put in the ring: vertex data
 // of BeginVertices, and vertex shaders patched for this draw's declaration.
 // It is read by the command processor when it runs the list, so it is reused
-// only after it went round: 32 MB, a few dozen frames.
+// only after it went round: 32 MB, a few dozen frames. Taken by several
+// recording threads at once.
 
 struct Scratch {
-  uint32_t base = 0, size = 0, offset = 0;
+  std::once_flag made;
+  uint32_t base = 0, size = 32u << 20;
+  std::atomic<uint32_t> offset{0};
 } g_scratch;
 
 uint32_t ScratchAlloc(uint32_t bytes) {
-  if (!g_scratch.base) {
+  std::call_once(g_scratch.made, [] {
     auto* memory = rex::system::kernel_memory();
-    g_scratch.size = 32u << 20;
     g_scratch.base =
         memory ? memory->SystemHeapAlloc(g_scratch.size, 4096, rex::memory::kSystemHeapPhysical) : 0;
-    if (!g_scratch.base) {
-      g_counts.no_scratch.fetch_add(1, std::memory_order_relaxed);
-      return 0;
+    if (g_scratch.base) {
+      REXLOG_INFO("Renut: native Direct3D scratch {:08X} ({} MB)", g_scratch.base, g_scratch.size >> 20);
     }
-    REXLOG_INFO("Renut: native Direct3D scratch {:08X} ({} MB)", g_scratch.base, g_scratch.size >> 20);
+  });
+  if (!g_scratch.base) {
+    g_counts.no_scratch.fetch_add(1, std::memory_order_relaxed);
+    return 0;
   }
   bytes = (bytes + 63) & ~63u;
   if (bytes > g_scratch.size / 4) return 0;
-  if (g_scratch.offset + bytes > g_scratch.size) g_scratch.offset = 0;
-  const uint32_t address = g_scratch.base + g_scratch.offset;
-  g_scratch.offset += bytes;
-  return address;
+  uint32_t at = g_scratch.offset.load(std::memory_order_relaxed), end;
+  do {
+    end = at + bytes > g_scratch.size ? bytes : at + bytes;
+  } while (!g_scratch.offset.compare_exchange_weak(at, end, std::memory_order_relaxed));
+  return g_scratch.base + end - bytes;
 }
 
 // A guest dword standing in for SetPending_Shaders' stack slot that
-// D3D_PatchVertexShaderToMatchPixelShader updates (SQ_PROGRAM_CNTL).
+// D3D_PatchVertexShaderToMatchPixelShader updates (SQ_PROGRAM_CNTL); one a
+// thread, as the stack slot was.
 uint32_t ProgramSlot() {
-  static uint32_t slot = 0;
+  thread_local uint32_t slot = 0;
   if (!slot) {
     if (auto* memory = rex::system::kernel_memory()) slot = memory->SystemHeapAlloc(16, 16);
   }
@@ -846,7 +933,7 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, base_vertex = ctx.r5.u32;
   const uint32_t first = ctx.r6.u32, total = ctx.r7.u32;
   const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
-  std::unique_lock lock(g_front.mutex);
+  auto lock = LockUnlessOwn(dev);
   Capture(ctx, base, dev, [&](Device& d) {
     FlushAll(d);
     const uint32_t ib = U32(base, dev + kIndexBuffer);
@@ -896,7 +983,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, base_vertex = ctx.r5.u32;
   const uint32_t first = ctx.r6.u32, total = ctx.r7.u32;
   const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
-  std::unique_lock lock(g_front.mutex);
+  auto lock = LockUnlessOwn(dev);
   Capture(ctx, base, dev, [&](Device& d) {
     const uint32_t ib = U32(base, dev + kIndexBuffer);
     S32(base, dev + 10612, (U32(base, dev + 10612) & ~3u) | 1);
@@ -973,7 +1060,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
 bool DrawVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, first = ctx.r5.u32, total = ctx.r6.u32;
   const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
-  std::unique_lock lock(g_front.mutex);
+  auto lock = LockUnlessOwn(dev);
   Capture(ctx, base, dev, [&](Device& d) {
     FlushAll(d);
     const uint32_t viz = VizToken(base, dev);
@@ -1002,7 +1089,7 @@ bool DrawVertices(PPCContext& ctx, uint8_t* base) {
 bool BeginVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
   const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
-  std::unique_lock lock(g_front.mutex);
+  auto lock = LockUnlessOwn(dev);
   g_counts.begin_vertices.fetch_add(1, std::memory_order_relaxed);
   const uint32_t dwords = (count * stride) >> 2;
   const uint32_t data = ScratchAlloc(dwords * 4);
@@ -1047,7 +1134,7 @@ bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t vertex_dwords = (vertices * stride) >> 2;
   const uint32_t index_dwords = wide ? indices : (indices + 1) >> 1;
   const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
-  std::unique_lock lock(g_front.mutex);
+  auto lock = LockUnlessOwn(dev);
   g_counts.indexed_up.fetch_add(1, std::memory_order_relaxed);
   const uint32_t vertex_data = ScratchAlloc(vertex_dwords * 4), index_data = ScratchAlloc(index_dwords * 4);
   if (!vertex_data || !index_data) {
@@ -1348,13 +1435,24 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
 // D3DDevice_BeginCommandBuffer(device, command buffer, flags, inherit, ...):
 // a list of its own from here to EndCommandBuffer.
 void BeginCommandBuffer(PPCContext& ctx) {
+  const uint32_t dev = ctx.r3.u32, cb = ctx.r4.u32;
   std::lock_guard lock(g_front.mutex);
   g_counts.recordings.fetch_add(1, std::memory_order_relaxed);
-  auto [it, added] = g_front.recording.try_emplace(ctx.r3.u32);
+  auto [it, added] = g_front.recording.try_emplace(dev);
   if (added) g_counts.devices.fetch_add(1, std::memory_order_relaxed);
-  if (it->second) g_counts.nested_recordings.fetch_add(1, std::memory_order_relaxed);
-  it->second = std::make_shared<List>();
-  it->second->command_buffer = ctx.r4.u32;
+  if (it->second) {
+    g_counts.nested_recordings.fetch_add(1, std::memory_order_relaxed);
+    it->second->open.store(false, std::memory_order_release);
+  }
+  auto list = std::make_shared<List>();
+  list->command_buffer = cb;
+  if (auto words = g_front.command_buffer_words.find(cb); words != g_front.command_buffer_words.end()) {
+    list->words.reserve(words->second + words->second / 8 + 64);
+  }
+  list->open.store(true, std::memory_order_release);
+  it->second = list;
+  t_recording_dev = dev;
+  t_recording = std::move(list);
 }
 
 // D3DDevice_EndCommandBuffer(device): Direct3D flushes what is still pending
@@ -1366,6 +1464,12 @@ void EndCommandBuffer(PPCContext& ctx, uint8_t* base) {
   if (it == g_front.recording.end() || !it->second) return;
   const uint32_t cb = U32(base, dev + kRecording);
   if (cb && (U32(base, cb + 108) & 0x8000)) Capture(ctx, base, dev, [&](Device& d) { FlushAll(d); });
+  it->second->open.store(false, std::memory_order_release);
+  if (t_recording == it->second) {
+    t_recording.reset();
+    t_recording_dev = 0;
+  }
+  g_front.command_buffer_words[it->second->command_buffer] = it->second->words.size();
   g_front.command_buffers[it->second->command_buffer] = it->second;
   it->second.reset();
 }
@@ -1388,18 +1492,21 @@ void RunCommandBuffer(PPCContext& ctx, uint8_t* base) {
     }
     d.out.Run(it->second);
   });
+  // A command buffer sets its own window scissor (BeginCommandBuffer does);
+  // Direct3D's RunCommandBuffer then sets the device's again.
+  g_front.immediate_clip_known = false;
 }
 
 // D3DDevice_SetPredication(device, mask): SET_BIN_MASK_LO, 0 meaning all.
 void SetPredication(PPCContext& ctx) {
-  std::lock_guard lock(g_front.mutex);
+  auto lock = LockUnlessOwn(ctx.r3.u32);
   Builder(Current(ctx.r3.u32)).Bin(0, ctx.r4.u32 ? ctx.r4.u32 : 0xFFFFFFFFu);
 }
 
 // D3DDevice_SetCommandBufferPredication(device, lo, hi): SET_BIN_MASK_LO/HI,
 // both 0 meaning all.
 void SetCommandBufferPredication(PPCContext& ctx) {
-  std::lock_guard lock(g_front.mutex);
+  auto lock = LockUnlessOwn(ctx.r3.u32);
   const uint32_t lo = ctx.r4.u32, hi = ctx.r5.u32;
   Builder b(Current(ctx.r3.u32));
   if (!lo && !hi) {
@@ -1416,12 +1523,31 @@ void SetCommandBufferPredication(PPCContext& ctx) {
 // kept in the device.
 void SetSurfaceClip(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
-  std::lock_guard lock(g_front.mutex);
+  auto lock = LockUnlessOwn(dev);
   g_counts.surface_clips.fetch_add(1, std::memory_order_relaxed);
   if (U8(base, dev + 10940) & 0x30) g_counts.tiled_surface_clips.fetch_add(1, std::memory_order_relaxed);
   const uint32_t x1 = ctx.r4.u32, y1 = ctx.r5.u32, x2 = ctx.r6.u32, y2 = ctx.r7.u32;
-  const uint32_t values[3] = {0, ((y1 << 16) & 0x3FFF0000u) | (x1 & 0x3FFF), ((y2 << 16) & 0x3FFF0000u) | (x2 & 0x3FFF)};
-  Builder(Current(dev)).Regs(0x2080, values, 3);
+  const std::array<uint32_t, 3> values = {0, ((y1 << 16) & 0x3FFF0000u) | (x1 & 0x3FFF),
+                                          ((y2 << 16) & 0x3FFF0000u) | (x2 & 0x3FFF)};
+  if (List* own = OwnRecording(dev)) {
+    Builder(*own).Regs(0x2080, values.data(), 3);
+    return;
+  }
+  if (g_front.main_device && dev != g_front.main_device) {
+    g_foreign_clip.store((uint64_t(x1 & 0xFFFF) << 48) | (uint64_t(y1 & 0xFFFF) << 32) | ((x2 & 0xFFFF) << 16) |
+                             (y2 & 0xFFFF),
+                         std::memory_order_relaxed);
+  }
+  g_front.window_clip[dev] = values;
+  List& list = Current(dev);
+  if (&list != g_front.immediate.get()) {
+    Builder(list).Regs(0x2080, values.data(), 3);
+  } else if (g_foreign_mode.load(std::memory_order_relaxed) != 1) {
+    // (In mode 1 Current has just put this device's scissor back.)
+    Builder(list).Regs(0x2080, values.data(), 3);
+    g_front.immediate_clip = values;
+    g_front.immediate_clip_known = true;
+  }
 }
 
 void Swap(PPCContext& ctx) {
@@ -1468,6 +1594,7 @@ void AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t* base) {
   if (GetMode() != Mode::kNative) return;
   const uint32_t calls = ctx.r4.u32, count = ctx.r5.u32;
   std::lock_guard lock(g_front.mutex);
+  if (g_front.main_device && ctx.r3.u32 != g_front.main_device) g_foreign_doorbells.fetch_add(1, std::memory_order_relaxed);
   List& list = *g_front.immediate;
   list.words.push_back(kOpSegments | (std::min(count, 0xFFFFu) << 8));
   list.words.push_back(g_front.sync_recording ? 1u : 0u);
@@ -1590,6 +1717,7 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
   if (function < g_calls.size() && function != renut::d3d::kD3D_CBlocker_Check) {
     g_calls[function].fetch_add(1, std::memory_order_relaxed);
   }
+  t_function = function;
   switch (Function(function)) {
     case kD3DDevice_DrawIndexedVertices:
       return DrawIndexedVertices(ctx, base);
@@ -1674,6 +1802,23 @@ std::string g_report_path;
 void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t bad,
                   const std::function<std::string()>& executor) {
   static uint64_t last_frame = 0, last_draws = 0, last_dropped = 0;
+  if (frame % 30 == 0) {
+    // The live switch for other devices' immediate calls.
+    std::string path;
+    {
+      std::lock_guard lock(g_report_mutex);
+      path = g_report_path;
+    }
+    path = path.substr(0, path.rfind('/')) + "/native-d3d-foreign";
+    if (FILE* file = std::fopen(path.c_str(), "r")) {
+      int mode = 1;
+      if (std::fscanf(file, "%d", &mode) == 1 && mode >= 0 && mode <= 2 &&
+          mode != g_foreign_mode.exchange(mode, std::memory_order_relaxed)) {
+        REXLOG_INFO("Renut: native Direct3D: other devices' immediate calls in mode {}", mode);
+      }
+      std::fclose(file);
+    }
+  }
   if (frame < last_frame + 300) return;
   const double f = double(frame - last_frame);
   auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
@@ -1696,6 +1841,21 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
       c(g_counts.doorbells), c(g_counts.native_doorbells), c(g_counts.fences), c(g_counts.presents),
       c(g_counts.callbacks), c(g_counts.lists_published), c(g_counts.lists_executed), c(g_counts.stuck_waits),
       g_sync_fallback.load() ? " (fell back to the ring)" : "", c(g_counts.indexed_up));
+  {
+    const uint64_t clip = g_foreign_clip.load(std::memory_order_relaxed);
+    out += fmt::format(
+        "== other devices' immediate calls (mode {}): last device {:08X}, doorbells {}, last surface clip "
+        "({},{})-({},{}); per frame by function:",
+        g_foreign_mode.load(), g_foreign_device.load(), c(g_foreign_doorbells), clip >> 48, (clip >> 32) & 0xFFFF,
+        (clip >> 16) & 0xFFFF, clip & 0xFFFF);
+    static std::array<uint64_t, renut::d3d::kFunctionCount> last{};
+    for (uint32_t i = 0; i < g_foreign.size(); ++i) {
+      const uint64_t n = c(g_foreign[i]);
+      if (n != last[i]) out += fmt::format(" {} {:.1f};", kFunctionNames[i], double(n - last[i]) / f);
+      last[i] = n;
+    }
+    out += "\n";
+  }
   if (executor) out += executor();
   last_frame = frame;
   last_draws = draws;

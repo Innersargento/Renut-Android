@@ -14,7 +14,8 @@
 //    sub_823B0CB0 and siblings), counted with their arguments dumped.
 //
 // Reports go to <files>/native-probe-<n>.txt every 600 swaps (eight kept,
-// rotating), whatever the log level. Off with renut_native_probe = false.
+// rotating), whatever the log level. On with renut_native_probe = true (it costs the
+// render jobs a lock and a stack walk on every Direct3D call).
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -42,7 +43,7 @@
 // draws, 2 also the native view.
 extern std::atomic<uint32_t> g_renut_native_mode;
 
-REXCVAR_DEFINE_BOOL(renut_native_probe, true, "reNut",
+REXCVAR_DEFINE_BOOL(renut_native_probe, false, "reNut",
                     "Native renderer reconnaissance: count the engine's draw paths and dump their "
                     "objects to <files>/native-probe-<n>.txt every 600 swaps");
 
