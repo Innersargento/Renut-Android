@@ -16,7 +16,7 @@ import java.util.*;
 import java.util.zip.*;
 
 public final class MainActivity extends androidx.activity.ComponentActivity {
-    private static final int ISO=10, XEX=11, DRIVER=12, EXPORT=13, SAVE_IMPORT=14, SAVE_EXPORT=15;
+    private static final int DRIVER=12, EXPORT=13, SAVE_IMPORT=14, SAVE_EXPORT=15;
     private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
     private TextView status, library, driver, fpsCounter, oneUiFix, tuDebug, ir3Debug, savesSummary;
     private LinearLayout savesList;
@@ -31,6 +31,13 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        // No game yet: the first-run screens introduce the project and install it. They hand
+        // over to this launcher (a new instance) once a game is imported.
+        if(!hasGame()){
+            startActivity(new Intent(this,WelcomeActivity.class));
+            finish();
+            return;
+        }
         getWindow().setStatusBarColor(Color.rgb(12,23,28));
         getWindow().setNavigationBarColor(Color.rgb(12,23,28));
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(Color.rgb(12,23,28));setContentView(root);
@@ -61,8 +68,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         body.addView(text("Prévia de desenvolvimento · 0.4\nImporte seus arquivos e teste a inicialização do Banjo com gráficos nativos Vulkan. Compatibilidade e desempenho estão em desenvolvimento.",15,muted));
         LinearLayout game=card(body,"01   SEU JOGO");
         library=text("Nenhum arquivo importado",16,ink); game.addView(library);
-        button(game,"Importar imagem ISO",()->pick(ISO));
-        button(game,"Importar apenas o XEX",()->pick(XEX));
         CheckBox showControls=new CheckBox(this);
         showControls.setText("Mostrar controles na tela");
         showControls.setTextColor(ink);
@@ -152,6 +157,11 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         }catch(IOException e){return 0;}
     }
     public void uiStartGame(){if(worker==null)startGame();}
+    /** Opens the import flow of the first-run screens (without their introduction). */
+    public void uiOpenGameImport(){
+        if(worker!=null)return;
+        startActivity(new Intent(this,WelcomeActivity.class).putExtra(WelcomeActivity.EXTRA_IMPORT_ONLY,true));
+    }
     private void startGame(){
         Intent i=new Intent(this,RuntimeActivity.class).putExtra("launch",true);
         i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
@@ -322,7 +332,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             String name=new String(Files.readAllBytes(active.toPath()),java.nio.charset.StandardCharsets.UTF_8).trim();
             File folder=new File(getFilesDir(),name);
             boolean full=new File(folder,"Bundle").isDirectory();
-            library.setText("Banjo-Kazooie: Nuts & Bolts\nEuropa · "+(full?"assets presentes":"XEX identificado; importe a ISO para obter os assets")+"\nInicialização experimental disponível");
+            library.setText("Banjo-Kazooie: Nuts & Bolts\n"+(full?"assets presentes":"XEX identificado; importe a ISO para obter os assets")+"\nInicialização experimental disponível");
         }catch(IOException e){library.setText("Nenhum arquivo importado");}
         driver.setText(uiDriverSelected());
         fpsCounter.setText(getPreferences(0).getBoolean("fps",false)?"Contador de FPS: ativado":"Contador de FPS: desativado");
@@ -360,43 +370,14 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
                 out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             }catch(IOException e){status.setText(e.getMessage());}return;
         }
-        if(worker!=null)return;
+        if(worker!=null||request!=DRIVER)return;
         for(Button b:actions)b.setEnabled(false);cancel.setVisibility(View.VISIBLE);progress.setVisibility(View.VISIBLE);progress.setIndeterminate(true);
         worker=new Thread(()->{
             File stage=new File(getFilesDir(),"import-"+UUID.randomUUID());
             boolean committed=false;
             try{
                 if(!stage.mkdir())throw new IOException("Não foi possível criar a pasta de importação.");
-                if(request==DRIVER){
-                    importDriver(uri,stage);committed=true;
-                }else{
-                    File gameData=new File(stage,"data");
-                    if(!gameData.mkdir())throw new IOException("Não foi possível criar a pasta de dados.");
-                    File xex;
-                    if(request==ISO){
-                        File iso=new File(stage,"source.iso");
-                        update("Copiando imagem para leitura. É necessário espaço para a ISO e os arquivos extraídos.",0,0);
-                        copy(uri,iso,16L*1024*1024*1024);
-                        try(RandomAccessFile input=new RandomAccessFile(iso,"r")){
-                            DiscImage disc=new DiscImage(input);
-                            DiscImage.Entry executable=disc.entries().stream().filter(e->e.path.equalsIgnoreCase("default.xex")).findFirst().orElseThrow(()->new IOException("XEX ausente."));
-                            File check=new File(stage,"check.xex");
-                            try(OutputStream out=new FileOutputStream(check)){
-                                if(executable.size>256L*1024*1024)throw new IOException("XEX excessivamente grande.");
-                                input.seek(executable.offset);byte[] block=new byte[1024*1024];long remaining=executable.size;
-                                while(remaining>0){int n=(int)Math.min(block.length,remaining);input.readFully(block,0,n);out.write(block,0,n);remaining-=n;}
-                            }
-                            GameFiles.requireEuropean(check);Files.delete(check.toPath());
-                            disc.extract(gameData,(done,total)->update("Extraindo arquivos do jogo…",done,total));
-                        }
-                        Files.delete(iso.toPath());
-                        xex=Arrays.stream(Objects.requireNonNull(gameData.listFiles())).filter(f->f.getName().equalsIgnoreCase("default.xex")).findFirst().orElseThrow(()->new IOException("XEX ausente."));
-                        if(!new File(gameData,"full-disc.marker").createNewFile())throw new IOException("Falha ao registrar importação.");
-                    }else{xex=new File(gameData,"default.xex");copy(uri,xex,256L*1024*1024);}
-                    GameFiles.requireEuropean(xex);
-                    if(Thread.currentThread().isInterrupted())throw new InterruptedIOException("Importação cancelada.");
-                    GameFiles.atomicWrite(new File(getFilesDir(),"active-game.txt"),stage.getName()+"/data");committed=true;
-                }
+                importDriver(uri,stage);committed=true;
                 runOnUiThread(()->status.setText("Importação concluída e validada."));
             }catch(Exception e){runOnUiThread(()->status.setText("Importação não concluída: "+e.getMessage()));}
             finally{
@@ -425,18 +406,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             }catch(Exception e){runOnUiThread(()->new AlertDialog.Builder(this).setTitle("Falha nos saves").setMessage(e.getMessage()).setPositiveButton("OK",null).show());}
             finally{runOnUiThread(()->{worker=null;for(Button b:actions)b.setEnabled(true);refreshSaves();});}
         },"renut-saves");worker.start();
-    }
-    private void copy(Uri source,File target,long limit)throws IOException{
-        try(InputStream in=getContentResolver().openInputStream(source);OutputStream out=new FileOutputStream(target)){
-            if(in==null)throw new IOException("Arquivo inacessível.");
-            byte[] buffer=new byte[1024*1024];long total=0;int count;
-            while((count=in.read(buffer))!=-1){
-                if(Thread.currentThread().isInterrupted())throw new InterruptedIOException("Importação cancelada.");
-                total+=count;if(total>limit)throw new IOException("Arquivo excede o limite de importação.");
-                if(target.getUsableSpace()<count+64L*1024*1024)throw new IOException("Espaço livre insuficiente.");
-                out.write(buffer,0,count);update("Copiados "+total/(1024*1024)+" MB",0,0);
-            }
-        }
     }
     private void update(String message,long done,long total)throws IOException{
         if(Thread.currentThread().isInterrupted())throw new InterruptedIOException("Importação cancelada.");

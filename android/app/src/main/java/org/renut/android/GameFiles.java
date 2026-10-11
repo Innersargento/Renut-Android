@@ -24,7 +24,7 @@ public final class GameFiles {
         } catch(NoSuchAlgorithmException e) { throw new IOException(e); }
     }
     public static void requireEuropean(File file) throws IOException {
-        if(!EXPECTED.equals(identify(file))) throw new IOException("XEX diferente da edição europeia cadastrada. O jogo anterior foi preservado.");
+        if(!EXPECTED.equals(identify(file))) throw new IOException("Este executável não é compatível com o reNut. O jogo anterior foi preservado.");
     }
     public static void atomicWrite(File destination,String text) throws IOException {
         File temp=new File(destination.getParentFile(),destination.getName()+".tmp");

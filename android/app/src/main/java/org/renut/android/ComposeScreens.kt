@@ -24,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Folder
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.*
@@ -79,6 +81,27 @@ object ComposeScreens {
         activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { RuntimeScreen(activity) } } })
     }
     @JvmStatic fun createGameMenu(activity: RuntimeActivity): GameMenu = GameMenu(activity)
+    @JvmStatic fun showWelcome(activity: WelcomeActivity, model: WelcomeModel) {
+        activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { WelcomeScreen(activity, model) } } })
+    }
+}
+
+/** What the first-run screens show; WelcomeActivity (Java) writes it, Compose observes it. */
+class WelcomeModel {
+    companion object {
+        const val INTRO = 0
+        const val NOTICE = 1
+        const val INSTALL = 2
+        const val DONE = 3
+        const val FAILED = 4
+    }
+    var step by mutableIntStateOf(INTRO)
+    var message by mutableStateOf("")
+    /** 0..1 while installing; negative when the size is not known (indeterminate bar). */
+    var fraction by mutableFloatStateOf(0f)
+    var error by mutableStateOf("")
+    /** True when the full ISO is being installed, false for the XEX alone. */
+    var wholeDisc by mutableStateOf(true)
 }
 
 /**
@@ -212,8 +235,8 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
                             Text("Banjo-Kazooie", color = Text, fontWeight = FontWeight.Bold, fontSize = 24.sp)
                             Text("Nuts & Bolts", color = Accent, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
                             Text(when (state) {
-                                2 -> "Edição europeia · jogo completo"
-                                1 -> "Edição europeia · só o XEX importado"
+                                2 -> "Jogo completo"
+                                1 -> "Só o XEX importado"
                                 else -> "Nenhum arquivo importado"
                             }, color = Muted, fontSize = 13.sp)
                         }
@@ -227,8 +250,8 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
                         Text("Jogar", fontWeight = FontWeight.Bold, fontSize = 19.sp)
                     }
                     if (state != 2) Text(
-                        if (state == 1) "Importe a imagem ISO completa para ter os arquivos que o jogo precisa."
-                        else "Importe a imagem ISO do jogo abaixo para começar.",
+                        if (state == 1) "Importe a imagem ISO completa em Configurações para ter os arquivos que o jogo precisa."
+                        else "Importe o jogo em Configurações para começar.",
                         color = Muted, fontSize = 13.sp)
                     else Text("Experimental: o desempenho e a compatibilidade ainda estão em desenvolvimento.", color = Muted, fontSize = 12.sp)
                     if (state == 2 && activity.uiRuntimeOption(RuntimeOptions.CHEATS, "false") == "true")
@@ -259,15 +282,6 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
             Panel("Ao abrir o app") {
                 ToggleRow("Iniciar direto no jogo", autoStart, !busy) { activity.uiSetAutoStart(it) }
                 Text("O jogo começa sem passar por esta tela. Para voltar aqui, saia do jogo pelo menu.", color = Muted, fontSize = 12.sp)
-            }
-        }
-        item {
-            Panel("Arquivos do jogo") {
-                ActionButton("Importar imagem ISO", !busy, outlined = true) { activity.uiAction("Importar imagem ISO") }
-                ActionButton("Importar apenas o XEX", !busy, outlined = true) { activity.uiAction("Importar apenas o XEX") }
-                if (busy) Text(activity.uiStatus(), color = Muted, fontSize = 13.sp, maxLines = 4, overflow = TextOverflow.Ellipsis)
-                if (activity.uiCanCancel()) ActionButton("Cancelar importação", true, outlined = true) { activity.uiCancelImport() }
-                Text("A importação da ISO precisa de espaço livre para a imagem e os arquivos extraídos.", color = Muted, fontSize = 12.sp)
             }
         }
     }
@@ -405,6 +419,17 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Header("RENUT / ANDROID", "Configurações", "Jogo, vídeo, controles e diagnóstico.") }
+        item {
+            Panel("Jogo") {
+                Text(when (activity.uiGameState()) {
+                    2 -> "Banjo-Kazooie: Nuts & Bolts · jogo completo"
+                    1 -> "Banjo-Kazooie: Nuts & Bolts · só o XEX importado"
+                    else -> "Nenhum jogo importado"
+                }, color = Muted, fontSize = 13.sp)
+                ActionButton("Importar jogo (ISO ou XEX)", !busy, outlined = true) { activity.uiOpenGameImport() }
+                Text("O jogo atual só é substituído depois que o novo for validado.", color = Muted, fontSize = 12.sp)
+            }
+        }
         item {
             Panel("Display") {
                 ToggleRow("Contador de FPS", fpsEnabled, !busy) { activity.uiSetFps(it) }
@@ -791,5 +816,108 @@ private val SidebarWidth = 360.dp
         if (activity.uiGraphics()) AndroidView(factory = { SurfaceView(activity).also(activity::attachComposeSurface) }, modifier = Modifier.fillMaxWidth().weight(1f))
         else Spacer(Modifier.weight(1f))
         ActionButton("Voltar", true) { activity.finish() }
+    }
+}
+
+// ---- First run ----------------------------------------------------------------------------------
+
+/** Content scrolls in the middle; the step's actions stay on the bottom edge of the screen. */
+@Composable private fun WelcomeScreen(activity: WelcomeActivity, model: WelcomeModel) {
+    Column(Modifier.fillMaxSize().background(Background).systemBarsPadding()) {
+        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            Column(
+                Modifier.widthIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(20.dp)
+            ) {
+                when (model.step) {
+                    WelcomeModel.INTRO -> WelcomeIntro()
+                    WelcomeModel.NOTICE -> WelcomeNotice()
+                    WelcomeModel.INSTALL -> WelcomeInstall(model)
+                    WelcomeModel.DONE -> WelcomeDone(model)
+                    else -> WelcomeFailed(model)
+                }
+            }
+        }
+        Column(
+            Modifier.align(Alignment.CenterHorizontally).widthIn(max = 560.dp).fillMaxWidth()
+                .padding(start = 24.dp, end = 24.dp, bottom = 20.dp, top = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) { WelcomeActions(activity, model) }
+    }
+}
+
+@Composable private fun ColumnScope.WelcomeActions(activity: WelcomeActivity, model: WelcomeModel) {
+    when (model.step) {
+        WelcomeModel.INTRO -> ActionButton("Continuar", true) { activity.uiContinueFromIntro() }
+        WelcomeModel.NOTICE -> {
+            ActionButton("Importar imagem ISO", true) { activity.uiPick(true) }
+            ActionButton("Importar apenas o XEX", true, outlined = true) { activity.uiPick(false) }
+        }
+        WelcomeModel.INSTALL -> ActionButton("Cancelar", true, outlined = true) { activity.uiCancelInstall() }
+        WelcomeModel.DONE -> ActionButton("Começar", true) { activity.uiFinish() }
+        else -> ActionButton("Tentar novamente", true) { activity.uiBackToNotice() }
+    }
+}
+
+@Composable private fun ColumnScope.WelcomeIntro() {
+    Header("RENUT / BEM-VINDO", "Renut Android", "Um projeto independente e experimental.")
+    Panel(null) {
+        Text("O reNut leva Banjo-Kazooie: Nuts & Bolts para o Android. O código do jogo é recompilado para ARM64 e os gráficos rodam em Vulkan, direto no seu aparelho.",
+            color = Text, fontSize = 15.sp)
+        Text("É uma prévia de desenvolvimento: o desempenho e a compatibilidade ainda estão sendo trabalhados.",
+            color = Muted, fontSize = 14.sp)
+    }
+}
+
+@Composable private fun ColumnScope.WelcomeNotice() {
+    Header("RENUT / ANTES DE COMEÇAR", "Importe o seu jogo", "O reNut não inclui o jogo e não baixa nada.")
+    Panel(null) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Top) {
+            Icon(Icons.Default.Warning, null, tint = Accent, modifier = Modifier.size(24.dp))
+            Text("Use apenas uma cópia do jogo que você possui.", color = Text, fontSize = 15.sp)
+        }
+        InfoRow("Imagem ISO (recomendado)", "Traz todos os arquivos do jogo. Precisa de espaço livre para a imagem copiada e para os arquivos extraídos.")
+        InfoRow("Apenas o XEX", "Só o executável (default.xex). Serve para testes: o jogo não inicia sem os arquivos da ISO.")
+        Text("A importação leva alguns minutos. Mantenha o app aberto até terminar.", color = Muted, fontSize = 13.sp)
+    }
+}
+
+@Composable private fun ColumnScope.WelcomeInstall(model: WelcomeModel) {
+    Header("RENUT / INSTALAÇÃO", "Instalando o jogo",
+        if (model.wholeDisc) "Copiando a imagem e extraindo os arquivos." else "Copiando o executável.")
+    Panel(null) {
+        Text(model.message, color = Text, fontSize = 15.sp)
+        if (model.fraction < 0f) LinearProgressIndicator(
+            modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+            color = Accent, trackColor = Color(0xFF3A3B3D))
+        else LinearProgressIndicator(
+            progress = { model.fraction.coerceIn(0f, 1f) },
+            modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+            color = Accent, trackColor = Color(0xFF3A3B3D))
+        if (model.fraction >= 0f) Text("${(model.fraction.coerceIn(0f, 1f) * 100).toInt()}%", color = Accent, fontWeight = FontWeight.Bold)
+        Text("Não feche o app durante a instalação.", color = Muted, fontSize = 13.sp)
+    }
+}
+
+@Composable private fun ColumnScope.WelcomeDone(model: WelcomeModel) {
+    Header("RENUT / PRONTO", "Tudo pronto", "O jogo foi importado e validado.")
+    Panel(null) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.CheckCircle, null, tint = Accent, modifier = Modifier.size(32.dp))
+            Text(
+                if (model.wholeDisc) "Banjo-Kazooie: Nuts & Bolts está instalado e pronto para jogar."
+                else "O executável foi importado. Para jogar, importe também a imagem ISO completa em Configurações.",
+                color = Text, fontSize = 15.sp)
+        }
+    }
+}
+
+@Composable private fun ColumnScope.WelcomeFailed(model: WelcomeModel) {
+    Header("RENUT / IMPORTAÇÃO", "Não foi possível importar", "Nada foi alterado no jogo anterior.")
+    Panel(null) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Top) {
+            Icon(Icons.Default.Warning, null, tint = Accent, modifier = Modifier.size(24.dp))
+            Text(model.error.ifEmpty { "Erro desconhecido." }, color = Text, fontSize = 15.sp)
+        }
     }
 }
