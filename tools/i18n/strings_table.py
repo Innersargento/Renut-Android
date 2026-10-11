@@ -171,12 +171,54 @@ add("settings_no_shadows", "Remover sombras", "Remove shadows", "移除阴影", 
 add("settings_no_bloom", "Remover bloom", "Remove bloom", "移除泛光", "Quitar bloom")
 add("settings_adpf", "Desempenho sustentado (ADPF)", "Sustained performance (ADPF)", "持续性能 (ADPF)",
     "Rendimiento sostenido (ADPF)")
-add("settings_adpf_note", "Informa ao Android o tempo de cada quadro para ele manter o processador no menor clock que acompanha o jogo, sem superaquecer. Vale na próxima partida; precisa do Android 13 ou superior.",
-    "Tells Android how long each frame takes so it keeps the processor at the lowest clock that keeps up with the game, without overheating. Applies next session; needs Android 13 or newer.",
-    "向 Android 报告每帧耗时，使系统以能跟上游戏的最低处理器频率运行，避免过热。下一局生效；需要 Android 13 或更高版本。",
-    "Informa a Android cuánto tarda cada fotograma para que mantenga el procesador en la frecuencia más baja que sigue al juego, sin sobrecalentar. Se aplica en la próxima partida; requiere Android 13 o superior.")
 add("settings_no_cao", "Remover sombras de contato (CAO)", "Remove contact shadows (CAO)", "移除接触阴影（CAO）",
     "Quitar sombras de contacto (CAO)")
+# ---- screen layout editor ---------------------------------------------------------------------
+add("settings_temp", "Temperatura", "Temperature", "温度", "Temperatura")
+add("layout_title", "Editar layout", "Edit layout", "编辑布局", "Editar diseño")
+add("layout_edit_button", "Editar layout…", "Edit layout…", "编辑布局…", "Editar diseño…")
+add("layout_profile", "Perfil", "Profile", "配置文件", "Perfil")
+add("layout_default", "Padrão", "Default", "默认", "Predeterminado")
+add("layout_save", "Salvar", "Save", "保存", "Guardar")
+add("layout_save_as", "Salvar como…", "Save as…", "另存为…", "Guardar como…")
+add("layout_delete", "Excluir", "Delete", "删除", "Eliminar")
+add("layout_done", "Concluir", "Done", "完成", "Terminar")
+add("layout_reset_item", "Restaurar posição", "Reset position", "恢复位置", "Restablecer posición")
+add("layout_size", "Tamanho", "Size", "大小", "Tamaño")
+add("layout_visible", "Visível", "Visible", "显示", "Visible")
+add("layout_opacity", "Opacidade", "Opacity", "不透明度", "Opacidad")
+add("layout_name_hint", "Nome do perfil", "Profile name", "配置文件名称", "Nombre del perfil")
+add("layout_save_as_title", "Salvar perfil como", "Save profile as", "将配置文件另存为", "Guardar perfil como")
+add("layout_name_taken", "Já existe um perfil com esse nome.", "A profile with that name already exists.",
+    "已存在同名配置文件。", "Ya existe un perfil con ese nombre.")
+add("layout_delete_title", "Excluir perfil?", "Delete profile?", "删除配置文件？", "¿Eliminar el perfil?")
+add("layout_delete_message", "O perfil \"%1$s\" será removido.", "The profile \"%1$s\" will be removed.",
+    "配置文件“%1$s”将被删除。", "Se eliminará el perfil «%1$s».")
+add("layout_unsaved_title", "Alterações não salvas", "Unsaved changes", "更改尚未保存", "Cambios sin guardar")
+add("layout_unsaved_message", "Salvar as mudanças feitas neste layout?", "Save the changes made to this layout?",
+    "要保存对此布局所做的更改吗？", "¿Guardar los cambios hechos en este diseño?")
+add("layout_discard", "Descartar", "Discard", "放弃", "Descartar")
+add("layout_hint", "Arraste um item para movê-lo. Toque nele para ajustar tamanho e visibilidade.",
+    "Drag an item to move it. Tap it to adjust its size and visibility.",
+    "拖动项目即可移动。点按项目可调整大小和显示。",
+    "Arrastra un elemento para moverlo. Tócalo para ajustar su tamaño y visibilidad.")
+add("layouts_title", "Layout do touchscreen", "Touchscreen layout", "触摸屏布局", "Diseño de la pantalla táctil")
+add("layouts_manage", "Layout do touchscreen", "Touchscreen layout", "触摸屏布局", "Diseño de la pantalla táctil")
+add("layouts_new", "Criar novo layout", "Create new layout", "创建新布局", "Crear nuevo diseño")
+add("layouts_create", "Criar", "Create", "创建", "Crear")
+add("layouts_edit", "Editar", "Edit", "编辑", "Editar")
+add("layouts_builtin", "Padrão do app (não editável)", "App default (not editable)", "应用默认布局（不可编辑）", "Predeterminado de la app (no editable)")
+add("layouts_active", "Em uso", "In use", "使用中", "En uso")
+add("layout_item_stick_l", "Analógico esquerdo", "Left stick", "左摇杆", "Stick izquierdo")
+add("layout_item_stick_r", "Analógico direito", "Right stick", "右摇杆", "Stick derecho")
+add("layout_item_dpad", "Direcional", "D-pad", "方向键", "Cruceta")
+add("layout_item_lt", "Gatilho esquerdo (LT)", "Left trigger (LT)", "左扳机 (LT)", "Gatillo izquierdo (LT)")
+add("layout_item_rt", "Gatilho direito (RT)", "Right trigger (RT)", "右扳机 (RT)", "Gatillo derecho (RT)")
+add("layout_item_lb", "Botão LB", "LB button", "LB 按钮", "Botón LB")
+add("layout_item_rb", "Botão RB", "RB button", "RB 按钮", "Botón RB")
+add("layout_item_back", "Botão Back", "Back button", "Back 按钮", "Botón Back")
+add("layout_item_start", "Botão Start", "Start button", "Start 按钮", "Botón Start")
+add("layout_item_face", "Botão %1$s", "%1$s button", "%1$s 按钮", "Botón %1$s")
 add("settings_footer", "reNut · prévia de desenvolvimento", "reNut · development preview", "reNut · 开发预览版",
     "reNut · versión preliminar de desarrollo")
 add("driver_delete_title", "Apagar driver?", "Delete driver?", "删除驱动程序？", "¿Eliminar el controlador?")

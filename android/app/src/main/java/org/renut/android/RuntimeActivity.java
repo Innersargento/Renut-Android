@@ -1,6 +1,7 @@
 package org.renut.android;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.os.Bundle;
 import android.graphics.Color;
 import android.hardware.input.InputManager;
@@ -44,7 +45,11 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native long nativeFrameCount();
     private static native long nativePrecompileProgress();
     private static native void nativeTextInputResult(String text,boolean cancelled);
-    private TextView fps;
+    private TextView fps, temp;
+    private ThermalReader thermal;
+    private HudLayout.Profile hudProfile;
+    // The player's switches (settings, sidebar); a readout also has to be visible in the layout profile.
+    private boolean fpsWanted, tempWanted;
     private AchievementToast achievementToast;
     // The one game screen that is open: the native side reports unlocks through a static method.
     private static volatile java.lang.ref.WeakReference<RuntimeActivity> current;
@@ -145,10 +150,31 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             fps=new TextView(this);fps.setTextColor(Color.rgb(120,255,120));fps.setTextSize(14);
             fps.setTypeface(android.graphics.Typeface.MONOSPACE,android.graphics.Typeface.BOLD);
             fps.setShadowLayer(3,1,1,Color.BLACK);fps.setText("FPS --");
-            fps.setVisibility(getIntent().getBooleanExtra("fps",false)?View.VISIBLE:View.GONE);
-            FrameLayout.LayoutParams at=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
-            at.bottomMargin=(int)(8*getResources().getDisplayMetrics().density);
-            root.addView(fps,at);
+            fpsWanted=getIntent().getBooleanExtra("fps",false);
+            fps.setVisibility(fpsWanted?View.VISIBLE:View.GONE);
+            // Both readouts sit where the screen layout profile says (applyHudLayout), measured from the top left.
+            root.addView(fps,new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.START));
+            temp=new TextView(this);temp.setTextColor(Color.rgb(255,196,110));temp.setTextSize(13);
+            temp.setTypeface(android.graphics.Typeface.MONOSPACE,android.graphics.Typeface.BOLD);
+            temp.setShadowLayer(3,1,1,Color.BLACK);temp.setText("");
+            tempWanted=getIntent().getBooleanExtra("temp",false);
+            temp.setVisibility(tempWanted?View.VISIBLE:View.GONE);
+            root.addView(temp,new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.START));
+            thermal=new ThermalReader(this);
+            View.OnLayoutChangeListener replace=(v,l,t,r,bm,ol,ot,or,ob)->placeReadouts();
+            root.addOnLayoutChangeListener(replace);fps.addOnLayoutChangeListener(replace);temp.addOnLayoutChangeListener(replace);
+            applyHudLayout();
+            // Temperatures change slowly: read the sensors off the UI thread every two seconds.
+            final java.util.concurrent.ExecutorService sensors=java.util.concurrent.Executors.newSingleThreadExecutor(
+                r->{Thread t=new Thread(r,"renut-thermal");t.setDaemon(true);return t;});
+            temp.postDelayed(new Runnable(){@Override public void run(){
+                if(isFinishing()){sensors.shutdown();return;}
+                if(temp.getVisibility()==View.VISIBLE)sensors.execute(()->{
+                    final String text=thermal.read();
+                    runOnUiThread(()->{if(!text.isEmpty())temp.setText(text);});
+                });
+                temp.postDelayed(this,2000);
+            }},500);
             final long[] last={-1,0};
             fps.postDelayed(new Runnable(){@Override public void run(){
                 if(isFinishing())return;
@@ -239,10 +265,51 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         overlay.setVisibility(visible?View.VISIBLE:View.GONE);
         getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("showControls",visible).apply();
     }
-    public boolean uiFpsVisible(){return fps!=null&&fps.getVisibility()==View.VISIBLE;}
+    /** Reads the selected screen layout profile and puts the controller and the readouts where it says. */
+    private void applyHudLayout(){
+        if(!launch||overlay==null)return;
+        hudProfile=HudLayout.load(this);
+        overlay.setLayout(hudProfile);  // each control carries its own opacity
+        fps.setVisibility(fpsWanted&&HudLayout.visible(hudProfile,HudLayout.FPS)?View.VISIBLE:View.GONE);
+        temp.setVisibility(tempWanted&&HudLayout.visible(hudProfile,HudLayout.TEMP)?View.VISIBLE:View.GONE);
+        placeReadouts();
+    }
+    private void placeReadouts(){
+        if(fps==null||temp==null||hudProfile==null)return;
+        View root=(View)fps.getParent();
+        int w=root.getWidth(),h=root.getHeight();
+        if(w<=0||h<=0)return;
+        placeReadout(fps,HudLayout.FPS,w,h);
+        placeReadout(temp,HudLayout.TEMP,w,h);
+    }
+    private void placeReadout(TextView view,String id,int w,int h){
+        HudLayout.Shape shape=HudLayout.shape(hudProfile,id,w,h);
+        HudLayout.Item item=hudProfile.items.get(id);
+        float scale=item==null?1f:item.scale;
+        view.setScaleX(scale);view.setScaleY(scale);
+        view.setAlpha(HudLayout.opacity(hudProfile,id));
+        view.setTranslationX(shape.cx-view.getWidth()/2f);
+        view.setTranslationY(shape.cy-view.getHeight()/2f);
+    }
+    public boolean uiTempVisible(){return tempWanted;}
+    public void uiSetTempVisible(boolean visible){
+        if(temp==null)return;
+        tempWanted=visible;
+        temp.setVisibility(visible&&HudLayout.visible(hudProfile,HudLayout.TEMP)?View.VISIBLE:View.GONE);
+        getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("temp",visible).apply();
+    }
+    /** The sources the readout can use on this device, for the sidebar (e.g. "CPU, GPU, BAT"). */
+    public String uiTemperatureSources(){return thermal==null?"":thermal.sources();}
+    /** Opens the screen layout editor over the game; the game stays alive behind it, as when the app is left. */
+    public void uiOpenLayoutEditor(){
+        if(!launch)return;
+        startActivity(new Intent(this,LayoutEditorActivity.class));
+    }
+    public boolean uiFpsVisible(){return fpsWanted;}
     public void uiSetFpsVisible(boolean visible){
         if(fps==null)return;
-        fps.setVisibility(visible?View.VISIBLE:View.GONE);
+        fpsWanted=visible;
+        fps.setVisibility(visible&&HudLayout.visible(hudProfile,HudLayout.FPS)?View.VISIBLE:View.GONE);
         getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("fps",visible).apply();
     }
     /** The player's pause. False when the game could not take it (not drawing yet), so the menu shows the truth. */
@@ -308,7 +375,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             }
             final String message=report;
             runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
-                if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);
+                if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);if(temp!=null)temp.setVisibility(View.GONE);
                     if(gameMenu!=null)gameMenu.getView().setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
                 else results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
         },"renut-runtime-validation").start();
@@ -340,6 +407,6 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     }
     // Leaving the screen no longer ends the game; only closing it does (onDestroy).
     @Override protected void onPause(){clearController();super.onPause();if(!launch){stop();finish();}}
-    @Override protected void onResume(){super.onResume();if(launch)setupController();}
+    @Override protected void onResume(){super.onResume();if(launch){setupController();applyHudLayout();}}
     @Override protected void onDestroy(){if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
 }

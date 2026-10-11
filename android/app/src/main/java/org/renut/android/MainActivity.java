@@ -172,6 +172,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
         i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
         i.putExtra("fps",getPreferences(0).getBoolean("fps",false));
+        i.putExtra("temp",getPreferences(0).getBoolean("temp",false));
         i.putExtra("showControls",getPreferences(0).getBoolean("showControls",true));
         boolean turnip=uiDriverIsTurnip();
         i.putExtra("oneUiFix",turnip&&getPreferences(0).getBoolean("oneui",true));
@@ -298,6 +299,15 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     public void uiSetAutoStart(boolean value){getPreferences(0).edit().putBoolean("autoStart",value).apply();}
     public boolean uiShowControls(){return getPreferences(0).getBoolean("showControls",true);}
     public void uiSetShowControls(boolean value){getPreferences(0).edit().putBoolean("showControls",value).apply();}
+    public boolean uiTempEnabled(){return getPreferences(0).getBoolean("temp",false);}
+    public void uiSetTemp(boolean value){getPreferences(0).edit().putBoolean("temp",value).apply();}
+    /** Names of the screen layout profiles ("default" is the built-in one) and the one in use. */
+    public java.util.List<String> uiLayoutNames(){return HudLayout.names(this);}
+    public String uiLayoutSelected(){return HudLayout.selectedName(this);}
+    public void uiSelectLayout(String name){
+        try{HudLayout.select(this,name);}catch(IOException e){Toast.makeText(this,e.getMessage(),Toast.LENGTH_LONG).show();}
+    }
+    public void uiOpenLayoutEditor(){if(worker==null)startActivity(new Intent(this,LayoutEditorActivity.class));}
     public boolean uiFpsEnabled(){return getPreferences(0).getBoolean("fps",false);}
     public void uiSetFps(boolean value){getPreferences(0).edit().putBoolean("fps",value).apply();refresh();}
     public boolean uiOneUiEnabled(){return getPreferences(0).getBoolean("oneui",true);}

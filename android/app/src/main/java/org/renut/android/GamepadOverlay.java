@@ -36,13 +36,16 @@ final class GamepadOverlay extends View {
     private static final class Control {
         final int kind, mask, index;
         final String label;
+        final String id;      // the element's name in HudLayout
         final int color;
         float cx, cy, r;      // circles
         final RectF rect = new RectF(); // triggers and bumpers
         boolean pressed;
+        boolean hidden;       // the profile leaves it out: neither drawn nor touchable
+        float opacity = 1f;   // the profile's, for this control alone
         float valueX, valueY; // stick deflection or trigger value
-        Control(int kind, int mask, int index, String label, int color) {
-            this.kind = kind; this.mask = mask; this.index = index; this.label = label; this.color = color;
+        Control(String id, int kind, int mask, int index, String label, int color) {
+            this.id = id; this.kind = kind; this.mask = mask; this.index = index; this.label = label; this.color = color;
         }
         boolean hit(float x, float y, float slop) {
             if (kind == K_TRIGGER || (kind == K_BUTTON && !rect.isEmpty())) {
@@ -71,20 +74,20 @@ final class GamepadOverlay extends View {
     GamepadOverlay(Context context, Sink sink) {
         super(context);
         this.sink = sink;
-        leftStick = new Control(K_STICK, L3, 0, "", Color.WHITE);
-        rightStick = new Control(K_STICK, R3, 1, "", Color.WHITE);
-        dpad = new Control(K_DPAD, 0, 0, "", Color.WHITE);
+        leftStick = new Control(HudLayout.STICK_L, K_STICK, L3, 0, "", Color.WHITE);
+        rightStick = new Control(HudLayout.STICK_R, K_STICK, R3, 1, "", Color.WHITE);
+        dpad = new Control(HudLayout.DPAD, K_DPAD, 0, 0, "", Color.WHITE);
         controls = new Control[] {
-            new Control(K_TRIGGER, 0, 0, "LT", Color.WHITE),
-            new Control(K_TRIGGER, 0, 1, "RT", Color.WHITE),
-            new Control(K_BUTTON, LB, 0, "LB", Color.WHITE),
-            new Control(K_BUTTON, RB, 0, "RB", Color.WHITE),
-            new Control(K_BUTTON, BACK, 0, "BACK", Color.WHITE),
-            new Control(K_BUTTON, START, 0, "START", Color.WHITE),
-            new Control(K_BUTTON, A, 0, "A", Color.rgb(93, 187, 47)),
-            new Control(K_BUTTON, B, 0, "B", Color.rgb(216, 39, 42)),
-            new Control(K_BUTTON, X, 0, "X", Color.rgb(30, 115, 190)),
-            new Control(K_BUTTON, Y, 0, "Y", Color.rgb(245, 184, 0)),
+            new Control(HudLayout.LT, K_TRIGGER, 0, 0, "LT", Color.WHITE),
+            new Control(HudLayout.RT, K_TRIGGER, 0, 1, "RT", Color.WHITE),
+            new Control(HudLayout.LB, K_BUTTON, LB, 0, "LB", Color.WHITE),
+            new Control(HudLayout.RB, K_BUTTON, RB, 0, "RB", Color.WHITE),
+            new Control(HudLayout.BACK, K_BUTTON, BACK, 0, "BACK", Color.WHITE),
+            new Control(HudLayout.START, K_BUTTON, START, 0, "START", Color.WHITE),
+            new Control(HudLayout.A, K_BUTTON, A, 0, "A", Color.rgb(93, 187, 47)),
+            new Control(HudLayout.B, K_BUTTON, B, 0, "B", Color.rgb(216, 39, 42)),
+            new Control(HudLayout.X, K_BUTTON, X, 0, "X", Color.rgb(30, 115, 190)),
+            new Control(HudLayout.Y, K_BUTTON, Y, 0, "Y", Color.rgb(245, 184, 0)),
             leftStick, rightStick, dpad,
         };
         line.setStyle(Paint.Style.STROKE);
@@ -93,35 +96,34 @@ final class GamepadOverlay extends View {
         setClickable(true);
     }
 
-    private Control find(String label) {
-        for (Control c : controls) if (label.equals(c.label)) return c;
-        throw new IllegalStateException(label);
+    private HudLayout.Profile profile;
+
+    /** The profile that says where each control sits, how big it is and whether it is shown. */
+    void setLayout(HudLayout.Profile layout) {
+        cancelTouches();
+        profile = layout;
+        applyLayout(getWidth(), getHeight());
+        invalidate();
     }
 
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+        applyLayout(w, h);
+    }
+
+    private void applyLayout(int w, int h) {
+        if (w <= 0 || h <= 0) return;
         float u = Math.min(w, h) / 10f; // layout unit
-        float side = Math.max(u * 0.4f, w * 0.02f);
-        // Triggers along the top corners, bumpers just below them.
-        find("LT").rect.set(side, u * 0.3f, side + u * 2.2f, u * 1.3f);
-        find("RT").rect.set(w - side - u * 2.2f, u * 0.3f, w - side, u * 1.3f);
-        find("LB").rect.set(side, u * 1.55f, side + u * 2.2f, u * 2.35f);
-        find("RB").rect.set(w - side - u * 2.2f, u * 1.55f, w - side, u * 2.35f);
-        // Left stick high, D-pad low and further in, as on the 360 pad.
-        place(leftStick, side + u * 1.9f, h * 0.52f, u * 1.55f);
-        place(dpad, side + u * 5.0f, h - u * 1.9f, u * 1.45f);
-        // Face buttons high on the right, right stick low and further in.
-        float fx = w - side - u * 2.1f, fy = h * 0.47f, gap = u * 1.05f, br = u * 0.62f;
-        place(find("Y"), fx, fy - gap, br);
-        place(find("X"), fx - gap, fy, br);
-        place(find("B"), fx + gap, fy, br);
-        place(find("A"), fx, fy + gap, br);
-        place(rightStick, w - side - u * 5.0f, h - u * 1.9f, u * 1.45f);
-        // Back and Start centred near the top.
-        float cy = u * 0.95f;
-        Control back = find("BACK"), start = find("START");
-        back.rect.set(w / 2f - u * 2.9f, cy - u * 0.38f, w / 2f - u * 1.0f, cy + u * 0.38f);
-        start.rect.set(w / 2f + u * 1.0f, cy - u * 0.38f, w / 2f + u * 2.9f, cy + u * 0.38f);
+        for (Control c : controls) {
+            HudLayout.Shape shape = HudLayout.shape(profile, c.id, w, h);
+            c.hidden = !HudLayout.visible(profile, c.id);
+            c.opacity = HudLayout.opacity(profile, c.id);
+            if (shape.circle) {
+                place(c, shape.cx, shape.cy, shape.r);
+            } else {
+                c.rect.set(shape.cx - shape.hw, shape.cy - shape.hh, shape.cx + shape.hw, shape.cy + shape.hh);
+            }
+        }
         text.setTextSize(u * 0.42f);
         line.setStrokeWidth(Math.max(2f, u * 0.05f));
     }
@@ -133,6 +135,15 @@ final class GamepadOverlay extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         for (Control c : controls) {
+            if (c.hidden) continue;
+            // One layer per control that is not fully opaque: everything it draws is faded together.
+            final boolean faded = c.opacity < 0.999f;
+            if (faded) {
+                float pad = c.kind == K_BUTTON && !c.rect.isEmpty() || c.kind == K_TRIGGER ? 4f : c.r + 4f;
+                RectF bounds = c.rect.isEmpty() ? new RectF(c.cx - pad, c.cy - pad, c.cx + pad, c.cy + pad)
+                        : new RectF(c.rect.left - 4, c.rect.top - 4, c.rect.right + 4, c.rect.bottom + 4);
+                canvas.saveLayerAlpha(bounds, Math.round(255 * c.opacity));
+            }
             int alpha = c.pressed ? 150 : 70;
             fill.setColor(c.color); fill.setAlpha(alpha);
             line.setColor(Color.WHITE); line.setAlpha(c.pressed ? 220 : 130);
@@ -178,6 +189,7 @@ final class GamepadOverlay extends View {
                     drawDpad(canvas, c);
                     break;
             }
+            if (faded) canvas.restore();
         }
     }
 
@@ -247,7 +259,7 @@ final class GamepadOverlay extends View {
         float slop = Math.min(getWidth(), getHeight()) / 40f;
         Control best = null;
         for (Control c : controls) {
-            if (c == exclude || !c.hit(x, y, slop)) continue;
+            if (c == exclude || c.hidden || !c.hit(x, y, slop)) continue;
             best = c;
             break;
         }

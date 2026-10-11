@@ -60,6 +60,19 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.ComposeView
+import android.content.Context
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Thermostat
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.Canvas
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -100,6 +113,12 @@ object ComposeScreens {
         activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { RuntimeScreen(activity) } } })
     }
     @JvmStatic fun createGameMenu(activity: RuntimeActivity): GameMenu = GameMenu(activity)
+    @JvmStatic fun showLayoutList(activity: LayoutEditorActivity, model: LayoutListModel) {
+        activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { LayoutListScreen(activity, model) } } })
+    }
+    @JvmStatic fun showLayoutEditor(activity: LayoutEditorActivity, model: LayoutEditorModel) {
+        activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { LayoutEditorScreen(activity, model) } } })
+    }
     @JvmStatic fun showWelcome(activity: WelcomeActivity, model: WelcomeModel) {
         activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { WelcomeScreen(activity, model) } } })
     }
@@ -507,6 +526,7 @@ private val SKIN_LABELS = listOf(
         dismissButton = { TextButton(onClick = { confirmDeleteDriver = false }) { Text(stringResource(R.string.common_cancel)) } })
     val busy = activity.uiBusy()
     val fpsEnabled = activity.uiFpsEnabled()
+    val tempEnabled = activity.uiTempEnabled()
     val controlsEnabled = activity.uiShowControls()
     val oneUiEnabled = activity.uiOneUiEnabled()
     val tuMode = activity.uiTuMode()
@@ -542,6 +562,7 @@ private val SKIN_LABELS = listOf(
         item {
             Panel(stringResource(R.string.settings_display)) {
                 ToggleRow(stringResource(R.string.settings_fps), fpsEnabled, !busy) { activity.uiSetFps(it) }
+                ToggleRow(stringResource(R.string.settings_temp), tempEnabled, !busy) { activity.uiSetTemp(it) }
                 ToggleRow(stringResource(R.string.settings_uncap), uncapFps, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_uncap_fps", it.toString())
                 }
@@ -551,6 +572,7 @@ private val SKIN_LABELS = listOf(
         item {
             Panel(stringResource(R.string.settings_controls)) {
                 ToggleRow(stringResource(R.string.settings_show_controls), controlsEnabled, !busy) { activity.uiSetShowControls(it) }
+                ActionButton(stringResource(R.string.layouts_manage), !busy, outlined = true) { activity.uiOpenLayoutEditor() }
                 ActionButton(stringResource(R.string.settings_external), !busy, outlined = true) { activity.uiAction("Configurar controle externo") }
             }
         }
@@ -586,7 +608,6 @@ private val SKIN_LABELS = listOf(
                 ToggleRow(stringResource(R.string.settings_adpf), sustained, !busy) {
                     activity.uiSetRuntimeOption("renut_adpf", it.toString())
                 }
-                Text(stringResource(R.string.settings_adpf_note), color = Muted, fontSize = 12.sp)
                 ToggleRow(stringResource(R.string.settings_no_cao), noContactShadows, !busy) {
                     activity.uiSetRuntimeOption("renut_disable_cao", it.toString())
                 }
@@ -781,6 +802,7 @@ private val SidebarWidth = 360.dp
 @Composable private fun ColumnScope.SidebarMain(activity: RuntimeActivity, menu: GameMenu) {
     var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
     var fpsVisible by remember { mutableStateOf(activity.uiFpsVisible()) }
+    var tempVisible by remember { mutableStateOf(activity.uiTempVisible()) }
     // The summary line is read from the files the runtime keeps, off the main thread.
     val snapshot by produceState<Achievements.Snapshot?>(null) {
         value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
@@ -810,6 +832,14 @@ private val SidebarWidth = 360.dp
         SidebarToggle(Icons.Default.Speed, stringResource(R.string.settings_fps), fpsVisible) {
             fpsVisible = it
             activity.uiSetFpsVisible(it)
+        }
+        SidebarToggle(Icons.Default.Thermostat, stringResource(R.string.settings_temp), tempVisible) {
+            tempVisible = it
+            activity.uiSetTempVisible(it)
+        }
+        SidebarItem(Icons.Default.Tune, stringResource(R.string.layouts_manage)) {
+            menu.close()
+            activity.uiOpenLayoutEditor()
         }
         SidebarItem(Icons.AutoMirrored.Filled.ExitToApp, stringResource(R.string.menu_exit)) { activity.finish() }
     }
@@ -1076,4 +1106,386 @@ private val SidebarWidth = 360.dp
             Text(model.error.ifEmpty { stringResource(R.string.fail_unknown) }, color = Text, fontSize = 15.sp)
         }
     }
+}
+
+// ---- Screen layout: saved layouts and the editor ------------------------------------------------------
+
+/** The saved layouts: which exist and which one the game uses. The list screen shows and changes them. */
+class LayoutListModel(private val context: Context) {
+    var names by mutableStateOf(HudLayout.names(context))
+    var selected by mutableStateOf(HudLayout.selectedName(context))
+
+    fun refresh() {
+        names = HudLayout.names(context)
+        selected = HudLayout.selectedName(context)
+    }
+
+    fun use(name: String) {
+        runCatching { HudLayout.select(context, name) }
+        refresh()
+    }
+
+    fun delete(name: String) {
+        runCatching { HudLayout.delete(context, name) }
+        refresh()
+    }
+
+    /** 0 created, 1 no name, 2 the name is taken. The new layout starts as the built-in one and becomes the one in use. */
+    fun create(raw: String): Int {
+        val name = raw.trim().take(24)
+        if (name.isEmpty()) return 1
+        if (name.equals(HudLayout.DEFAULT, ignoreCase = true) || names.any { it.equals(name, ignoreCase = true) }) return 2
+        runCatching { HudLayout.save(context, HudLayout.Profile(name)) }
+        refresh()
+        return 0
+    }
+}
+
+/**
+ * What the editor works on: a copy of one profile, the element picked, and whether the copy
+ * differs from what is saved. Elements are moved in place, so [revision] is what tells Compose
+ * to redraw.
+ */
+class LayoutEditorModel(private val context: Context, initial: String) {
+    var profile by mutableStateOf(HudLayout.load(context, initial))
+    var names by mutableStateOf(HudLayout.names(context))
+    var picked by mutableStateOf<String?>(null)
+    var revision by mutableIntStateOf(0)
+    var dirty by mutableStateOf(false)
+    /** The "save the changes?" question, raised by Back while there are unsaved ones. */
+    var asking by mutableStateOf(false)
+
+    fun touch() { revision++; dirty = true }
+
+    /** False when this is the built-in profile, which is never overwritten: the caller asks for a name. */
+    fun save(): Boolean {
+        if (profile.isDefault()) return false
+        runCatching { HudLayout.save(context, profile) }
+        names = HudLayout.names(context)
+        dirty = false
+        return true
+    }
+
+    /** 0 saved, 1 no name, 2 the name is taken. */
+    fun saveAs(raw: String): Int {
+        val name = raw.trim().take(24)
+        if (name.isEmpty()) return 1
+        if (name.equals(HudLayout.DEFAULT, ignoreCase = true) || names.any { it.equals(name, ignoreCase = true) }) return 2
+        profile = profile.copy(name)
+        runCatching { HudLayout.save(context, profile) }
+        names = HudLayout.names(context)
+        dirty = false
+        revision++
+        return 0
+    }
+
+    fun resetPicked() {
+        val id = picked ?: return
+        val item = profile.item(id)
+        item.placed = false
+        item.scale = 1f
+        item.visible = true
+        touch()
+    }
+}
+
+private val EDITOR_LABELS = mapOf(
+    HudLayout.LT to "LT", HudLayout.RT to "RT", HudLayout.LB to "LB", HudLayout.RB to "RB",
+    HudLayout.STICK_L to "L", HudLayout.STICK_R to "R", HudLayout.DPAD to "D-PAD",
+    HudLayout.Y to "Y", HudLayout.X to "X", HudLayout.B to "B", HudLayout.A to "A",
+    HudLayout.BACK to "BACK", HudLayout.START to "START")
+
+private fun editorColor(id: String): Color = when (id) {
+    HudLayout.A -> Color(0xFF5DBB2F)
+    HudLayout.B -> Color(0xFFD8272A)
+    HudLayout.X -> Color(0xFF1E73BE)
+    HudLayout.Y -> Color(0xFFF5B800)
+    HudLayout.FPS -> Color(0xFF78FF78)
+    HudLayout.TEMP -> Color(0xFFFFC46E)
+    else -> Color.White
+}
+
+@Composable private fun layoutProfileLabel(name: String): String =
+    if (name == HudLayout.DEFAULT) stringResource(R.string.layout_default) else name
+
+@Composable private fun layoutItemName(id: String): String = when (id) {
+    HudLayout.LT -> stringResource(R.string.layout_item_lt)
+    HudLayout.RT -> stringResource(R.string.layout_item_rt)
+    HudLayout.LB -> stringResource(R.string.layout_item_lb)
+    HudLayout.RB -> stringResource(R.string.layout_item_rb)
+    HudLayout.STICK_L -> stringResource(R.string.layout_item_stick_l)
+    HudLayout.STICK_R -> stringResource(R.string.layout_item_stick_r)
+    HudLayout.DPAD -> stringResource(R.string.layout_item_dpad)
+    HudLayout.BACK -> stringResource(R.string.layout_item_back)
+    HudLayout.START -> stringResource(R.string.layout_item_start)
+    HudLayout.FPS -> stringResource(R.string.settings_fps)
+    HudLayout.TEMP -> stringResource(R.string.settings_temp)
+    else -> stringResource(R.string.layout_item_face, id.uppercase())
+}
+
+/** The element under a touch, the one drawn last (on top) first. */
+private fun pickElement(model: LayoutEditorModel, at: androidx.compose.ui.geometry.Offset, size: IntSize): String? {
+    if (size.width <= 0) return null
+    val slop = minOf(size.width, size.height) / 40f
+    for (id in HudLayout.IDS.reversed()) {
+        if (HudLayout.shape(model.profile, id, size.width, size.height).contains(at.x, at.y, slop)) return id
+    }
+    return null
+}
+
+private fun moveElement(model: LayoutEditorModel, id: String, by: androidx.compose.ui.geometry.Offset, size: IntSize) {
+    if (size.width <= 0) return
+    val shape = HudLayout.shape(model.profile, id, size.width, size.height)
+    val item = model.profile.item(id)
+    item.placed = true
+    item.x = HudLayout.clamp((shape.cx + by.x) / size.width, 0f, 1f)
+    item.y = HudLayout.clamp((shape.cy + by.y) / size.height, 0f, 1f)
+    model.touch()
+}
+
+/** A name for a new layout; asks again with the reason while the answer is not usable. */
+@Composable private fun LayoutNameDialog(
+    title: String, initial: String, confirmLabel: String, onDismiss: () -> Unit, onConfirm: (String) -> Int
+) {
+    var name by remember { mutableStateOf(initial) }
+    var problem by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                OutlinedTextField(name, { name = it.take(24); problem = false }, singleLine = true,
+                    label = { Text(stringResource(R.string.layout_name_hint)) })
+                if (problem) Text(stringResource(R.string.layout_name_taken), color = Color(0xFFFF8A80), fontSize = 12.sp)
+            }
+        },
+        confirmButton = { TextButton({ if (onConfirm(name) != 0) problem = true }) { Text(confirmLabel) } },
+        dismissButton = { TextButton(onDismiss) { Text(stringResource(R.string.common_cancel)) } })
+}
+
+@Composable private fun LayoutListScreen(activity: LayoutEditorActivity, model: LayoutListModel) {
+    var creating by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf<String?>(null) }
+    Column(Modifier.fillMaxSize().background(Background).systemBarsPadding()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton({ activity.finish() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.common_back), tint = Text) }
+            Text(stringResource(R.string.layouts_title), color = Text, fontWeight = FontWeight.Bold, fontSize = 21.sp,
+                modifier = Modifier.weight(1f))
+            Button({ creating = true }, shape = RoundedCornerShape(12.dp)) { Text(stringResource(R.string.layouts_new)) }
+        }
+        LazyColumn(
+            Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(model.names, key = { it }) { name ->
+                val active = name == model.selected
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = if (active) Color(0xFF2A2018) else Surface),
+                    shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth().clickable { model.use(name) }
+                ) {
+                    Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        RadioButton(selected = active, onClick = { model.use(name) })
+                        Column(Modifier.weight(1f)) {
+                            Text(layoutProfileLabel(name), color = Text, fontWeight = FontWeight.SemiBold, fontSize = 16.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            if (name == HudLayout.DEFAULT) Text(stringResource(R.string.layouts_builtin), color = Muted, fontSize = 12.sp)
+                            else if (active) Text(stringResource(R.string.layouts_active), color = Accent, fontSize = 12.sp)
+                        }
+                        // The built-in layout is a fixed starting point: it can be used and copied, not edited.
+                        if (name != HudLayout.DEFAULT) {
+                            OutlinedButton({ activity.edit(name) }, shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp)) { Text(stringResource(R.string.layouts_edit)) }
+                            OutlinedButton({ deleting = name }, shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp)) { Text(stringResource(R.string.layout_delete)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (creating) LayoutNameDialog(
+        stringResource(R.string.layouts_new), "", stringResource(R.string.layouts_create),
+        onDismiss = { creating = false },
+        onConfirm = { entered ->
+            val result = model.create(entered)
+            if (result == 0) { creating = false; activity.edit(entered.trim().take(24)) }
+            result
+        })
+    deleting?.let { name ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text(stringResource(R.string.layout_delete_title)) },
+            text = { Text(stringResource(R.string.layout_delete_message, name)) },
+            confirmButton = { TextButton({ deleting = null; model.delete(name) }) { Text(stringResource(R.string.layout_delete)) } },
+            dismissButton = { TextButton({ deleting = null }) { Text(stringResource(R.string.common_cancel)) } })
+    }
+}
+
+@Composable private fun LayoutEditorScreen(activity: LayoutEditorActivity, model: LayoutEditorModel) {
+    var size by remember { mutableStateOf(IntSize.Zero) }
+    var dragging by remember { mutableStateOf<String?>(null) }
+    var askName by remember { mutableStateOf(false) }
+    // The panel can be moved out of the way of whatever is being placed; it starts in the middle,
+    // which the pad's own layout leaves free.
+    var panelShift by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    val labels = remember { android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = android.graphics.Paint.Align.CENTER
+        isFakeBoldText = true
+        color = android.graphics.Color.WHITE
+    } }
+    // What the temperature readout will show on this device (or an example where nothing can be read).
+    val sampleTemp = remember { runCatching { ThermalReader(context).read() }.getOrDefault("").ifEmpty { "BAT 36°" } }
+
+    Box(
+        Modifier.fillMaxSize().background(Color(0xFF0B0C0E)).onSizeChanged { size = it }
+            .pointerInput(Unit) { detectTapGestures { p -> model.picked = pickElement(model, p, size) } }
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragStart = { p ->
+                        dragging = pickElement(model, p, size)
+                        if (dragging != null) model.picked = dragging
+                    },
+                    onDrag = { change, amount ->
+                        change.consume()
+                        dragging?.let { moveElement(model, it, amount, size) }
+                    },
+                    onDragEnd = { dragging = null },
+                    onDragCancel = { dragging = null })
+            }
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            model.revision  // read: a moved element redraws
+            val w = this.size.width.toInt()
+            val h = this.size.height.toInt()
+            val canvas = drawContext.canvas.nativeCanvas
+            val unit = minOf(w, h) / 10f
+            drawRect(Color(0xFF121418))
+            for (id in HudLayout.IDS) {
+                val shape = HudLayout.shape(model.profile, id, w, h)
+                val shown = HudLayout.visible(model.profile, id)
+                val tint = editorColor(id)
+                val readout = HudLayout.isReadout(id)
+                // Each element is drawn with its own opacity, as the game will draw it.
+                val alpha = (if (shown) 1f else 0.25f) * HudLayout.opacity(model.profile, id)
+                val outline = if (id == model.picked) Color(0xFFFF9B45) else tint.copy(alpha = 0.8f * alpha)
+                val strokeWidth = if (id == model.picked) unit * 0.09f else unit * 0.05f
+                if (readout) {
+                    val text = if (id == HudLayout.FPS) "FPS 30.0" else sampleTemp
+                    labels.color = tint.copy(alpha = alpha).toArgb()
+                    labels.textSize = unit * 0.34f * (model.profile.items[id]?.scale ?: 1f)
+                    canvas.drawText(text, shape.cx, shape.cy + labels.textSize / 3f, labels)
+                    drawRoundRect(
+                        outline, androidx.compose.ui.geometry.Offset(shape.cx - shape.hw, shape.cy - shape.hh),
+                        androidx.compose.ui.geometry.Size(shape.hw * 2, shape.hh * 2),
+                        androidx.compose.ui.geometry.CornerRadius(unit * 0.15f), style = Stroke(strokeWidth))
+                    continue
+                }
+                val fill = tint.copy(alpha = 0.34f * alpha)
+                if (shape.circle) {
+                    drawCircle(fill, shape.r, androidx.compose.ui.geometry.Offset(shape.cx, shape.cy))
+                    drawCircle(outline, shape.r, androidx.compose.ui.geometry.Offset(shape.cx, shape.cy), style = Stroke(strokeWidth))
+                } else {
+                    val topLeft = androidx.compose.ui.geometry.Offset(shape.cx - shape.hw, shape.cy - shape.hh)
+                    val extent = androidx.compose.ui.geometry.Size(shape.hw * 2, shape.hh * 2)
+                    val corner = androidx.compose.ui.geometry.CornerRadius(minOf(shape.hh, shape.hw) * 0.7f)
+                    drawRoundRect(fill, topLeft, extent, corner)
+                    drawRoundRect(outline, topLeft, extent, corner, style = Stroke(strokeWidth))
+                }
+                labels.color = Color.White.copy(alpha = 0.95f * alpha).toArgb()
+                labels.textSize = unit * 0.36f
+                canvas.drawText(EDITOR_LABELS[id] ?: "", shape.cx, shape.cy + labels.textSize / 3f, labels)
+            }
+        }
+
+        val maxPanelHeight = with(density) { (size.height * 0.8f).toDp() }
+        Card(
+            Modifier.align(Alignment.Center)
+                .offset { androidx.compose.ui.unit.IntOffset(panelShift.x.toInt(), panelShift.y.toInt()) }
+                .widthIn(max = 292.dp).heightIn(max = maxPanelHeight)
+                // A touch on the panel is the panel's, not a pick of the element under it.
+                .pointerInput(Unit) { detectTapGestures { } },
+            colors = CardDefaults.cardColors(containerColor = Color(0xE61C1E21)), shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                // The title: drag here to move the panel.
+                Row(
+                    Modifier.fillMaxWidth().pointerInput(Unit) {
+                        detectDragGestures { change, amount ->
+                            change.consume()
+                            panelShift = androidx.compose.ui.geometry.Offset(panelShift.x + amount.x, panelShift.y + amount.y)
+                        }
+                    },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(stringResource(R.string.layout_title), color = Text, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        Text(layoutProfileLabel(model.profile.name), color = Accent, fontSize = 12.sp, maxLines = 1,
+                            overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    val picked = model.picked
+                    if (picked == null) {
+                        Text(stringResource(R.string.layout_hint), color = Muted, fontSize = 11.sp)
+                    } else {
+                        val item = model.profile.item(picked)
+                        model.revision  // the sliders follow resets
+                        Text(layoutItemName(picked), color = Text, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(stringResource(R.string.layout_size), color = Muted, fontSize = 12.sp, modifier = Modifier.width(64.dp))
+                            Slider(item.scale, { item.scale = it; model.touch() },
+                                valueRange = HudLayout.MIN_SCALE..HudLayout.MAX_SCALE, modifier = Modifier.weight(1f).height(28.dp))
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(stringResource(R.string.layout_opacity), color = Muted, fontSize = 12.sp, modifier = Modifier.width(64.dp))
+                            Slider(item.opacity, { item.opacity = it; model.touch() },
+                                valueRange = HudLayout.MIN_OPACITY..1f, modifier = Modifier.weight(1f).height(28.dp))
+                        }
+                        // A pad control cannot be hidden; the FPS and temperature readouts can.
+                        if (HudLayout.isReadout(picked)) Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(stringResource(R.string.layout_visible), color = Muted, fontSize = 12.sp, modifier = Modifier.width(64.dp))
+                            Switch(item.visible, { item.visible = it; model.touch() }, modifier = Modifier.scale(0.8f))
+                        }
+                        OutlinedButton({ model.resetPicked() }, Modifier.fillMaxWidth().height(34.dp), shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 8.dp)) {
+                            Text(stringResource(R.string.layout_reset_item), fontSize = 12.sp, maxLines = 1)
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 4.dp)) {
+                        Button({ if (!model.save()) askName = true }, Modifier.weight(1f).height(36.dp),
+                            enabled = model.dirty, shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 4.dp)) { Text(stringResource(R.string.layout_save), fontSize = 12.sp, maxLines = 1) }
+                        OutlinedButton({ askName = true }, Modifier.weight(1f).height(36.dp), shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 4.dp)) { Text(stringResource(R.string.layout_save_as), fontSize = 12.sp, maxLines = 1) }
+                        OutlinedButton({ activity.leave() }, Modifier.weight(1f).height(36.dp), shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 4.dp)) { Text(stringResource(R.string.layout_done), fontSize = 12.sp, maxLines = 1) }
+                    }
+                }
+            }
+        }
+    }
+
+    if (askName) LayoutNameDialog(
+        stringResource(R.string.layout_save_as_title), if (model.profile.isDefault()) "" else model.profile.name,
+        stringResource(R.string.layout_save), onDismiss = { askName = false },
+        onConfirm = { entered -> model.saveAs(entered).also { if (it == 0) askName = false } })
+    if (model.asking) AlertDialog(
+        onDismissRequest = { model.asking = false },
+        title = { Text(stringResource(R.string.layout_unsaved_title)) },
+        text = { Text(stringResource(R.string.layout_unsaved_message)) },
+        confirmButton = {
+            TextButton({
+                model.asking = false
+                if (model.save()) activity.finish() else askName = true
+            }) { Text(stringResource(R.string.layout_save)) }
+        },
+        dismissButton = {
+            Row {
+                TextButton({ model.asking = false }) { Text(stringResource(R.string.common_cancel)) }
+                TextButton({ model.asking = false; activity.finish() }) { Text(stringResource(R.string.layout_discard)) }
+            }
+        })
 }

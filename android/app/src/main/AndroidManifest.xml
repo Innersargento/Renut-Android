@@ -18,6 +18,9 @@
         <activity android:name=".WelcomeActivity" android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode" />
         <activity android:name=".ControllerSettingsActivity" android:exported="false" />
+        <!-- The screen layout editor; landscape, as the layout it edits is. -->
+        <activity android:name=".LayoutEditorActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode" />
         <activity android:name=".ProbeActivity" android:process=":gpu" android:exported="false" />
         <activity android:name=".RuntimeActivity" android:process=":runtime" android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
