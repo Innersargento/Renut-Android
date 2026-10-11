@@ -101,6 +101,8 @@
     <string name="settings_async">异步编译着色器和管线</string>
     <string name="settings_no_shadows">移除阴影</string>
     <string name="settings_no_bloom">移除泛光</string>
+    <string name="settings_adpf">持续性能 (ADPF)</string>
+    <string name="settings_adpf_note">向 Android 报告每帧耗时，使系统以能跟上游戏的最低处理器频率运行，避免过热。下一局生效；需要 Android 13 或更高版本。</string>
     <string name="settings_no_cao">移除接触阴影（CAO）</string>
     <string name="settings_footer">reNut · 开发预览版</string>
     <string name="driver_delete_title">删除驱动程序？</string>

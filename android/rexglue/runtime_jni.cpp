@@ -31,6 +31,7 @@
 #include <rex/system/xthread.h>
 #include <rex/input/input_system.h>
 #include "renut_android_init.h"
+#include "adpf.h"
 using rex::X_STATUS;
 extern const rex::PPCImageInfo PPCImageConfig;
 void renutSetContentActivity(JNIEnv*, jobject);
@@ -108,6 +109,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeS
 // jump of minutes for the physics.
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeBackground(JNIEnv*,jclass) {
   renut::d3d::SetBackground(true);
+  renut::adpf::SetActive(false);
   if(auto* plume=renut::PlumeRenderer::Get())plume->PauseForBackground();
   rex::chrono::Clock::set_guest_time_scalar(0.02);
   {
@@ -129,6 +131,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nat
   if(attached){
     rex::chrono::Clock::set_guest_time_scalar(1.0);
     renut::d3d::SetBackground(false);
+    renut::adpf::SetActive(!pause_wanted.load());
   }
   return attached?JNI_TRUE:JNI_FALSE;
 }
@@ -139,6 +142,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nat
   auto* plume=renut::PlumeRenderer::Get();
   if(!plume)return JNI_FALSE;
   pause_wanted=paused;
+  renut::adpf::SetActive(!paused);
   rex::system::XThread::SetTitlePaused(paused);
   plume->SetPaused(paused);
   renut::d3d::SetBackground(paused);
@@ -425,6 +429,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       note("Iniciando o ponto de entrada do Banjo; acompanhe rexglue-runtime.log.");
       auto thread=runtime.LaunchModule();
       if(!thread)throw std::runtime_error("Falha ao iniciar a thread principal do jogo.");
+      renut::adpf::Start();
       const auto started=std::chrono::steady_clock::now();
       while(!render_stopped && !game_context->HasQuitFromUIThread()){
         game_context->ExecutePendingFunctionsFromUIThread();game_window->Pump();
@@ -443,6 +448,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     }
     if(graphics){validateSwap(runtime,*graphics);note(graphics->report());}
     renut::TextInputStop();
+    renut::adpf::Stop();
     renut::AchievementsStop(runtime);
     ReleasePause();
     {

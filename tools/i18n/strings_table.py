@@ -169,6 +169,12 @@ add("settings_async", "Compilação assíncrona de shaders e pipelines", "Asynch
     "异步编译着色器和管线", "Compilación asíncrona de shaders y pipelines")
 add("settings_no_shadows", "Remover sombras", "Remove shadows", "移除阴影", "Quitar sombras")
 add("settings_no_bloom", "Remover bloom", "Remove bloom", "移除泛光", "Quitar bloom")
+add("settings_adpf", "Desempenho sustentado (ADPF)", "Sustained performance (ADPF)", "持续性能 (ADPF)",
+    "Rendimiento sostenido (ADPF)")
+add("settings_adpf_note", "Informa ao Android o tempo de cada quadro para ele manter o processador no menor clock que acompanha o jogo, sem superaquecer. Vale na próxima partida; precisa do Android 13 ou superior.",
+    "Tells Android how long each frame takes so it keeps the processor at the lowest clock that keeps up with the game, without overheating. Applies next session; needs Android 13 or newer.",
+    "向 Android 报告每帧耗时，使系统以能跟上游戏的最低处理器频率运行，避免过热。下一局生效；需要 Android 13 或更高版本。",
+    "Informa a Android cuánto tarda cada fotograma para que mantenga el procesador en la frecuencia más baja que sigue al juego, sin sobrecalentar. Se aplica en la próxima partida; requiere Android 13 o superior.")
 add("settings_no_cao", "Remover sombras de contato (CAO)", "Remove contact shadows (CAO)", "移除接触阴影（CAO）",
     "Quitar sombras de contacto (CAO)")
 add("settings_footer", "reNut · prévia de desenvolvimento", "reNut · development preview", "reNut · 开发预览版",

@@ -101,6 +101,8 @@
     <string name="settings_async">Compilación asíncrona de shaders y pipelines</string>
     <string name="settings_no_shadows">Quitar sombras</string>
     <string name="settings_no_bloom">Quitar bloom</string>
+    <string name="settings_adpf">Rendimiento sostenido (ADPF)</string>
+    <string name="settings_adpf_note">Informa a Android cuánto tarda cada fotograma para que mantenga el procesador en la frecuencia más baja que sigue al juego, sin sobrecalentar. Se aplica en la próxima partida; requiere Android 13 o superior.</string>
     <string name="settings_no_cao">Quitar sombras de contacto (CAO)</string>
     <string name="settings_footer">reNut · versión preliminar de desarrollo</string>
     <string name="driver_delete_title">¿Eliminar el controlador?</string>
