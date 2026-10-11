@@ -35,23 +35,23 @@ final class GameImporter {
         File stage = new File(files, "import-" + UUID.randomUUID());
         boolean committed = false;
         try {
-            if (!stage.mkdir()) throw new IOException("Não foi possível criar a pasta de importação.");
+            if (!stage.mkdir()) throw new IOException(Language.s(R.string.imp_stage_fail));
             File data = new File(stage, "data");
-            if (!data.mkdir()) throw new IOException("Não foi possível criar a pasta de dados.");
+            if (!data.mkdir()) throw new IOException(Language.s(R.string.imp_data_fail));
             File xex;
             if (wholeDisc) {
                 File iso = new File(stage, "source.iso");
                 long size = sizeOf(context, source);
-                progress.update("Copiando a imagem para o aparelho…", 0);
+                progress.update(Language.s(R.string.imp_copy_image), 0);
                 copy(context, source, iso, ISO_LIMIT, copied -> progress.update(
-                        "Copiando a imagem · " + copied / (1024 * 1024) + " MB",
+                        Language.s(R.string.imp_copy_image_mb, copied / (1024 * 1024)),
                         size > 0 ? Math.min(1.0, copied / (double) size) * COPY_SHARE : -1));
                 try (RandomAccessFile input = new RandomAccessFile(iso, "r")) {
                     DiscImage disc = new DiscImage(input);
                     DiscImage.Entry executable = disc.entries().stream()
                             .filter(e -> e.path.equalsIgnoreCase("default.xex")).findFirst()
-                            .orElseThrow(() -> new IOException("Esta imagem não tem o executável do jogo (default.xex)."));
-                    if (executable.size > XEX_LIMIT) throw new IOException("XEX excessivamente grande.");
+                            .orElseThrow(() -> new IOException(Language.s(R.string.imp_no_xex)));
+                    if (executable.size > XEX_LIMIT) throw new IOException(Language.s(R.string.imp_xex_big));
                     File check = new File(stage, "check.xex");
                     try (OutputStream out = new FileOutputStream(check)) {
                         input.seek(executable.offset);
@@ -66,23 +66,23 @@ final class GameImporter {
                     }
                     GameFiles.requireEuropean(check);
                     Files.delete(check.toPath());
-                    progress.update("Extraindo os arquivos do jogo…", COPY_SHARE);
-                    disc.extract(data, (done, total) -> progress.update("Extraindo os arquivos do jogo…",
+                    progress.update(Language.s(R.string.imp_extract), COPY_SHARE);
+                    disc.extract(data, (done, total) -> progress.update(Language.s(R.string.imp_extract),
                             total > 0 ? COPY_SHARE + (1 - COPY_SHARE) * Math.min(1.0, done / (double) total) : -1));
                 }
                 Files.delete(iso.toPath());
                 xex = Arrays.stream(Objects.requireNonNull(data.listFiles()))
                         .filter(f -> f.getName().equalsIgnoreCase("default.xex")).findFirst()
-                        .orElseThrow(() -> new IOException("XEX ausente."));
-                if (!new File(data, "full-disc.marker").createNewFile()) throw new IOException("Falha ao registrar importação.");
+                        .orElseThrow(() -> new IOException(Language.s(R.string.imp_xex_missing)));
+                if (!new File(data, "full-disc.marker").createNewFile()) throw new IOException(Language.s(R.string.imp_marker_fail));
             } else {
                 xex = new File(data, "default.xex");
-                progress.update("Copiando o executável…", -1);
-                copy(context, source, xex, XEX_LIMIT, copied -> progress.update("Copiando o executável…", -1));
+                progress.update(Language.s(R.string.imp_copy_xex), -1);
+                copy(context, source, xex, XEX_LIMIT, copied -> progress.update(Language.s(R.string.imp_copy_xex), -1));
             }
-            progress.update("Verificando o executável…", 0.99);
+            progress.update(Language.s(R.string.imp_verify), 0.99);
             GameFiles.requireEuropean(xex);
-            if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Importação cancelada.");
+            if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException(Language.s(R.string.import_cancelled));
             String previous = activeFolder(files);
             GameFiles.atomicWrite(new File(files, "active-game.txt"), stage.getName() + "/data");
             committed = true;
@@ -125,15 +125,15 @@ final class GameImporter {
     private static void copy(Context context, Uri source, File target, long limit, Bytes progress) throws IOException {
         try (InputStream in = context.getContentResolver().openInputStream(source);
              OutputStream out = new FileOutputStream(target)) {
-            if (in == null) throw new IOException("Arquivo inacessível.");
+            if (in == null) throw new IOException(Language.s(R.string.imp_unreadable));
             byte[] buffer = new byte[1024 * 1024];
             long total = 0;
             int count;
             while ((count = in.read(buffer)) != -1) {
-                if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Importação cancelada.");
+                if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException(Language.s(R.string.import_cancelled));
                 total += count;
-                if (total > limit) throw new IOException("Arquivo excede o limite de importação.");
-                if (target.getUsableSpace() < count + 64L * 1024 * 1024) throw new IOException("Espaço livre insuficiente.");
+                if (total > limit) throw new IOException(Language.s(R.string.imp_limit));
+                if (target.getUsableSpace() < count + 64L * 1024 * 1024) throw new IOException(Language.s(R.string.imp_no_space));
                 out.write(buffer, 0, count);
                 progress.done(total);
             }

@@ -36,6 +36,7 @@ final class TextPrompt extends FrameLayout {
     private final LinearLayout card;
     private final TextView heading, detail, counter;
     private final EditText field;
+    private final Button cancelButton, okButton;
     private int maxLength;
     private boolean showing;
 
@@ -102,14 +103,14 @@ final class TextPrompt extends FrameLayout {
         LinearLayout buttons = new LinearLayout(context);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         buttons.setGravity(Gravity.END);
-        Button cancel = button("Cancelar", false);
-        cancel.setOnClickListener(v -> cancel());
-        Button ok = button("OK", true);
-        ok.setOnClickListener(v -> accept());
+        cancelButton = button(Language.s(R.string.common_cancel), false);
+        cancelButton.setOnClickListener(v -> cancel());
+        okButton = button(Language.s(R.string.common_ok), true);
+        okButton.setOnClickListener(v -> accept());
         LinearLayout.LayoutParams buttonAt = new LinearLayout.LayoutParams(-2, dp(44));
         buttonAt.leftMargin = dp(10);
-        buttons.addView(cancel, buttonAt);
-        buttons.addView(ok, buttonAt);
+        buttons.addView(cancelButton, buttonAt);
+        buttons.addView(okButton, buttonAt);
         LinearLayout.LayoutParams buttonsAt = new LinearLayout.LayoutParams(-1, -2);
         buttonsAt.topMargin = dp(6);
         card.addView(buttons, buttonsAt);
@@ -126,7 +127,9 @@ final class TextPrompt extends FrameLayout {
     void show(String title, String description, String initial, int maxLength) {
         if (showing) answer("", true);
         this.maxLength = Math.max(1, maxLength);
-        heading.setText(title == null || title.isEmpty() ? "Digite o texto" : title);
+        cancelButton.setText(Language.s(R.string.common_cancel));
+        okButton.setText(Language.s(R.string.common_ok));
+        heading.setText(title == null || title.isEmpty() ? Language.s(R.string.textbox_default_title) : title);
         detail.setText(description == null ? "" : description);
         detail.setVisibility(description == null || description.isEmpty() ? GONE : VISIBLE);
         field.setFilters(new InputFilter[] { new InputFilter.LengthFilter(this.maxLength) });

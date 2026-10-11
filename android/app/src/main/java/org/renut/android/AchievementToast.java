@@ -55,7 +55,7 @@ final class AchievementToast extends LinearLayout {
         text.setOrientation(VERTICAL);
         text.setPadding(dp(12), 0, 0, 0);
         TextView heading = new TextView(context);
-        heading.setText("CONQUISTA DESBLOQUEADA");
+        heading.setText(Language.s(R.string.ach_toast_heading));
         heading.setTextColor(Color.rgb(255, 155, 69));
         heading.setTextSize(11);
         heading.setTypeface(null, Typeface.BOLD);

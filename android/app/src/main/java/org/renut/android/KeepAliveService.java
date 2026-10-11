@@ -20,6 +20,10 @@ import android.os.IBinder;
  * brings the game to the front.
  */
 public final class KeepAliveService extends Service {
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(Language.attach(base));
+    }
+
     private static final String CHANNEL = "renut_game";
     private static final int ID = 1;
 
@@ -41,7 +45,7 @@ public final class KeepAliveService extends Service {
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= 26 && manager != null) {
             manager.createNotificationChannel(new NotificationChannel(
-                CHANNEL, "Jogo em execução", NotificationManager.IMPORTANCE_LOW));
+                CHANNEL, Language.s(R.string.service_channel), NotificationManager.IMPORTANCE_LOW));
         }
         // The launcher intent of an app that is already running brings its task forward.
         Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
@@ -52,7 +56,7 @@ public final class KeepAliveService extends Service {
         Notification notification = builder
             .setSmallIcon(R.drawable.ic_renut)
             .setContentTitle("reNut")
-            .setContentText("O jogo está aberto. Toque para voltar.")
+            .setContentText(Language.s(R.string.service_text))
             .setOngoing(true)
             .setContentIntent(tap)
             .build();

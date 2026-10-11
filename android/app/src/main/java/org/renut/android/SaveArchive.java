@@ -19,14 +19,14 @@ final class SaveArchive {
     }
     private static void collect(File root,File dir,List<String> names)throws IOException {
         File[] children=dir.listFiles();
-        if(children==null)throw new IOException("Pasta de saves inacessível.");
+        if(children==null)throw new IOException(Language.s(R.string.save_folder));
         for(File child:children){
             if(Files.isSymbolicLink(child.toPath()))continue;
             if(child.isDirectory())collect(root,child,names);
             else if(child.isFile()){
                 String name=root.toPath().relativize(child.toPath()).toString().replace(File.separatorChar,'/');
                 if(isSavePath(name)){
-                    if(names.size()>=MAX_FILES)throw new IOException("Há arquivos demais para exportar.");
+                    if(names.size()>=MAX_FILES)throw new IOException(Language.s(R.string.save_too_many));
                     names.add(name);
                 }
             }
@@ -44,13 +44,13 @@ final class SaveArchive {
     }
     static void exportZip(File root,OutputStream output)throws IOException {
         List<String> names=list(root);
-        if(names.isEmpty())throw new IOException("Nenhum save encontrado.");
+        if(names.isEmpty())throw new IOException(Language.s(R.string.save_none));
         long total=0;
         try(ZipOutputStream zip=new ZipOutputStream(output)){
             byte[] buffer=new byte[65536];
             for(String name:names){
                 File file=new File(root,name.replace('/',File.separatorChar));
-                total+=file.length();if(total>MAX_BYTES)throw new IOException("Saves excedem 512 MB.");
+                total+=file.length();if(total>MAX_BYTES)throw new IOException(Language.s(R.string.save_size));
                 zip.putNextEntry(new ZipEntry(name));
                 try(InputStream in=new FileInputStream(file)){int n;while((n=in.read(buffer))!=-1)zip.write(buffer,0,n);}
                 zip.closeEntry();
@@ -59,7 +59,7 @@ final class SaveArchive {
     }
     static void importZip(File root,InputStream input)throws IOException {
         File stage=new File(root.getParentFile(),"save-import-"+UUID.randomUUID());
-        if(!stage.mkdir())throw new IOException("Não foi possível preparar a importação.");
+        if(!stage.mkdir())throw new IOException(Language.s(R.string.save_prepare));
         try{
             int count=0;long total=0;byte[] buffer=new byte[65536];Set<String> names=new HashSet<>();
             try(ZipInputStream zip=new ZipInputStream(input)){
@@ -68,25 +68,25 @@ final class SaveArchive {
                     String name=entry.getName();
                     if(entry.isDirectory())continue;
                     if(!isSavePath(name)||!names.add(name)||++count>MAX_FILES)
-                        throw new IOException("ZIP contém caminho inválido ou arquivos demais.");
+                        throw new IOException(Language.s(R.string.save_zip_path));
                     File out=new File(stage,name.replace('/',File.separatorChar));
                     if(!out.getCanonicalPath().startsWith(stage.getCanonicalPath()+File.separator))
-                        throw new IOException("Caminho inválido no ZIP.");
-                    if(!out.getParentFile().isDirectory()&&!out.getParentFile().mkdirs())throw new IOException("Falha ao criar pasta de save.");
+                        throw new IOException(Language.s(R.string.save_zip_path2));
+                    if(!out.getParentFile().isDirectory()&&!out.getParentFile().mkdirs())throw new IOException(Language.s(R.string.save_mkdir));
                     try(OutputStream file=new FileOutputStream(out)){
                         int n;while((n=zip.read(buffer))!=-1){
-                            total+=n;if(total>MAX_BYTES)throw new IOException("ZIP de saves excede 512 MB.");
+                            total+=n;if(total>MAX_BYTES)throw new IOException(Language.s(R.string.save_zip_size));
                             file.write(buffer,0,n);
                         }
                     }
                     zip.closeEntry();
                 }
             }
-            if(count==0)throw new IOException("ZIP não contém saves compatíveis.");
+            if(count==0)throw new IOException(Language.s(R.string.save_zip_empty));
             for(String name:names){
                 File source=new File(stage,name.replace('/',File.separatorChar));
                 File target=new File(root,name.replace('/',File.separatorChar));
-                if(!target.getParentFile().isDirectory()&&!target.getParentFile().mkdirs())throw new IOException("Falha ao criar pasta de destino.");
+                if(!target.getParentFile().isDirectory()&&!target.getParentFile().mkdirs())throw new IOException(Language.s(R.string.save_dest));
                 Files.move(source.toPath(),target.toPath(),StandardCopyOption.REPLACE_EXISTING);
             }
         }finally{GameFiles.removeTree(stage);}

@@ -11,13 +11,8 @@ import org.json.JSONObject;
 /** Android gamepad bindings, stored separately for each device descriptor. */
 final class ExternalController {
     static final int BUTTON_COUNT = 14, TRIGGER_START = 14, AXIS_START = 16, COUNT = 20;
-    static final String[] LABELS = {
-        "Direcional cima", "Direcional baixo", "Direcional esquerda", "Direcional direita",
-        "Start", "Back", "L3", "R3", "LB", "RB", "A", "B", "X", "Y",
-        "Gatilho esquerdo", "Gatilho direito",
-        "Analógico esquerdo →", "Analógico esquerdo ↑",
-        "Analógico direito →", "Analógico direito ↑"
-    };
+    /** Name of control {@code index}, in the app's language (the order of R.array.controller_labels). */
+    static String label(int index) { return Language.array(R.array.controller_labels)[index]; }
     static final int[] MASKS = {
         GamepadOverlay.UP, GamepadOverlay.DOWN, GamepadOverlay.LEFT, GamepadOverlay.RIGHT,
         GamepadOverlay.START, GamepadOverlay.BACK, GamepadOverlay.L3, GamepadOverlay.R3,
@@ -35,7 +30,7 @@ final class ExternalController {
         }
         String label() {
             if (key) return KeyEvent.keyCodeToString(code).replace("KEYCODE_", "");
-            return "Eixo " + MotionEvent.axisToString(code).replace("AXIS_", "")
+            return Language.s(R.string.ctrl_axis, MotionEvent.axisToString(code).replace("AXIS_", ""))
                 + (sign < 0 ? " −" : " +");
         }
     }
@@ -43,7 +38,7 @@ final class ExternalController {
     static final class Profile {
         final Binding[] bindings = new Binding[COUNT];
         String describe(int index) {
-            return bindings[index] == null ? "Não atribuído" : bindings[index].label();
+            return bindings[index] == null ? Language.s(R.string.ctrl_unassigned) : bindings[index].label();
         }
     }
 

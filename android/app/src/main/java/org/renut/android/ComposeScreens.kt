@@ -8,11 +8,15 @@ import androidx.activity.ComponentActivity
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -28,6 +32,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Language as LanguageIcon
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -54,12 +59,25 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
+
+/**
+ * The move between two pages of one screen: the new page slides in a short way from the side it
+ * is "ahead" in (forward = from the right) while the old one slides off and fades.
+ */
+private fun pageTransition(forward: Boolean): ContentTransform {
+    val travel: (Int) -> Int = { width -> if (forward) width / 5 else -width / 5 }
+    return (slideInHorizontally(tween(300)) { travel(it) } + fadeIn(tween(300))) togetherWith
+        (slideOutHorizontally(tween(300)) { -travel(it) } + fadeOut(tween(160)))
+}
 
 private val Background = Color(0xFF101113)
 private val Surface = Color(0xFF1C1E21)
@@ -137,6 +155,17 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
 }
 
 @Composable private fun RenutTheme(content: @Composable () -> Unit) {
+    // Every stringResource below reads this context, so choosing another language re-renders in place.
+    val host = LocalContext.current
+    val language = Language.code.ifEmpty { Language.OPTIONS[0].code }
+    val localized = remember(host, language) { Language.derive(host, language) }
+    CompositionLocalProvider(
+        LocalContext provides localized,
+        LocalConfiguration provides localized.resources.configuration
+    ) { RenutMaterial(content) }
+}
+
+@Composable private fun RenutMaterial(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = darkColorScheme(
             primary = Accent, onPrimary = Background, background = Background,
@@ -157,21 +186,26 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
         bottomBar = {
             NavigationBar(containerColor = Surface) {
                 NavigationBarItem(selected = page == 0, onClick = { page = 0 },
-                    icon = { Icon(Icons.Default.PlayArrow, null) }, label = { Text("Jogar") })
+                    icon = { Icon(Icons.Default.PlayArrow, null) }, label = { Text(stringResource(R.string.nav_play)) })
                 NavigationBarItem(selected = page == 1, onClick = { page = 1 },
-                    icon = { Icon(Icons.Default.Folder, null) }, label = { Text("Saves") })
+                    icon = { Icon(Icons.Default.Folder, null) }, label = { Text(stringResource(R.string.nav_saves)) })
                 NavigationBarItem(selected = page == 2, onClick = { page = 2 },
-                    icon = { Icon(Icons.Default.EmojiEvents, null) }, label = { Text("Conquistas") })
+                    icon = { Icon(Icons.Default.EmojiEvents, null) }, label = { Text(stringResource(R.string.nav_achievements)) })
                 NavigationBarItem(selected = page == 3, onClick = { page = 3 },
-                    icon = { Icon(Icons.Default.Settings, null) }, label = { Text("Configurações") })
+                    icon = { Icon(Icons.Default.Settings, null) }, label = { Text(stringResource(R.string.nav_settings)) })
             }
         }
     ) { padding ->
-        when (page) {
-            0 -> PlayScreen(activity, Modifier.padding(padding), tick) { page = 2 }
-            1 -> SaveScreen(activity, Modifier.padding(padding), tick)
-            2 -> AchievementsScreen(activity, Modifier.padding(padding), tick)
-            else -> SettingsScreen(activity, Modifier.padding(padding), tick)
+        AnimatedContent(
+            targetState = page, label = "launcher-page",
+            transitionSpec = { pageTransition(targetState > initialState) }
+        ) { shown ->
+            when (shown) {
+                0 -> PlayScreen(activity, Modifier.padding(padding), tick) { page = 2 }
+                1 -> SaveScreen(activity, Modifier.padding(padding), tick)
+                2 -> AchievementsScreen(activity, Modifier.padding(padding), tick)
+                else -> SettingsScreen(activity, Modifier.padding(padding), tick)
+            }
         }
     }
 }
@@ -181,25 +215,25 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
     val saves = rememberUpdatedState(runCatching { activity.uiSaves() }.getOrDefault(emptyList()))
     val visibleSaves = saves.value.filterNot { it.contains("/Headers/") }.ifEmpty { saves.value }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        item { Header("SEUS SAVES", "Arquivos do jogo", "Gerencie os saves guardados neste aparelho.") }
+        item { Header(stringResource(R.string.saves_eyebrow), stringResource(R.string.saves_title), stringResource(R.string.saves_subtitle)) }
         item {
-            Panel("Biblioteca") {
-                Text(if (visibleSaves.isEmpty()) "Nenhum save encontrado" else "${visibleSaves.size} save(s) encontrado(s)", color = Text, fontWeight = FontWeight.SemiBold)
-                Text("Os arquivos são lidos da pasta usada pelo jogo.", color = Muted, fontSize = 13.sp)
+            Panel(stringResource(R.string.saves_panel_library)) {
+                Text(if (visibleSaves.isEmpty()) stringResource(R.string.saves_none) else stringResource(R.string.saves_found, visibleSaves.size), color = Text, fontWeight = FontWeight.SemiBold)
+                Text(stringResource(R.string.saves_note), color = Muted, fontSize = 13.sp)
             }
         }
         if (visibleSaves.isNotEmpty()) {
-            item { SectionTitle("Arquivos") }
+            item { SectionTitle(stringResource(R.string.saves_section_files)) }
             items(visibleSaves) { name -> Panel(null) {
                 Text(name.substringAfterLast('/'), color = Text, fontWeight = FontWeight.SemiBold)
-                Text("Save do jogo", color = Muted, fontSize = 13.sp)
+                Text(stringResource(R.string.saves_item), color = Muted, fontSize = 13.sp)
             } }
         }
         item {
-            Panel("Transferir") {
-                ActionButton("Exportar saves (.zip)", !activity.uiBusy()) { activity.uiAction("Exportar saves (.zip)") }
-                ActionButton("Importar saves (.zip)", !activity.uiBusy(), outlined = true) { activity.uiAction("Importar saves (.zip)") }
-                Text("A importação pede confirmação antes de substituir arquivos existentes.", color = Muted, fontSize = 12.sp)
+            Panel(stringResource(R.string.saves_panel_transfer)) {
+                ActionButton(stringResource(R.string.saves_export), !activity.uiBusy()) { activity.uiAction("Exportar saves (.zip)") }
+                ActionButton(stringResource(R.string.saves_import), !activity.uiBusy(), outlined = true) { activity.uiAction("Importar saves (.zip)") }
+                Text(stringResource(R.string.saves_import_note), color = Muted, fontSize = 12.sp)
             }
         }
     }
@@ -219,7 +253,7 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
         runCatching { BitmapFactory.decodeFile(java.io.File(activity.filesDir, "achievements/title.png").path)?.asImageBitmap() }.getOrNull()
     }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        item { Header("RENUT / JOGAR", "Pronto para jogar?", "Sua aventura continua de onde você parou.") }
+        item { Header(stringResource(R.string.play_eyebrow), stringResource(R.string.play_title), stringResource(R.string.play_subtitle)) }
         item {
             Card(colors = CardDefaults.cardColors(containerColor = Color.Transparent), shape = RoundedCornerShape(24.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(
@@ -235,9 +269,9 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
                             Text("Banjo-Kazooie", color = Text, fontWeight = FontWeight.Bold, fontSize = 24.sp)
                             Text("Nuts & Bolts", color = Accent, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
                             Text(when (state) {
-                                2 -> "Jogo completo"
-                                1 -> "Só o XEX importado"
-                                else -> "Nenhum arquivo importado"
+                                2 -> stringResource(R.string.play_state_full)
+                                1 -> stringResource(R.string.play_state_xex)
+                                else -> stringResource(R.string.play_state_none)
                             }, color = Muted, fontSize = 13.sp)
                         }
                     }
@@ -247,15 +281,15 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
                     ) {
                         Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(28.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("Jogar", fontWeight = FontWeight.Bold, fontSize = 19.sp)
+                        Text(stringResource(R.string.nav_play), fontWeight = FontWeight.Bold, fontSize = 19.sp)
                     }
                     if (state != 2) Text(
-                        if (state == 1) "Importe a imagem ISO completa em Configurações para ter os arquivos que o jogo precisa."
-                        else "Importe o jogo em Configurações para começar.",
+                        if (state == 1) stringResource(R.string.play_hint_xex)
+                        else stringResource(R.string.play_hint_none),
                         color = Muted, fontSize = 13.sp)
-                    else Text("Experimental: o desempenho e a compatibilidade ainda estão em desenvolvimento.", color = Muted, fontSize = 12.sp)
+                    else Text(stringResource(R.string.play_experimental), color = Muted, fontSize = 12.sp)
                     if (state == 2 && activity.uiRuntimeOption(RuntimeOptions.CHEATS, "false") == "true")
-                        Text("Cheats ligados nesta partida", color = Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text(stringResource(R.string.play_cheats_on), color = Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -266,7 +300,7 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
                     Row(Modifier.padding(18.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.EmojiEvents, null, tint = Accent, modifier = Modifier.size(32.dp))
                         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("${data.unlocked.size} de ${data.count()} conquistas", color = Text, fontWeight = FontWeight.SemiBold)
+                            Text(stringResource(R.string.play_ach_progress, data.unlocked.size, data.count()), color = Text, fontWeight = FontWeight.SemiBold)
                             LinearProgressIndicator(
                                 progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
                                 modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
@@ -279,23 +313,24 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
         }
         item { CheatsPanel(activity, !busy) }
         item {
-            Panel("Ao abrir o app") {
-                ToggleRow("Iniciar direto no jogo", autoStart, !busy) { activity.uiSetAutoStart(it) }
-                Text("O jogo começa sem passar por esta tela. Para voltar aqui, saia do jogo pelo menu.", color = Muted, fontSize = 12.sp)
+            Panel(stringResource(R.string.play_panel_open)) {
+                ToggleRow(stringResource(R.string.play_autostart), autoStart, !busy) { activity.uiSetAutoStart(it) }
+                Text(stringResource(R.string.play_autostart_note), color = Muted, fontSize = 12.sp)
             }
         }
     }
 }
 
 private val CHEAT_LABELS = listOf(
-    "renut_cheat_infinite_health" to "Vida infinita",
-    "renut_cheat_infinite_fuel_ammo" to "Combustível e munição infinitos",
-    "renut_cheat_infinite_parts" to "Peças infinitas",
-    "renut_cheat_no_timer" to "Sem limite de tempo nas missões",
-    "renut_cheat_no_notes_spent" to "Notas não são gastas",
-    "renut_cheat_vehicles_anywhere" to "Trocar e montar veículo em qualquer lugar",
-    "renut_cheat_extended_build_range" to "Área de montagem maior (Mumbo's Motors)")
-private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tuxedo" to "Smoking")
+    "renut_cheat_infinite_health" to R.string.cheat_infinite_health,
+    "renut_cheat_infinite_fuel_ammo" to R.string.cheat_infinite_fuel_ammo,
+    "renut_cheat_infinite_parts" to R.string.cheat_infinite_parts,
+    "renut_cheat_no_timer" to R.string.cheat_no_timer,
+    "renut_cheat_no_notes_spent" to R.string.cheat_no_notes_spent,
+    "renut_cheat_vehicles_anywhere" to R.string.cheat_vehicles_anywhere,
+    "renut_cheat_extended_build_range" to R.string.cheat_extended_build_range)
+private val SKIN_LABELS = listOf(
+    "default" to R.string.skin_default, "robot" to R.string.skin_robot, "tuxedo" to R.string.skin_tuxedo)
 
 /** Cheats of the next game start. The switches live in renut.toml, which the runtime reads at launch. */
 @Composable private fun CheatsPanel(activity: MainActivity, enabled: Boolean) {
@@ -306,26 +341,27 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
         }
     }
     var skin by remember { mutableStateOf(activity.uiRuntimeOption(RuntimeOptions.CHEAT_SKIN, "default")) }
-    Panel("Cheats") {
-        ToggleRow("Aplicar cheats ao jogar", master, enabled) {
+    Panel(stringResource(R.string.cheats_panel)) {
+        ToggleRow(stringResource(R.string.cheats_master), master, enabled) {
             master = it
             activity.uiSetRuntimeOption(RuntimeOptions.CHEATS, it.toString())
         }
         if (master) {
             CHEAT_LABELS.forEach { (key, label) ->
-                ToggleRow(label, flags[key] == true, enabled) {
+                ToggleRow(stringResource(label), flags[key] == true, enabled) {
                     flags[key] = it
                     activity.uiSetRuntimeOption(key, it.toString())
                 }
             }
-            SingleChoiceSelector("Visual do Banjo", SKIN_LABELS.firstOrNull { it.first == skin }?.second ?: "Normal",
-                SKIN_LABELS.map { it.second }) { label ->
-                val value = SKIN_LABELS.first { it.second == label }.first
+            val skinNames = SKIN_LABELS.map { stringResource(it.second) }
+            SingleChoiceSelector(stringResource(R.string.cheats_skin),
+                skinNames[SKIN_LABELS.indexOfFirst { it.first == skin }.coerceAtLeast(0)], skinNames) { label ->
+                val value = SKIN_LABELS[skinNames.indexOf(label).coerceAtLeast(0)].first
                 skin = value
                 activity.uiSetRuntimeOption(RuntimeOptions.CHEAT_SKIN, value)
             }
         }
-        Text("Valem a partir da próxima partida. Peças infinitas altera as contagens de peças do seu save.", color = Muted, fontSize = 12.sp)
+        Text(stringResource(R.string.cheats_note), color = Muted, fontSize = 12.sp)
     }
 }
 
@@ -340,30 +376,30 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     }
     val data = snapshot
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        item { Header("CONQUISTAS", "Suas conquistas", "As conquistas desbloqueadas no jogo, neste aparelho.") }
+        item { Header(stringResource(R.string.ach_eyebrow), stringResource(R.string.ach_title), stringResource(R.string.ach_subtitle)) }
         if (data == null) {
             if (loaded.value) item {
-                Panel("Ainda sem lista") {
-                    Text("A lista de conquistas é lida do seu jogo na primeira vez em que ele inicia. Abra o jogo uma vez e volte aqui.", color = Muted, fontSize = 14.sp)
+                Panel(stringResource(R.string.ach_panel_nolist)) {
+                    Text(stringResource(R.string.ach_nolist), color = Muted, fontSize = 14.sp)
                 }
             }
         } else {
             item {
-                Panel("Progresso") {
-                    Text("${data.unlocked.size} de ${data.count()} desbloqueadas", color = Text, fontWeight = FontWeight.SemiBold)
+                Panel(stringResource(R.string.ach_panel_progress)) {
+                    Text(stringResource(R.string.ach_unlocked_count, data.unlocked.size, data.count()), color = Text, fontWeight = FontWeight.SemiBold)
                     LinearProgressIndicator(
                         progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
                         modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
                         color = Accent, trackColor = Color(0xFF3A3B3D))
-                    Text("${data.earnedGamerscore} de ${data.gamerscore} G", color = Muted, fontSize = 13.sp)
+                    Text(stringResource(R.string.ach_gamerscore, data.earnedGamerscore, data.gamerscore), color = Muted, fontSize = 13.sp)
                 }
             }
             if (data.unlocked.isNotEmpty()) {
-                item { SectionTitle("Desbloqueadas") }
+                item { SectionTitle(stringResource(R.string.ach_section_unlocked)) }
                 items(data.unlocked, key = { it.id }) { AchievementRow(it) }
             }
             if (data.locked.isNotEmpty()) {
-                item { SectionTitle("Bloqueadas") }
+                item { SectionTitle(stringResource(R.string.ach_section_locked)) }
                 items(data.locked, key = { it.id }) { AchievementRow(it) }
             }
         }
@@ -386,7 +422,8 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
                 Text(item.label, color = if (unlocked) Text else Muted, fontWeight = FontWeight.Bold, fontSize = if (compact) 14.sp else 16.sp)
                 Text(item.shownDescription(), color = Muted, fontSize = if (compact) 12.sp else 13.sp)
                 if (unlocked) Text(
-                    "Desbloqueada em " + DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(item.unlockedAt)),
+                    stringResource(R.string.ach_unlocked_on, DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT,
+                        Language.locale(LocalContext.current)).format(Date(item.unlockedAt))),
                     color = Accent, fontSize = if (compact) 11.sp else 12.sp)
             }
             if (item.gamerscore > 0) Text("${item.gamerscore} G", color = if (unlocked) Accent else Muted,
@@ -401,10 +438,10 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     var confirmDeleteDriver by remember { mutableStateOf(false) }
     if (confirmDeleteDriver) AlertDialog(
         onDismissRequest = { confirmDeleteDriver = false },
-        title = { Text("Apagar driver?") },
-        text = { Text("\"$driver\" será removido do aparelho e o driver do sistema passará a ser usado. Você poderá importá-lo de novo.") },
-        confirmButton = { TextButton(onClick = { confirmDeleteDriver = false; activity.uiDeleteDriver() }) { Text("Apagar") } },
-        dismissButton = { TextButton(onClick = { confirmDeleteDriver = false }) { Text("Cancelar") } })
+        title = { Text(stringResource(R.string.driver_delete_title)) },
+        text = { Text(stringResource(R.string.driver_delete_message, driver)) },
+        confirmButton = { TextButton(onClick = { confirmDeleteDriver = false; activity.uiDeleteDriver() }) { Text(stringResource(R.string.common_delete)) } },
+        dismissButton = { TextButton(onClick = { confirmDeleteDriver = false }) { Text(stringResource(R.string.common_cancel)) } })
     val busy = activity.uiBusy()
     val fpsEnabled = activity.uiFpsEnabled()
     val controlsEnabled = activity.uiShowControls()
@@ -418,67 +455,97 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        item { Header("RENUT / ANDROID", "Configurações", "Jogo, vídeo, controles e diagnóstico.") }
         item {
-            Panel("Jogo") {
-                Text(when (activity.uiGameState()) {
-                    2 -> "Banjo-Kazooie: Nuts & Bolts · jogo completo"
-                    1 -> "Banjo-Kazooie: Nuts & Bolts · só o XEX importado"
-                    else -> "Nenhum jogo importado"
-                }, color = Muted, fontSize = 13.sp)
-                ActionButton("Importar jogo (ISO ou XEX)", !busy, outlined = true) { activity.uiOpenGameImport() }
-                Text("O jogo atual só é substituído depois que o novo for validado.", color = Muted, fontSize = 12.sp)
+            Row(verticalAlignment = Alignment.Top) {
+                Box(Modifier.weight(1f)) {
+                    Header(stringResource(R.string.settings_eyebrow), stringResource(R.string.settings_title), stringResource(R.string.settings_subtitle))
+                }
+                LanguageMenu()
             }
         }
         item {
-            Panel("Display") {
-                ToggleRow("Contador de FPS", fpsEnabled, !busy) { activity.uiSetFps(it) }
-                ToggleRow("Destravar FPS", uncapFps, !busy) {
+            Panel(stringResource(R.string.settings_game)) {
+                Text(when (activity.uiGameState()) {
+                    2 -> stringResource(R.string.settings_game_full)
+                    1 -> stringResource(R.string.settings_game_xex)
+                    else -> stringResource(R.string.settings_game_none)
+                }, color = Muted, fontSize = 13.sp)
+                ActionButton(stringResource(R.string.settings_import_game), !busy, outlined = true) { activity.uiOpenGameImport() }
+                Text(stringResource(R.string.settings_import_note), color = Muted, fontSize = 12.sp)
+            }
+        }
+        item {
+            Panel(stringResource(R.string.settings_display)) {
+                ToggleRow(stringResource(R.string.settings_fps), fpsEnabled, !busy) { activity.uiSetFps(it) }
+                ToggleRow(stringResource(R.string.settings_uncap), uncapFps, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_uncap_fps", it.toString())
                 }
-                Text("Usa o modo de apresentação imediato e a maior frequência da tela na próxima partida. Pode alterar o ritmo de partes do jogo.", color = Muted, fontSize = 12.sp)
+                Text(stringResource(R.string.settings_uncap_note), color = Muted, fontSize = 12.sp)
             }
         }
         item {
-            Panel("Controles") {
-                ToggleRow("Mostrar controles na tela", controlsEnabled, !busy) { activity.uiSetShowControls(it) }
-                ActionButton("Configurar controle externo", !busy, outlined = true) { activity.uiAction("Configurar controle externo") }
+            Panel(stringResource(R.string.settings_controls)) {
+                ToggleRow(stringResource(R.string.settings_show_controls), controlsEnabled, !busy) { activity.uiSetShowControls(it) }
+                ActionButton(stringResource(R.string.settings_external), !busy, outlined = true) { activity.uiAction("Configurar controle externo") }
             }
         }
         item {
-            Panel("Avançado") {
-                SingleChoiceSelector("Driver", driver, activity.uiDriverChoices(), !busy) { activity.uiSelectDriver(it) }
-                ActionButton("Importar driver Adreno (.zip)", !busy, outlined = true) { activity.uiAction("Importar driver Adreno (.zip)") }
-                if (activity.uiDriverStored()) ActionButton("Apagar driver selecionado", !busy, outlined = true) { confirmDeleteDriver = true }
+            Panel(stringResource(R.string.settings_advanced)) {
+                SingleChoiceSelector(stringResource(R.string.settings_driver), driver, activity.uiDriverChoices(), !busy) { activity.uiSelectDriver(it) }
+                ActionButton(stringResource(R.string.settings_driver_import), !busy, outlined = true) { activity.uiAction("Importar driver Adreno (.zip)") }
+                if (busy) Text(activity.uiStatus(), color = Muted, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                if (activity.uiDriverStored()) ActionButton(stringResource(R.string.settings_driver_delete), !busy, outlined = true) { confirmDeleteDriver = true }
                 if (turnip) {
                     ToggleRow("One UI fix", oneUiEnabled, !busy) { activity.uiSetOneUi(it) }
                     MultiModeSelector("TU_DEBUG", tuMode, listOf("perf", "sysmem", "gmem")) { activity.uiSetTuMode(it) }
                     MultiModeSelector("IR3_SHADER_DEBUG", ir3Mode, listOf("nopreamble", "noearlypreamble", "nouboopt", "nodescprefetch")) { activity.uiSetIr3Mode(it) }
                 } else {
-                    Text("Opções do Adreno (One UI fix, TU_DEBUG, IR3_SHADER_DEBUG) aparecem ao selecionar um driver Turnip.", color = Muted, fontSize = 12.sp)
+                    Text(stringResource(R.string.settings_turnip_note), color = Muted, fontSize = 12.sp)
                 }
-                ActionButton("Apagar cache de shaders", !busy, outlined = true) { activity.uiAction("Apagar cache de shaders") }
+                ActionButton(stringResource(R.string.settings_clear_shaders), !busy, outlined = true) { activity.uiAction("Apagar cache de shaders") }
             }
         }
         item {
-            Panel("Opções do runtime") {
-                Text("Aplicadas na próxima inicialização do jogo.", color = Muted, fontSize = 13.sp)
-                SingleChoiceSelector("Nível do log", logLevel,
+            Panel(stringResource(R.string.settings_runtime)) {
+                Text(stringResource(R.string.settings_runtime_note), color = Muted, fontSize = 13.sp)
+                SingleChoiceSelector(stringResource(R.string.settings_log_level), logLevel,
                     listOf("trace", "debug", "info", "warn", "error", "critical", "off")) {
                     activity.uiSetRuntimeOption("log_level", it)
                 }
-                ToggleRow("Compilação assíncrona de shaders e pipelines", shaderAsync, !busy) {
+                ToggleRow(stringResource(R.string.settings_async), shaderAsync, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_async_pipelines", it.toString())
                 }
-                ToggleRow("Remover sombras", noShadows, !busy) {
+                ToggleRow(stringResource(R.string.settings_no_shadows), noShadows, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
                 }
-                ToggleRow("Remover bloom", noBloom, !busy) {
+                ToggleRow(stringResource(R.string.settings_no_bloom), noBloom, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_bloom", it.toString())
                 }
             }
         }
-        item { Text("reNut · prévia de desenvolvimento", color = Muted, fontSize = 12.sp) }
+        item { Text(stringResource(R.string.settings_footer), color = Muted, fontSize = 12.sp) }
+    }
+}
+
+/** The language button: shows the current language and lists the others, each in its own language. */
+@Composable private fun LanguageMenu(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    var open by remember { mutableStateOf(false) }
+    val current = Language.OPTIONS.firstOrNull { it.code == Language.code } ?: Language.OPTIONS[0]
+    Box(modifier) {
+        TextButton(onClick = { open = true }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)) {
+            Icon(Icons.Default.LanguageIcon, stringResource(R.string.language_label), tint = Accent, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(current.name, color = Text, fontSize = 14.sp)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            Language.OPTIONS.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(option.name) },
+                    leadingIcon = { RadioButton(selected = option.code == current.code, onClick = null) },
+                    onClick = { open = false; Language.set(context, option.code) })
+            }
+        }
     }
 }
 
@@ -520,10 +587,10 @@ private val SKIN_LABELS = listOf("default" to "Normal", "robot" to "Robô", "tux
     var local by remember { mutableStateOf(selected) }
     Box {
         OutlinedButton(onClick = { local = selected; expanded = true }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
-            Text("$label: ${(if (expanded) local else selected).ifEmpty { "Desativado" }.replace(",", ", ")}")
+            Text("$label: ${(if (expanded) local else selected).ifEmpty { stringResource(R.string.common_disabled) }.replace(",", ", ")}")
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            DropdownMenuItem(text = { Text("Desativado") }, leadingIcon = {
+            DropdownMenuItem(text = { Text(stringResource(R.string.common_disabled)) }, leadingIcon = {
                 Checkbox(checked = local.isEmpty(), onCheckedChange = null)
             }, onClick = { local = ""; onSelect("") })
             choices.forEach { choice ->
@@ -600,7 +667,7 @@ private val SidebarWidth = 360.dp
             .clip(RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp))
             .background(Color(0x66000000)).clickable { menu.open() },
         contentAlignment = Alignment.Center
-    ) { Icon(Icons.Default.Menu, "Abrir menu", tint = Color(0xB3FFFFFF), modifier = Modifier.size(18.dp)) }
+    ) { Icon(Icons.Default.Menu, stringResource(R.string.menu_open), tint = Color(0xB3FFFFFF), modifier = Modifier.size(18.dp)) }
 }
 
 @Composable private fun PausedChip(menu: GameMenu, modifier: Modifier) {
@@ -610,24 +677,31 @@ private val SidebarWidth = 360.dp
         horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(Icons.Default.Pause, null, tint = Accent, modifier = Modifier.size(18.dp))
-        Text("Pausado", color = Text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+        Text(stringResource(R.string.menu_paused), color = Text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
         Button(onClick = { menu.requestPaused(false) }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
             modifier = Modifier.height(32.dp), shape = RoundedCornerShape(10.dp)) {
             Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(4.dp))
-            Text("Retomar", fontSize = 13.sp)
+            Text(stringResource(R.string.menu_resume), fontSize = 13.sp)
         }
         IconButton(onClick = { menu.open() }, modifier = Modifier.size(32.dp)) {
-            Icon(Icons.Default.Menu, "Abrir menu", tint = Muted, modifier = Modifier.size(20.dp))
+            Icon(Icons.Default.Menu, stringResource(R.string.menu_open), tint = Muted, modifier = Modifier.size(20.dp))
         }
     }
 }
 
 @Composable private fun Sidebar(activity: RuntimeActivity, menu: GameMenu, modifier: Modifier) {
-    Column(modifier.padding(horizontal = 14.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        when (menu.page) {
-            GameMenu.Page.Main -> SidebarMain(activity, menu)
-            GameMenu.Page.Achievements -> SidebarAchievements(activity, menu)
+    Box(modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+        AnimatedContent(
+            targetState = menu.page, label = "sidebar-page", modifier = Modifier.fillMaxSize(),
+            transitionSpec = { pageTransition(targetState.ordinal > initialState.ordinal) }
+        ) { shown ->
+            Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                when (shown) {
+                    GameMenu.Page.Main -> SidebarMain(activity, menu)
+                    GameMenu.Page.Achievements -> SidebarAchievements(activity, menu)
+                }
+            }
         }
     }
 }
@@ -636,37 +710,36 @@ private val SidebarWidth = 360.dp
     var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
     var fpsVisible by remember { mutableStateOf(activity.uiFpsVisible()) }
     // The summary line is read from the files the runtime keeps, off the main thread.
-    val summary by produceState<String?>(null) {
-        value = withContext(Dispatchers.IO) {
-            Achievements.load(activity.filesDir)?.let { "${it.unlocked.size} de ${it.count()} · ${it.earnedGamerscore} G" }
-        }
+    val snapshot by produceState<Achievements.Snapshot?>(null) {
+        value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
     }
+    val summary = snapshot?.let { stringResource(R.string.menu_ach_summary, it.unlocked.size, it.count(), it.earnedGamerscore) }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Text("RENUT / JOGO", color = Accent, fontWeight = FontWeight.Bold, fontSize = 11.sp, letterSpacing = 1.sp)
-            Text("Menu do jogo", color = Text, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+            Text(stringResource(R.string.menu_eyebrow), color = Accent, fontWeight = FontWeight.Bold, fontSize = 11.sp, letterSpacing = 1.sp)
+            Text(stringResource(R.string.menu_title), color = Text, fontWeight = FontWeight.Bold, fontSize = 20.sp)
         }
-        IconButton(onClick = { menu.close() }, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Close, "Fechar menu", tint = Muted) }
+        IconButton(onClick = { menu.close() }, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Close, stringResource(R.string.menu_close), tint = Muted) }
     }
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        SidebarItem(Icons.Default.PlayArrow, "Continuar", highlighted = true) { menu.close() }
-        if (menu.isPaused) SidebarItem(Icons.Default.PlayArrow, "Retomar jogo", "O jogo está pausado") {
+        SidebarItem(Icons.Default.PlayArrow, stringResource(R.string.menu_continue), highlighted = true) { menu.close() }
+        if (menu.isPaused) SidebarItem(Icons.Default.PlayArrow, stringResource(R.string.menu_resume_game), stringResource(R.string.menu_paused_hint)) {
             menu.requestPaused(false); menu.close()
-        } else SidebarItem(Icons.Default.Pause, "Pausar jogo", "Congela o jogo até você retomar") {
+        } else SidebarItem(Icons.Default.Pause, stringResource(R.string.menu_pause_game), stringResource(R.string.menu_pause_hint)) {
             menu.requestPaused(true); menu.close()
         }
-        SidebarItem(Icons.Default.EmojiEvents, "Conquistas", summary ?: "Ver a lista do jogo", chevron = true) {
+        SidebarItem(Icons.Default.EmojiEvents, stringResource(R.string.nav_achievements), summary ?: stringResource(R.string.menu_ach_hint), chevron = true) {
             menu.page = GameMenu.Page.Achievements
         }
-        SidebarToggle(Icons.Default.SportsEsports, "Controles na tela", controlsVisible) {
+        SidebarToggle(Icons.Default.SportsEsports, stringResource(R.string.menu_onscreen_controls), controlsVisible) {
             controlsVisible = it
             activity.uiSetGameControlsVisible(it)
         }
-        SidebarToggle(Icons.Default.Speed, "Contador de FPS", fpsVisible) {
+        SidebarToggle(Icons.Default.Speed, stringResource(R.string.settings_fps), fpsVisible) {
             fpsVisible = it
             activity.uiSetFpsVisible(it)
         }
-        SidebarItem(Icons.AutoMirrored.Filled.ExitToApp, "Sair do jogo") { activity.finish() }
+        SidebarItem(Icons.AutoMirrored.Filled.ExitToApp, stringResource(R.string.menu_exit)) { activity.finish() }
     }
 }
 
@@ -684,14 +757,14 @@ private val SidebarWidth = 360.dp
     val data = snapshot
     Row(verticalAlignment = Alignment.CenterVertically) {
         IconButton(onClick = { menu.page = GameMenu.Page.Main }) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar ao menu", tint = Text)
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.menu_back), tint = Text)
         }
-        Text("Conquistas", Modifier.weight(1f), color = Text, fontWeight = FontWeight.Bold, fontSize = 22.sp)
-        IconButton(onClick = { menu.close() }) { Icon(Icons.Default.Close, "Fechar menu", tint = Muted) }
+        Text(stringResource(R.string.nav_achievements), Modifier.weight(1f), color = Text, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+        IconButton(onClick = { menu.close() }) { Icon(Icons.Default.Close, stringResource(R.string.menu_close), tint = Muted) }
     }
     if (data == null) {
         if (loaded.value) Text(
-            "A lista é lida do seu jogo na primeira vez em que ele inicia. Ela aparece aqui depois dessa primeira partida.",
+            stringResource(R.string.menu_ach_none),
             color = Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 4.dp))
         return
     }
@@ -699,9 +772,9 @@ private val SidebarWidth = 360.dp
         item {
             Column(Modifier.padding(horizontal = 4.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row {
-                    Text("${data.unlocked.size} de ${data.count()} desbloqueadas", Modifier.weight(1f), color = Text,
+                    Text(stringResource(R.string.ach_unlocked_count, data.unlocked.size, data.count()), Modifier.weight(1f), color = Text,
                         fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                    Text("${data.earnedGamerscore} de ${data.gamerscore} G", color = Accent, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text(stringResource(R.string.ach_gamerscore, data.earnedGamerscore, data.gamerscore), color = Accent, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
                 LinearProgressIndicator(
                     progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
@@ -710,11 +783,11 @@ private val SidebarWidth = 360.dp
             }
         }
         if (data.unlocked.isNotEmpty()) {
-            item { Text("Desbloqueadas", color = Accent, fontWeight = FontWeight.Bold, fontSize = 14.sp) }
+            item { Text(stringResource(R.string.ach_section_unlocked), color = Accent, fontWeight = FontWeight.Bold, fontSize = 14.sp) }
             items(data.unlocked, key = { it.id }) { AchievementRow(it, compact = true) }
         }
         if (data.locked.isNotEmpty()) {
-            item { Text("Bloqueadas", color = Accent, fontWeight = FontWeight.Bold, fontSize = 14.sp) }
+            item { Text(stringResource(R.string.ach_section_locked), color = Accent, fontWeight = FontWeight.Bold, fontSize = 14.sp) }
             items(data.locked, key = { it.id }) { AchievementRow(it, compact = true) }
         }
     }
@@ -759,23 +832,23 @@ private val SidebarWidth = 360.dp
     val devices = activity.uiDevices()
     Scaffold(containerColor = Background, topBar = {
         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { activity.finish() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar") }
-            Text("Controle externo", color = Text, fontWeight = FontWeight.Bold, fontSize = 21.sp)
+            IconButton(onClick = { activity.finish() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.common_back)) }
+            Text(stringResource(R.string.ctrl_title), color = Text, fontWeight = FontWeight.Bold, fontSize = 21.sp)
         }
     }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            item { Text("Conecte um controle USB ou Bluetooth. O mapeamento é salvo para cada aparelho.", color = Muted) }
+            item { Text(stringResource(R.string.ctrl_intro), color = Muted) }
             item {
-                Panel("Dispositivo") {
-                    ActionButton(devices.getOrNull(activity.uiSelected()) ?: "Nenhum controle conectado", true, outlined = true) { chooseDevice = true }
-                    ActionButton("Atualizar lista de controles", true, outlined = true) { activity.uiRefresh(); tick++ }
+                Panel(stringResource(R.string.ctrl_panel_device)) {
+                    ActionButton(devices.getOrNull(activity.uiSelected()) ?: stringResource(R.string.ctrl_none), true, outlined = true) { chooseDevice = true }
+                    ActionButton(stringResource(R.string.ctrl_refresh), true, outlined = true) { activity.uiRefresh(); tick++ }
                 }
             }
             item {
-                Panel("Mapeamento") {
+                Panel(stringResource(R.string.ctrl_panel_mapping)) {
                     Text(activity.uiStatus(), color = Muted, fontSize = 14.sp)
-                    ActionButton("Mapear automaticamente", devices.isNotEmpty()) { activity.uiAutomatic(); tick++ }
-                    if (activity.uiPending() >= 0) ActionButton("Cancelar captura", true, outlined = true) { activity.uiCancel(); tick++ }
+                    ActionButton(stringResource(R.string.ctrl_auto), devices.isNotEmpty()) { activity.uiAutomatic(); tick++ }
+                    if (activity.uiPending() >= 0) ActionButton(stringResource(R.string.ctrl_cancel_capture), true, outlined = true) { activity.uiCancel(); tick++ }
                 }
             }
             items(activity.uiBindings().withIndex().toList()) { (index, label) ->
@@ -787,11 +860,11 @@ private val SidebarWidth = 360.dp
         }
     }
     if (chooseDevice) AlertDialog(onDismissRequest = { chooseDevice = false },
-        title = { Text("Selecionar controle") },
+        title = { Text(stringResource(R.string.ctrl_choose_title)) },
         text = { Column { devices.forEachIndexed { index, name ->
             Text(name, Modifier.fillMaxWidth().clickable { activity.uiSelect(index); chooseDevice = false; tick++ }.padding(12.dp))
         } } },
-        confirmButton = { TextButton(onClick = { chooseDevice = false }) { Text("Fechar") } })
+        confirmButton = { TextButton(onClick = { chooseDevice = false }) { Text(stringResource(R.string.common_close)) } })
 }
 
 @Composable private fun ProbeScreen(activity: ProbeActivity) {
@@ -799,10 +872,10 @@ private val SidebarWidth = 360.dp
     LaunchedEffect(Unit) { while (true) { delay(500); tick++ } }
     @Suppress("UNUSED_VARIABLE") val refresh = tick
     Column(Modifier.fillMaxSize().background(Background).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Header("TESTE GRÁFICO", "Plume", "Apresentação Vulkan no aparelho")
-        Panel("Resultado") { Text(activity.uiStatus(), color = Text, fontSize = 13.sp) }
+        Header(stringResource(R.string.probe_eyebrow), "Plume", stringResource(R.string.probe_subtitle))
+        Panel(stringResource(R.string.result_panel)) { Text(activity.uiStatus(), color = Text, fontSize = 13.sp) }
         AndroidView(factory = { SurfaceView(activity).also(activity::attachComposeSurface) }, modifier = Modifier.fillMaxWidth().weight(1f))
-        ActionButton("Voltar à biblioteca", true) { activity.finish() }
+        ActionButton(stringResource(R.string.probe_back), true) { activity.finish() }
     }
 }
 
@@ -811,11 +884,11 @@ private val SidebarWidth = 360.dp
     LaunchedEffect(Unit) { while (true) { delay(500); tick++ } }
     @Suppress("UNUSED_VARIABLE") val refresh = tick
     Column(Modifier.fillMaxSize().background(Background).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Header("TESTE DO RUNTIME", if (activity.uiGraphics()) "RexGlue + Plume" else "Runtime ARM64", "Validação experimental")
-        Panel("Resultado") { Text(activity.uiStatus(), color = Text, fontSize = 13.sp) }
+        Header(stringResource(R.string.runtime_eyebrow), if (activity.uiGraphics()) "RexGlue + Plume" else "Runtime ARM64", stringResource(R.string.runtime_subtitle))
+        Panel(stringResource(R.string.result_panel)) { Text(activity.uiStatus(), color = Text, fontSize = 13.sp) }
         if (activity.uiGraphics()) AndroidView(factory = { SurfaceView(activity).also(activity::attachComposeSurface) }, modifier = Modifier.fillMaxWidth().weight(1f))
         else Spacer(Modifier.weight(1f))
-        ActionButton("Voltar", true) { activity.finish() }
+        ActionButton(stringResource(R.string.common_back), true) { activity.finish() }
     }
 }
 
@@ -823,68 +896,79 @@ private val SidebarWidth = 360.dp
 
 /** Content scrolls in the middle; the step's actions stay on the bottom edge of the screen. */
 @Composable private fun WelcomeScreen(activity: WelcomeActivity, model: WelcomeModel) {
-    Column(Modifier.fillMaxSize().background(Background).systemBarsPadding()) {
-        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-            Column(
-                Modifier.widthIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(24.dp),
-                verticalArrangement = Arrangement.spacedBy(20.dp)
-            ) {
-                when (model.step) {
-                    WelcomeModel.INTRO -> WelcomeIntro()
-                    WelcomeModel.NOTICE -> WelcomeNotice()
-                    WelcomeModel.INSTALL -> WelcomeInstall(model)
-                    WelcomeModel.DONE -> WelcomeDone(model)
-                    else -> WelcomeFailed(model)
+    Box(Modifier.fillMaxSize().background(Background)) {
+    AnimatedContent(
+        targetState = model.step, label = "welcome-step",
+        modifier = Modifier.fillMaxSize(),
+        transitionSpec = { pageTransition(targetState > initialState) }
+    ) { step ->
+        // `step` (not model.step) so a leaving page keeps its own content and buttons while it fades out.
+        Column(Modifier.fillMaxSize().systemBarsPadding()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Column(
+                    Modifier.widthIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(24.dp),
+                    verticalArrangement = Arrangement.spacedBy(20.dp)
+                ) {
+                    when (step) {
+                        WelcomeModel.INTRO -> WelcomeIntro()
+                        WelcomeModel.NOTICE -> WelcomeNotice()
+                        WelcomeModel.INSTALL -> WelcomeInstall(model)
+                        WelcomeModel.DONE -> WelcomeDone(model)
+                        else -> WelcomeFailed(model)
+                    }
                 }
             }
+            Column(
+                Modifier.align(Alignment.CenterHorizontally).widthIn(max = 560.dp).fillMaxWidth()
+                    .padding(start = 24.dp, end = 24.dp, bottom = 20.dp, top = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) { WelcomeActions(activity, step) }
         }
-        Column(
-            Modifier.align(Alignment.CenterHorizontally).widthIn(max = 560.dp).fillMaxWidth()
-                .padding(start = 24.dp, end = 24.dp, bottom = 20.dp, top = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) { WelcomeActions(activity, model) }
+    }
+    // Top right, above every step and outside the page animation.
+    LanguageMenu(Modifier.align(Alignment.TopEnd).systemBarsPadding().padding(8.dp))
     }
 }
 
-@Composable private fun ColumnScope.WelcomeActions(activity: WelcomeActivity, model: WelcomeModel) {
-    when (model.step) {
-        WelcomeModel.INTRO -> ActionButton("Continuar", true) { activity.uiContinueFromIntro() }
+@Composable private fun ColumnScope.WelcomeActions(activity: WelcomeActivity, step: Int) {
+    when (step) {
+        WelcomeModel.INTRO -> ActionButton(stringResource(R.string.welcome_continue), true) { activity.uiContinueFromIntro() }
         WelcomeModel.NOTICE -> {
-            ActionButton("Importar imagem ISO", true) { activity.uiPick(true) }
-            ActionButton("Importar apenas o XEX", true, outlined = true) { activity.uiPick(false) }
+            ActionButton(stringResource(R.string.btn_import_iso), true) { activity.uiPick(true) }
+            ActionButton(stringResource(R.string.btn_import_xex), true, outlined = true) { activity.uiPick(false) }
         }
-        WelcomeModel.INSTALL -> ActionButton("Cancelar", true, outlined = true) { activity.uiCancelInstall() }
-        WelcomeModel.DONE -> ActionButton("Começar", true) { activity.uiFinish() }
-        else -> ActionButton("Tentar novamente", true) { activity.uiBackToNotice() }
+        WelcomeModel.INSTALL -> ActionButton(stringResource(R.string.common_cancel), true, outlined = true) { activity.uiCancelInstall() }
+        WelcomeModel.DONE -> ActionButton(stringResource(R.string.btn_start), true) { activity.uiFinish() }
+        else -> ActionButton(stringResource(R.string.btn_retry), true) { activity.uiBackToNotice() }
     }
 }
 
 @Composable private fun ColumnScope.WelcomeIntro() {
-    Header("RENUT / BEM-VINDO", "Renut Android", "Um projeto independente e experimental.")
+    Header(stringResource(R.string.welcome_intro_eyebrow), stringResource(R.string.welcome_intro_title), stringResource(R.string.welcome_intro_subtitle))
     Panel(null) {
-        Text("O reNut leva Banjo-Kazooie: Nuts & Bolts para o Android. O código do jogo é recompilado para ARM64 e os gráficos rodam em Vulkan, direto no seu aparelho.",
+        Text(stringResource(R.string.welcome_intro_body1),
             color = Text, fontSize = 15.sp)
-        Text("É uma prévia de desenvolvimento: o desempenho e a compatibilidade ainda estão sendo trabalhados.",
+        Text(stringResource(R.string.welcome_intro_body2),
             color = Muted, fontSize = 14.sp)
     }
 }
 
 @Composable private fun ColumnScope.WelcomeNotice() {
-    Header("RENUT / ANTES DE COMEÇAR", "Importe o seu jogo", "O reNut não inclui o jogo e não baixa nada.")
+    Header(stringResource(R.string.notice_eyebrow), stringResource(R.string.notice_title), stringResource(R.string.notice_subtitle))
     Panel(null) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Top) {
             Icon(Icons.Default.Warning, null, tint = Accent, modifier = Modifier.size(24.dp))
-            Text("Use apenas uma cópia do jogo que você possui.", color = Text, fontSize = 15.sp)
+            Text(stringResource(R.string.notice_legal), color = Text, fontSize = 15.sp)
         }
-        InfoRow("Imagem ISO (recomendado)", "Traz todos os arquivos do jogo. Precisa de espaço livre para a imagem copiada e para os arquivos extraídos.")
-        InfoRow("Apenas o XEX", "Só o executável (default.xex). Serve para testes: o jogo não inicia sem os arquivos da ISO.")
-        Text("A importação leva alguns minutos. Mantenha o app aberto até terminar.", color = Muted, fontSize = 13.sp)
+        InfoRow(stringResource(R.string.notice_iso_title), stringResource(R.string.notice_iso_body))
+        InfoRow(stringResource(R.string.notice_xex_title), stringResource(R.string.notice_xex_body))
+        Text(stringResource(R.string.notice_time), color = Muted, fontSize = 13.sp)
     }
 }
 
 @Composable private fun ColumnScope.WelcomeInstall(model: WelcomeModel) {
-    Header("RENUT / INSTALAÇÃO", "Instalando o jogo",
-        if (model.wholeDisc) "Copiando a imagem e extraindo os arquivos." else "Copiando o executável.")
+    Header(stringResource(R.string.install_eyebrow), stringResource(R.string.install_title),
+        if (model.wholeDisc) stringResource(R.string.install_sub_disc) else stringResource(R.string.install_sub_xex))
     Panel(null) {
         Text(model.message, color = Text, fontSize = 15.sp)
         if (model.fraction < 0f) LinearProgressIndicator(
@@ -895,29 +979,29 @@ private val SidebarWidth = 360.dp
             modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
             color = Accent, trackColor = Color(0xFF3A3B3D))
         if (model.fraction >= 0f) Text("${(model.fraction.coerceIn(0f, 1f) * 100).toInt()}%", color = Accent, fontWeight = FontWeight.Bold)
-        Text("Não feche o app durante a instalação.", color = Muted, fontSize = 13.sp)
+        Text(stringResource(R.string.install_dont_close), color = Muted, fontSize = 13.sp)
     }
 }
 
 @Composable private fun ColumnScope.WelcomeDone(model: WelcomeModel) {
-    Header("RENUT / PRONTO", "Tudo pronto", "O jogo foi importado e validado.")
+    Header(stringResource(R.string.done_eyebrow), stringResource(R.string.done_title), stringResource(R.string.done_subtitle))
     Panel(null) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.CheckCircle, null, tint = Accent, modifier = Modifier.size(32.dp))
             Text(
-                if (model.wholeDisc) "Banjo-Kazooie: Nuts & Bolts está instalado e pronto para jogar."
-                else "O executável foi importado. Para jogar, importe também a imagem ISO completa em Configurações.",
+                if (model.wholeDisc) stringResource(R.string.done_body_disc)
+                else stringResource(R.string.done_body_xex),
                 color = Text, fontSize = 15.sp)
         }
     }
 }
 
 @Composable private fun ColumnScope.WelcomeFailed(model: WelcomeModel) {
-    Header("RENUT / IMPORTAÇÃO", "Não foi possível importar", "Nada foi alterado no jogo anterior.")
+    Header(stringResource(R.string.fail_eyebrow), stringResource(R.string.fail_title), stringResource(R.string.fail_subtitle))
     Panel(null) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Top) {
             Icon(Icons.Default.Warning, null, tint = Accent, modifier = Modifier.size(24.dp))
-            Text(model.error.ifEmpty { "Erro desconhecido." }, color = Text, fontSize = 15.sp)
+            Text(model.error.ifEmpty { stringResource(R.string.fail_unknown) }, color = Text, fontSize = 15.sp)
         }
     }
 }

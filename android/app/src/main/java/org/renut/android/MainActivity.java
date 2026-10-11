@@ -29,8 +29,13 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     private final ArrayList<Button> actions=new ArrayList<>();
     private final Map<String,Runnable> uiActions=new LinkedHashMap<>();
 
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(Language.attach(base));
+    }
+
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        Transitions.fadeOpen(this);  // arriving from the first-run screens or leaving the game
         // No game yet: the first-run screens introduce the project and install it. They hand
         // over to this launcher (a new instance) once a game is imported.
         if(!hasGame()){
@@ -95,10 +100,10 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         button(graphics,"Importar driver Adreno (.zip)",()->pick(DRIVER));
         button(graphics,"Usar driver do sistema",()->{getPreferences(0).edit().remove("driverDir").remove("driverLib").apply(); refresh();});
         button(graphics,"Apagar cache de shaders",()->new AlertDialog.Builder(this)
-            .setTitle("Apagar cache de shaders?")
-            .setMessage("Remove o cache Vulkan salvo pelo Plume. Os shaders serão compilados novamente na próxima execução; seus jogos e saves serão preservados.")
-            .setNegativeButton("Cancelar",null)
-            .setPositiveButton("Apagar",(dialog,which)->clearShaderCache())
+            .setTitle(Language.s(R.string.shader_cache_title))
+            .setMessage(Language.s(R.string.shader_cache_message))
+            .setNegativeButton(Language.s(R.string.common_cancel),null)
+            .setPositiveButton(Language.s(R.string.common_delete),(dialog,which)->clearShaderCache())
             .show());
         fpsCounter=text("",16,ink); graphics.addView(fpsCounter);
         button(graphics,"Ativar/desativar contador de FPS",()->{
@@ -175,6 +180,9 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         i.putExtra("ir3Debug",turnip?getPreferences(0).getString("ir3Debug",""):"");
         startActivity(i);
     }
+    private void toast(String message){
+        runOnUiThread(()->Toast.makeText(this,message,Toast.LENGTH_LONG).show());
+    }
     private int dp(int n){return (int)(getResources().getDisplayMetrics().density*n);}
     private TextView text(String value,int size,int color){TextView t=new TextView(this);t.setText(value);t.setTextSize(size);t.setTextColor(color);t.setPadding(0,dp(7),0,dp(9));return t;}
     private LinearLayout card(LinearLayout parent,String label){
@@ -195,7 +203,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     public String uiLibrary(){return library.getText().toString();}
     public String uiStatus(){return status.getText().toString();}
     public String uiDriver(){return driver.getText().toString();}
-    private static final String SYSTEM_DRIVER="Driver do sistema";
+    private String systemDriver(){return Language.s(R.string.driver_system);}
     /** Drivers kept on the device: {dir, lib, name}. The one in use is mirrored in driverDir/driverLib. */
     private java.util.List<JSONObject> storedDrivers(){
         ArrayList<JSONObject> list=new ArrayList<>();
@@ -223,17 +231,17 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         return same==0?name:name+" ("+(same+1)+")";
     }
     public java.util.List<String> uiDriverChoices(){
-        ArrayList<String> out=new ArrayList<>();out.add(SYSTEM_DRIVER);
+        ArrayList<String> out=new ArrayList<>();out.add(systemDriver());
         java.util.List<JSONObject> list=storedDrivers();
         for(int i=0;i<list.size();i++)out.add(driverLabel(list,i));
         return out;
     }
     public String uiDriverSelected(){
         String dir=getPreferences(0).getString("driverDir","");
-        if(dir.isEmpty())return SYSTEM_DRIVER;
+        if(dir.isEmpty())return systemDriver();
         java.util.List<JSONObject> list=storedDrivers();
         for(int i=0;i<list.size();i++)if(list.get(i).optString("dir").equals(dir))return driverLabel(list,i);
-        return SYSTEM_DRIVER;
+        return systemDriver();
     }
     public void uiSelectDriver(String label){
         SharedPreferences.Editor edit=getPreferences(0).edit();
@@ -279,7 +287,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         list.removeIf(d->d.optString("dir").equals(dir));
         saveDrivers(list);
         getPreferences(0).edit().remove("driverDir").remove("driverLib").apply();
-        try{GameFiles.removeTree(new File(dir));}catch(IOException e){status.setText("Driver removido da lista, mas os arquivos não foram apagados: "+e.getMessage());}
+        try{GameFiles.removeTree(new File(dir));}catch(IOException e){toast(Language.s(R.string.driver_remove_failed,e.getMessage()));}
         refresh();
     }
     public String uiFps(){return fpsCounter.getText().toString();}
@@ -301,7 +309,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     public String uiRuntimeOption(String key,String fallback){return RuntimeOptions.get(this,key,fallback);}
     public void uiSetRuntimeOption(String key,String value){
         try { RuntimeOptions.set(this,key,value); }
-        catch(IOException e){status.setText("Não foi possível salvar renut.toml: "+e.getMessage());}
+        catch(IOException e){toast(Language.s(R.string.toml_save_failed,e.getMessage()));}
     }
     public java.util.List<String> uiSaves()throws IOException{return SaveArchive.list(new File(getFilesDir(),"runtime-user"));}
     private void pick(int code){startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE),code);}
@@ -321,8 +329,8 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             boolean removed=false;
             File[] files=root.listFiles((dir,name)->name.startsWith("plume-pipelines"));
             if(files!=null)for(File file:files)removed=Files.deleteIfExists(file.toPath())||removed;
-            status.setText(removed?"Cache de shaders apagado. Será recriado na próxima execução.":"Nenhum cache de shaders salvo para apagar.");
-        }catch(IOException e){status.setText("Não foi possível apagar o cache de shaders: "+e.getMessage());}
+            toast(Language.s(removed?R.string.shader_cache_cleared:R.string.shader_cache_none));
+        }catch(IOException e){toast(Language.s(R.string.shader_cache_failed,e.getMessage()));}
     }
     @Override protected void onResume(){super.onResume();refresh();refreshSaves();}
     private void refresh(){
@@ -354,16 +362,16 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             if(worker!=null)return;
             final boolean importing=request==SAVE_IMPORT;
             if(importing){
-                new AlertDialog.Builder(this).setTitle("Importar saves?")
-                    .setMessage("Arquivos com o mesmo caminho serão substituídos. Feche o jogo antes de continuar.")
-                    .setNegativeButton("Cancelar",null)
-                    .setPositiveButton("Importar",(dialog,which)->transferSaves(uri,true)).show();
+                new AlertDialog.Builder(this).setTitle(Language.s(R.string.saves_import_title))
+                    .setMessage(Language.s(R.string.saves_import_message))
+                    .setNegativeButton(Language.s(R.string.common_cancel),null)
+                    .setPositiveButton(Language.s(R.string.saves_import_action),(dialog,which)->transferSaves(uri,true)).show();
             }else transferSaves(uri,false);
             return;
         }
         if(request==EXPORT){
             try(OutputStream out=getContentResolver().openOutputStream(uri)){
-                if(out==null)throw new IOException("Destino indisponível.");
+                if(out==null)throw new IOException(Language.s(R.string.unavailable_dest));
                 String text="Aparelho: "+Build.MANUFACTURER+" "+Build.MODEL+"\nAndroid: "+Build.VERSION.RELEASE+"\nABI: "+Arrays.toString(Build.SUPPORTED_ABIS)+"\n"+report;
                 File runtimeReport=new File(getFilesDir(),"runtime-report.txt");
                 if(runtimeReport.isFile())text+="\n\n"+new String(Files.readAllBytes(runtimeReport.toPath()),java.nio.charset.StandardCharsets.UTF_8);
@@ -376,10 +384,10 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             File stage=new File(getFilesDir(),"import-"+UUID.randomUUID());
             boolean committed=false;
             try{
-                if(!stage.mkdir())throw new IOException("Não foi possível criar a pasta de importação.");
+                if(!stage.mkdir())throw new IOException(Language.s(R.string.imp_stage_fail));
                 importDriver(uri,stage);committed=true;
-                runOnUiThread(()->status.setText("Importação concluída e validada."));
-            }catch(Exception e){runOnUiThread(()->status.setText("Importação não concluída: "+e.getMessage()));}
+                toast(Language.s(R.string.driver_import_done));
+            }catch(Exception e){toast(Language.s(R.string.driver_import_failed,String.valueOf(e.getMessage())));}
             finally{
                 if(!committed)try{GameFiles.removeTree(stage);}catch(IOException ignored){}
                 runOnUiThread(()->{worker=null;cancel.setVisibility(View.GONE);progress.setVisibility(View.GONE);for(Button b:actions)b.setEnabled(true);refresh();});
@@ -393,22 +401,22 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
                 File saveRoot=new File(getFilesDir(),"runtime-user");
                 if(importing){
                     try(InputStream in=getContentResolver().openInputStream(uri)){
-                        if(in==null)throw new IOException("Arquivo indisponível.");
+                        if(in==null)throw new IOException(Language.s(R.string.file_unavailable));
                         SaveArchive.importZip(saveRoot,in);
                     }
                 }else{
                     try(OutputStream out=getContentResolver().openOutputStream(uri)){
-                        if(out==null)throw new IOException("Destino indisponível.");
+                        if(out==null)throw new IOException(Language.s(R.string.unavailable_dest));
                         SaveArchive.exportZip(saveRoot,out);
                     }
                 }
-                runOnUiThread(()->Toast.makeText(this,importing?"Saves importados.":"Saves exportados.",Toast.LENGTH_LONG).show());
-            }catch(Exception e){runOnUiThread(()->new AlertDialog.Builder(this).setTitle("Falha nos saves").setMessage(e.getMessage()).setPositiveButton("OK",null).show());}
+                runOnUiThread(()->Toast.makeText(this,Language.s(importing?R.string.saves_imported:R.string.saves_exported),Toast.LENGTH_LONG).show());
+            }catch(Exception e){runOnUiThread(()->new AlertDialog.Builder(this).setTitle(Language.s(R.string.saves_failed_title)).setMessage(e.getMessage()).setPositiveButton(Language.s(R.string.common_ok),null).show());}
             finally{runOnUiThread(()->{worker=null;for(Button b:actions)b.setEnabled(true);refreshSaves();});}
         },"renut-saves");worker.start();
     }
     private void update(String message,long done,long total)throws IOException{
-        if(Thread.currentThread().isInterrupted())throw new InterruptedIOException("Importação cancelada.");
+        if(Thread.currentThread().isInterrupted())throw new InterruptedIOException(Language.s(R.string.import_cancelled));
         long now=SystemClock.elapsedRealtime();if(now-lastProgress<250)return;lastProgress=now;
         runOnUiThread(()->{status.setText(message);progress.setIndeterminate(total==0);if(total>0)progress.setProgress((int)(done*100/total));});
     }
@@ -419,29 +427,29 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             while((e=zip.getNextEntry())!=null){
                 String name=e.getName();
                 if(name.contains("/")||name.contains("\\")||name.equals("..")||name.contains(":")||!names.add(name)||++files>32)
-                    throw new IOException("Pacote de driver inválido: use um ZIP com arquivos na raiz.");
+                    throw new IOException(Language.s(R.string.driver_invalid_pack));
                 File out=new File(stage,name);
-                if(!out.getCanonicalPath().startsWith(stage.getCanonicalPath()+File.separator))throw new IOException("Caminho inválido no ZIP.");
+                if(!out.getCanonicalPath().startsWith(stage.getCanonicalPath()+File.separator))throw new IOException(Language.s(R.string.driver_zip_path));
                 try(OutputStream stream=new FileOutputStream(out)){
-                    int n;while((n=zip.read(buffer))!=-1){total+=n;if(total>256L*1024*1024)throw new IOException("Driver excede 256 MB.");stream.write(buffer,0,n);update("Importando driver…",0,0);}
+                    int n;while((n=zip.read(buffer))!=-1){total+=n;if(total>256L*1024*1024)throw new IOException(Language.s(R.string.driver_too_big));stream.write(buffer,0,n);update(Language.s(R.string.driver_importing),0,0);}
                 }
             }
         }
-        File meta=new File(stage,"meta.json");if(meta.length()>65536)throw new IOException("Metadados excessivos.");
+        File meta=new File(stage,"meta.json");if(meta.length()>65536)throw new IOException(Language.s(R.string.driver_meta_big));
         JSONObject json=new JSONObject(new String(Files.readAllBytes(meta.toPath()),java.nio.charset.StandardCharsets.UTF_8));
         String lib=json.getString("libraryName");
-        if(!names.contains(lib)||!lib.endsWith(".so"))throw new IOException("Biblioteca do driver ausente.");
-        if(json.optInt("minApi",28)>Build.VERSION.SDK_INT)throw new IOException("Driver exige uma versão Android mais recente.");
+        if(!names.contains(lib)||!lib.endsWith(".so"))throw new IOException(Language.s(R.string.driver_lib_missing));
+        if(json.optInt("minApi",28)>Build.VERSION.SDK_INT)throw new IOException(Language.s(R.string.driver_needs_android));
         try(RandomAccessFile elf=new RandomAccessFile(new File(stage,lib),"r")){
             byte[] h=new byte[20];elf.readFully(h);
             if(h[0]!=127||h[1]!='E'||h[2]!='L'||h[3]!='F'||h[4]!=2||h[5]!=1||(h[18]&255)!=183||h[19]!=0)
-                throw new IOException("O driver precisa ser uma biblioteca ELF ARM64.");
+                throw new IOException(Language.s(R.string.driver_not_arm64));
         }
-        if(Thread.currentThread().isInterrupted())throw new InterruptedIOException("Importação cancelada.");
+        if(Thread.currentThread().isInterrupted())throw new InterruptedIOException(Language.s(R.string.import_cancelled));
         java.util.List<JSONObject> list=storedDrivers();
         list.add(new JSONObject().put("dir",stage.getAbsolutePath()).put("lib",lib).put("name",json.optString("name",lib).trim().isEmpty()?lib:json.optString("name",lib).trim()));
         if(!getPreferences(0).edit().putString("drivers",new org.json.JSONArray(list).toString())
-            .putString("driverDir",stage.getAbsolutePath()).putString("driverLib",lib).commit())throw new IOException("Não foi possível salvar o driver.");
+            .putString("driverDir",stage.getAbsolutePath()).putString("driverLib",lib).commit())throw new IOException(Language.s(R.string.driver_save_failed));
     }
     @Override protected void onDestroy(){Thread t=worker;if(t!=null)t.interrupt();super.onDestroy();}
 }

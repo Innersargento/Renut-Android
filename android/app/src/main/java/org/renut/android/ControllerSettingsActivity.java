@@ -26,8 +26,18 @@ public final class ControllerSettingsActivity extends androidx.activity.Componen
     private int pending = -1;
     private int ink = Color.rgb(226, 237, 235);
 
+    @Override public void finish() {
+        super.finish();
+        Transitions.slideClose(this);
+    }
+
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(Language.attach(base));
+    }
+
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        Transitions.slideOpen(this);
         getWindow().setStatusBarColor(Color.rgb(12, 23, 28));
         getWindow().setNavigationBarColor(Color.rgb(12, 23, 28));
         ScrollView scroll = new ScrollView(this);
@@ -40,21 +50,21 @@ public final class ControllerSettingsActivity extends androidx.activity.Componen
         setContentView(scroll);
 
         TextView title = label("CONTROLE EXTERNO", 24); body.addView(title);
-        body.addView(label("Conecte um controle USB ou Bluetooth. O mapeamento é salvo para cada aparelho.", 14));
+        body.addView(label(Language.s(R.string.ctrl_intro), 14));
         chooser = new Spinner(this); body.addView(chooser);
-        button(body, "Atualizar lista de controles", this::refreshDevices);
-        button(body, "Mapear automaticamente", () -> {
+        button(body, Language.s(R.string.ctrl_refresh), this::refreshDevices);
+        button(body, Language.s(R.string.ctrl_auto), () -> {
             if (device == null) return;
             ExternalController.reset(this, device);
             profile = ExternalController.automatic(device);
             pending = -1;
-            status.setText("Mapeamento padrão do Android aplicado.");
+            status.setText(Language.s(R.string.ctrl_status_default));
             renderRows();
         });
         status = label("", 15); body.addView(status);
-        button(body, "Cancelar captura", () -> {
+        button(body, Language.s(R.string.ctrl_cancel_capture), () -> {
             pending = -1;
-            status.setText("Selecione um comando abaixo para mapear manualmente.");
+            status.setText(Language.s(R.string.ctrl_status_select));
         });
         rows = new LinearLayout(this); rows.setOrientation(LinearLayout.VERTICAL); body.addView(rows);
         refreshDevices();
@@ -69,13 +79,13 @@ public final class ControllerSettingsActivity extends androidx.activity.Componen
     public String uiStatus(){return status.getText().toString();}
     public java.util.List<String> uiBindings(){
         ArrayList<String> labels=new ArrayList<>();
-        if(profile!=null)for(int i=0;i<ExternalController.COUNT;i++)labels.add(ExternalController.LABELS[i]+"  ·  "+profile.describe(i));
+        if(profile!=null)for(int i=0;i<ExternalController.COUNT;i++)labels.add(ExternalController.label(i)+"  ·  "+profile.describe(i));
         return labels;
     }
     public int uiPending(){return pending;}
     public void uiRefresh(){refreshDevices();}
-    public void uiAutomatic(){if(device!=null){ExternalController.reset(this,device);profile=ExternalController.automatic(device);pending=-1;status.setText("Mapeamento padrão do Android aplicado.");renderRows();}}
-    public void uiCancel(){pending=-1;status.setText("Selecione um comando abaixo para mapear manualmente.");}
+    public void uiAutomatic(){if(device!=null){ExternalController.reset(this,device);profile=ExternalController.automatic(device);pending=-1;status.setText(Language.s(R.string.ctrl_status_default));renderRows();}}
+    public void uiCancel(){pending=-1;status.setText(Language.s(R.string.ctrl_status_select));}
     public void uiCapture(int index){if(index>=0&&index<rows.getChildCount())rows.getChildAt(index).performClick();}
 
     @Override protected void onResume() { super.onResume(); if (chooser != null) refreshDevices(); }
@@ -100,7 +110,7 @@ public final class ControllerSettingsActivity extends androidx.activity.Componen
         }
         ArrayList<String> names = new ArrayList<>();
         for (InputDevice found : devices) names.add(found.getName());
-        if (names.isEmpty()) names.add("Nenhum controle conectado");
+        if (names.isEmpty()) names.add(Language.s(R.string.ctrl_none));
         ArrayAdapter<String> adapter = new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, names) {
             @Override public View getView(int position, View convertView, android.view.ViewGroup parent) {
                 View view = super.getView(position, convertView, parent);
@@ -123,17 +133,17 @@ public final class ControllerSettingsActivity extends androidx.activity.Componen
                 if (device != null) {
                     ExternalController.select(ControllerSettingsActivity.this, device);
                     profile = ExternalController.load(ControllerSettingsActivity.this, device);
-                    status.setText("Mapeamento carregado. Toque em um comando para alterar manualmente.");
+                    status.setText(Language.s(R.string.ctrl_status_loaded));
                 } else {
                     profile = null;
-                    status.setText("Conecte um controle e toque em Atualizar lista de controles.");
+                    status.setText(Language.s(R.string.ctrl_status_connect));
                 }
                 renderRows();
             }
             @Override public void onNothingSelected(android.widget.AdapterView<?> parent) {}
         });
         if (devices.isEmpty()) { device = null; profile = null; rows.removeAllViews();
-            status.setText("Conecte um controle e toque em Atualizar lista de controles."); }
+            status.setText(Language.s(R.string.ctrl_status_connect)); }
     }
 
     private void renderRows() {
@@ -141,11 +151,11 @@ public final class ControllerSettingsActivity extends androidx.activity.Componen
         if (profile == null) return;
         for (int i = 0; i < ExternalController.COUNT; i++) {
             final int index = i;
-            button(rows, ExternalController.LABELS[i] + "  ·  " + profile.describe(i), () -> {
+            button(rows, ExternalController.label(i) + "  ·  " + profile.describe(i), () -> {
                 pending = index;
                 status.setText(index >= ExternalController.AXIS_START
-                    ? "Mova " + ExternalController.LABELS[index] + " no controle."
-                    : "Pressione " + ExternalController.LABELS[index] + " no controle.");
+                    ? Language.s(R.string.ctrl_move, ExternalController.label(index))
+                    : Language.s(R.string.ctrl_press, ExternalController.label(index)));
             });
         }
     }
@@ -160,14 +170,14 @@ public final class ControllerSettingsActivity extends androidx.activity.Componen
         profile.bindings[index] = binding;
         ExternalController.save(this, device, profile);
         pending = -1;
-        status.setText(ExternalController.LABELS[index] + " atribuído a " + binding.label() + ".");
+        status.setText(Language.s(R.string.ctrl_assigned, ExternalController.label(index), binding.label()));
         renderRows();
     }
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (captureDevice(event.getDevice()) && event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
             if (pending >= ExternalController.AXIS_START) {
-                status.setText("Mova o analógico; esta função precisa de um eixo.");
+                status.setText(Language.s(R.string.ctrl_need_axis));
                 return true;
             }
             complete(new ExternalController.Binding(true, event.getKeyCode(), 1));

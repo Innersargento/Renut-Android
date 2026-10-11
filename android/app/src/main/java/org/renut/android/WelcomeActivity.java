@@ -24,11 +24,17 @@ public final class WelcomeActivity extends androidx.activity.ComponentActivity {
     private boolean importOnly;
     private long lastUpdate;
 
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(Language.attach(base));
+    }
+
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         getWindow().setStatusBarColor(Color.rgb(16, 17, 19));
         getWindow().setNavigationBarColor(Color.rgb(16, 17, 19));
         importOnly = getIntent().getBooleanExtra(EXTRA_IMPORT_ONLY, false);
+        // First run comes up over the launcher's redirect (fade); a re-import slides in from Configurações.
+        if (importOnly) Transitions.slideOpen(this); else Transitions.fadeOpen(this);
         boolean seen = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(SEEN, false);
         model.setStep(importOnly || seen ? WelcomeModel.NOTICE : WelcomeModel.INTRO);
         ComposeScreens.showWelcome(this, model);
@@ -73,7 +79,7 @@ public final class WelcomeActivity extends androidx.activity.ComponentActivity {
 
     private void install(Uri uri, boolean wholeDisc) {
         model.setWholeDisc(wholeDisc);
-        model.setMessage("Preparando a importação…");
+        model.setMessage(Language.s(R.string.imp_preparing));
         model.setFraction(0f);
         model.setError("");
         model.setStep(WelcomeModel.INSTALL);
@@ -83,7 +89,7 @@ public final class WelcomeActivity extends androidx.activity.ComponentActivity {
             boolean cancelled = false;
             try {
                 GameImporter.run(this, uri, wholeDisc, (message, fraction) -> {
-                    if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Importação cancelada.");
+                    if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException(Language.s(R.string.import_cancelled));
                     long now = SystemClock.elapsedRealtime();
                     if (now - lastUpdate < 200) return;
                     lastUpdate = now;
@@ -105,6 +111,11 @@ public final class WelcomeActivity extends androidx.activity.ComponentActivity {
             });
         }, "renut-welcome-import");
         worker.start();
+    }
+
+    @Override public void finish() {
+        super.finish();
+        if (importOnly) Transitions.slideClose(this); else Transitions.fadeClose(this);
     }
 
     /** Back walks the steps backwards: notice -> introduction -> leaves the app. */

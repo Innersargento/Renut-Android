@@ -9,11 +9,11 @@ import java.util.Locale;
 public final class GameFiles {
     public static final String EXPECTED="d57b15b73490ca8334fb2fc7a53e0b21936a187731fa4f891273f4feaf38d3bc";
     public static String identify(File file) throws IOException {
-        if(file.length()<24 || file.length()>256L*1024*1024) throw new IOException("Tamanho XEX inválido.");
+        if(file.length()<24 || file.length()>256L*1024*1024) throw new IOException(Language.s(R.string.xex_size_invalid));
         try(InputStream in=new FileInputStream(file)) {
             byte[] magic=new byte[4];
             if(in.read(magic)!=4 || magic[0]!='X' || magic[1]!='E' || magic[2]!='X' || magic[3]!='2')
-                throw new IOException("O executável não tem cabeçalho XEX2.");
+                throw new IOException(Language.s(R.string.xex_no_header));
         }
         try(InputStream in=new FileInputStream(file)) {
             MessageDigest digest=MessageDigest.getInstance("SHA-256"); byte[] b=new byte[1024*1024]; int n;
@@ -24,7 +24,7 @@ public final class GameFiles {
         } catch(NoSuchAlgorithmException e) { throw new IOException(e); }
     }
     public static void requireEuropean(File file) throws IOException {
-        if(!EXPECTED.equals(identify(file))) throw new IOException("Este executável não é compatível com o reNut. O jogo anterior foi preservado.");
+        if(!EXPECTED.equals(identify(file))) throw new IOException(Language.s(R.string.incompatible_xex));
     }
     public static void atomicWrite(File destination,String text) throws IOException {
         File temp=new File(destination.getParentFile(),destination.getName()+".tmp");
@@ -35,9 +35,9 @@ public final class GameFiles {
         if(!root.exists()) return;
         if(!Files.isSymbolicLink(root.toPath()) && root.isDirectory()) {
             File[] files=root.listFiles();
-            if(files==null) throw new IOException("Não foi possível acessar a pasta temporária.");
+            if(files==null) throw new IOException(Language.s(R.string.temp_unreachable));
             for(File child:files) removeTree(child);
         }
-        if(!root.delete()) throw new IOException("Não foi possível remover arquivo temporário.");
+        if(!root.delete()) throw new IOException(Language.s(R.string.temp_remove));
     }
 }

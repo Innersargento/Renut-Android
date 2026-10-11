@@ -75,11 +75,20 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private boolean textPromptShowing(){return textPrompt!=null&&textPrompt.isShowing();}
     public int openContentFd(String uri, String mode) throws java.io.IOException {
         android.os.ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(android.net.Uri.parse(uri),mode);
-        if(descriptor==null)throw new java.io.IOException("Arquivo indisponível.");
+        if(descriptor==null)throw new java.io.IOException(Language.s(R.string.file_unavailable));
         try {return descriptor.detachFd();} finally {descriptor.close();}
+    }
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(Language.attach(base));
+    }
+
+    @Override public void finish() {
+        super.finish();
+        Transitions.fadeClose(this);
     }
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        Transitions.fadeOpen(this);
         launch=getIntent().getBooleanExtra("launch",false);
         if(launch && "true".equals(RuntimeOptions.get(this,"renut_plume_uncap_fps","false"))){
             Display display=getDisplay();
@@ -170,10 +179,10 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         int pad=(int)(20*getResources().getDisplayMetrics().density);
         body.setPadding(pad,pad*2,pad,pad);body.setBackgroundColor(Color.rgb(12,23,28));
         body.setOnApplyWindowInsetsListener((v,i)->{v.setPadding(pad,pad+i.getSystemWindowInsetTop(),pad,pad+i.getSystemWindowInsetBottom());return i;});
-        status.setText(graphics?"RexGlue + Plume\nImagem de teste na memória do runtime. Ainda não representa cenas do jogo.":"Validando o runtime ARM64…\nEste teste ainda não inicia o jogo.");
+        status.setText(graphics?Language.s(R.string.runtime_graphics_status):Language.s(R.string.runtime_validating));
         body.addView(results,new LinearLayout.LayoutParams(-1,graphics?-2:0,graphics?0:1));
         if(graphics){surface=new SurfaceView(this);surface.getHolder().addCallback(this);body.addView(surface,new LinearLayout.LayoutParams(-1,0,1));}
-        Button close=new Button(this);close.setText("Voltar");close.setOnClickListener(v->finish());body.addView(close);
+        Button close=new Button(this);close.setText(Language.s(R.string.common_back));close.setOnClickListener(v->finish());body.addView(close);
         ComposeScreens.showRuntime(this);
         if(!graphics)startValidation(null);
     }
@@ -189,7 +198,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         android.graphics.drawable.GradientDrawable background=new android.graphics.drawable.GradientDrawable();
         background.setColor(Color.argb(230,28,30,33));background.setCornerRadius(18*density);
         card.setBackground(background);card.setClickable(false);card.setVisibility(View.GONE);
-        TextView heading=new TextView(this);heading.setText("Preparando shaders");
+        TextView heading=new TextView(this);heading.setText(Language.s(R.string.precompile_title));
         heading.setTextColor(Color.rgb(244,240,235));heading.setTextSize(16);heading.setTypeface(null,android.graphics.Typeface.BOLD);
         card.addView(heading);
         TextView detail=new TextView(this);detail.setTextColor(Color.rgb(168,162,156));detail.setTextSize(13);
@@ -206,7 +215,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 int done=(int)(p&0xFFFFFF),total=(int)((p>>24)&0xFFFFFF);
                 boolean running=(p>>48&1)!=0,waiting=(p>>49&1)!=0;
                 if(waiting&&total>0){
-                    detail.setText(String.format(java.util.Locale.ROOT,"%d de %d pipelines · %d%%",done,total,done*100/total));
+                    detail.setText(Language.s(R.string.precompile_detail,done,total,done*100/total));
                     bar.setProgress((int)(done*1000L/total));
                     card.setVisibility(View.VISIBLE);
                 }else card.setVisibility(View.GONE);
@@ -294,7 +303,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                     getIntent().getBooleanExtra("sceneMsaa",false),
                     getIntent().getStringExtra("tuDebug"),getIntent().getStringExtra("ir3Debug"));
             }catch(Throwable e){
-                report="Falha ao iniciar o runtime: "+e;
+                report=Language.s(R.string.runtime_start_failed,String.valueOf(e));
                 try{Files.write(new File(getFilesDir(),"runtime-report.txt").toPath(),report.getBytes(StandardCharsets.UTF_8));}catch(Exception ignored){}
             }
             final String message=report;

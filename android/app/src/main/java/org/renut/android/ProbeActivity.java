@@ -8,6 +8,10 @@ import java.io.File;
 
 /** A fresh process selects one Vulkan loader; exiting discards all driver state. */
 public final class ProbeActivity extends androidx.activity.ComponentActivity implements SurfaceHolder.Callback {
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(Language.attach(base));
+    }
+
     static { System.loadLibrary("renut_probe"); }
     private static native String nativeRun(Surface surface,String hooks,String directory,String library);
     private static native void nativeStop();
@@ -21,10 +25,10 @@ public final class ProbeActivity extends androidx.activity.ComponentActivity imp
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         LinearLayout box=new LinearLayout(this);box.setOrientation(LinearLayout.VERTICAL);box.setPadding(24,48,24,32);
         box.setOnApplyWindowInsetsListener((v,i)->{v.setPadding(24,24+i.getSystemWindowInsetTop(),24,24+i.getSystemWindowInsetBottom());return i;});
-        status=new TextView(this);status.setText("Testando apresentação Plume…\nA animação dura alguns segundos.");
+        status=new TextView(this);status.setText(Language.s(R.string.probe_running));
         results=new ScrollView(this);results.addView(status);box.addView(results);
         surface=new SurfaceView(this);surface.getHolder().addCallback(this);box.addView(surface,new LinearLayout.LayoutParams(-1,0,1));
-        Button close=new Button(this);close.setText("Voltar à biblioteca");close.setOnClickListener(v->finish());box.addView(close);
+        Button close=new Button(this);close.setText(Language.s(R.string.probe_back));close.setOnClickListener(v->finish());box.addView(close);
         ComposeScreens.showProbe(this);
     }
     public String uiStatus(){return status.getText().toString();}
@@ -35,7 +39,7 @@ public final class ProbeActivity extends androidx.activity.ComponentActivity imp
         render=new Thread(()->{
             String result=nativeRun(holder.getSurface(),getApplicationInfo().nativeLibraryDir,
                 getIntent().getStringExtra("driverDir"),getIntent().getStringExtra("driverLib"));
-            try{GameFiles.atomicWrite(new File(getFilesDir(),"probe-report.txt"),result);}catch(Exception e){result+="\nNão foi possível salvar o diagnóstico.";}
+            try{GameFiles.atomicWrite(new File(getFilesDir(),"probe-report.txt"),result);}catch(Exception e){result+=Language.s(R.string.probe_save_failed);}
             final String message=result;runOnUiThread(()->{status.setText(message);surface.setVisibility(View.GONE);results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));});
         },"renut-vulkan");render.start();
     }
