@@ -1,42 +1,55 @@
 #!/usr/bin/env bash
 # Decompress the XCTD files (magic 0FF512ED) of Bundle/4f into plain CAFFs, for
-# tools/shaders/extract_caff_shaders.py. Runs in WSL.
+# tools/shaders/extract_caff_shaders.py. Needs a C compiler (clang) and the
+# libmspack sources that tools/prepare.py deps fetches.
 #
 #   tools/shaders/decompress_xctd.sh <game Bundle/4f dir> <out dir>
 #
-# XCTD is xcompress LZX decoded segment by segment with XMemDecompressSegmentTD,
-# which only exists in Microsoft's xcompress library. QuickBMS's Windows build
-# links it (its Linux build does not), so this runs quickbms.exe through WSL
-# interop, from https://aluigi.altervista.org/papers/quickbms.zip unpacked
-# into $QUICKBMS_DIR (default ~/qbms/win).
+# XCTD is the console's transparent file compression: LZX in independent
+# segments, which xctd_decompress.c reads (the format is described there).
+# This replaces an earlier QuickBMS step that only ran on Windows.
 set -euo pipefail
 
 IN=$1
 OUT=$2
-QBMS=${QUICKBMS_DIR:-$HOME/qbms/win}/quickbms_4gb_files.exe
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/../.." && pwd)
+MSPACK=${MSPACK_DIR:-$ROOT/external/rexglue-android/thirdparty/libmspack/libmspack/mspack}
+BIN=${XCTD_BIN:-$ROOT/out/prepare/xctd_decompress}
+CC_BIN=${CC:-$(command -v clang || command -v cc || command -v gcc)}
+
+if [ ! -f "$MSPACK/lzxd.c" ]; then
+    echo "libmspack not found at $MSPACK (run tools/prepare.py deps)" >&2
+    exit 1
+fi
+if [ ! -x "$BIN" ] || [ "$HERE/xctd_decompress.c" -nt "$BIN" ]; then
+    mkdir -p "$(dirname "$BIN")"
+    "$CC_BIN" -O2 -I"$MSPACK" "$HERE/xctd_decompress.c" "$MSPACK/lzxd.c" -o "$BIN"
+fi
 
 mkdir -p "$OUT"
-script=$(mktemp --suffix=.bms)
-printf 'comtype xmemdecompress\nget ZSIZE asize\nclog "" 0 ZSIZE ZSIZE\n' > "$script"
+export BIN OUT
 
-ok=0
-bad=0
-for f in "$IN"/*; do
+one() {
+    f=$1
     name=$(basename "$f")
-    [ "$(head -c4 "$f" | xxd -p)" = "0ff512ed" ] || continue
-    [ -s "$OUT/$name" ] && { ok=$((ok + 1)); continue; }
-    tmp=$(mktemp -d)
-    "$QBMS" -Q -o "$(wslpath -w "$script")" "$(wslpath -w "$f")" "$(wslpath -w "$tmp")" > /dev/null 2>&1 || true
-    result=$(ls "$tmp" | head -1)
-    if [ -n "$result" ] && [ "$(head -c4 "$tmp/$result")" = "CAFF" ]; then
-        mv "$tmp/$result" "$OUT/$name"
-        ok=$((ok + 1))
+    # Only XCTD files; the rest of the folder is not ours to touch.
+    [ "$(head -c4 "$f" | od -An -tx1 | tr -d ' \n')" = "0ff512ed" ] || return 0
+    [ -s "$OUT/$name" ] && return 0
+    if "$BIN" "$f" "$OUT/$name.part" && [ "$(head -c4 "$OUT/$name.part")" = "CAFF" ]; then
+        mv "$OUT/$name.part" "$OUT/$name"
     else
-        bad=$((bad + 1))
-        echo "failed: $name"
+        rm -f "$OUT/$name.part"
+        echo "failed: $name" >&2
+        return 1
     fi
-    rm -rf "$tmp"
-done
-rm -f "$script"
-echo "decompressed $ok, failed $bad"
-[ "$bad" -eq 0 ]
+}
+export -f one
+
+JOBS=$(nproc 2>/dev/null || echo 2)
+if ! find "$IN" -maxdepth 1 -type f -print0 | xargs -0 -n1 -P"$JOBS" bash -c 'one "$0"'; then
+    echo "some XCTD files could not be decompressed" >&2
+    exit 1
+fi
+echo "decompressed $(find "$OUT" -maxdepth 1 -type f ! -name '*.part' | wc -l) files into $OUT"

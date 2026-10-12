@@ -14,8 +14,14 @@
 # that compiles but is garbage. See docs/SHADERS-PLUME.md.
 set -euo pipefail
 
-INPUT=$1
-OUT_DIR=$2
+# --prepare-only: fetch and build the recompiler, then stop (tools/prepare.py deps).
+PREPARE_ONLY=0
+if [ "${1:-}" = "--prepare-only" ]; then
+    PREPARE_ONLY=1
+else
+    INPUT=$1
+    OUT_DIR=$2
+fi
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${XENOS_RECOMP_WORK:-$HOME/rxr}
@@ -33,6 +39,7 @@ git apply "$HERE/renut-xenosrecomp.patch"
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ > /dev/null
 cmake --build build -j"$(nproc)"
+[ "$PREPARE_ONLY" = 1 ] && exit 0
 
 mkdir -p "$OUT_DIR"
 # The fifth argument lists the vertex shaders to recompile a second time as the
