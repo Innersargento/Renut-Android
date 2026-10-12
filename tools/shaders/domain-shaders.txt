@@ -11,3 +11,7 @@ F09B139EE9188255
 # adaptive tessellation.
 631D40DF78B583F7
 8EDDB32357201CD0
+
+# A further water surface, found from a device log of 12/10 (4 patch draws a frame: n=2553 twice,
+# n=30 twice). Its microcode is not a container anywhere in the game: it comes from files/plume-miss.
+E3EE93145D133624

@@ -2618,6 +2618,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint32_t next_3d_descriptor_ = 1;
 
   Stats stats_;
+  // Vertex shaders whose patch draws were dropped for want of a domain form, logged once each.
+  std::unordered_set<uint64_t> patch_drop_logged_;
   uint64_t swaps_ = 0;
   uint64_t reported_silent_frames_ = 0;
 };
@@ -6031,6 +6033,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   if (topology == RenderPrimitiveTopology::UNKNOWN) {
     ++stats_.skipped_prim;
+    if ((prim_type == xenos::PrimitiveType::kTrianglePatch || prim_type == xenos::PrimitiveType::kQuadPatch) &&
+        patch_drop_logged_.insert(vs->entry->hash).second) {
+      // Water with no domain form simply does not appear. tools/prepare.py dumps reads this line back.
+      REXLOG_INFO(
+          "Renut: Plume patch draw dropped: vs={:016X} has no domain form (list it in "
+          "tools/shaders/domain-shaders.txt)",
+          vs->entry->hash);
+    }
     // The patches Plume could not tessellate go through here: the shader and
     // the tessellation mode say which.
     Trace("dropped prim={} n={} vs={:016X} ps={:016X} tess={} indexed={}", uint32_t(prim_type),

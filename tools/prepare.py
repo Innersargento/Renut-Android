@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -544,6 +545,43 @@ def stage_codegen(args):
 
 # ---- stage: shaders ------------------------------------------------------------------------------
 
+def cache_hashes(cache_cpp):
+    """Container hashes of the entries in a generated shader_cache.cpp."""
+    text = Path(cache_cpp).read_text(encoding="utf-8", errors="replace")
+    return {int(m, 16) for m in re.findall(r"^\t\{ (0x[0-9A-Fa-f]+),", text, re.M)}
+
+
+def report_runtime_shaders(out_dir):
+    """Tells how many of the shaders that only exist at run time came out of the captures.
+
+    Bloom and the tessellated water are among them: without their shaders the draws are dropped and the
+    effects simply do not appear, so a short capture session shows up as exactly that.
+    """
+    listed = set()
+    for line in (TOOLS / "shaders" / "runtime-shaders.txt").read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            listed.add(int(line, 16))
+    have = cache_hashes(out_dir / "shader_cache.cpp")
+    missing = listed - have
+    say("   shaders gerados em runtime: %d de %d presentes" % (len(listed) - len(missing), len(listed)))
+    domain = []
+    log = LOGS / "shaders-recompile.log"
+    if log.is_file():
+        text = log.read_text(encoding="utf-8", errors="replace")
+        text = text[max(text.rfind(chr(10) + "$ "), 0):]  # the log is appended to: only the last run counts
+        domain = re.findall(r"Domain shader (0x[0-9A-Fa-f]+) is not in the input", text)
+    if domain:
+        say("   FALTAM os shaders de domínio da água tesselada: %s" % ", ".join(sorted(set(domain))))
+    if missing:
+        say("   AVISO: faltam %d shaders gerados em runtime. O que depende deles não aparece (bloom/brilho, água "
+            "tesselada, outros efeitos)." % len(missing))
+        say("   Eles só são capturados quando o jogo os cria. Jogue passando por água, lojas e pelo menos um mundo, "
+            "depois repita: prepare.py dumps, prepare.py shaders, e recompile o app.")
+        say("   As capturas ficam no aparelho e se acumulam entre sessões; não apague os dados do app.")
+    return len(missing)
+
+
 def python_tool(script, *args, log):
     run([sys.executable, "-I", str(TOOLS / "shaders" / script), *[str(a) for a in args]], log=log)
 
@@ -590,6 +628,24 @@ def decompress_xctd(source, destination):
                                          shlex.quote(to_linux_path(OUT / "xctd_decompress")))
     linux_bash("%s bash %s %s %s" % (env, shlex.quote(script), shlex.quote(to_linux_path(source)),
                                      shlex.quote(to_linux_path(destination))), log="shaders-xctd-unpack.log")
+
+
+def merged_domain_list(dumps):
+    """The repository's list of vertex shaders run as the domain stage of a tessellated draw, plus the ones the
+    device log named (prepare.py dumps)."""
+    lines = (TOOLS / "shaders" / "domain-shaders.txt").read_text(encoding="utf-8").splitlines()
+    extra = dumps / "domain-shaders.txt"
+    if extra.is_file():
+        have = {l.strip().upper() for l in lines}
+        added = [l.strip() for l in extra.read_text(encoding="utf-8").splitlines()
+                 if l.strip() and l.strip().upper() not in have]
+        if added:
+            say("   formas de domínio extras vindas do aparelho: %s" % ", ".join(added))
+            lines += ["", "# from the device log (prepare.py dumps)"] + added
+    target = OUT / "domain-shaders.txt"
+    OUT.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target
 
 
 def stage_shaders(args):
@@ -642,10 +698,14 @@ def stage_shaders(args):
     # 4. recompile
     out = OUT / "shaders-out"
     out.mkdir(parents=True, exist_ok=True)
+    domain = merged_domain_list(dumps)
     script = to_linux_path(TOOLS / "shaders" / "recompile_shaders.sh")
     say("   recompilando (clona/compila a ferramenta na primeira vez)")
-    linux_bash("%s bash %s %s %s" % (shader_work_env(), shlex.quote(script), shlex.quote(to_linux_path(inp)),
-                                     shlex.quote(to_linux_path(out))), log="shaders-recompile.log")
+    linux_bash("%s DOMAIN_SHADERS=%s bash %s %s %s" % (shader_work_env(), shlex.quote(to_linux_path(domain)),
+                                                       shlex.quote(script), shlex.quote(to_linux_path(inp)),
+                                                       shlex.quote(to_linux_path(out))), log="shaders-recompile.log")
+
+    report_runtime_shaders(out)
 
     # 5. install what the Android build consumes
     if args.no_install:
@@ -703,7 +763,18 @@ def stage_dumps(args):
         except tarfile.TarError:
             pass
         temp.unlink()
-    if not pulled:
+    log = subprocess.run([adb, "exec-out", "run-as", XEX_PACKAGE, "cat", "files/rexglue-runtime.log"], capture_output=True)
+    wanted = set(re.findall(r"patch draw dropped: vs=([0-9A-Fa-f]{16})", log.stdout.decode("utf-8", errors="replace")))
+    if wanted:
+        # Water that has no domain form (tools/shaders/domain-shaders.txt) is dropped; the next recompile adds it.
+        known = set()
+        domain_file = target / "domain-shaders.txt"
+        if domain_file.is_file():
+            known = {l.strip().upper() for l in domain_file.read_text(encoding="utf-8").splitlines() if l.strip()}
+        merged = sorted(known | {h.upper() for h in wanted})
+        domain_file.write_text("\n".join(merged) + "\n", encoding="utf-8")
+        say("   %d shader(s) de água sem forma de domínio registrados em %s" % (len(merged), domain_file.relative_to(ROOT)))
+    if not pulled and not wanted:
         fail("nada para baixar: o app precisa ser a build de depuração (run-as) e já ter rodado o jogo.")
     say("   %d arquivos em %s. Rode 'prepare.py shaders' de novo para incorporá-los." % (pulled, target.relative_to(ROOT)))
 

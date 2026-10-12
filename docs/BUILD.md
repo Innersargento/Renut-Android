@@ -168,19 +168,74 @@ exemplo em `~/.bashrc`) ou crie `android/local.properties` com
 ## 4. Segunda passada: shaders gerados em runtime
 
 Cerca de 150 shaders (3%) **não existem em nenhum arquivo do jogo**: o próprio
-jogo os gera ou altera enquanto roda. Só podem ser capturados no aparelho.
-Sem eles o jogo funciona, mas os desenhos que dependem deles são descartados.
+jogo os gera ou altera enquanto roda, e só ele sabe quando. Eles só podem ser
+capturados no aparelho, **e só os que o jogo chegou a criar durante as suas
+sessões**.
 
-Depois de jogar uma vez com a build de depuração instalada:
+Entre eles estão justamente o **bloom (o brilho)** e a **água tesselada**. Sem
+esses shaders o app roda, mas esses desenhos são descartados: o brilho não
+aparece e a água some. Se for isso que você vê, faltam capturas.
 
 ```bash
 python3 tools/prepare.py dumps         # baixa as capturas do aparelho via adb
 python3 tools/prepare.py shaders       # recompila incluindo as capturas
-python3 tools/prepare.py apk           # (ou Build APK no Android Studio)
+python3 tools/prepare.py apk           # (ou Build APK no Android Studio) e reinstale
 ```
 
-`dumps` exige o app de depuração (`run-as`), o aparelho conectado com a
-depuração USB autorizada e o jogo já ter rodado ao menos uma sessão.
+O passo `shaders` termina com um resumo:
+
+```
+   shaders gerados em runtime: 152 de 152 presentes
+```
+
+Se aparecer um número menor, o resumo diz quantos faltam e, no caso da água,
+quais shaders de domínio faltam (`FALTAM os shaders de domínio da água ...`).
+Enquanto não for **152 de 152**, faltam efeitos. Para completar:
+
+1. Jogue com a build de depuração instalada **passando pelo que falta**: a
+   água (o voo de abertura e o mar do primeiro mundo), lojas e pelo menos um
+   mundo inteiro. Quanto mais variado, mais shaders são criados.
+2. Repita `dumps`, `shaders` e recompile o app (as capturas **se acumulam** no
+   aparelho entre as sessões; só pedem uma nova passada).
+3. Reinstale o APK novo. Os shaders ficam dentro do app: sem recompilar, nada
+   muda.
+
+Cuidados:
+
+- `dumps` exige a **build de depuração** (usa `run-as`), o aparelho conectado
+  com a depuração USB autorizada e o jogo já ter rodado.
+- **Não apague os dados do app** nem desinstale entre as passadas: as capturas
+  moram em `files/shader-dump` do aparelho. Atualizar o app por cima (instalar
+  `-r`) mantém tudo.
+- Os arquivos `plume-miss` também são baixados, mas só os do tipo `vs_*.ucode`
+  são aproveitados; para pixel shaders o que vale são as capturas completas
+  (`shader-dump`).
+
+---
+
+### A água continua sem aparecer, mesmo com 150 de 152
+
+A água tesselada é desenhada pelo shader de vértice do jogo rodando como
+"estágio de domínio". Nada no shader diz isso: a lista está em
+`tools/shaders/domain-shaders.txt`, e um shader de água que não esteja nela é
+descartado (`patch_draws=0` e `skipped_prim` fixo no log).
+
+O app avisa quando isso acontece, uma vez por shader, em
+`files/rexglue-runtime.log`:
+
+```
+Renut: Plume patch draw dropped: vs=E3EE93145D133624 has no domain form (...)
+```
+
+`prepare.py dumps` lê essas linhas e `prepare.py shaders` já as inclui na
+compilação seguinte (aparece como `formas de domínio extras vindas do
+aparelho`). Então o ciclo é o mesmo: jogar, `dumps`, `shaders`, recompilar.
+Se achar um hash que vale para todo mundo, acrescente-o em
+`domain-shaders.txt`.
+
+Um shader de domínio que o jogo cria a partir de microcódigo "solto" só chega
+pelo `plume-miss` (por isso o `dumps` baixa essa pasta também): sem ela o
+container nem existe para a lista apontar.
 
 ---
 
