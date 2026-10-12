@@ -103,6 +103,7 @@
     <string name="settings_advanced">Avanzado</string>
     <string name="settings_driver">Controlador</string>
     <string name="driver_system">Controlador del sistema</string>
+    <string name="driver_bundled_label">%1$s (incluido)</string>
     <string name="settings_driver_import">Importar controlador Adreno (.zip)</string>
     <string name="settings_driver_delete">Eliminar el controlador seleccionado</string>
     <string name="settings_turnip_note">Las opciones de Adreno (One UI fix, TU_DEBUG, IR3_SHADER_DEBUG) aparecen al seleccionar un controlador Turnip.</string>

@@ -172,6 +172,7 @@ add("settings_external", "Controles externos e jogadores", "External controllers
 add("settings_advanced", "Avançado", "Advanced", "高级", "Avanzado")
 add("settings_driver", "Driver", "Driver", "驱动程序", "Controlador")
 add("driver_system", "Driver do sistema", "System driver", "系统驱动程序", "Controlador del sistema")
+add("driver_bundled_label", "%1$s (incluído)", "%1$s (bundled)", "%1$s（内置）", "%1$s (incluido)")
 add("settings_driver_import", "Importar driver Adreno (.zip)", "Import Adreno driver (.zip)", "导入 Adreno 驱动程序 (.zip)",
     "Importar controlador Adreno (.zip)")
 add("settings_driver_delete", "Apagar driver selecionado", "Delete selected driver", "删除所选驱动程序",

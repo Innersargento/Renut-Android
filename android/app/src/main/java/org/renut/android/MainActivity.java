@@ -43,6 +43,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             finish();
             return;
         }
+        BundledDriver.sync(this,getPreferences(0));  // unpacks the Turnip that ships in the APK and makes it the default on Adreno
         getWindow().setStatusBarColor(Color.rgb(12,23,28));
         getWindow().setNavigationBarColor(Color.rgb(12,23,28));
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(Color.rgb(12,23,28));setContentView(root);
@@ -98,7 +99,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         LinearLayout graphics=card(body,"02   GRÁFICOS");
         driver=text("Driver do sistema",16,ink); graphics.addView(driver);
         button(graphics,"Importar driver Adreno (.zip)",()->pick(DRIVER));
-        button(graphics,"Usar driver do sistema",()->{getPreferences(0).edit().remove("driverDir").remove("driverLib").apply(); refresh();});
+        button(graphics,"Usar driver do sistema",()->{getPreferences(0).edit().remove("driverDir").remove("driverLib").putBoolean(BundledDriver.PREF_CHOSEN,true).apply(); refresh();});
         button(graphics,"Apagar cache de shaders",()->new AlertDialog.Builder(this)
             .setTitle(Language.s(R.string.shader_cache_title))
             .setMessage(Language.s(R.string.shader_cache_message))
@@ -229,6 +230,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     private String driverLabel(java.util.List<JSONObject> list,int index){
         String name=list.get(index).optString("name");int same=0;
         for(int i=0;i<index;i++)if(list.get(i).optString("name").equals(name))same++;
+        if(list.get(index).optBoolean("bundled"))name=Language.s(R.string.driver_bundled_label,name);
         return same==0?name:name+" ("+(same+1)+")";
     }
     public java.util.List<String> uiDriverChoices(){
@@ -252,13 +254,14 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             edit.putString("driverDir",list.get(i).optString("dir")).putString("driverLib",list.get(i).optString("lib"));found=true;
         }
         if(!found)edit.remove("driverDir").remove("driverLib");
-        edit.apply();refresh();
+        edit.putBoolean(BundledDriver.PREF_CHOSEN,true).apply();refresh();
     }
     private final java.util.Map<String,Boolean> turnipCache=new java.util.HashMap<>();
     /** True only when the selected driver is Turnip: its library carries the TU_DEBUG option table, which no other driver has. */
     public boolean uiDriverIsTurnip(){
         String dir=getPreferences(0).getString("driverDir",""),lib=getPreferences(0).getString("driverLib","");
         if(dir.isEmpty()||lib.isEmpty())return false;
+        if(BundledDriver.isBundledDir(dir))return true;  // known Turnip: skip scanning 14 MB
         File so=new File(dir,lib);
         if(!so.isFile())return false;
         String key=so.getAbsolutePath()+":"+so.length()+":"+so.lastModified();
@@ -279,7 +282,11 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         }catch(IOException ignored){}
         return false;
     }
-    public boolean uiDriverStored(){return !getPreferences(0).getString("driverDir","").isEmpty();}
+    /** True for a driver the user imported; the bundled one is part of the app and cannot be deleted. */
+    public boolean uiDriverStored(){
+        String dir=getPreferences(0).getString("driverDir","");
+        return !dir.isEmpty()&&!BundledDriver.isBundledDir(dir);
+    }
     /** Removes the selected stored driver from the device and falls back to the system one. */
     public void uiDeleteDriver(){
         String dir=getPreferences(0).getString("driverDir","");
@@ -287,7 +294,9 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         java.util.List<JSONObject> list=storedDrivers();
         list.removeIf(d->d.optString("dir").equals(dir));
         saveDrivers(list);
-        getPreferences(0).edit().remove("driverDir").remove("driverLib").apply();
+        // Back to the default: the bundled driver on Adreno, the system one elsewhere.
+        getPreferences(0).edit().remove("driverDir").remove("driverLib").putBoolean(BundledDriver.PREF_CHOSEN,false).apply();
+        BundledDriver.sync(this,getPreferences(0));
         try{GameFiles.removeTree(new File(dir));}catch(IOException e){toast(Language.s(R.string.driver_remove_failed,e.getMessage()));}
         refresh();
     }
@@ -459,7 +468,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         java.util.List<JSONObject> list=storedDrivers();
         list.add(new JSONObject().put("dir",stage.getAbsolutePath()).put("lib",lib).put("name",json.optString("name",lib).trim().isEmpty()?lib:json.optString("name",lib).trim()));
         if(!getPreferences(0).edit().putString("drivers",new org.json.JSONArray(list).toString())
-            .putString("driverDir",stage.getAbsolutePath()).putString("driverLib",lib).commit())throw new IOException(Language.s(R.string.driver_save_failed));
+            .putString("driverDir",stage.getAbsolutePath()).putString("driverLib",lib).putBoolean(BundledDriver.PREF_CHOSEN,true).commit())throw new IOException(Language.s(R.string.driver_save_failed));
     }
     @Override protected void onDestroy(){Thread t=worker;if(t!=null)t.interrupt();super.onDestroy();}
 }

@@ -103,6 +103,7 @@
     <string name="settings_advanced">高级</string>
     <string name="settings_driver">驱动程序</string>
     <string name="driver_system">系统驱动程序</string>
+    <string name="driver_bundled_label">%1$s（内置）</string>
     <string name="settings_driver_import">导入 Adreno 驱动程序 (.zip)</string>
     <string name="settings_driver_delete">删除所选驱动程序</string>
     <string name="settings_turnip_note">选择 Turnip 驱动程序后，将显示 Adreno 选项（One UI fix、TU_DEBUG、IR3_SHADER_DEBUG）。</string>
