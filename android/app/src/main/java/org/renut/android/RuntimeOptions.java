@@ -20,6 +20,8 @@ final class RuntimeOptions {
         "renut_cheat_extended_build_range"};
     static final String CHEAT_SKIN = "renut_cheat_banjo_skin";
     static final String[] SKINS = {"default", "robot", "tuxedo"};
+    /** 0 full, 1 half, 2 quarter: how far the world's textures are reduced (plume_gpu.cpp). */
+    static final String TEXTURE_QUALITY = "renut_plume_texture_quality";
 
     private static final Set<String> BOOLEANS = new java.util.HashSet<>(java.util.Arrays.asList(
         "renut_plume_async_pipelines", "renut_plume_uncap_fps", "renut_plume_no_shadows", "renut_plume_no_bloom",
@@ -53,6 +55,7 @@ final class RuntimeOptions {
         boolean text = key.equals("log_level") || key.equals(CHEAT_SKIN);
         if (!(BOOLEANS.contains(key) && (value.equals("true") || value.equals("false"))
             || key.equals("log_level") && LEVELS.contains(value)
+            || key.equals(TEXTURE_QUALITY) && (value.equals("0") || value.equals("1") || value.equals("2"))
             || key.equals(CHEAT_SKIN) && java.util.Arrays.asList(SKINS).contains(value)))
             throw new IllegalArgumentException("Opção inválida: " + key);
         File file = config(context);

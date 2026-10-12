@@ -136,6 +136,12 @@ REXCVAR_DEFINE_INT32(renut_plume_bc_textures, 1, "reNut/Plume",
                      "already are (a quarter to an eighth of the RGBA8 the decoder makes, no CPU decode) on a GPU "
                      "that samples BC (Adreno): 0 off, 1 on. Live: files/plume-bc.")
     .range(0, 1);
+REXCVAR_DEFINE_INT32(renut_plume_texture_quality, 0, "reNut/Plume",
+                     "Texture quality: 0 full, 1 half, 2 quarter. A 2D texture the game samples with mip "
+                     "filtering (the world; the interface and fonts are read from the base level alone and "
+                     "stay sharp) drops its top one or two mips, never below 64 px. Live: "
+                     "files/plume-texquality.")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
                     "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                     "next start; a scene load waits until they are built. Not in low-memory mode, which only "
@@ -1265,6 +1271,8 @@ struct GuestTexture {
   // the CPU), and whether the compressed upload was tried and did not fit.
   BcKind bc = BcKind::kNone;
   bool bc_blocked = false;
+  // Guest mips below the host image's top level (max dimension and quality).
+  uint32_t skip = 0;
 };
 
 // Bytes a 2D guest texture takes on the host, its mip chain included.
@@ -1714,6 +1722,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // BC textures: the device samples them, and files/plume-bc / the cvar want them.
   bool bc_supported_ = false;
   uint32_t bc_mode_ = 1;
+  // 0 full, 1 half, 2 quarter: mips of a mip-filtered 2D texture not kept on the host.
+  uint32_t texture_quality_ = 0;
   uint64_t texture_budget_ = 0;  // bytes of decoded 2D textures; 0 = unlimited
   // Filled by the guest thread that tripped a watch (inside its fault
   // handler), drained by this one.
@@ -1795,6 +1805,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     std::array<TextureLevel, 14> levels_layout{};
     std::array<uint32_t, 14> starts{};
     bool usable = false;
+    // The guest reads the top level alone (interface, fonts, post): never reduced.
+    bool base_map = false;
   };
   const FetchLayout* LayoutOf(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
@@ -3149,6 +3161,9 @@ bool PlumeCommandProcessor::SetupContext() {
   bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
   REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
               bc_mode_ ? "on" : "off");
+  texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
+  REXLOG_INFO("Renut: Plume texture quality: {}",
+              texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
   // One slice per frame in flight, after the permanent allocations.
   const uint64_t upload_bytes = upload_slice_size_ * kPlumeFramesInFlight + 4096;
   upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
@@ -4851,6 +4866,10 @@ const PlumeCommandProcessor::FetchLayout* PlumeCommandProcessor::LayoutOf(
   layout.top_level = top_level;
   HashCombine(key, last_level);
   HashCombine(key, uint32_t(fetch.packed_mips));
+  // The same memory read with and without mips is two host images under
+  // texture quality, so the choice is part of the key.
+  layout.base_map = fetch.mip_filter == xenos::TextureFilter::kBaseMap;
+  HashCombine(key, uint32_t(layout.base_map));
   layout.key = key;
   for (uint32_t i = 0; i < layout.levels; ++i) {
     auto& level = layout.levels_layout[i];
@@ -4884,6 +4903,17 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   if (max_texture_dim_) {
     while (skip + 1 < levels && std::max(layouts[skip].width, layouts[skip].height) > max_texture_dim_) ++skip;
   }
+  // Texture quality: one mip lower for half, two for quarter, on a texture the
+  // guest filters across mips, and never to a side under 64 px. What it reads
+  // from its base level alone (the interface, fonts) is not touched.
+  if (texture_quality_ && !fetch_layout->base_map) {
+    uint32_t reduced = 0;
+    while (reduced < texture_quality_ && reduced + 1 < levels &&
+           std::max(layouts[reduced + 1].width, layouts[reduced + 1].height) >= 64) {
+      ++reduced;
+    }
+    skip = std::max(skip, reduced);
+  }
   const uint32_t host_levels = levels - skip;
   GuestTexture* texture_node = texture_memo_.Find(key);
   if (!texture_node) {
@@ -4906,7 +4936,7 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   DrainWatchHits();
   const bool unchanged =
       texture.checked_frame == swaps_ || (texture.watched && ((swaps_ + key) & 255) != 0);
-  if (texture.texture && unchanged && texdump_directory_.empty() && texture.bc == want) {
+  if (texture.texture && unchanged && texdump_directory_.empty() && texture.bc == want && texture.skip == skip) {
     texture.checked_frame = swaps_;
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
@@ -4933,9 +4963,10 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     }
     texture.watched = true;
   }
-  for (uint32_t i = 0; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
+  // The mips the host does not keep (see skip) are not read, so not hashed.
+  for (uint32_t i = skip; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
   if (!texdump_directory_.empty() && dumped_.insert(key).second) texture.content = ~content;
-  if (texture.texture && texture.content == content && texture.bc == want) {
+  if (texture.texture && texture.content == content && texture.bc == want && texture.skip == skip) {
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
@@ -4976,6 +5007,7 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     texture.width = width;
     texture.height = height;
     texture.bc = kind;
+    texture.skip = skip;
     texture.layout = RenderTextureLayout::UNKNOWN;
     if (!texture.texture) {
       texture.failed = true;
@@ -9513,6 +9545,19 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         for (auto& [key, texture] : guest_textures_) RetireGuestTexture(texture);
         guest_textures_.clear();
         texture_memo_.Clear();
+      }
+    }
+    {
+      int quality = std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2);
+      if (FILE* file = std::fopen((root + "/plume-texquality").c_str(), "r")) {
+        int value = quality;
+        if (std::fscanf(file, "%d", &value) == 1) quality = std::clamp(value, 0, 2);
+        std::fclose(file);
+      }
+      if (uint32_t(quality) != texture_quality_) {
+        REXLOG_INFO("Renut: Plume texture quality {} (each texture is uploaded again when it is next drawn)",
+                    quality == 0 ? "full" : quality == 1 ? "half" : "quarter");
+        texture_quality_ = uint32_t(quality);
       }
     }
     {

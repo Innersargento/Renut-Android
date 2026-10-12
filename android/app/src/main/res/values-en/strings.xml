@@ -115,6 +115,11 @@
     <string name="settings_no_shadows">Remove shadows</string>
     <string name="settings_no_bloom">Remove bloom</string>
     <string name="settings_adpf">Sustained performance (ADPF)</string>
+    <string name="settings_texture_quality">Texture quality</string>
+    <string name="texture_quality_full">Full</string>
+    <string name="texture_quality_half">Half</string>
+    <string name="texture_quality_quarter">Quarter</string>
+    <string name="settings_texture_quality_note">Lowers the resolution of the world\'s textures (less memory and bandwidth); the interface and fonts are unchanged.</string>
     <string name="settings_temp">Temperature</string>
     <string name="layout_title">Edit layout</string>
     <string name="layout_edit_button">Edit layout…</string>

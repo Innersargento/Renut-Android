@@ -676,6 +676,11 @@ private val SKIN_LABELS = listOf(
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
     val sustained = activity.uiRuntimeOption("renut_adpf", "true") == "true"
+    val textureLevels = listOf(stringResource(R.string.texture_quality_full), stringResource(R.string.texture_quality_half),
+        stringResource(R.string.texture_quality_quarter))
+    var textureQuality by remember {
+        mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
+    }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
             Row(verticalAlignment = Alignment.Top) {
@@ -739,6 +744,13 @@ private val SKIN_LABELS = listOf(
                 ToggleRow(stringResource(R.string.settings_async), shaderAsync, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_async_pipelines", it.toString())
                 }
+                SingleChoiceSelector(stringResource(R.string.settings_texture_quality), textureLevels[textureQuality],
+                    textureLevels, !busy) { choice ->
+                    val level = textureLevels.indexOf(choice).coerceAtLeast(0)
+                    textureQuality = level
+                    activity.uiSetRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, level.toString())
+                }
+                Text(stringResource(R.string.settings_texture_quality_note), color = Muted, fontSize = 12.sp)
                 ToggleRow(stringResource(R.string.settings_no_shadows), noShadows, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
                 }

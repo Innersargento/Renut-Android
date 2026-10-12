@@ -192,6 +192,15 @@ add("settings_no_shadows", "Remover sombras", "Remove shadows", "移除阴影", 
 add("settings_no_bloom", "Remover bloom", "Remove bloom", "移除泛光", "Quitar bloom")
 add("settings_adpf", "Desempenho sustentado (ADPF)", "Sustained performance (ADPF)", "持续性能 (ADPF)",
     "Rendimiento sostenido (ADPF)")
+add("settings_texture_quality", "Qualidade das texturas", "Texture quality", "纹理质量", "Calidad de texturas")
+add("texture_quality_full", "Completa", "Full", "完整", "Completa")
+add("texture_quality_half", "Metade", "Half", "一半", "Mitad")
+add("texture_quality_quarter", "Um quarto", "Quarter", "四分之一", "Un cuarto")
+add("settings_texture_quality_note",
+    "Reduz a resolução das texturas do mundo (menos memória e banda); interface e fontes não mudam.",
+    "Lowers the resolution of the world's textures (less memory and bandwidth); the interface and fonts are unchanged.",
+    "降低场景纹理的分辨率（减少内存和带宽）；界面和字体不受影响。",
+    "Reduce la resolución de las texturas del mundo (menos memoria y ancho de banda); la interfaz y las fuentes no cambian.")
 # ---- screen layout editor ---------------------------------------------------------------------
 add("settings_temp", "Temperatura", "Temperature", "温度", "Temperatura")
 add("layout_title", "Editar layout", "Edit layout", "编辑布局", "Editar diseño")

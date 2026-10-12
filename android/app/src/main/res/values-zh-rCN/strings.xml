@@ -115,6 +115,11 @@
     <string name="settings_no_shadows">移除阴影</string>
     <string name="settings_no_bloom">移除泛光</string>
     <string name="settings_adpf">持续性能 (ADPF)</string>
+    <string name="settings_texture_quality">纹理质量</string>
+    <string name="texture_quality_full">完整</string>
+    <string name="texture_quality_half">一半</string>
+    <string name="texture_quality_quarter">四分之一</string>
+    <string name="settings_texture_quality_note">降低场景纹理的分辨率（减少内存和带宽）；界面和字体不受影响。</string>
     <string name="settings_temp">温度</string>
     <string name="layout_title">编辑布局</string>
     <string name="layout_edit_button">编辑布局…</string>
