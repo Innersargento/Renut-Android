@@ -99,7 +99,7 @@
     <string name="settings_uncap_note">Usa o modo de apresentação imediato e a maior frequência da tela na próxima partida. Pode alterar o ritmo de partes do jogo.</string>
     <string name="settings_controls">Controles</string>
     <string name="settings_show_controls">Mostrar controles na tela</string>
-    <string name="settings_external">Configurar controle externo</string>
+    <string name="settings_external">Controles externos e jogadores</string>
     <string name="settings_advanced">Avançado</string>
     <string name="settings_driver">Driver</string>
     <string name="driver_system">Driver do sistema</string>
@@ -190,9 +190,12 @@
     <string name="menu_ach_hint">Ver a lista do jogo</string>
     <string name="menu_ach_summary">%1$d de %2$d · %3$d G</string>
     <string name="menu_onscreen_controls">Controles na tela</string>
+    <string name="menu_controllers">Controles e jogadores</string>
+    <string name="menu_controllers_count">%1$d conectado(s)</string>
+    <string name="menu_controllers_two">2 jogadores</string>
     <string name="menu_exit">Sair do jogo</string>
     <string name="menu_ach_none">A lista é lida do seu jogo na primeira vez em que ele inicia. Ela aparece aqui depois dessa primeira partida.</string>
-    <string name="ctrl_title">Controle externo</string>
+    <string name="ctrl_title">Controles externos</string>
     <string name="ctrl_intro">Conecte um controle USB ou Bluetooth. O mapeamento é salvo para cada aparelho.</string>
     <string name="ctrl_panel_device">Dispositivo</string>
     <string name="ctrl_none">Nenhum controle conectado</string>
@@ -211,6 +214,14 @@
     <string name="ctrl_need_axis">Mova o analógico; esta função precisa de um eixo.</string>
     <string name="ctrl_unassigned">Não atribuído</string>
     <string name="ctrl_axis">Eixo %1$s</string>
+    <string name="ctrl_players_title">Controles conectados e jogadores</string>
+    <string name="ctrl_players_none">Nenhum controle conectado. Conecte um controle USB ou Bluetooth; ele aparece aqui na hora.</string>
+    <string name="ctrl_player_one">Jogador 1</string>
+    <string name="ctrl_player_two">Jogador 2</string>
+    <string name="ctrl_player_off">Não usar</string>
+    <string name="ctrl_players_two_active">Modo de 2 jogadores ativo: o jogo reconhece o Jogador 2.</string>
+    <string name="ctrl_players_hint_one">Conecte um segundo controle (ou escolha Jogador 2 em um controle) para jogar em dois.</string>
+    <string name="ctrl_players_touch">A tela sensível ao toque sempre controla o Jogador 1.</string>
     <string name="probe_eyebrow">TESTE GRÁFICO</string>
     <string name="probe_subtitle">Apresentação Vulkan no aparelho</string>
     <string name="probe_running">Testando apresentação Plume…\nA animação dura alguns segundos.</string>

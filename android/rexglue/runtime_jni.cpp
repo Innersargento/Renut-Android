@@ -159,14 +159,21 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeS
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeTrigger(JNIEnv*,jclass,jint trigger,jfloat value) {
   renut::SetTouchTrigger(trigger,value);
 }
-extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalButton(JNIEnv*,jclass,jint button,jboolean down) {
-  renut::SetExternalButton(uint16_t(button),down);
+// The Android gamepads: player 0 shares the guest's first pad with the touch controller, player
+// 1 is the second guest user (local multiplayer).
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalButton(JNIEnv*,jclass,jint player,jint button,jboolean down) {
+  renut::SetExternalButton(player,uint16_t(button),down);
 }
-extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalStick(JNIEnv*,jclass,jint stick,jfloat x,jfloat y) {
-  renut::SetExternalStick(stick,x,y);
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalStick(JNIEnv*,jclass,jint player,jint stick,jfloat x,jfloat y) {
+  renut::SetExternalStick(player,stick,x,y);
 }
-extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalTrigger(JNIEnv*,jclass,jint trigger,jfloat value) {
-  renut::SetExternalTrigger(trigger,value);
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalTrigger(JNIEnv*,jclass,jint player,jint trigger,jfloat value) {
+  renut::SetExternalTrigger(player,trigger,value);
+}
+// A gamepad is (or is no longer) assigned to player 1. The game notices on its next poll and is
+// told through the sign-in notification.
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeSetPlayerAttached(JNIEnv*,jclass,jint player,jboolean attached) {
+  renut::SetPlayerAttached(player,attached);
 }
 extern "C" uint64_t renut_guest_swap_count();
 extern "C" JNIEXPORT jlong JNICALL Java_org_renut_android_RuntimeActivity_nativeFrameCount(JNIEnv*,jclass) {
@@ -381,6 +388,8 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       config.input_factory=[](bool tool_mode){
         auto input=rex::input::CreateDefaultInputSystem(tool_mode);
         input->AddDriver(std::make_unique<renut::TouchInput>());
+        // Two guest users: the touch controller feeds the first, a second gamepad the second.
+        input->SetDeviceAssignment(std::make_unique<renut::PlayerAssignment>());
         return input;
       };
       note("Inicializando tradutor Xenos → SPIR-V e renderizador Vulkan.");

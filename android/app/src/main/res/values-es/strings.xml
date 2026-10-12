@@ -99,7 +99,7 @@
     <string name="settings_uncap_note">Usa la presentación inmediata y la mayor frecuencia de la pantalla en la próxima partida. Puede alterar el ritmo de partes del juego.</string>
     <string name="settings_controls">Controles</string>
     <string name="settings_show_controls">Mostrar controles en pantalla</string>
-    <string name="settings_external">Configurar mando externo</string>
+    <string name="settings_external">Mandos externos y jugadores</string>
     <string name="settings_advanced">Avanzado</string>
     <string name="settings_driver">Controlador</string>
     <string name="driver_system">Controlador del sistema</string>
@@ -190,9 +190,12 @@
     <string name="menu_ach_hint">Ver la lista del juego</string>
     <string name="menu_ach_summary">%1$d de %2$d · %3$d G</string>
     <string name="menu_onscreen_controls">Controles en pantalla</string>
+    <string name="menu_controllers">Mandos y jugadores</string>
+    <string name="menu_controllers_count">%1$d conectado(s)</string>
+    <string name="menu_controllers_two">2 jugadores</string>
     <string name="menu_exit">Salir del juego</string>
     <string name="menu_ach_none">La lista se lee de tu juego la primera vez que arranca. Aparece aquí después de esa primera partida.</string>
-    <string name="ctrl_title">Mando externo</string>
+    <string name="ctrl_title">Mandos externos</string>
     <string name="ctrl_intro">Conecta un mando USB o Bluetooth. La asignación se guarda para cada dispositivo.</string>
     <string name="ctrl_panel_device">Dispositivo</string>
     <string name="ctrl_none">Ningún mando conectado</string>
@@ -211,6 +214,14 @@
     <string name="ctrl_need_axis">Mueve el stick; esta función necesita un eje.</string>
     <string name="ctrl_unassigned">Sin asignar</string>
     <string name="ctrl_axis">Eje %1$s</string>
+    <string name="ctrl_players_title">Mandos conectados y jugadores</string>
+    <string name="ctrl_players_none">Ningún mando conectado. Conecta un mando USB o Bluetooth; aparecerá aquí al instante.</string>
+    <string name="ctrl_player_one">Jugador 1</string>
+    <string name="ctrl_player_two">Jugador 2</string>
+    <string name="ctrl_player_off">No usar</string>
+    <string name="ctrl_players_two_active">Modo de 2 jugadores activo: el juego reconoce al Jugador 2.</string>
+    <string name="ctrl_players_hint_one">Conecta un segundo mando (o pon uno como Jugador 2) para jugar de a dos.</string>
+    <string name="ctrl_players_touch">La pantalla táctil siempre controla al Jugador 1.</string>
     <string name="probe_eyebrow">PRUEBA GRÁFICA</string>
     <string name="probe_subtitle">Presentación Vulkan en el dispositivo</string>
     <string name="probe_running">Probando la presentación de Plume…\nLa animación dura unos segundos.</string>

@@ -20,13 +20,17 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private TextPrompt textPrompt;
     private boolean controlsVisible;
     private float gameRefreshRate=60f;
-    private ExternalController.Player controller;
-    private int controllerDeviceId = -1;
+    // One per local player: the gamepad that plays as player one (together with the touch screen)
+    // and the one that plays as player two. Null while no gamepad is assigned to that player.
+    private final ExternalController.Player[] controllers = new ExternalController.Player[ExternalController.PLAYERS];
+    // Connected gamepads that play as nobody (a third pad, or one the player switched off); their
+    // events are dropped without looking at the assignment again.
+    private final java.util.HashSet<Integer> spareIds = new java.util.HashSet<>();
     private InputManager inputManager;
     private final InputManager.InputDeviceListener deviceListener = new InputManager.InputDeviceListener() {
-        @Override public void onInputDeviceAdded(int id) { if (launch) setupController(); }
-        @Override public void onInputDeviceChanged(int id) { if (launch && id == controllerDeviceId) { clearController(); setupController(); } }
-        @Override public void onInputDeviceRemoved(int id) { if (id == controllerDeviceId) { clearController(); setupController(); } }
+        @Override public void onInputDeviceAdded(int id) { if (launch) setupControllers(); }
+        @Override public void onInputDeviceChanged(int id) { if (launch) setupControllers(); }
+        @Override public void onInputDeviceRemoved(int id) { if (launch) setupControllers(); }
     };
     private ScrollView results;
     private boolean started, graphics, launch;
@@ -39,9 +43,10 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native void nativeButton(int button,boolean down);
     private static native void nativeStick(int stick,float x,float y);
     private static native void nativeTrigger(int trigger,float value);
-    private static native void nativeExternalButton(int button,boolean down);
-    private static native void nativeExternalStick(int stick,float x,float y);
-    private static native void nativeExternalTrigger(int trigger,float value);
+    private static native void nativeExternalButton(int player,int button,boolean down);
+    private static native void nativeExternalStick(int player,int stick,float x,float y);
+    private static native void nativeExternalTrigger(int player,int trigger,float value);
+    private static native void nativeSetPlayerAttached(int player,boolean attached);
     private static native long nativeFrameCount();
     private static native long nativePrecompileProgress();
     private static native void nativeTextInputResult(String text,boolean cancelled);
@@ -111,7 +116,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         if(launch){
             inputManager=(InputManager)getSystemService(INPUT_SERVICE);
             inputManager.registerInputDeviceListener(deviceListener,null);
-            setupController();
+            setupControllers();
         }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if(launch){
@@ -328,20 +333,57 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         if(launch&&results.getVisibility()!=View.VISIBLE){showGameMenu();return;}
         super.onBackPressed();
     }
-    private void setupController(){
-        if(controller!=null)return;
-        InputDevice device=ExternalController.findSelected(this);
-        if(device==null)return;
-        controllerDeviceId=device.getId();
-        controller=new ExternalController.Player(device,ExternalController.load(this,device),new ExternalController.Sink(){
-            @Override public void button(int mask,boolean down){if(loaded)nativeExternalButton(mask,down);}
-            @Override public void stick(int stick,float x,float y){if(loaded)nativeExternalStick(stick,x,y);}
-            @Override public void trigger(int trigger,float value){if(loaded)nativeExternalTrigger(trigger,value);}
-        });
+    /**
+     * Brings the players' gamepads in line with what is connected and with the player's choices
+     * (assign): a pad that is no longer the one for its player lets go of its buttons, a new one
+     * starts. Cheap when nothing changed, so it may be called on any device event.
+     */
+    private void setupControllers(){
+        InputDevice[] assigned=new InputDevice[ExternalController.PLAYERS];
+        spareIds.clear();
+        for(ExternalController.Pad pad:ExternalController.pads(this)){
+            if(pad.role>=0)assigned[pad.role]=pad.device;else spareIds.add(pad.device.getId());
+        }
+        for(int player=0;player<ExternalController.PLAYERS;player++){
+            final int slot=player;
+            ExternalController.Player current=controllers[slot];
+            InputDevice device=assigned[slot];
+            if(current!=null&&device!=null&&current.deviceId()==device.getId())continue;
+            if(current!=null){current.release();controllers[slot]=null;}
+            if(device==null)continue;
+            controllers[slot]=new ExternalController.Player(device,ExternalController.load(this,device),new ExternalController.Sink(){
+                @Override public void button(int mask,boolean down){if(loaded)nativeExternalButton(slot,mask,down);}
+                @Override public void stick(int stick,float x,float y){if(loaded)nativeExternalStick(slot,stick,x,y);}
+                @Override public void trigger(int trigger,float value){if(loaded)nativeExternalTrigger(slot,trigger,value);}
+            });
+        }
+        syncSecondPlayer();
     }
-    private void clearController(){
-        if(controller!=null)controller.release();
-        controller=null;controllerDeviceId=-1;
+    /** Tells the game whether a second player's pad is there; it learns of the change on its next poll. */
+    private void syncSecondPlayer(){
+        if(loaded)nativeSetPlayerAttached(ExternalController.PLAYER_TWO,controllers[ExternalController.PLAYER_TWO]!=null);
+    }
+    private void clearControllers(){
+        for(int player=0;player<ExternalController.PLAYERS;player++){
+            if(controllers[player]!=null)controllers[player].release();
+            controllers[player]=null;
+        }
+    }
+    /** The menus changed who plays as whom. */
+    public void uiControllersChanged(){if(launch)setupControllers();}
+    private boolean routeKey(KeyEvent event){
+        for(ExternalController.Player player:controllers)if(player!=null&&player.key(event))return true;
+        return false;
+    }
+    private boolean routeMotion(MotionEvent event){
+        for(ExternalController.Player player:controllers)if(player!=null&&player.motion(event))return true;
+        return false;
+    }
+    /** A gamepad no player has yet: connected without the listener hearing of it, or just assigned. */
+    private boolean unknownPad(InputDevice device){
+        if(!ExternalController.isGamepad(device)||spareIds.contains(device.getId()))return false;
+        for(ExternalController.Player player:controllers)if(player!=null&&player.accepts(device))return false;
+        return true;
     }
     @Override public boolean dispatchKeyEvent(KeyEvent event){
         if(launch&&event.getKeyCode()==KeyEvent.KEYCODE_BACK){
@@ -349,11 +391,17 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             return true;
         }
         if(launch&&(textPromptShowing()||gameMenu!=null&&gameMenu.isOpen()))return super.dispatchKeyEvent(event);
-        if(launch){setupController();if(controller!=null&&controller.key(event))return true;}
+        if(launch){
+            if(unknownPad(event.getDevice()))setupControllers();
+            if(routeKey(event))return true;
+        }
         return super.dispatchKeyEvent(event);
     }
     @Override public boolean dispatchGenericMotionEvent(MotionEvent event){
-        if(launch&&!textPromptShowing()){setupController();if(controller!=null&&controller.motion(event))return true;}
+        if(launch&&!textPromptShowing()){
+            if(unknownPad(event.getDevice()))setupControllers();
+            if(routeMotion(event))return true;
+        }
         return super.dispatchGenericMotionEvent(event);
     }
     private void startValidation(Surface target){
@@ -363,6 +411,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             try {
                 System.loadLibrary("SDL3");org.libsdl.app.SDL.setupJNI();org.libsdl.app.SDL.initialize();org.libsdl.app.SDL.setContext(this);
                 System.loadLibrary("renut_runtime");loaded=true;
+                runOnUiThread(this::syncSecondPlayer);  // a second pad that was already plugged in
                 if(cancelled){nativeStop();return;}
                 report=nativeValidate(getFilesDir().getAbsolutePath(),target,getApplicationInfo().nativeLibraryDir,
                     getIntent().getStringExtra("driverDir"),getIntent().getStringExtra("driverLib"),
@@ -406,7 +455,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         else{stop();if(launch&&!isFinishing())finish();}  // not loaded yet: nothing to keep
     }
     // Leaving the screen no longer ends the game; only closing it does (onDestroy).
-    @Override protected void onPause(){clearController();super.onPause();if(!launch){stop();finish();}}
-    @Override protected void onResume(){super.onResume();if(launch){setupController();applyHudLayout();}}
+    @Override protected void onPause(){clearControllers();super.onPause();if(!launch){stop();finish();}}
+    @Override protected void onResume(){super.onResume();if(launch){setupControllers();applyHudLayout();}}
     @Override protected void onDestroy(){if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
 }

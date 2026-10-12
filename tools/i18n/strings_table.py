@@ -167,8 +167,8 @@ add("settings_uncap_note", "Usa o modo de apresentação imediato e a maior freq
 add("settings_controls", "Controles", "Controls", "控制", "Controles")
 add("settings_show_controls", "Mostrar controles na tela", "Show on-screen controls", "显示屏幕控制按键",
     "Mostrar controles en pantalla")
-add("settings_external", "Configurar controle externo", "Set up external controller", "设置外接手柄",
-    "Configurar mando externo")
+add("settings_external", "Controles externos e jogadores", "External controllers and players", "外接手柄与玩家",
+    "Mandos externos y jugadores")
 add("settings_advanced", "Avançado", "Advanced", "高级", "Avanzado")
 add("settings_driver", "Driver", "Driver", "驱动程序", "Controlador")
 add("driver_system", "Driver do sistema", "System driver", "系统驱动程序", "Controlador del sistema")
@@ -300,6 +300,9 @@ add("menu_pause_hint", "Congela o jogo até você retomar", "Freezes the game un
 add("menu_ach_hint", "Ver a lista do jogo", "See the game's list", "查看游戏的成就列表", "Ver la lista del juego")
 add("menu_ach_summary", "%1$d de %2$d · %3$d G", "%1$d of %2$d · %3$d G", "%1$d / %2$d · %3$d G", "%1$d de %2$d · %3$d G")
 add("menu_onscreen_controls", "Controles na tela", "On-screen controls", "屏幕控制按键", "Controles en pantalla")
+add("menu_controllers", "Controles e jogadores", "Controllers and players", "手柄与玩家", "Mandos y jugadores")
+add("menu_controllers_count", "%1$d conectado(s)", "%1$d connected", "已连接 %1$d 个", "%1$d conectado(s)")
+add("menu_controllers_two", "2 jogadores", "2 players", "双人模式", "2 jugadores")
 add("menu_exit", "Sair do jogo", "Exit game", "退出游戏", "Salir del juego")
 add("menu_ach_none", "A lista é lida do seu jogo na primeira vez em que ele inicia. Ela aparece aqui depois dessa primeira partida.",
     "The list is read from your game the first time it starts. It appears here after that first session.",
@@ -307,7 +310,7 @@ add("menu_ach_none", "A lista é lida do seu jogo na primeira vez em que ele ini
     "La lista se lee de tu juego la primera vez que arranca. Aparece aquí después de esa primera partida.")
 
 # ---- external controller --------------------------------------------------------------------------
-add("ctrl_title", "Controle externo", "External controller", "外接手柄", "Mando externo")
+add("ctrl_title", "Controles externos", "External controllers", "外接手柄", "Mandos externos")
 add("ctrl_intro", "Conecte um controle USB ou Bluetooth. O mapeamento é salvo para cada aparelho.",
     "Connect a USB or Bluetooth controller. The mapping is saved for each device.",
     "连接 USB 或蓝牙手柄。按键映射会为每个设备分别保存。",
@@ -338,6 +341,25 @@ add("ctrl_need_axis", "Mova o analógico; esta função precisa de um eixo.", "M
     "请移动摇杆；此功能需要使用摇杆轴。", "Mueve el stick; esta función necesita un eje.")
 add("ctrl_unassigned", "Não atribuído", "Unassigned", "未分配", "Sin asignar")
 add("ctrl_axis", "Eixo %1$s", "Axis %1$s", "轴 %1$s", "Eje %1$s")
+add("ctrl_players_title", "Controles conectados e jogadores", "Connected controllers and players",
+    "已连接的手柄与玩家", "Mandos conectados y jugadores")
+add("ctrl_players_none", "Nenhum controle conectado. Conecte um controle USB ou Bluetooth; ele aparece aqui na hora.",
+    "No controller connected. Plug in a USB or Bluetooth controller; it shows up here right away.",
+    "未连接手柄。请连接 USB 或蓝牙手柄，它会立即显示在这里。",
+    "Ningún mando conectado. Conecta un mando USB o Bluetooth; aparecerá aquí al instante.")
+add("ctrl_player_one", "Jogador 1", "Player 1", "玩家 1", "Jugador 1")
+add("ctrl_player_two", "Jogador 2", "Player 2", "玩家 2", "Jugador 2")
+add("ctrl_player_off", "Não usar", "Don't use", "不使用", "No usar")
+add("ctrl_players_two_active", "Modo de 2 jogadores ativo: o jogo reconhece o Jogador 2.",
+    "2-player mode is on: the game recognizes Player 2.",
+    "双人模式已开启：游戏已识别玩家 2。", "Modo de 2 jugadores activo: el juego reconoce al Jugador 2.")
+add("ctrl_players_hint_one", "Conecte um segundo controle (ou escolha Jogador 2 em um controle) para jogar em dois.",
+    "Connect a second controller (or set one to Player 2) to play with two.",
+    "连接第二个手柄（或将某个手柄设为玩家 2）即可双人游戏。",
+    "Conecta un segundo mando (o pon uno como Jugador 2) para jugar de a dos.")
+add("ctrl_players_touch", "A tela sensível ao toque sempre controla o Jogador 1.",
+    "The touch screen always controls Player 1.", "触屏始终控制玩家 1。",
+    "La pantalla táctil siempre controla al Jugador 1.")
 
 # ---- diagnostic screens ---------------------------------------------------------------------------
 add("probe_eyebrow", "TESTE GRÁFICO", "GRAPHICS TEST", "图形测试", "PRUEBA GRÁFICA")

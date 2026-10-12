@@ -99,7 +99,7 @@
     <string name="settings_uncap_note">下一局将使用即时呈现模式和屏幕的最高刷新率。这可能会改变游戏部分内容的节奏。</string>
     <string name="settings_controls">控制</string>
     <string name="settings_show_controls">显示屏幕控制按键</string>
-    <string name="settings_external">设置外接手柄</string>
+    <string name="settings_external">外接手柄与玩家</string>
     <string name="settings_advanced">高级</string>
     <string name="settings_driver">驱动程序</string>
     <string name="driver_system">系统驱动程序</string>
@@ -190,6 +190,9 @@
     <string name="menu_ach_hint">查看游戏的成就列表</string>
     <string name="menu_ach_summary">%1$d / %2$d · %3$d G</string>
     <string name="menu_onscreen_controls">屏幕控制按键</string>
+    <string name="menu_controllers">手柄与玩家</string>
+    <string name="menu_controllers_count">已连接 %1$d 个</string>
+    <string name="menu_controllers_two">双人模式</string>
     <string name="menu_exit">退出游戏</string>
     <string name="menu_ach_none">该列表会在游戏首次启动时从游戏中读取，首局结束后会显示在这里。</string>
     <string name="ctrl_title">外接手柄</string>
@@ -211,6 +214,14 @@
     <string name="ctrl_need_axis">请移动摇杆；此功能需要使用摇杆轴。</string>
     <string name="ctrl_unassigned">未分配</string>
     <string name="ctrl_axis">轴 %1$s</string>
+    <string name="ctrl_players_title">已连接的手柄与玩家</string>
+    <string name="ctrl_players_none">未连接手柄。请连接 USB 或蓝牙手柄，它会立即显示在这里。</string>
+    <string name="ctrl_player_one">玩家 1</string>
+    <string name="ctrl_player_two">玩家 2</string>
+    <string name="ctrl_player_off">不使用</string>
+    <string name="ctrl_players_two_active">双人模式已开启：游戏已识别玩家 2。</string>
+    <string name="ctrl_players_hint_one">连接第二个手柄（或将某个手柄设为玩家 2）即可双人游戏。</string>
+    <string name="ctrl_players_touch">触屏始终控制玩家 1。</string>
     <string name="probe_eyebrow">图形测试</string>
     <string name="probe_subtitle">设备上的 Vulkan 呈现</string>
     <string name="probe_running">正在测试 Plume 呈现…\n动画将持续几秒钟。</string>

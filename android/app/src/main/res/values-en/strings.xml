@@ -99,7 +99,7 @@
     <string name="settings_uncap_note">Uses immediate presentation and the screen\'s highest refresh rate in the next session. It can change the pacing of parts of the game.</string>
     <string name="settings_controls">Controls</string>
     <string name="settings_show_controls">Show on-screen controls</string>
-    <string name="settings_external">Set up external controller</string>
+    <string name="settings_external">External controllers and players</string>
     <string name="settings_advanced">Advanced</string>
     <string name="settings_driver">Driver</string>
     <string name="driver_system">System driver</string>
@@ -190,9 +190,12 @@
     <string name="menu_ach_hint">See the game\'s list</string>
     <string name="menu_ach_summary">%1$d of %2$d · %3$d G</string>
     <string name="menu_onscreen_controls">On-screen controls</string>
+    <string name="menu_controllers">Controllers and players</string>
+    <string name="menu_controllers_count">%1$d connected</string>
+    <string name="menu_controllers_two">2 players</string>
     <string name="menu_exit">Exit game</string>
     <string name="menu_ach_none">The list is read from your game the first time it starts. It appears here after that first session.</string>
-    <string name="ctrl_title">External controller</string>
+    <string name="ctrl_title">External controllers</string>
     <string name="ctrl_intro">Connect a USB or Bluetooth controller. The mapping is saved for each device.</string>
     <string name="ctrl_panel_device">Device</string>
     <string name="ctrl_none">No controller connected</string>
@@ -211,6 +214,14 @@
     <string name="ctrl_need_axis">Move the stick; this function needs an axis.</string>
     <string name="ctrl_unassigned">Unassigned</string>
     <string name="ctrl_axis">Axis %1$s</string>
+    <string name="ctrl_players_title">Connected controllers and players</string>
+    <string name="ctrl_players_none">No controller connected. Plug in a USB or Bluetooth controller; it shows up here right away.</string>
+    <string name="ctrl_player_one">Player 1</string>
+    <string name="ctrl_player_two">Player 2</string>
+    <string name="ctrl_player_off">Don\'t use</string>
+    <string name="ctrl_players_two_active">2-player mode is on: the game recognizes Player 2.</string>
+    <string name="ctrl_players_hint_one">Connect a second controller (or set one to Player 2) to play with two.</string>
+    <string name="ctrl_players_touch">The touch screen always controls Player 1.</string>
     <string name="probe_eyebrow">GRAPHICS TEST</string>
     <string name="probe_subtitle">Vulkan presentation on the device</string>
     <string name="probe_running">Testing Plume presentation…\nThe animation lasts a few seconds.</string>

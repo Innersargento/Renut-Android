@@ -5,6 +5,7 @@ import android.content.SharedPreferences;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import java.io.File;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -57,22 +58,131 @@ final class ExternalController {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
+    /** The controller whose mapping the mapping screen shows (not who plays as whom, see {@link #assign}). */
     static String selected(Context context) { return prefs(context).getString(SELECTED, ""); }
     static void select(Context context, InputDevice device) {
         prefs(context).edit().putString(SELECTED, descriptor(device)).apply();
     }
 
-    static InputDevice findSelected(Context context) {
-        String selected = selected(context);
-        InputDevice first = null;
-        for (int id : InputDevice.getDeviceIds()) {
-            InputDevice device = InputDevice.getDevice(id);
-            if (!isGamepad(device)) continue;
-            if (first == null) first = device;
-            if (descriptor(device).equals(selected)) return device;
-        }
-        return selected.isEmpty() ? first : null;
+    // ---- who plays as whom -------------------------------------------------------------------
+    // The game sees two local players: the first is the touch screen plus one gamepad, the second a
+    // gamepad of its own. Which gamepad is which is chosen in the sidebar (game process) and in the
+    // controller screen (app process), so it lives in a file both read fresh, not in SharedPreferences.
+
+    static final int PLAYERS = 2;
+    static final int PLAYER_ONE = 0, PLAYER_TWO = 1, NOT_USED = -1;
+    private static final String ASSIGNMENT_FILE = "controller-players.json";
+
+    /** A connected gamepad and the player it plays as ({@link #PLAYER_ONE}, {@link #PLAYER_TWO}, {@link #NOT_USED}). */
+    static final class Pad {
+        final InputDevice device;
+        final int role;
+        /** The device's name, with a number when two connected pads are called the same. */
+        final String name;
+        Pad(InputDevice device, int role, String name) { this.device = device; this.role = role; this.name = name; }
     }
+
+    private static final class Choice {
+        final String[] player = {"", ""};  // "" = automatic, else the descriptor asked for
+        final java.util.LinkedHashSet<String> ignored = new java.util.LinkedHashSet<>();
+    }
+
+    private static File assignmentFile(Context context) { return new File(context.getFilesDir(), ASSIGNMENT_FILE); }
+
+    private static Choice readChoice(Context context) {
+        Choice choice = new Choice();
+        try {
+            byte[] bytes = java.nio.file.Files.readAllBytes(assignmentFile(context).toPath());
+            JSONObject json = new JSONObject(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+            choice.player[0] = json.optString("p1", "");
+            choice.player[1] = json.optString("p2", "");
+            JSONArray ignored = json.optJSONArray("ignored");
+            if (ignored != null) for (int i = 0; i < ignored.length(); i++) choice.ignored.add(ignored.optString(i));
+        } catch (Exception ignored) { /* none yet, or unreadable: everything automatic */ }
+        return choice;
+    }
+
+    private static void writeChoice(Context context, Choice choice) {
+        try {
+            JSONObject json = new JSONObject();
+            json.put("p1", choice.player[0]);
+            json.put("p2", choice.player[1]);
+            json.put("ignored", new JSONArray(choice.ignored));
+            File target = assignmentFile(context), temporary = new File(target.getPath() + ".tmp");
+            java.nio.file.Files.write(temporary.toPath(), json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            java.nio.file.Files.move(temporary.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception ignored) { /* the choice is only lost, nothing else depends on it */ }
+    }
+
+    /** Every connected gamepad, in the order they were plugged in. */
+    static java.util.List<InputDevice> connected() {
+        int[] ids = InputDevice.getDeviceIds();
+        java.util.Arrays.sort(ids);
+        java.util.ArrayList<InputDevice> pads = new java.util.ArrayList<>();
+        for (int id : ids) {
+            InputDevice device = InputDevice.getDevice(id);
+            if (isGamepad(device)) pads.add(device);
+        }
+        return pads;
+    }
+
+    /**
+     * The gamepad each player uses, null for none. A choice made by the player wins while that pad is
+     * connected; whatever is left over is handed out in plug-in order, so two pads just work as
+     * player one and player two without opening any menu.
+     */
+    static InputDevice[] assign(Context context) {
+        Choice choice = readChoice(context);
+        java.util.ArrayList<InputDevice> free = new java.util.ArrayList<>();
+        for (InputDevice device : connected()) if (!choice.ignored.contains(descriptor(device))) free.add(device);
+        InputDevice[] result = new InputDevice[PLAYERS];
+        for (int player = 0; player < PLAYERS; player++) {
+            if (choice.player[player].isEmpty()) continue;
+            for (InputDevice device : free) {
+                if (descriptor(device).equals(choice.player[player])) { result[player] = device; break; }
+            }
+            if (result[player] != null) free.remove(result[player]);
+        }
+        for (int player = 0; player < PLAYERS; player++) {
+            if (result[player] == null && !free.isEmpty()) result[player] = free.remove(0);
+        }
+        return result;
+    }
+
+    /** The connected gamepads with the player each plays as, for the menus. */
+    static java.util.List<Pad> pads(Context context) {
+        InputDevice[] assigned = assign(context);
+        java.util.List<InputDevice> all = connected();
+        java.util.ArrayList<Pad> pads = new java.util.ArrayList<>();
+        for (InputDevice device : all) {
+            int role = NOT_USED;
+            for (int player = 0; player < PLAYERS; player++) {
+                if (assigned[player] != null && assigned[player].getId() == device.getId()) role = player;
+            }
+            int same = 0, index = 0;
+            for (InputDevice other : all) {
+                if (!other.getName().equals(device.getName())) continue;
+                same++;
+                if (other.getId() <= device.getId()) index++;
+            }
+            pads.add(new Pad(device, role, same > 1 ? device.getName() + " #" + index : device.getName()));
+        }
+        return pads;
+    }
+
+    /** Makes {@code device} play as {@code role}. The other player keeps its own pad or goes back to automatic. */
+    static void setRole(Context context, InputDevice device, int role) {
+        Choice choice = readChoice(context);
+        String key = descriptor(device);
+        choice.ignored.remove(key);
+        for (int player = 0; player < PLAYERS; player++) if (choice.player[player].equals(key)) choice.player[player] = "";
+        if (role == PLAYER_ONE || role == PLAYER_TWO) choice.player[role] = key;
+        else choice.ignored.add(key);
+        writeChoice(context, choice);
+    }
+
+    /** Whether a second gamepad is playing: the game then sees two local players. */
+    static boolean twoPlayers(Context context) { return assign(context)[PLAYER_TWO] != null; }
 
     static Profile automatic(InputDevice device) {
         Profile profile = new Profile();
@@ -164,9 +274,11 @@ final class ExternalController {
         Player(InputDevice device, Profile profile, Sink sink) {
             this.device = device; this.profile = profile; this.sink = sink;
         }
+        /** By the runtime id, not the descriptor: two identical pads can share a descriptor. */
         boolean accepts(InputDevice eventDevice) {
-            return isGamepad(eventDevice) && descriptor(device).equals(descriptor(eventDevice));
+            return eventDevice != null && eventDevice.getId() == device.getId() && isGamepad(eventDevice);
         }
+        int deviceId() { return device.getId(); }
         boolean key(KeyEvent event) {
             if (!accepts(event.getDevice())) return false;
             if (event.getAction() != KeyEvent.ACTION_DOWN && event.getAction() != KeyEvent.ACTION_UP) return false;

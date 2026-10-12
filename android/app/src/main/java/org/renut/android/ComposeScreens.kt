@@ -44,6 +44,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Gamepad
 import androidx.compose.material.icons.filled.Language as LanguageIcon
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
@@ -161,7 +162,7 @@ class WelcomeModel {
  * RuntimeActivity (Java) drives it; Compose observes the state below.
  */
 class GameMenu internal constructor(private val activity: RuntimeActivity) {
-    internal enum class Page { Main, Achievements }
+    internal enum class Page { Main, Achievements, Controllers }
 
     var isOpen by mutableStateOf(false); private set
     var isPaused by mutableStateOf(false); private set
@@ -925,6 +926,7 @@ private val SidebarWidth = 360.dp
                 when (shown) {
                     GameMenu.Page.Main -> SidebarMain(activity, menu)
                     GameMenu.Page.Achievements -> SidebarAchievements(activity, menu)
+                    GameMenu.Page.Controllers -> SidebarControllers(activity, menu)
                 }
             }
         }
@@ -956,6 +958,9 @@ private val SidebarWidth = 360.dp
         }
         SidebarItem(Icons.Default.EmojiEvents, stringResource(R.string.nav_achievements), summary ?: stringResource(R.string.menu_ach_hint), chevron = true) {
             menu.page = GameMenu.Page.Achievements
+        }
+        SidebarItem(Icons.Default.Gamepad, stringResource(R.string.menu_controllers), padSummary(activity), chevron = true) {
+            menu.page = GameMenu.Page.Controllers
         }
         SidebarToggle(Icons.Default.SportsEsports, stringResource(R.string.menu_onscreen_controls), controlsVisible) {
             controlsVisible = it
@@ -1027,6 +1032,79 @@ private val SidebarWidth = 360.dp
     }
 }
 
+/** The sidebar's page of connected controllers, one row each with the player it plays as. */
+@Composable private fun ColumnScope.SidebarControllers(activity: RuntimeActivity, menu: GameMenu) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = { menu.page = GameMenu.Page.Main }) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.menu_back), tint = Text)
+        }
+        Text(stringResource(R.string.menu_controllers), Modifier.weight(1f), color = Text, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+        IconButton(onClick = { menu.close() }) { Icon(Icons.Default.Close, stringResource(R.string.menu_close), tint = Muted) }
+    }
+    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        PlayersPanel(activity) { activity.uiControllersChanged() }
+    }
+}
+
+/** The controllers as a line for the sidebar's list: how many are connected and whether two play. */
+@Composable private fun padSummary(context: Context): String {
+    var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) { while (true) { delay(700); tick++ } }
+    val pads = remember(tick) { ExternalController.pads(context) }
+    if (pads.isEmpty()) return stringResource(R.string.ctrl_none)
+    val count = stringResource(R.string.menu_controllers_count, pads.size)
+    return if (pads.count { it.role >= 0 } >= 2 || pads.any { it.role == ExternalController.PLAYER_TWO })
+        count + " · " + stringResource(R.string.menu_controllers_two) else count
+}
+
+/**
+ * The connected gamepads, each with the player it plays as. Shared by the controller screen and the
+ * game's sidebar; [onChanged] runs after a choice has been saved so a running game picks it up now.
+ * The touch screen is not listed: it always belongs to the first player.
+ */
+@Composable private fun PlayersPanel(context: Context, onChanged: () -> Unit) {
+    var tick by remember { mutableIntStateOf(0) }
+    // Plugging a pad in or out is not announced to Compose; look again every now and then.
+    LaunchedEffect(Unit) { while (true) { delay(700); tick++ } }
+    val pads = remember(tick) { ExternalController.pads(context) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (pads.isEmpty()) Text(stringResource(R.string.ctrl_players_none), color = Muted, fontSize = 13.sp)
+        pads.forEach { pad ->
+            PadRow(pad) { role ->
+                ExternalController.setRole(context, pad.device, role)
+                tick++
+                onChanged()
+            }
+        }
+        val twoPlayers = pads.any { it.role == ExternalController.PLAYER_TWO }
+        if (twoPlayers) Text(stringResource(R.string.ctrl_players_two_active), color = Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        else if (pads.isNotEmpty()) Text(stringResource(R.string.ctrl_players_hint_one), color = Muted, fontSize = 13.sp)
+        Text(stringResource(R.string.ctrl_players_touch), color = Muted, fontSize = 12.sp)
+    }
+}
+
+@Composable private fun PadRow(pad: ExternalController.Pad, onRole: (Int) -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF26282B)).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Gamepad, null, tint = if (pad.role >= 0) Accent else Muted, modifier = Modifier.size(24.dp))
+            Text(pad.name, Modifier.weight(1f), color = Text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                ExternalController.PLAYER_ONE to R.string.ctrl_player_one,
+                ExternalController.PLAYER_TWO to R.string.ctrl_player_two,
+                ExternalController.NOT_USED to R.string.ctrl_player_off
+            ).forEach { (role, label) ->
+                FilterChip(selected = pad.role == role, onClick = { onRole(role) }, label = { Text(stringResource(label), fontSize = 13.sp) })
+            }
+        }
+    }
+}
+
 @Composable private fun SidebarItem(
     icon: ImageVector, title: String, subtitle: String? = null, highlighted: Boolean = false,
     chevron: Boolean = false, onClick: () -> Unit
@@ -1072,6 +1150,7 @@ private val SidebarWidth = 360.dp
     }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { Text(stringResource(R.string.ctrl_intro), color = Muted) }
+            item { Panel(stringResource(R.string.ctrl_players_title)) { PlayersPanel(activity) {} } }
             item {
                 Panel(stringResource(R.string.ctrl_panel_device)) {
                     ActionButton(devices.getOrNull(activity.uiSelected()) ?: stringResource(R.string.ctrl_none), true, outlined = true) { chooseDevice = true }
