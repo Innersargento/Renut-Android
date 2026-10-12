@@ -335,6 +335,66 @@ bool DecodeTextureLevel(const xenos::xe_gpu_texture_fetch_t& fetch, const Textur
   return true;
 }
 
+BcKind BcKindFor(TextureFormat format) {
+  switch (format) {
+    case TextureFormat::k_DXT1:
+    case TextureFormat::k_DXT1_AS_16_16_16_16:
+      return BcKind::kBC1;
+    case TextureFormat::k_DXT2_3:
+    case TextureFormat::k_DXT2_3_AS_16_16_16_16:
+      return BcKind::kBC2;
+    case TextureFormat::k_DXT4_5:
+    case TextureFormat::k_DXT4_5_AS_16_16_16_16:
+      return BcKind::kBC3;
+    case TextureFormat::k_DXT5A:
+      return BcKind::kBC4;
+    case TextureFormat::k_DXN:
+      return BcKind::kBC5;
+    default:
+      return BcKind::kNone;
+  }
+}
+
+uint32_t BcBlockBytes(BcKind kind) {
+  switch (kind) {
+    case BcKind::kBC1:
+    case BcKind::kBC4:
+      return 8;
+    case BcKind::kNone:
+      return 0;
+    default:
+      return 16;
+  }
+}
+
+bool CopyTextureLevelBlocks(const xenos::xe_gpu_texture_fetch_t& fetch, const TextureLevel& level,
+                            const uint8_t* data, std::vector<uint8_t>& blocks) {
+  const auto* info = rex::graphics::FormatInfo::Get(fetch.format);
+  const BcKind kind = BcKindFor(fetch.format);
+  if (!info || !data || kind == BcKind::kNone) return false;
+  const uint32_t bpb = info->bytes_per_block();
+  if (bpb != BcBlockBytes(kind) || info->block_width != 4 || info->block_height != 4) return false;
+  if (level.extent == 0 || level.row_pitch == 0) return false;
+  const uint32_t pitch_blocks = level.row_pitch / bpb;
+  const uint32_t blocks_x = (level.width + 3) / 4, blocks_y = (level.height + 3) / 4;
+  const uint32_t bpb_log2 = Log2(bpb);
+  blocks.resize(size_t(blocks_x) * blocks_y * bpb);
+  uint8_t* out = blocks.data();
+  for (uint32_t by = 0; by < blocks_y; ++by) {
+    for (uint32_t bx = 0; bx < blocks_x; ++bx, out += bpb) {
+      const uint32_t x_block = bx + level.x_blocks, y_block = by + level.y_blocks;
+      const size_t offset = fetch.tiled
+                                ? size_t(rex::graphics::texture_util::GetTiledOffset2D(
+                                      int32_t(x_block), int32_t(y_block), pitch_blocks, bpb_log2))
+                                : size_t(y_block) * level.row_pitch + size_t(x_block) * bpb;
+      if (offset + bpb > level.extent) return false;
+      std::memcpy(out, data + offset, bpb);
+      SwapBlock(out, bpb, fetch.endianness);
+    }
+  }
+  return true;
+}
+
 bool DecodeTexture3D(const xenos::xe_gpu_texture_fetch_t& fetch, const uint8_t* data,
                      std::vector<uint32_t>& rgba, uint32_t& width, uint32_t& height,
                      uint32_t& depth, uint32_t& extent) {

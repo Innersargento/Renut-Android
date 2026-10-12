@@ -131,6 +131,11 @@ REXCVAR_DEFINE_INT32(renut_plume_low_memory, -1, "reNut/Plume",
 REXCVAR_DEFINE_INT32(renut_plume_texture_max_dim, 0, "reNut/Plume",
                      "Largest side a guest texture keeps on the host; the top mips of a larger one are dropped. "
                      "0 follows low-memory mode (512 there, no limit otherwise).");
+REXCVAR_DEFINE_INT32(renut_plume_bc_textures, 1, "reNut/Plume",
+                     "Upload the guest's DXT1/2/3/4/5, DXT5A and DXN 2D textures as the BC1-BC5 blocks they "
+                     "already are (a quarter to an eighth of the RGBA8 the decoder makes, no CPU decode) on a GPU "
+                     "that samples BC (Adreno): 0 off, 1 on. Live: files/plume-bc.")
+    .range(0, 1);
 REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
                     "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                     "next start; a scene load waits until they are built. Not in low-memory mode, which only "
@@ -1256,7 +1261,19 @@ struct GuestTexture {
   // write-watched while `watched` (see GetGuestTexture).
   std::array<uint32_t, 2> watch_begin{}, watch_end{};
   bool watched = false;
+  // 2D textures: the block format the host image holds (kNone: RGBA8 decoded on
+  // the CPU), and whether the compressed upload was tried and did not fit.
+  BcKind bc = BcKind::kNone;
+  bool bc_blocked = false;
 };
+
+// Bytes a 2D guest texture takes on the host, its mip chain included.
+uint64_t HostTextureBytes(const GuestTexture& t) {
+  const uint64_t base = t.bc != BcKind::kNone
+                            ? uint64_t((t.width + 3) / 4) * ((t.height + 3) / 4) * BcBlockBytes(t.bc)
+                            : uint64_t(t.width) * t.height * 4;
+  return t.levels > 1 ? base * 4 / 3 : base;
+}
 
 uint64_t ContentHash(const uint8_t* data, uint32_t span);
 
@@ -1284,7 +1301,7 @@ uint32_t ExportElementBytes(uint32_t format) {
 }
 
 struct Stats {
-  uint64_t textures_decoded = 0, texture_failures = 0;
+  uint64_t textures_decoded = 0, texture_failures = 0, textures_bc = 0;
   uint64_t draws = 0, drawn = 0, no_vs = 0, no_ps = 0, bad_shader = 0, skipped_prim = 0,
            no_target = 0, resolves = 0, clears = 0, pipelines = 0, overflow = 0;
   // Render passes begun. A tiler resolves and reloads the whole target at each
@@ -1694,6 +1711,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint64_t upload_slice_size_ = kUploadSize;
   uint64_t kept_budget_ = 384ull << 20;
   uint32_t max_texture_dim_ = 0;
+  // BC textures: the device samples them, and files/plume-bc / the cvar want them.
+  bool bc_supported_ = false;
+  uint32_t bc_mode_ = 1;
   uint64_t texture_budget_ = 0;  // bytes of decoded 2D textures; 0 = unlimited
   // Filled by the guest thread that tripped a watch (inside its fault
   // handler), drained by this one.
@@ -2543,6 +2563,11 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     if (descriptor) retired_descriptor_slots_[slot_].push_back(descriptor);
     descriptor = 0;
   }
+  // A 2D guest texture's image, its view (a swizzled BC texture has one) and descriptor.
+  void RetireGuestTexture(GuestTexture& texture) {
+    if (texture.view) retired_views_[slot_].push_back(std::move(texture.view));
+    RetireTexture(texture.texture, texture.descriptor);
+  }
   void RetireSwizzled(Resolved& r) {
     for (auto& [key, s] : r.swizzled) {
       if (s.view) retired_views_[slot_].push_back(std::move(s.view));
@@ -3120,6 +3145,10 @@ bool PlumeCommandProcessor::SetupContext() {
                 low_memory_ ? "low" : "full", total_ram >> 20, upload_slice_size_ >> 20, kept_budget_ >> 20,
                 texture_budget_ >> 20, max_texture_dim_);
   }
+  bc_supported_ = device_->getCapabilities().textureCompressionBC;
+  bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
+  REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
+              bc_mode_ ? "on" : "off");
   // One slice per frame in flight, after the permanent allocations.
   const uint64_t upload_bytes = upload_slice_size_ * kPlumeFramesInFlight + 4096;
   upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
@@ -4210,7 +4239,7 @@ void PlumeCommandProcessor::EvictIdleTextures() {
   const uint64_t limit_2d = idle_for(free_2d < 512);
   for (auto it = guest_textures_.begin(); it != guest_textures_.end();) {
     if (!idle(it->second.checked_frame, limit_2d)) { ++it; continue; }
-    RetireTexture(it->second.texture, it->second.descriptor);
+    RetireGuestTexture(it->second);
     it = guest_textures_.erase(it);
     ++evicted;
   }
@@ -4222,8 +4251,7 @@ void PlumeCommandProcessor::EvictIdleTextures() {
     std::vector<std::pair<uint64_t, uint64_t>> by_age;  // frame last checked, key
     for (const auto& [key, t] : guest_textures_) {
       if (!t.texture) continue;
-      const uint64_t base = uint64_t(t.width) * t.height * 4;
-      bytes += t.levels > 1 ? base * 4 / 3 : base;
+      bytes += HostTextureBytes(t);
       by_age.emplace_back(t.checked_frame == ~0ull ? 0 : t.checked_frame, key);
     }
     if (bytes > texture_budget_) {
@@ -4232,9 +4260,8 @@ void PlumeCommandProcessor::EvictIdleTextures() {
         if (bytes <= texture_budget_ || swaps_ - frame < 3) break;
         auto it = guest_textures_.find(key);
         if (it == guest_textures_.end()) continue;
-        const uint64_t base = uint64_t(it->second.width) * it->second.height * 4;
-        bytes -= it->second.levels > 1 ? base * 4 / 3 : base;
-        RetireTexture(it->second.texture, it->second.descriptor);
+        bytes -= HostTextureBytes(it->second);
+        RetireGuestTexture(it->second);
         guest_textures_.erase(it);
         ++evicted;
       }
@@ -4865,6 +4892,12 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   }
   GuestTexture& texture = *texture_node;
   if (texture.failed) return 0;
+  // The block format this texture is kept in: its own when the device samples
+  // it and the blocks fit, RGBA8 decoded on the CPU otherwise (and always while
+  // a texture dump asks for the decoded pixels).
+  const BcKind want = bc_supported_ && bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()
+                          ? BcKindFor(fetch.format)
+                          : BcKind::kNone;
   // Checked once per frame; the draws after the first reuse the result. A
   // texture whose memory is write-watched and was not written since is not
   // checked at all - hashing every texture in use every frame was a tenth of
@@ -4873,7 +4906,7 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   DrainWatchHits();
   const bool unchanged =
       texture.checked_frame == swaps_ || (texture.watched && ((swaps_ + key) & 255) != 0);
-  if (texture.texture && unchanged && texdump_directory_.empty()) {
+  if (texture.texture && unchanged && texdump_directory_.empty() && texture.bc == want) {
     texture.checked_frame = swaps_;
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
@@ -4902,13 +4935,20 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   }
   for (uint32_t i = 0; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
   if (!texdump_directory_.empty() && dumped_.insert(key).second) texture.content = ~content;
-  if (texture.texture && texture.content == content) {
+  if (texture.texture && texture.content == content && texture.bc == want) {
     Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
   std::vector<uint32_t> rgba;
+  std::vector<uint8_t> blocks;
   const uint32_t width = layouts[skip].width, height = layouts[skip].height;
-  if (!DecodeTextureLevel(fetch, layouts[skip], data[skip], 0, rgba)) {
+  BcKind kind = want;
+  if (kind != BcKind::kNone && !CopyTextureLevelBlocks(fetch, layouts[skip], data[skip], blocks)) {
+    // Not a shape a block upload takes: this texture goes through the decoder.
+    texture.bc_blocked = true;
+    kind = BcKind::kNone;
+  }
+  if (kind == BcKind::kNone && !DecodeTextureLevel(fetch, layouts[skip], data[skip], 0, rgba)) {
     texture.failed = true;
     ++stats_.texture_failures;
     if (unsupported_formats_.insert(uint32_t(fetch.format)).second) {
@@ -4917,19 +4957,56 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     return 0;
   }
   if (!texdump_directory_.empty()) DumpTexture(fetch, rgba, width, height, "2d");
+  RenderFormat host_format = RenderFormat::R8G8B8A8_UNORM;
+  switch (kind) {
+    case BcKind::kBC1: host_format = RenderFormat::BC1_UNORM; break;
+    case BcKind::kBC2: host_format = RenderFormat::BC2_UNORM; break;
+    case BcKind::kBC3: host_format = RenderFormat::BC3_UNORM; break;
+    case BcKind::kBC4: host_format = RenderFormat::BC4_UNORM; break;
+    case BcKind::kBC5: host_format = RenderFormat::BC5_UNORM; break;
+    default: break;
+  }
   // New contents reuse the image when its shape is unchanged: earlier draws of
   // this frame may still reference it, and the upload is ordered after them.
-  if (!texture.texture || texture.levels != host_levels || texture.width != width || texture.height != height) {
-    RetireTexture(texture.texture, texture.descriptor);
-    texture.texture = device_->createTexture(
-        RenderTextureDesc::Texture2D(width, height, host_levels, RenderFormat::R8G8B8A8_UNORM));
+  if (!texture.texture || texture.levels != host_levels || texture.width != width || texture.height != height ||
+      texture.bc != kind) {
+    RetireGuestTexture(texture);
+    texture.texture = device_->createTexture(RenderTextureDesc::Texture2D(width, height, host_levels, host_format));
     texture.levels = host_levels;
     texture.width = width;
     texture.height = height;
+    texture.bc = kind;
     texture.layout = RenderTextureLayout::UNKNOWN;
     if (!texture.texture) {
       texture.failed = true;
       return 0;
+    }
+    if (kind != BcKind::kNone) {
+      // The decoder applied the fetch constant's swizzle to the pixels; the
+      // blocks keep the guest's channels, so the view applies it. Identity
+      // (X Y Z W, the usual one) needs no view.
+      uint32_t swizzle[4];
+      bool identity = true;
+      for (int i = 0; i < 4; ++i) {
+        swizzle[i] = (fetch.swizzle >> (3 * i)) & 7;
+        identity = identity && swizzle[i] == uint32_t(i);
+      }
+      if (!identity) {
+        auto pick = [](uint32_t s) {
+          switch (s) {
+            case 0: return RenderSwizzle::R;
+            case 1: return RenderSwizzle::G;
+            case 2: return RenderSwizzle::B;
+            case 3: return RenderSwizzle::A;
+            case 5: return RenderSwizzle::ONE;
+            default: return RenderSwizzle::ZERO;
+          }
+        };
+        RenderTextureViewDesc view = RenderTextureViewDesc::Texture2D(host_format);
+        view.componentMapping = RenderComponentMapping(pick(swizzle[0]), pick(swizzle[1]), pick(swizzle[2]),
+                                                       pick(swizzle[3]));
+        texture.view = texture.texture->createTextureView(view);
+      }
     }
   }
   texture.content = content;
@@ -4943,9 +5020,24 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
   uint32_t w = width, h = height;
   for (uint32_t level = 0; level < host_levels; ++level) {
-    if (level && !DecodeTextureLevel(fetch, layouts[skip + level], data[skip + level], 0, rgba)) return 0;
     w = layouts[skip + level].width;
     h = layouts[skip + level].height;
+    if (kind != BcKind::kNone) {
+      // The guest's blocks as they are; a level that does not fit its memory
+      // (not seen) stays zero blocks rather than leave the image half written.
+      if (level && !CopyTextureLevelBlocks(fetch, layouts[skip + level], data[skip + level], blocks)) {
+        blocks.assign(size_t((w + 3) / 4) * ((h + 3) / 4) * BcBlockBytes(kind), 0);
+      }
+      const uint64_t staging = Allocate(blocks.size(), 512);
+      if (staging == UINT64_MAX) return 0;
+      std::memcpy(Pointer(staging), blocks.data(), blocks.size());
+      // The row is counted in texels and a multiple of the 4-texel block.
+      L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
+                               RenderTextureCopyLocation::PlacedFootprint(
+                                   upload_.get(), host_format, w, h, 1, ((w + 3) / 4) * 4, staging));
+      continue;
+    }
+    if (level && !DecodeTextureLevel(fetch, layouts[skip + level], data[skip + level], 0, rgba)) return 0;
     const uint64_t staging = Allocate(uint64_t(w) * h * 4, 512);
     if (staging == UINT64_MAX) return 0;
     std::memcpy(Pointer(staging), rgba.data(), size_t(w) * h * 4);
@@ -4954,8 +5046,9 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
                                  upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, w, staging));
   }
   Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
-  SetTexture2D(texture.descriptor, texture.texture.get());
+  SetTexture2D(texture.descriptor, texture.texture.get(), texture.view.get());
   ++stats_.textures_decoded;
+  if (kind != BcKind::kNone) ++stats_.textures_bc;
   return texture.descriptor;
 }
 
@@ -9407,6 +9500,22 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       fetch_spec_mode_ = uint32_t(fetch_spec);
     }
     {
+      int bc = std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1);
+      if (FILE* file = std::fopen((root + "/plume-bc").c_str(), "r")) {
+        int value = bc;
+        if (std::fscanf(file, "%d", &value) == 1) bc = std::clamp(value, 0, 1);
+        std::fclose(file);
+      }
+      if (uint32_t(bc) != bc_mode_) {
+        REXLOG_INFO("Renut: Plume BC textures {}: the 2D guest textures are uploaded again", bc ? "on" : "off");
+        bc_mode_ = uint32_t(bc);
+        // Every 2D texture is rebuilt in the other form the next time it is drawn.
+        for (auto& [key, texture] : guest_textures_) RetireGuestTexture(texture);
+        guest_textures_.clear();
+        texture_memo_.Clear();
+      }
+    }
+    {
       int rel = std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2);
       if (FILE* file = std::fopen((root + "/plume-relconst").c_str(), "r")) {
         int value = rel;
@@ -9820,11 +9929,12 @@ void PlumeCommandProcessor::ReportMemory() {
   auto chain = [](uint64_t base, uint32_t levels, uint32_t num, uint32_t den) {
     return levels > 1 ? base * num / den : base;
   };
-  uint64_t tex2d = 0, tex2d_n = 0, stacks = 0, volumes = 0, cubes = 0, resolved = 0, resolved_n = 0, target_bytes = 0;
+  uint64_t tex2d = 0, tex2d_n = 0, tex2d_bc_n = 0, stacks = 0, volumes = 0, cubes = 0, resolved = 0, resolved_n = 0, target_bytes = 0;
   for (const auto& [key, t] : guest_textures_) {
     if (!t.texture) continue;
-    tex2d += chain(uint64_t(t.width) * t.height * 4, t.levels, 4, 3);
+    tex2d += HostTextureBytes(t);
     ++tex2d_n;
+    if (t.bc != BcKind::kNone) ++tex2d_bc_n;
   }
   for (const auto& [key, t] : guest_stacks_) {
     if (t.texture) stacks += chain(uint64_t(t.width) * t.height * t.depth * 4, t.levels, 4, 3);
@@ -9867,10 +9977,10 @@ void PlumeCommandProcessor::ReportMemory() {
     std::fclose(status);
   }
   REXLOG_INFO(
-      "Renut: Plume memory @{}: vma blocks {} MB allocations {} MB | tex2d {} MB ({}) stacks {} MB "
+      "Renut: Plume memory @{}: vma blocks {} MB allocations {} MB | tex2d {} MB ({}, {} as BC) stacks {} MB "
       "volumes {} MB cubes {} MB resolved {} MB ({}) targets {} MB ({}) kept {} MB exports {} MB "
       "upload {} MB | rss {} MB swap {} MB",
-      swaps_, mb(blocks), mb(allocations), mb(tex2d), tex2d_n, mb(stacks), mb(volumes), mb(cubes),
+      swaps_, mb(blocks), mb(allocations), mb(tex2d), tex2d_n, tex2d_bc_n, mb(stacks), mb(volumes), mb(cubes),
       mb(resolved), resolved_n, mb(target_bytes), targets_.size(), mb(kept_bytes_), mb(export_bytes),
       mb(upload_slice_size_ * kPlumeFramesInFlight), rss_kb >> 10, swap_kb >> 10);
 }
@@ -9911,6 +10021,10 @@ void PlumeCommandProcessor::Report() {
   }
   if (stats_.native_draws) {
     REXLOG_INFO("Renut: Plume native renderer: {} rigid depth draws", stats_.native_draws);
+  }
+  if (bc_supported_ && bc_mode_) {
+    REXLOG_INFO("Renut: Plume BC textures: {} of the {} 2D uploads were blocks, not decoded pixels",
+                stats_.textures_bc, stats_.textures_decoded);
   }
   if (shadow_min_indices_) {
     REXLOG_INFO("Renut: Plume shadow casters under {} indices dropped: {}", shadow_min_indices_,

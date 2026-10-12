@@ -14,7 +14,7 @@ index 2048557..4cf1f47 100644
          virtual void clearDepthStencil(bool clearDepth = true, bool clearStencil = true, float depthValue = 1.0f, uint32_t stencilValue = 0, const RenderRect *clearRects = nullptr, uint32_t clearRectsCount = 0) = 0;
          virtual void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) = 0;
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
-index 9dcfedf..a26ee26 100644
+index 9dcfedf..2bd0930 100644
 --- a/plume_render_interface_types.h
 +++ b/plume_render_interface_types.h
 @@ -160,6 +160,20 @@ namespace plume {
@@ -109,8 +109,19 @@ index 9dcfedf..a26ee26 100644
          
          // Samplers.
          bool samplerMirrorClampToEdge = false;
+@@ -1800,6 +1841,10 @@ namespace plume {
+         bool triangleFan = false;
+         bool dynamicDepthBias = false;
+ 
++        // reNut: BC1-BC5 textures can be sampled (VkPhysicalDeviceFeatures::textureCompressionBC).
++        // Adreno has it, Mali does not.
++        bool textureCompressionBC = false;
++
+         // UMA.
+         bool uma = false;
+ 
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index f1dd503..fa8e74d 100644
+index f1dd503..aeed92b 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -13,6 +13,8 @@
@@ -473,7 +484,7 @@ index f1dd503..fa8e74d 100644
          allocatorInfo.flags |= bufferDeviceAddressSupported ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0;
          allocatorInfo.physicalDevice = physicalDevice;
          allocatorInfo.device = vk;
-@@ -4129,6 +4330,7 @@ namespace plume {
+@@ -4129,12 +4330,14 @@ namespace plume {
          capabilities.descriptorIndexing = descriptorIndexingSupported;
          capabilities.scalarBlockLayout = scalarBlockLayoutSupported;
          capabilities.bufferDeviceAddress = bufferDeviceAddressSupported;
@@ -481,7 +492,14 @@ index f1dd503..fa8e74d 100644
          capabilities.samplerMirrorClampToEdge = supportedOptionalExtensions.find(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME) != supportedOptionalExtensions.end();
          capabilities.presentWait = presentWaitSupported;
          capabilities.displayTiming = supportedOptionalExtensions.find(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) != supportedOptionalExtensions.end();
-@@ -4177,7 +4379,16 @@ namespace plume {
+         capabilities.maxTextureSize = physicalDeviceProperties.limits.maxImageDimension2D;
+         capabilities.preferHDR = memoryHeapSize > (512 * 1024 * 1024);
+         capabilities.dynamicDepthBias = true;
++        capabilities.textureCompressionBC = deviceFeatures.features.textureCompressionBC == VK_TRUE;
+         capabilities.queryPools = true;
+         capabilities.uma = (description.type == RenderDeviceType::INTEGRATED) && hasHostVisibleDeviceLocalMemory;
+         capabilities.gpuUploadHeap = capabilities.uma;
+@@ -4177,7 +4380,16 @@ namespace plume {
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {

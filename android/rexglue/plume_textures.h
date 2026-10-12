@@ -34,6 +34,21 @@ bool DecodeTextureLevel(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetc
                         const TextureLevel& level, const uint8_t* data, uint32_t slice,
                         std::vector<uint32_t>& rgba);
 
+// The guest's block-compressed formats whose blocks are, once byte-swapped, the
+// very blocks of a BC format a desktop-class GPU samples (Adreno does; Mali does
+// not): DXT1 = BC1, DXT2/3 = BC2, DXT4/5 = BC3, DXT5A = BC4, DXN = BC5. Those
+// textures can be uploaded as they are, a quarter to an eighth of the RGBA8 the
+// decoder makes, with the fetch constant's swizzle in the view instead.
+enum class BcKind : uint8_t { kNone = 0, kBC1, kBC2, kBC3, kBC4, kBC5 };
+BcKind BcKindFor(rex::graphics::xenos::TextureFormat format);
+// Bytes of one 4x4 block of the host format (8 for BC1/BC4, 16 for the others).
+uint32_t BcBlockBytes(BcKind kind);
+// The level's blocks as rows of `blocks_x` blocks, untiled and byte-swapped,
+// in `blocks` (blocks_x * blocks_y * BcBlockBytes bytes). False when the level
+// does not fit the guest memory it was located in.
+bool CopyTextureLevelBlocks(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch, const TextureLevel& level,
+                            const uint8_t* data, std::vector<uint8_t>& blocks);
+
 // Bytes the base level of the texture spans in guest memory (for hashing).
 uint32_t TextureBaseSpan(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch);
 
