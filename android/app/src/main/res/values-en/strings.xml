@@ -119,6 +119,10 @@
     <string name="texture_quality_full">Full</string>
     <string name="texture_quality_half">Half</string>
     <string name="texture_quality_quarter">Quarter</string>
+    <string name="settings_shadow_quality">Shadow quality</string>
+    <string name="shadow_quality_full">Full</string>
+    <string name="shadow_quality_medium">Medium · 3/4</string>
+    <string name="shadow_quality_low">Low · 1/2</string>
     <string name="settings_temp">Temperature</string>
     <string name="layout_title">Edit layout</string>
     <string name="layout_edit_button">Edit layout…</string>

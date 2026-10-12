@@ -142,6 +142,11 @@ REXCVAR_DEFINE_INT32(renut_plume_texture_quality, 0, "reNut/Plume",
                      "stay sharp) drops its top one or two mips, never below 64 px. Live: "
                      "files/plume-texquality.")
     .range(0, 2);
+REXCVAR_DEFINE_INT32(renut_plume_shadow_quality, 0, "reNut/Plume",
+                     "Shadow map resolution: 0 full, 1 three quarters, 2 half (a side of the dynamic maps; "
+                     "the cached atlas is not touched). The maps are drawn and resolved smaller and sampled "
+                     "with the same coordinates. Read at start.")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
                     "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                     "next start; a scene load waits until they are built. Not in low-memory mode, which only "
@@ -1193,7 +1198,20 @@ struct Target {
   // was last used in.
   uint32_t surface = 0, surface_info = 0;
   uint64_t used_frame = 0;
+  // Quarters of the guest's resolution the host draws it at: 4 is the guest's
+  // size, less is a shadow map under the shadow quality option (width and
+  // height are host pixels; the guest's viewport, scissor, clears and resolve
+  // rectangles are scaled by this).
+  uint32_t scale = 4;
 };
+
+// A guest pixel coordinate in a target's host pixels, rounded down or up.
+inline uint32_t HostFloor(const Target* target, uint32_t value) {
+  return target ? uint32_t(uint64_t(value) * target->scale / 4) : value;
+}
+inline uint32_t HostCeil(const Target* target, uint32_t value) {
+  return target ? uint32_t((uint64_t(value) * target->scale + 3) / 4) : value;
+}
 
 // Keys of the render targets: one per surface (see SurfaceTarget).
 constexpr uint64_t kSurfaceTargetKey = 1ull << 63;
@@ -1724,6 +1742,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint32_t bc_mode_ = 1;
   // 0 full, 1 half, 2 quarter: mips of a mip-filtered 2D texture not kept on the host.
   uint32_t texture_quality_ = 0;
+  // Quarters of the guest's resolution the dynamic shadow maps (depth D24S8
+  // surfaces of 640 px and more) are drawn at: 4, 3 or 2.
+  uint32_t shadow_scale_ = 4;
   uint64_t texture_budget_ = 0;  // bytes of decoded 2D textures; 0 = unlimited
   // Filled by the guest thread that tripped a watch (inside its fault
   // handler), drained by this one.
@@ -3164,6 +3185,8 @@ bool PlumeCommandProcessor::SetupContext() {
   texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
   REXLOG_INFO("Renut: Plume texture quality: {}",
               texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
+  shadow_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
+  REXLOG_INFO("Renut: Plume shadow map resolution: {}/4 of the guest's", shadow_scale_);
   // One slice per frame in flight, after the permanent allocations.
   const uint64_t upload_bytes = upload_slice_size_ * kPlumeFramesInFlight + 4096;
   upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
@@ -4567,8 +4590,16 @@ Target* PlumeCommandProcessor::SurfaceTarget(uint32_t slot) {
   target.used_frame = swaps_;
   if (target.texture) return &target;
   const uint32_t pitch = s.surface_info & 0x3FFF;
-  const uint32_t width = std::max({pitch, ((s.dims >> 18) & 0x3FFF) + 1, 16u});
-  const uint32_t height = std::max(((((s.dims >> 3) & 0x7FFF) + 1) + 15) & ~15u, 16u);
+  uint32_t width = std::max({pitch, ((s.dims >> 18) & 0x3FFF) + 1, 16u});
+  uint32_t height = std::max(((((s.dims >> 3) & 0x7FFF) + 1) + 15) & ~15u, 16u);
+  // The dynamic shadow maps are the only D24S8 depth surfaces (the scene's is
+  // D24FS8) of this size: drawn at the shadow quality's fraction of it.
+  uint32_t scale = 4;
+  if (depth && format == 0 && shadow_scale_ != 4 && std::min(width, height) >= 640) {
+    scale = shadow_scale_;
+    width = std::max((width * scale + 3) / 4, 16u);
+    height = std::max((height * scale + 3) / 4, 16u);
+  }
   const RenderFormat rf = depth ? RenderFormat::D32_FLOAT_S8_UINT
                                 : ColorFormat(xenos::ColorRenderTargetFormat(format));
   target.texture = device_->createTexture(depth ? RenderTextureDesc::DepthTarget(width, height, rf)
@@ -4581,6 +4612,7 @@ Target* PlumeCommandProcessor::SurfaceTarget(uint32_t slot) {
   target.width = width;
   target.height = height;
   target.depth = depth;
+  target.scale = scale;
   target.layout = RenderTextureLayout::UNKNOWN;
   target.surface = s.object;
   target.surface_info = s.info;
@@ -6011,8 +6043,10 @@ void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
   const uint32_t stencil = w[10] & 0xFF;
   ++stats_.clears;
   auto clip = [&](const Target& t) {
-    return RenderRect(std::clamp(x1, 0, int32_t(t.width)), std::clamp(y1, 0, int32_t(t.height)),
-                      std::clamp(x2, 0, int32_t(t.width)), std::clamp(y2, 0, int32_t(t.height)));
+    const auto low = [&](int32_t v) { return int32_t(HostFloor(&t, uint32_t(std::max(v, 0)))); };
+    const auto high = [&](int32_t v) { return int32_t(HostCeil(&t, uint32_t(std::max(v, 0)))); };
+    return RenderRect(std::clamp(low(x1), 0, int32_t(t.width)), std::clamp(low(y1), 0, int32_t(t.height)),
+                      std::clamp(high(x2), 0, int32_t(t.width)), std::clamp(high(y2), 0, int32_t(t.height)));
   };
   Trace("native clear flags={:X} present={:X} rect=({},{})-({},{}) color=({}, {}, {}, {}) z={} s={}", flags,
         present, x1, y1, x2, y2, color[0], color[1], color[2], color[3], z, stencil);
@@ -6961,6 +6995,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // window y = yo + ys * ndc becomes a viewport of height -2 * ys at yo + ys.
   const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
   const Target* extent = colors[0] ? colors[0] : depth;
+  // Its size in guest pixels: a shadow map is drawn at a fraction of it.
+  const uint32_t guest_width = extent ? (extent->width * 4 + extent->scale - 1) / extent->scale : 0;
+  const uint32_t guest_height = extent ? (extent->height * 4 + extent->scale - 1) / extent->scale : 0;
   // Window offset (predicated tiling moves each band to the target's origin)
   // and the D3D9 pixel centre at integer coordinates.
   float window_x = 0.f, window_y = 0.f;
@@ -6988,14 +7025,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     viewport = RenderViewport(xo - xs + window_x, yo + ys + window_y, 2.f * xs, -2.f * ys,
                               std::clamp(zo, 0.f, 1.f), std::clamp(zo + zs, 0.f, 1.f));
   } else {
-    viewport = RenderViewport(window_x, window_y, float(extent->width), float(extent->height));
-    scale_offset[0] = 2.f / float(extent->width);
-    scale_offset[1] = -2.f / float(extent->height);
+    viewport = RenderViewport(window_x, window_y, float(guest_width), float(guest_height));
+    scale_offset[0] = 2.f / float(guest_width);
+    scale_offset[1] = -2.f / float(guest_height);
     scale_offset[2] = -1.f;
     scale_offset[3] = 1.f;
   }
   if (viewport.width <= 0.f) {
-    viewport = RenderViewport(0.f, 0.f, float(extent->width), float(extent->height));
+    viewport = RenderViewport(0.f, 0.f, float(guest_width), float(guest_height));
   }
   // Debug, split mode 5 (game_fixes.cpp): the band a predicated packet belongs
   // to, for the scissor below. Only predicated packets count - the mask stays
@@ -8005,6 +8042,20 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // plume-skip bit 8388608 scissors every draw to one pixel: vertex work and
   // binning stay, fragment work goes. What is left is the per-draw cost.
   if (skip_mask_ & 8388608) scissor_rect = RenderRect(0, 0, 1, 1);
+  // A shadow map drawn at a fraction of the guest's resolution (see Target).
+  if (extent && extent->scale != 4) {
+    const float fraction = float(extent->scale) / 4.f;
+    pk.viewport.x *= fraction;
+    pk.viewport.y *= fraction;
+    pk.viewport.width *= fraction;
+    pk.viewport.height *= fraction;
+    auto low = [&](int32_t v) { return int32_t(HostFloor(extent, uint32_t(std::max(v, 0)))); };
+    auto high = [&](int32_t v) { return int32_t(HostCeil(extent, uint32_t(std::max(v, 0)))); };
+    scissor_rect = RenderRect(std::min(low(scissor_rect.left), int32_t(extent->width)),
+                              std::min(low(scissor_rect.top), int32_t(extent->height)),
+                              std::min(high(scissor_rect.right), int32_t(extent->width)),
+                              std::min(high(scissor_rect.bottom), int32_t(extent->height)));
+  }
   pk.scissor = scissor_rect;
   draw_slots_.clear();
   for (const auto& slot : input_slots) {
@@ -8617,12 +8668,15 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
   // pass-closing barrier the mark sat. Removing a category of work and
   // measuring the difference does not depend on that.
   if (skip_mask_ & 33554432) return true;
-  const uint32_t width = surfaces.width, height = surfaces.height;
-  if (!width || !height) return true;
+  if (!surfaces.width || !surfaces.height) return true;
   const bool copying_depth = info.IsCopyingDepth();
-  // The source is the surface the resolve names, the rectangle in its pixels.
+  // The source is the surface the resolve names, the rectangle in its pixels:
+  // the host's (a shadow map is drawn smaller than the guest thinks).
   Target* source = surfaces.source;
-  const uint32_t x = surfaces.x, y = surfaces.y;
+  const uint32_t x = HostFloor(source, surfaces.x), y = HostFloor(source, surfaces.y);
+  const uint32_t width = HostCeil(source, surfaces.x + surfaces.width) - x;
+  const uint32_t height = HostCeil(source, surfaces.y + surfaces.height) - y;
+  if (!width || !height) return true;
   // plume-skip bit 134217728 drops every clear, these and Direct3D's. The
   // picture is wrong; it measures what the clear-only passes cost.
   const bool skip_clears = skip_mask_ & 134217728;
@@ -8638,10 +8692,12 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
       info.rb_copy_control.copy_command != xenos::CopyCommand::kNull) {
     uint32_t sx = x, sy = y;
     uint32_t w = std::min(width, source->width - x), h = std::min(copy_height, source->height - y);
-    const uint32_t dest_w = std::max(uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32u, w);
-    const uint32_t dest_h = std::max(uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) * 32u, h);
-    const uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8;
-    const uint32_t dy = info.copy_dest_coordinate_info.offset_y_div_8 * 8;
+    const uint32_t dest_w =
+        std::max(HostCeil(source, uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32u), w);
+    const uint32_t dest_h =
+        std::max(HostCeil(source, uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) * 32u), h);
+    const uint32_t dx = HostFloor(source, info.copy_dest_coordinate_info.offset_x_div_8 * 8);
+    const uint32_t dy = HostFloor(source, info.copy_dest_coordinate_info.offset_y_div_8 * 8);
     const auto* dest_info = rex::graphics::FormatInfo::Get(
         xenos::TextureFormat(uint32_t(info.copy_dest_info.copy_dest_format)));
     const uint32_t dest_bpp = dest_info ? std::max(1u, dest_info->bits_per_pixel / 8) : 4;
@@ -8664,7 +8720,8 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
     Resolved* chosen = nullptr;
     uint32_t dest_x = 0, dest_y = 0;
     if (to_object) {
-      int32_t ox = int32_t(sx) + surfaces.dest_dx, oy = int32_t(sy) + surfaces.dest_dy;
+      const int32_t scale = int32_t(source->scale);
+      int32_t ox = int32_t(sx) + surfaces.dest_dx * scale / 4, oy = int32_t(sy) + surfaces.dest_dy * scale / 4;
       if (ox < 0) {
         const uint32_t cut = std::min(w, uint32_t(-ox));
         sx += cut, w -= cut, ox = 0;
@@ -8673,8 +8730,8 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
         const uint32_t cut = std::min(h, uint32_t(-oy));
         sy += cut, h -= cut, oy = 0;
       }
-      chosen = &GetResolved(surfaces.object_base, dest_format, std::max(surfaces.object_width, 1u),
-                            std::max(surfaces.object_height, 1u));
+      chosen = &GetResolved(surfaces.object_base, dest_format, HostCeil(source, std::max(surfaces.object_width, 1u)),
+                            HostCeil(source, std::max(surfaces.object_height, 1u)));
       dest_x = uint32_t(ox);
       dest_y = uint32_t(oy);
       w = dest_x < chosen->width ? std::min(w, chosen->width - dest_x) : 0;
@@ -8782,7 +8839,10 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
       std::array<Target*, 4> none{};
       SetFramebuffer(GetFramebuffer(none, 0, depth));
       const uint32_t d = info.rb_depth_clear;
-      L()->clearDepthStencil(true, true, float(d >> 8) / float(0xFFFFFF), d & 0xFF, &rect, 1);
+      const RenderRect depth_rect(int32_t(HostFloor(depth, surfaces.x)), int32_t(HostFloor(depth, surfaces.y)),
+                                  int32_t(HostCeil(depth, surfaces.x + surfaces.width)),
+                                  int32_t(HostCeil(depth, surfaces.y + surfaces.height)));
+      L()->clearDepthStencil(true, true, float(d >> 8) / float(0xFFFFFF), d & 0xFF, &depth_rect, 1);
       ++stats_.clears;
     }
   }

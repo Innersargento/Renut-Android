@@ -196,6 +196,10 @@ add("settings_texture_quality", "Qualidade das texturas", "Texture quality", "�
 add("texture_quality_full", "Completa", "Full", "完整", "Completa")
 add("texture_quality_half", "Metade", "Half", "一半", "Mitad")
 add("texture_quality_quarter", "Um quarto", "Quarter", "四分之一", "Un cuarto")
+add("settings_shadow_quality", "Qualidade das sombras", "Shadow quality", "阴影质量", "Calidad de sombras")
+add("shadow_quality_full", "Completa", "Full", "完整", "Completa")
+add("shadow_quality_medium", "Média · 3/4", "Medium · 3/4", "中 · 3/4", "Media · 3/4")
+add("shadow_quality_low", "Baixa · 1/2", "Low · 1/2", "低 · 1/2", "Baja · 1/2")
 # ---- screen layout editor ---------------------------------------------------------------------
 add("settings_temp", "Temperatura", "Temperature", "温度", "Temperatura")
 add("layout_title", "Editar layout", "Edit layout", "编辑布局", "Editar diseño")

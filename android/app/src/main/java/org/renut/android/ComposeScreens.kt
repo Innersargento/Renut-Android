@@ -681,6 +681,11 @@ private val SKIN_LABELS = listOf(
     var textureQuality by remember {
         mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
     }
+    val shadowLevels = listOf(stringResource(R.string.shadow_quality_full), stringResource(R.string.shadow_quality_medium),
+        stringResource(R.string.shadow_quality_low))
+    var shadowQuality by remember {
+        mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.SHADOW_QUALITY, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
+    }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
             Row(verticalAlignment = Alignment.Top) {
@@ -749,6 +754,12 @@ private val SKIN_LABELS = listOf(
                     val level = textureLevels.indexOf(choice).coerceAtLeast(0)
                     textureQuality = level
                     activity.uiSetRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, level.toString())
+                }
+                SingleChoiceSelector(stringResource(R.string.settings_shadow_quality), shadowLevels[shadowQuality],
+                    shadowLevels, !busy) { choice ->
+                    val level = shadowLevels.indexOf(choice).coerceAtLeast(0)
+                    shadowQuality = level
+                    activity.uiSetRuntimeOption(RuntimeOptions.SHADOW_QUALITY, level.toString())
                 }
                 ToggleRow(stringResource(R.string.settings_no_shadows), noShadows, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
