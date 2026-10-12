@@ -119,6 +119,10 @@
     <string name="texture_quality_full">Full</string>
     <string name="texture_quality_half">Half</string>
     <string name="texture_quality_quarter">Quarter</string>
+    <string name="settings_internal_resolution">Internal resolution</string>
+    <string name="internal_resolution_full">Full · 720p</string>
+    <string name="internal_resolution_three_quarters">3/4 · 540p</string>
+    <string name="internal_resolution_half">Half · 360p</string>
     <string name="settings_shadow_quality">Shadow quality</string>
     <string name="shadow_quality_full">Full</string>
     <string name="shadow_quality_medium">Medium · 3/4</string>

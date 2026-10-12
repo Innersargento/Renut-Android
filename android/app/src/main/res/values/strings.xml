@@ -119,6 +119,10 @@
     <string name="texture_quality_full">Completa</string>
     <string name="texture_quality_half">Metade</string>
     <string name="texture_quality_quarter">Um quarto</string>
+    <string name="settings_internal_resolution">Resolução interna</string>
+    <string name="internal_resolution_full">Completa · 720p</string>
+    <string name="internal_resolution_three_quarters">3/4 · 540p</string>
+    <string name="internal_resolution_half">Metade · 360p</string>
     <string name="settings_shadow_quality">Qualidade das sombras</string>
     <string name="shadow_quality_full">Completa</string>
     <string name="shadow_quality_medium">Média · 3/4</string>

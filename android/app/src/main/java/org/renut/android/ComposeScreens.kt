@@ -686,6 +686,11 @@ private val SKIN_LABELS = listOf(
     var shadowQuality by remember {
         mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.SHADOW_QUALITY, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
     }
+    val resolutionLevels = listOf(stringResource(R.string.internal_resolution_full),
+        stringResource(R.string.internal_resolution_three_quarters), stringResource(R.string.internal_resolution_half))
+    var internalResolution by remember {
+        mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.INTERNAL_RESOLUTION, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
+    }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
             Row(verticalAlignment = Alignment.Top) {
@@ -754,6 +759,12 @@ private val SKIN_LABELS = listOf(
                     val level = textureLevels.indexOf(choice).coerceAtLeast(0)
                     textureQuality = level
                     activity.uiSetRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, level.toString())
+                }
+                SingleChoiceSelector(stringResource(R.string.settings_internal_resolution), resolutionLevels[internalResolution],
+                    resolutionLevels, !busy) { choice ->
+                    val level = resolutionLevels.indexOf(choice).coerceAtLeast(0)
+                    internalResolution = level
+                    activity.uiSetRuntimeOption(RuntimeOptions.INTERNAL_RESOLUTION, level.toString())
                 }
                 SingleChoiceSelector(stringResource(R.string.settings_shadow_quality), shadowLevels[shadowQuality],
                     shadowLevels, !busy) { choice ->

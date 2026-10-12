@@ -147,6 +147,11 @@ REXCVAR_DEFINE_INT32(renut_plume_shadow_quality, 0, "reNut/Plume",
                      "the cached atlas is not touched). The maps are drawn and resolved smaller and sampled "
                      "with the same coordinates. Read at start.")
     .range(0, 2);
+REXCVAR_DEFINE_INT32(renut_plume_internal_resolution, 0, "reNut/Plume",
+                     "Internal resolution of the scene: 0 full, 1 three quarters (960x540), 2 half (640x360) of "
+                     "the guest's 1280x720. The scene's colour and depth surfaces are drawn smaller, resolved "
+                     "smaller and shown stretched. Read at start.")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
                     "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                     "next start; a scene load waits until they are built. Not in low-memory mode, which only "
@@ -1269,6 +1274,9 @@ struct Resolved {
   // A draw has fetched this resolve (or it was presented). One that nothing ever samples is a
   // copy the CPU reads, like Photo Mode's picture (see ReadbackResolve).
   bool sampled = false;
+  // Quarters of the guest's resolution it was resolved at (Target::scale of
+  // the surface it came from): width and height are host pixels.
+  uint32_t scale = 4;
 };
 
 struct GuestTexture {
@@ -1608,7 +1616,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Photo Mode encodes its picture from them): the GPU copy is run and waited for, then
   // written into the resolve's tiled destination. See ReadbackResolve.
   void ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info, uint32_t base_address, uint32_t dest_x,
-                       uint32_t dest_y, uint32_t w, uint32_t h, uint32_t pitch, uint32_t bpp);
+                       uint32_t dest_y, uint32_t w, uint32_t h, uint32_t pitch, uint32_t bpp, uint32_t scale = 4);
   // Debug: appends a line to <files>/plume-resolve.log while <files>/plume-resolve-log exists.
   void LogResolveLine(const std::string& line);
   // <files>/plume-readback: absent or "auto" = full-screen colour copies into a texture no draw
@@ -1745,6 +1753,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Quarters of the guest's resolution the dynamic shadow maps (depth D24S8
   // surfaces of 640 px and more) are drawn at: 4, 3 or 2.
   uint32_t shadow_scale_ = 4;
+  // The same for the scene's own 1280x720 colour and depth surfaces.
+  uint32_t internal_scale_ = 4;
   uint64_t texture_budget_ = 0;  // bytes of decoded 2D textures; 0 = unlimited
   // Filled by the guest thread that tripped a watch (inside its fault
   // handler), drained by this one.
@@ -3187,6 +3197,8 @@ bool PlumeCommandProcessor::SetupContext() {
               texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
   shadow_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
   REXLOG_INFO("Renut: Plume shadow map resolution: {}/4 of the guest's", shadow_scale_);
+  internal_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_internal_resolution), 0, 2));
+  REXLOG_INFO("Renut: Plume internal resolution: {}/4 of the guest's", internal_scale_);
   // One slice per frame in flight, after the permanent allocations.
   const uint64_t upload_bytes = upload_slice_size_ * kPlumeFramesInFlight + 4096;
   upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
@@ -4597,6 +4609,11 @@ Target* PlumeCommandProcessor::SurfaceTarget(uint32_t slot) {
   uint32_t scale = 4;
   if (depth && format == 0 && shadow_scale_ != 4 && std::min(width, height) >= 640) {
     scale = shadow_scale_;
+  } else if (internal_scale_ != 4 && width == 1280 && height >= 704 && height <= 736) {
+    // The scene's colour and depth: the internal resolution option.
+    scale = internal_scale_;
+  }
+  if (scale != 4) {
     width = std::max((width * scale + 3) / 4, 16u);
     height = std::max((height * scale + 3) / 4, 16u);
   }
@@ -6328,7 +6345,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           depth_dump_frame_ = r.written_frame;
         }
       }
-      const uint32_t fw = fetch.size_2d.width + 1, fh = fetch.size_2d.height + 1;
+      const uint32_t fw = uint32_t((uint64_t(fetch.size_2d.width + 1) * r.scale + 3) / 4);
+      const uint32_t fh = uint32_t((uint64_t(fetch.size_2d.height + 1) * r.scale + 3) / 4);
       // A depth resolve goes through a view that repeats the depth (see
       // Resolved::swizzled). A colour resolve already holds the channels in
       // the order its fetch swizzle expects; applying it again swapped red
@@ -8743,6 +8761,7 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
     }
     Resolved& dest = *chosen;
     ++dest.generation;
+    dest.scale = source->scale;
     dest.depth = copying_depth;
     dest.written = ++resolve_serial_;
     InvalidateResolvedLookups();
@@ -8790,11 +8809,14 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
             uint32_t(dest.format)));
       }
       if (readback_mode_ && !copying_depth && w && h) {
-        const bool big = to_object && w >= 1000 && h >= 500;
+        // The size it has in guest pixels, whatever resolution it was drawn at.
+        const uint32_t guest_w = uint32_t(uint64_t(w) * 4 / source->scale);
+        const uint32_t guest_h = uint32_t(uint64_t(h) * 4 / source->scale);
+        const bool big = to_object && guest_w >= 1000 && guest_h >= 500;
         // Auto: a full-screen copy into a texture that no draw has fetched. Everything the scene
         // resolves for post-processing is fetched the same frame; Photo Mode's picture never is.
         if ((readback_mode_ == 1 && big && !dest.sampled) || (readback_mode_ == 2 && big) ||
-            (readback_mode_ == 3 && w >= 256 && h >= 128) ||
+            (readback_mode_ == 3 && guest_w >= 256 && guest_h >= 128) ||
             (readback_mode_ == 4 && base_address == readback_address_)) {
           // The forced modes at most once every 90 frames per address, so a scene resolve into the same
           // texture every frame does not stall it; auto only has to keep one that is never fetched
@@ -8802,7 +8824,8 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
           auto last = readback_last_.find(base_address);
           if (last == readback_last_.end() || swaps_ - last->second >= (readback_mode_ == 1 ? 8u : 90u)) {
             readback_last_[base_address] = swaps_;
-              ReadbackResolve(dest, info, base_address, dest_x, dest_y, w, h, dest.guest_pitch, dest_bpp);
+              ReadbackResolve(dest, info, base_address, dest_x, dest_y, w, h, dest.guest_pitch, dest_bpp,
+                              source->scale);
           }
         }
       }
@@ -8868,8 +8891,8 @@ void PlumeCommandProcessor::LogResolveLine(const std::string& line) {
 // not signalled before this returns.
 void PlumeCommandProcessor::ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info,
                                             uint32_t base_address, uint32_t dest_x, uint32_t dest_y, uint32_t w,
-                                            uint32_t h, uint32_t pitch, uint32_t bpp) {
-  if (bpp != 4 || !dest.texture || !w || !h || !base_address) return;
+                                            uint32_t h, uint32_t pitch, uint32_t bpp, uint32_t scale) {
+  if (bpp != 4 || !dest.texture || !w || !h || !base_address || !scale) return;
   const bool rgba8 = dest.format == RenderFormat::R8G8B8A8_UNORM;
   const bool half = dest.format == RenderFormat::R16G16B16A16_FLOAT;
   if (!rgba8 && !half) {
@@ -8901,9 +8924,15 @@ void PlumeCommandProcessor::ReadbackResolve(Resolved& dest, const draw_util::Res
   };
   uint32_t written = 0;
   const uint32_t limit = dest.guest_bytes;
-  for (uint32_t y = 0; y < h; ++y) {
+  // A resolve drawn at a fraction of the guest's resolution is written at the
+  // guest's: each guest pixel takes the host texel under it.
+  const uint32_t guest_w = uint32_t(uint64_t(w) * 4 / scale), guest_h = uint32_t(uint64_t(h) * 4 / scale);
+  const uint32_t guest_x = uint32_t(uint64_t(dest_x) * 4 / scale), guest_y = uint32_t(uint64_t(dest_y) * 4 / scale);
+  for (uint32_t gy = 0; gy < guest_h; ++gy) {
+    const uint32_t y = std::min(uint32_t(uint64_t(gy) * scale / 4), h - 1);
     const uint8_t* src = pixels + size_t(y) * row_texels * texel;
-    for (uint32_t x = 0; x < w; ++x) {
+    for (uint32_t gx = 0; gx < guest_w; ++gx) {
+      const uint32_t x = std::min(uint32_t(uint64_t(gx) * scale / 4), w - 1);
       uint32_t r, g, b, a;
       if (rgba8) {
         r = src[x * 4], g = src[x * 4 + 1], b = src[x * 4 + 2], a = src[x * 4 + 3];
@@ -8914,7 +8943,7 @@ void PlumeCommandProcessor::ReadbackResolve(Resolved& dest, const draw_util::Res
       if (swap_rb) std::swap(r, b);
       const uint32_t native = r | (g << 8) | (b << 16) | (a << 24);
       const uint32_t value = xenos::GpuSwap(native, endian);
-      const uint32_t at = uint32_t(gfx::texture_util::GetTiledOffset2D(int32_t(dest_x + x), int32_t(dest_y + y),
+      const uint32_t at = uint32_t(gfx::texture_util::GetTiledOffset2D(int32_t(guest_x + gx), int32_t(guest_y + gy),
                                                                          pitch, 2));
       if (at + 4 > limit) continue;
       std::memcpy(guest + at, &value, 4);
