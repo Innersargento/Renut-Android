@@ -360,6 +360,12 @@ add("ctrl_players_hint_one", "Conecte um segundo controle (ou escolha Jogador 2 
 add("ctrl_players_touch", "A tela sensível ao toque sempre controla o Jogador 1.",
     "The touch screen always controls Player 1.", "触屏始终控制玩家 1。",
     "La pantalla táctil siempre controla al Jugador 1.")
+add("ctrl_rumble", "Vibração", "Vibration", "震动", "Vibración")
+add("ctrl_rumble_note", "Cada controle vibra com o jogador dele. Se o controle não tem motor de vibração, ou você joga só na tela, o celular vibra no lugar.",
+    "Each controller rumbles for its own player. If a controller has no rumble motor, or you play on the touch screen alone, the phone vibrates instead.",
+    "每个手柄为各自的玩家震动。如果手柄没有震动马达，或只使用触屏，则由手机震动代替。",
+    "Cada mando vibra para su jugador. Si el mando no tiene motor de vibración, o juegas solo en la pantalla, vibra el teléfono.")
+add("ctrl_rumble_test", "Testar vibração", "Test vibration", "测试震动", "Probar vibración")
 
 # ---- diagnostic screens ---------------------------------------------------------------------------
 add("probe_eyebrow", "TESTE GRÁFICO", "GRAPHICS TEST", "图形测试", "PRUEBA GRÁFICA")

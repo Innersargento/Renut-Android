@@ -85,6 +85,7 @@ final class ExternalController {
     private static final class Choice {
         final String[] player = {"", ""};  // "" = automatic, else the descriptor asked for
         final java.util.LinkedHashSet<String> ignored = new java.util.LinkedHashSet<>();
+        boolean rumble = true;
     }
 
     private static File assignmentFile(Context context) { return new File(context.getFilesDir(), ASSIGNMENT_FILE); }
@@ -96,6 +97,7 @@ final class ExternalController {
             JSONObject json = new JSONObject(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
             choice.player[0] = json.optString("p1", "");
             choice.player[1] = json.optString("p2", "");
+            choice.rumble = json.optBoolean("rumble", true);
             JSONArray ignored = json.optJSONArray("ignored");
             if (ignored != null) for (int i = 0; i < ignored.length(); i++) choice.ignored.add(ignored.optString(i));
         } catch (Exception ignored) { /* none yet, or unreadable: everything automatic */ }
@@ -108,6 +110,7 @@ final class ExternalController {
             json.put("p1", choice.player[0]);
             json.put("p2", choice.player[1]);
             json.put("ignored", new JSONArray(choice.ignored));
+            json.put("rumble", choice.rumble);
             File target = assignmentFile(context), temporary = new File(target.getPath() + ".tmp");
             java.nio.file.Files.write(temporary.toPath(), json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
             java.nio.file.Files.move(temporary.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
@@ -178,6 +181,14 @@ final class ExternalController {
         for (int player = 0; player < PLAYERS; player++) if (choice.player[player].equals(key)) choice.player[player] = "";
         if (role == PLAYER_ONE || role == PLAYER_TWO) choice.player[role] = key;
         else choice.ignored.add(key);
+        writeChoice(context, choice);
+    }
+
+    /** Whether the game's vibration is played at all (on the gamepads, or the phone when a pad has no motors). */
+    static boolean rumbleEnabled(Context context) { return readChoice(context).rumble; }
+    static void setRumbleEnabled(Context context, boolean enabled) {
+        Choice choice = readChoice(context);
+        choice.rumble = enabled;
         writeChoice(context, choice);
     }
 
@@ -279,6 +290,7 @@ final class ExternalController {
             return eventDevice != null && eventDevice.getId() == device.getId() && isGamepad(eventDevice);
         }
         int deviceId() { return device.getId(); }
+        InputDevice device() { return device; }
         boolean key(KeyEvent event) {
             if (!accepts(event.getDevice())) return false;
             if (event.getAction() != KeyEvent.ACTION_DOWN && event.getAction() != KeyEvent.ACTION_UP) return false;

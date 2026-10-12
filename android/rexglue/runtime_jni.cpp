@@ -170,6 +170,10 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeE
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeExternalTrigger(JNIEnv*,jclass,jint player,jint trigger,jfloat value) {
   renut::SetExternalTrigger(player,trigger,value);
 }
+// The rumble the game asked for, both players: see rumble_packed in touch_input.h.
+extern "C" JNIEXPORT jlong JNICALL Java_org_renut_android_RuntimeActivity_nativeRumble(JNIEnv*,jclass) {
+  return jlong(renut::rumble_packed.load());
+}
 // A gamepad is (or is no longer) assigned to player 1. The game notices on its next poll and is
 // told through the sign-in notification.
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeSetPlayerAttached(JNIEnv*,jclass,jint player,jboolean attached) {

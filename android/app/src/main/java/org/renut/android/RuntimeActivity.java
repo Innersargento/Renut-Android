@@ -26,6 +26,9 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     // Connected gamepads that play as nobody (a third pad, or one the player switched off); their
     // events are dropped without looking at the assignment again.
     private final java.util.HashSet<Integer> spareIds = new java.util.HashSet<>();
+    // The game's vibration, played on each player's gamepad (or the phone). Off when the player says so.
+    private Rumble rumble;
+    private boolean rumbleWanted = true;
     private InputManager inputManager;
     private final InputManager.InputDeviceListener deviceListener = new InputManager.InputDeviceListener() {
         @Override public void onInputDeviceAdded(int id) { if (launch) setupControllers(); }
@@ -47,6 +50,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native void nativeExternalStick(int player,int stick,float x,float y);
     private static native void nativeExternalTrigger(int player,int trigger,float value);
     private static native void nativeSetPlayerAttached(int player,boolean attached);
+    private static native long nativeRumble();
     private static native long nativeFrameCount();
     private static native long nativePrecompileProgress();
     private static native void nativeTextInputResult(String text,boolean cancelled);
@@ -194,6 +198,17 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             root.addView(results,new FrameLayout.LayoutParams(-1,-1));
             gameMenu=ComposeScreens.createGameMenu(this);
             root.addView(gameMenu.getView(),new FrameLayout.LayoutParams(-1,-1));
+            rumble=new Rumble(this);
+            rumbleWanted=ExternalController.rumbleEnabled(this);
+            fps.postDelayed(new Runnable(){@Override public void run(){
+                if(isFinishing())return;
+                if(loaded){
+                    // A frozen game keeps asking for its last rumble: the motors must not keep running.
+                    boolean quiet=!rumbleWanted||inBackground||(gameMenu!=null&&gameMenu.isPaused());
+                    rumble.apply(quiet?0:nativeRumble(),rumbleDevices());
+                }
+                fps.postDelayed(this,33);
+            }},33);
             achievementToast=new AchievementToast(this);
             root.addView(achievementToast,AchievementToast.params(this));
             addPrecompileNote(root);
@@ -340,6 +355,8 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
      */
     private void setupControllers(){
         InputDevice[] assigned=new InputDevice[ExternalController.PLAYERS];
+        rumbleWanted=ExternalController.rumbleEnabled(this);
+        boolean changed=false;
         spareIds.clear();
         for(ExternalController.Pad pad:ExternalController.pads(this)){
             if(pad.role>=0)assigned[pad.role]=pad.device;else spareIds.add(pad.device.getId());
@@ -349,6 +366,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             ExternalController.Player current=controllers[slot];
             InputDevice device=assigned[slot];
             if(current!=null&&device!=null&&current.deviceId()==device.getId())continue;
+            changed=true;
             if(current!=null){current.release();controllers[slot]=null;}
             if(device==null)continue;
             controllers[slot]=new ExternalController.Player(device,ExternalController.load(this,device),new ExternalController.Sink(){
@@ -357,13 +375,28 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 @Override public void trigger(int trigger,float value){if(loaded)nativeExternalTrigger(slot,trigger,value);}
             });
         }
+        if(changed&&rumble!=null)rumble.stop();  // the motors that were running belong to another pad now
         syncSecondPlayer();
+    }
+    /** The gamepad each player is playing on, null for none (the touch screen alone). */
+    private InputDevice[] rumbleDevices(){
+        InputDevice[] devices=new InputDevice[ExternalController.PLAYERS];
+        for(int player=0;player<ExternalController.PLAYERS;player++)
+            if(controllers[player]!=null)devices[player]=controllers[player].device();
+        return devices;
+    }
+    public boolean uiRumbleEnabled(){return rumbleWanted;}
+    public void uiSetRumble(boolean enabled){
+        rumbleWanted=enabled;
+        ExternalController.setRumbleEnabled(this,enabled);
+        if(!enabled&&rumble!=null)rumble.stop();
     }
     /** Tells the game whether a second player's pad is there; it learns of the change on its next poll. */
     private void syncSecondPlayer(){
         if(loaded)nativeSetPlayerAttached(ExternalController.PLAYER_TWO,controllers[ExternalController.PLAYER_TWO]!=null);
     }
     private void clearControllers(){
+        if(rumble!=null)rumble.stop();
         for(int player=0;player<ExternalController.PLAYERS;player++){
             if(controllers[player]!=null)controllers[player].release();
             controllers[player]=null;
@@ -457,5 +490,5 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     // Leaving the screen no longer ends the game; only closing it does (onDestroy).
     @Override protected void onPause(){clearControllers();super.onPause();if(!launch){stop();finish();}}
     @Override protected void onResume(){super.onResume();if(launch){setupControllers();applyHudLayout();}}
-    @Override protected void onDestroy(){if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
+    @Override protected void onDestroy(){if(rumble!=null)rumble.stop();if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
 }

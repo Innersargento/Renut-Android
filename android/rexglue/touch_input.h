@@ -69,6 +69,18 @@ inline Pad pads[kPads];
 // Player 0 is always there (the touch controller); player 1 follows the second gamepad.
 inline bool pad_attached[kPads] = {true, false};
 
+// What the game last asked of each player's rumble motors: 16 bits for the left (heavy) motor
+// then 16 for the right (light) one, player 0 in the low 32 bits. The app reads it and drives the
+// gamepad's motors, or the phone's when the pad has none.
+inline std::atomic<uint64_t> rumble_packed{0};
+inline void SetRumble(int player, uint16_t left, uint16_t right) {
+  const int shift = player * 32;
+  const uint64_t value = (uint64_t(left) | uint64_t(right) << 16) << shift;
+  const uint64_t keep = ~(0xFFFFFFFFull << shift);
+  uint64_t old = rumble_packed.load();
+  while (!rumble_packed.compare_exchange_weak(old, (old & keep) | value)) {}
+}
+
 // Bit (0-7, in kTouchKeys order) of the direction a stick points to, or -1.
 inline int StickDirection(int16_t x, int16_t y) {
   float fx = x / 32767.f, fy = y / 32767.f;
@@ -199,6 +211,7 @@ inline bool SetPlayerAttached(int player, bool attached) {
   const uint32_t packet = pad.packet + 1;
   pad = Pad{};
   pad.packet = packet;
+  if (!attached) SetRumble(player, 0, 0);
   return true;
 }
 inline bool PlayerAttached(int player) {
@@ -297,11 +310,21 @@ class TouchInput final : public rex::input::InputDriver {
       out->gamepad.thumb_ly = int16_t(0xFFC0);
       out->gamepad.thumb_rx = int16_t(0xFFC0);
       out->gamepad.thumb_ry = int16_t(0xFFC0);
+      // Both motors, so that titles which only rumble a pad that says it can do so do.
+      out->vibration.left_motor_speed = 0xFFFF;
+      out->vibration.right_motor_speed = 0xFFFF;
     }
     return X_ERROR_SUCCESS;
   }
-  rex::X_RESULT SetDeviceVibration(rex::input::DeviceId id, rex::input::X_INPUT_VIBRATION*) override {
-    return PlayerOf(id) >= 0 ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
+  rex::X_RESULT SetDeviceVibration(rex::input::DeviceId id,
+                                   rex::input::X_INPUT_VIBRATION* vibration) override {
+    const int player = PlayerOf(id);
+    if (player < 0) return X_ERROR_DEVICE_NOT_CONNECTED;
+    if (vibration) {
+      SetRumble(player, static_cast<uint16_t>(vibration->left_motor_speed),
+                static_cast<uint16_t>(vibration->right_motor_speed));
+    }
+    return X_ERROR_SUCCESS;
   }
   rex::X_RESULT GetDeviceKeystroke(rex::input::DeviceId id, uint32_t,
                                    rex::input::X_INPUT_KEYSTROKE* out) override {

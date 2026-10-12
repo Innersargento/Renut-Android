@@ -222,6 +222,9 @@
     <string name="ctrl_players_two_active">2-player mode is on: the game recognizes Player 2.</string>
     <string name="ctrl_players_hint_one">Connect a second controller (or set one to Player 2) to play with two.</string>
     <string name="ctrl_players_touch">The touch screen always controls Player 1.</string>
+    <string name="ctrl_rumble">Vibration</string>
+    <string name="ctrl_rumble_note">Each controller rumbles for its own player. If a controller has no rumble motor, or you play on the touch screen alone, the phone vibrates instead.</string>
+    <string name="ctrl_rumble_test">Test vibration</string>
     <string name="probe_eyebrow">GRAPHICS TEST</string>
     <string name="probe_subtitle">Vulkan presentation on the device</string>
     <string name="probe_running">Testing Plume presentation…\nThe animation lasts a few seconds.</string>

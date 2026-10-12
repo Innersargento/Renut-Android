@@ -222,6 +222,9 @@
     <string name="ctrl_players_two_active">Modo de 2 jugadores activo: el juego reconoce al Jugador 2.</string>
     <string name="ctrl_players_hint_one">Conecta un segundo mando (o pon uno como Jugador 2) para jugar de a dos.</string>
     <string name="ctrl_players_touch">La pantalla táctil siempre controla al Jugador 1.</string>
+    <string name="ctrl_rumble">Vibración</string>
+    <string name="ctrl_rumble_note">Cada mando vibra para su jugador. Si el mando no tiene motor de vibración, o juegas solo en la pantalla, vibra el teléfono.</string>
+    <string name="ctrl_rumble_test">Probar vibración</string>
     <string name="probe_eyebrow">PRUEBA GRÁFICA</string>
     <string name="probe_subtitle">Presentación Vulkan en el dispositivo</string>
     <string name="probe_running">Probando la presentación de Plume…\nLa animación dura unos segundos.</string>

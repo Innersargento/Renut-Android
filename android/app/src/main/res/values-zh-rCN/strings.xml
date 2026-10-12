@@ -222,6 +222,9 @@
     <string name="ctrl_players_two_active">双人模式已开启：游戏已识别玩家 2。</string>
     <string name="ctrl_players_hint_one">连接第二个手柄（或将某个手柄设为玩家 2）即可双人游戏。</string>
     <string name="ctrl_players_touch">触屏始终控制玩家 1。</string>
+    <string name="ctrl_rumble">震动</string>
+    <string name="ctrl_rumble_note">每个手柄为各自的玩家震动。如果手柄没有震动马达，或只使用触屏，则由手机震动代替。</string>
+    <string name="ctrl_rumble_test">测试震动</string>
     <string name="probe_eyebrow">图形测试</string>
     <string name="probe_subtitle">设备上的 Vulkan 呈现</string>
     <string name="probe_running">正在测试 Plume 呈现…\n动画将持续几秒钟。</string>

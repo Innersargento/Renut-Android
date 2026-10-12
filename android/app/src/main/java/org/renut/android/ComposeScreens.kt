@@ -52,6 +52,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SportsEsports
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Vibration
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.*
@@ -937,6 +938,7 @@ private val SidebarWidth = 360.dp
     var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
     var fpsVisible by remember { mutableStateOf(activity.uiFpsVisible()) }
     var tempVisible by remember { mutableStateOf(activity.uiTempVisible()) }
+    var rumbleOn by remember { mutableStateOf(activity.uiRumbleEnabled()) }
     // The summary line is read from the files the runtime keeps, off the main thread.
     val snapshot by produceState<Achievements.Snapshot?>(null) {
         value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
@@ -961,6 +963,10 @@ private val SidebarWidth = 360.dp
         }
         SidebarItem(Icons.Default.Gamepad, stringResource(R.string.menu_controllers), padSummary(activity), chevron = true) {
             menu.page = GameMenu.Page.Controllers
+        }
+        SidebarToggle(Icons.Default.Vibration, stringResource(R.string.ctrl_rumble), rumbleOn) {
+            rumbleOn = it
+            activity.uiSetRumble(it)
         }
         SidebarToggle(Icons.Default.SportsEsports, stringResource(R.string.menu_onscreen_controls), controlsVisible) {
             controlsVisible = it
@@ -1076,6 +1082,14 @@ private val SidebarWidth = 360.dp
                 onChanged()
             }
         }
+        var rumble by remember { mutableStateOf(ExternalController.rumbleEnabled(context)) }
+        ToggleRow(stringResource(R.string.ctrl_rumble), rumble, true) {
+            rumble = it
+            ExternalController.setRumbleEnabled(context, it)
+            onChanged()
+        }
+        Text(stringResource(R.string.ctrl_rumble_note), color = Muted, fontSize = 12.sp)
+        ActionButton(stringResource(R.string.ctrl_rumble_test), rumble, outlined = true) { Rumble.test(context) }
         val twoPlayers = pads.any { it.role == ExternalController.PLAYER_TWO }
         if (twoPlayers) Text(stringResource(R.string.ctrl_players_two_active), color = Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         else if (pads.isNotEmpty()) Text(stringResource(R.string.ctrl_players_hint_one), color = Muted, fontSize = 13.sp)
