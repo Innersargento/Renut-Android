@@ -1208,6 +1208,19 @@ struct Target {
   // height are host pixels; the guest's viewport, scissor, clears and resolve
   // rectangles are scaled by this).
   uint32_t scale = 4;
+  // A depth resolve took this target's image for its texture (AliasDepthResolve):
+  // the key of the resolve holding it and the image itself, so a draw that uses
+  // the surface again without clearing all of it gets the contents copied back.
+  uint64_t restore_key = 0;
+  const RenderTexture* restore_image = nullptr;
+  // How often this surface was resolved in place and then cleared whole before
+  // anything else used it (the pattern of a shadow map), and whether it is
+  // between the two now. Two surfaces that alternate into one texture need their
+  // old contents copied back only until the pattern has been seen twice;
+  // after that the contents are not worth a copy a frame (depth_undefined).
+  uint32_t alias_cycles = 0;
+  bool aliased_since_clear = false;
+  bool depth_undefined = false;
 };
 
 // A guest pixel coordinate in a target's host pixels, rounded down or up.
@@ -1277,6 +1290,10 @@ struct Resolved {
   // Quarters of the guest's resolution it was resolved at (Target::scale of
   // the surface it came from): width and height are host pixels.
   uint32_t scale = 4;
+  // `texture` is a depth target's own image, not a copy of it: a depth map
+  // resolved whole is sampled in place (AliasDepthResolve). `format` is then the
+  // depth format, and the views and the fitted copy are made accordingly.
+  bool alias = false;
 };
 
 struct GuestTexture {
@@ -1373,6 +1390,10 @@ struct Stats {
   // those windows had in game order against the order they were recorded in.
   uint64_t deferred_draws = 0, defer_windows = 0, defer_binds_before = 0, defer_binds_after = 0;
   uint64_t shadow_culled = 0;  // plume-shadowmin
+  // Depth resolves that handed their image over instead of copying it, the
+  // ones whose surface was used again and got the contents copied back, and
+  // the ones a full clear made unnecessary.
+  uint64_t depth_aliased = 0, depth_restored = 0, depth_dropped = 0, depth_abandoned = 0;
   uint64_t native_draws = 0;   // drawn by the native renderer (plume-native)
   uint64_t twin_skipped = 0;   // MSAA off: per-band copies of a draw already drawn
   // New pipelines by how they were made: found in the driver's cache at the
@@ -1829,6 +1850,16 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void SetFramebuffer(RenderFramebuffer* framebuffer);
   uint32_t FittedResolved(Resolved& resolved, uint32_t width, uint32_t height);
   Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height);
+  // A depth map resolved whole into a texture object, without the copy: the
+  // surface's image becomes the resolved texture and the surface takes another
+  // (files/plume-depthalias, default on). nullptr when no image was available.
+  Resolved* AliasDepthResolve(Target& source, uint32_t address);
+  // Copies the contents back into a surface whose image went to a resolve, for a
+  // draw or a partial clear that uses them. A clear of the whole surface drops
+  // them instead (true: the image is fresh, so its stencil is undefined too).
+  bool RestoreAliasedDepth(Target& target, bool full_clear);
+  void NoteAliasedUse(Target& target, bool whole_clear);
+  bool depth_alias_ = true;
   // Everything LayoutOf works out from a fetch constant, kept per constant.
   struct FetchLayout {
     uint64_t key = 0;
@@ -2654,6 +2685,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
         for (auto it = resolved_.begin(); it != resolved_.end();) {
           if (uint32_t(it->first) == address) {
             RetireSwizzled(it->second);
+            if (it->second.alias) RetireFramebuffers();  // a framebuffer may still name its image
             RetireTexture(it->second.texture, it->second.descriptor);
             RetireTexture(it->second.fitted, it->second.fitted_descriptor);
             it = resolved_.erase(it);
@@ -4343,6 +4375,7 @@ void PlumeCommandProcessor::EvictIdleTextures() {
     Resolved& r = it->second;
     if (!idle(r.written_frame, limit_resolved) || !idle(r.checked_frame, limit_resolved)) { ++it; continue; }
     RetireSwizzled(r);
+    if (r.alias) RetireFramebuffers();
     RetireTexture(r.texture, r.descriptor);
     RetireTexture(r.fitted, r.fitted_descriptor);
     it = resolved_.erase(it);
@@ -4533,7 +4566,10 @@ uint32_t PlumeCommandProcessor::SwizzledResolved(Resolved& r, bool fitted, uint3
       if (code == 0 && stencil_first) return RenderSwizzle::G;
       return code < 4 ? RenderSwizzle::R : code == 5 ? RenderSwizzle::ONE : RenderSwizzle::ZERO;
     };
-    RenderTextureViewDesc desc = RenderTextureViewDesc::Texture2D(r.format);
+    // An aliased depth map is read through its own format (the view takes the
+    // depth aspect); its fitted copy is the R32_FLOAT a depth resolve makes.
+    RenderTextureViewDesc desc =
+        RenderTextureViewDesc::Texture2D(fitted && r.alias ? RenderFormat::R32_FLOAT : r.format);
     desc.componentMapping = RenderComponentMapping(lane(swizzle & 7), lane((swizzle >> 3) & 7),
                                                    lane((swizzle >> 6) & 7), lane((swizzle >> 9) & 7));
     s.view = texture->createTextureView(desc);
@@ -4549,7 +4585,8 @@ uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint
   if (!r.fitted || r.fitted_width != width || r.fitted_height != height) {
     RetireSwizzled(r);
     RetireTexture(r.fitted, r.fitted_descriptor);
-    r.fitted = device_->createTexture(RenderTextureDesc::Texture2D(width, height, 1, r.format));
+    r.fitted = device_->createTexture(
+        RenderTextureDesc::Texture2D(width, height, 1, r.alias ? RenderFormat::R32_FLOAT : r.format));
     r.fitted_width = width;
     r.fitted_height = height;
     r.fitted_layout = RenderTextureLayout::UNKNOWN;
@@ -4559,11 +4596,26 @@ uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint
     SetTexture2D(r.fitted_descriptor, r.fitted.get());
   }
   if (r.fitted_generation != r.generation) {
-    Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
-    Transition(r.fitted.get(), r.fitted_layout, RenderTextureLayout::COPY_DEST);
-    RenderBox box(0, 0, int32_t(width), int32_t(height), 0, 1);
-    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(r.fitted.get()),
-                             RenderTextureCopyLocation::Subresource(r.texture.get()), 0, 0, 0, &box);
+    if (r.alias) {
+      // The depth image goes through CopyDepth, which takes it and its layout
+      // from a target.
+      Target image;
+      image.texture = std::move(r.texture);
+      image.layout = r.layout;
+      image.depth = true;
+      image.width = r.width;
+      image.height = r.height;
+      Transition(r.fitted.get(), r.fitted_layout, RenderTextureLayout::COPY_DEST);
+      CopyDepth(image, 0, 0, width, height, r.fitted.get(), 0, 0, false);
+      r.texture = std::move(image.texture);
+      r.layout = image.layout;
+    } else {
+      Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
+      Transition(r.fitted.get(), r.fitted_layout, RenderTextureLayout::COPY_DEST);
+      RenderBox box(0, 0, int32_t(width), int32_t(height), 0, 1);
+      L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(r.fitted.get()),
+                               RenderTextureCopyLocation::Subresource(r.texture.get()), 0, 0, 0, &box);
+    }
     r.fitted_generation = r.generation;
   }
   Transition(r.fitted.get(), r.fitted_layout, RenderTextureLayout::SHADER_READ);
@@ -4604,6 +4656,13 @@ Target* PlumeCommandProcessor::SurfaceTarget(uint32_t slot) {
   const uint32_t pitch = s.surface_info & 0x3FFF;
   uint32_t width = std::max({pitch, ((s.dims >> 18) & 0x3FFF) + 1, 16u});
   uint32_t height = std::max(((((s.dims >> 3) & 0x7FFF) + 1) + 15) & ~15u, 16u);
+  // A D24S8 shadow map is its D3D surface's size, not the EDRAM pitch padded to
+  // whole tiles (1040 for 1024): the extra columns are never drawn, and sampled
+  // as a resolved texture in place (AliasDepthResolve) they would stretch the map.
+  if (depth && format == 0) {
+    const uint32_t exact = std::max(((s.dims >> 18) & 0x3FFF) + 1, 16u);
+    if (exact < width) width = exact;
+  }
   // The dynamic shadow maps are the only D24S8 depth surfaces (the scene's is
   // D24FS8) of this size: drawn at the shadow quality's fraction of it.
   uint32_t scale = 4;
@@ -4657,6 +4716,10 @@ bool PlumeCommandProcessor::GrowSurfaceTarget(Target& target, uint32_t width, ui
   target.width = width;
   target.height = height;
   target.layout = RenderTextureLayout::UNKNOWN;
+  target.restore_key = 0;  // what it held was lost with its image
+  target.restore_image = nullptr;
+  target.alias_cycles = 0;
+  target.aliased_since_clear = false;
   ++surface_grown_;
   RetireFramebuffers();
   return true;
@@ -4860,6 +4923,119 @@ Resolved& PlumeCommandProcessor::GetResolved(uint32_t address, RenderFormat form
   resolved.layout = RenderTextureLayout::UNKNOWN;
   resolved.descriptor = AllocateTextureDescriptor();
   return resolved;
+}
+
+// A shadow map's resolve without its copy. CopyDepth stages the depth through a
+// buffer into R32_FLOAT, which is the same bits a depth image gives a fetch when
+// it is sampled through a depth view, so the surface's image can simply become
+// the resolved texture. The surface takes the image the previous map of this
+// destination was in (the two swap every frame), or a new one the first time.
+//
+// The surface's contents are not there for the game any more. That is only
+// seen if the game uses the surface again without clearing all of it, and then
+// RestoreAliasedDepth copies them back from the resolved image, which is still
+// the map as it was resolved - what the old path's surface held all along.
+Resolved* PlumeCommandProcessor::AliasDepthResolve(Target& source, uint32_t address) {
+  // The surface has a copy of its own pending: give it back before the image
+  // goes, or the resolve would take an undefined one.
+  if (source.restore_key) RestoreAliasedDepth(source, false);
+  const RenderFormat format = source.format;
+  const uint64_t key = ResolvedKey(address, format);
+  Resolved& r = resolved_[key];
+  // The name the texture is fetched by comes first, so that nothing has moved
+  // when there is none to be had.
+  if (!r.descriptor) r.descriptor = AllocateTextureDescriptor();
+  if (!r.descriptor) {
+    if (!r.texture) resolved_.erase(key);
+    return nullptr;
+  }
+  // Another surface's map is in this destination: that surface gets its
+  // contents back before its image is reused.
+  if (r.alias && r.texture) {
+    for (auto& [target_key, other] : targets_) {
+      if (&other == &source || other.restore_key != key || other.restore_image != r.texture.get()) continue;
+      if (other.alias_cycles >= 2) {
+        // Its map is resolved in place and it is cleared whole before it is
+        // used again, twice over: nothing of what it held is read.
+        other.restore_key = 0;
+        other.restore_image = nullptr;
+        other.depth_undefined = true;
+        ++stats_.depth_abandoned;
+      } else {
+        RestoreAliasedDepth(other, false);
+      }
+    }
+  }
+  std::unique_ptr<RenderTexture> fresh;
+  RenderTextureLayout fresh_layout = RenderTextureLayout::UNKNOWN;
+  if (r.alias && r.texture && r.width == source.width && r.height == source.height) {
+    fresh = std::move(r.texture);
+    fresh_layout = r.layout;
+  } else {
+    fresh = device_->createTexture(RenderTextureDesc::DepthTarget(source.width, source.height, format));
+    if (!fresh) {
+      if (!r.texture) {
+        if (r.descriptor) retired_descriptor_slots_[slot_].push_back(r.descriptor);
+        resolved_.erase(key);
+      }
+      return nullptr;
+    }
+  }
+  InvalidateResolvedLookups();
+  RetireSwizzled(r);
+  if (r.texture) {
+    // An alias of another size: its descriptor stays, the image goes.
+    RetireFramebuffers();
+    retired_slots_[slot_].push_back(std::move(r.texture));
+  }
+  r.texture = std::move(source.texture);
+  r.layout = source.layout;
+  r.format = format;
+  r.width = source.width;
+  r.height = source.height;
+  r.alias = true;
+  source.texture = std::move(fresh);
+  source.layout = fresh_layout;
+  source.restore_key = key;
+  source.restore_image = r.texture.get();
+  source.aliased_since_clear = true;
+  ++stats_.depth_aliased;
+  return &r;
+}
+
+// What a depth surface that was resolved in place is used for next, for the
+// pattern AliasDepthResolve waits for: a clear of all of it ends the cycle and
+// counts, anything else breaks the run. `whole` is a clear that covered the
+// surface; the caller restores or drops the contents itself.
+void PlumeCommandProcessor::NoteAliasedUse(Target& target, bool whole_clear) {
+  if (!target.aliased_since_clear) return;
+  target.aliased_since_clear = false;
+  target.alias_cycles = whole_clear ? target.alias_cycles + 1 : 0;
+}
+
+bool PlumeCommandProcessor::RestoreAliasedDepth(Target& target, bool full_clear) {
+  const uint64_t key = target.restore_key;
+  const RenderTexture* image = target.restore_image;
+  target.restore_key = 0;
+  target.restore_image = nullptr;
+  if (!key) return false;
+  if (full_clear) {
+    ++stats_.depth_dropped;
+    return true;
+  }
+  auto found = resolved_.find(key);
+  if (found == resolved_.end() || !found->second.alias || found->second.texture.get() != image ||
+      !target.texture || found->second.width != target.width || found->second.height != target.height) {
+    // The map was evicted or resolved over by another surface: what the target
+    // held is gone, as it is for a target that was grown.
+    return false;
+  }
+  Resolved& r = found->second;
+  Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
+  Transition(target.texture.get(), target.layout, RenderTextureLayout::COPY_DEST);
+  L()->copyTexture(target.texture.get(), r.texture.get());
+  ++stats_.depth_restored;
+  return false;
 }
 
 // A texture's content key. The game streams textures into reused memory and
@@ -6085,10 +6261,27 @@ void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
     if (Target* depth = NativeTarget(4, w[16])) {
       const RenderRect rect = clip(*depth);
       if (rect.right > rect.left && rect.bottom > rect.top) {
+        // A surface whose image went to a depth resolve (AliasDepthResolve): a
+        // clear of the whole depth needs nothing of the old contents - the
+        // stencil comes up undefined in the other image, so it is cleared too -
+        // and a smaller one or a stencil-only clear needs them back.
+        bool fresh = false;
+        if (depth->restore_key || depth->aliased_since_clear || depth->depth_undefined) {
+          const bool whole = clear_depth && rect.left <= 0 && rect.top <= 0 && rect.right >= int32_t(depth->width) &&
+                             rect.bottom >= int32_t(depth->height);
+          NoteAliasedUse(*depth, whole);
+          if (depth->restore_key) fresh = RestoreAliasedDepth(*depth, whole);
+          if (depth->depth_undefined) {
+            // The contents were given up (AliasDepthResolve): the stencil is
+            // undefined as well, which a whole clear settles.
+            fresh = fresh || whole;
+            depth->depth_undefined = !whole;
+          }
+        }
         Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
         std::array<Target*, 4> none{};
         SetFramebuffer(GetFramebuffer(none, 0, depth));
-        L()->clearDepthStencil(clear_depth, clear_stencil, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
+        L()->clearDepthStencil(clear_depth, clear_stencil || fresh, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
       }
     }
   }
@@ -6291,7 +6484,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   for (uint32_t i = 0; i < color_count; ++i) {
     Transition(colors[i]->texture.get(), colors[i]->layout, RenderTextureLayout::COLOR_WRITE);
   }
-  if (depth) Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+  if (depth) {
+    // A surface whose image went to a depth resolve and is drawn to without
+    // being cleared: what it held comes back (AliasDepthResolve).
+    if (depth->restore_key) RestoreAliasedDepth(*depth, false);
+    // Used again without a clear: not the pattern (and whatever it holds is what
+    // it holds).
+    if (depth->aliased_since_clear) NoteAliasedUse(*depth, false);
+    depth->depth_undefined = false;
+    Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+  }
 
   // Textures used by the draw: resolved render targets, by guest address.
   uint32_t texture_descriptor[32] = {};
@@ -6328,7 +6530,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         SnapshotResolved(r);
         Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
       }
-      if (depth_dump_ps_ && !depth_dump_ && r.depth && r.texture && ps && ps->entry->hash == depth_dump_ps_) {
+      if (depth_dump_ps_ && !depth_dump_ && r.depth && !r.alias && r.texture && ps &&
+          ps->entry->hash == depth_dump_ps_) {
         const uint32_t bytes = r.format == RenderFormat::R32G32_FLOAT ? 8 : 4;
         depth_dump_row_ = (r.width + 63) & ~63u;
         depth_dump_ = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(depth_dump_row_) * r.height * bytes));
@@ -8691,6 +8894,9 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
   // The source is the surface the resolve names, the rectangle in its pixels:
   // the host's (a shadow map is drawn smaller than the guest thinks).
   Target* source = surfaces.source;
+  // A surface whose image went to an earlier resolve and is read again: what it
+  // held comes back first (AliasDepthResolve).
+  if (source && source->restore_key) RestoreAliasedDepth(*source, false);
   const uint32_t x = HostFloor(source, surfaces.x), y = HostFloor(source, surfaces.y);
   const uint32_t width = HostCeil(source, surfaces.x + surfaces.width) - x;
   const uint32_t height = HostCeil(source, surfaces.y + surfaces.height) - y;
@@ -8736,6 +8942,7 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
     // address and offset.
     const bool to_object = surfaces.object_base != 0;
     Resolved* chosen = nullptr;
+    Resolved* aliased = nullptr;
     uint32_t dest_x = 0, dest_y = 0;
     if (to_object) {
       const int32_t scale = int32_t(source->scale);
@@ -8748,8 +8955,18 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
         const uint32_t cut = std::min(h, uint32_t(-oy));
         sy += cut, h -= cut, oy = 0;
       }
-      chosen = &GetResolved(surfaces.object_base, dest_format, HostCeil(source, std::max(surfaces.object_width, 1u)),
-                            HostCeil(source, std::max(surfaces.object_height, 1u)));
+      const uint32_t object_w = HostCeil(source, std::max(surfaces.object_width, 1u));
+      const uint32_t object_h = HostCeil(source, std::max(surfaces.object_height, 1u));
+      // A depth map taken whole into a texture of exactly its size (the
+      // shadow maps) is not copied: see AliasDepthResolve. Anything else - the
+      // scene's depth with its stencil, a part of a surface - copies as before.
+      if (depth_alias_ && copying_depth && !with_stencil && source->depth && source->texture &&
+          !(skip_mask_ & (268435456 | 536870912)) && sx == 0 && sy == 0 && ox == 0 && oy == 0 &&
+          w == source->width && h == source->height && object_w == w && object_h == h) {
+        aliased = AliasDepthResolve(*source, surfaces.object_base);
+        chosen = aliased;
+      }
+      if (!chosen) chosen = &GetResolved(surfaces.object_base, dest_format, object_w, object_h);
       dest_x = uint32_t(ox);
       dest_y = uint32_t(oy);
       w = dest_x < chosen->width ? std::min(w, chosen->width - dest_x) : 0;
@@ -8776,7 +8993,9 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
       dest.guest_hash = ContentHash(memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
       dest.checked_frame = swaps_;
     }
-    if (dest.texture && copying_depth && w && h) {
+    if (aliased) {
+      // Nothing to copy: the texture is the surface's own image.
+    } else if (dest.texture && copying_depth && w && h) {
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
       CopyDepth(*source, sx, sy, w, h, dest.texture.get(), dest_x, dest_y, with_stencil && dest.format == dest_format);
     } else if (dest.texture && w && h) {
@@ -8792,7 +9011,7 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
       }
     }
     if (dest.texture) {
-      if (snap_address_ && info.copy_dest_base == snap_address_ && ++snap_seen_ == snap_ordinal_) {
+      if (snap_address_ && !dest.alias && info.copy_dest_base == snap_address_ && ++snap_seen_ == snap_ordinal_) {
         SnapshotResolved(dest);
       }
       Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
@@ -8858,13 +9077,22 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
   if (info.IsClearingDepth() && !skip_clears) {
     Target* depth = surfaces.depth;
     if (depth) {
+      const RenderRect depth_rect(int32_t(HostFloor(depth, surfaces.x)), int32_t(HostFloor(depth, surfaces.y)),
+                                  int32_t(HostCeil(depth, surfaces.x + surfaces.width)),
+                                  int32_t(HostCeil(depth, surfaces.y + surfaces.height)));
+      // A surface whose image went to a resolve: a clear of all of it needs
+      // nothing from the old one, a smaller rectangle needs it back.
+      if (depth->restore_key || depth->aliased_since_clear || depth->depth_undefined) {
+        const bool whole = depth_rect.left <= 0 && depth_rect.top <= 0 &&
+                           depth_rect.right >= int32_t(depth->width) && depth_rect.bottom >= int32_t(depth->height);
+        NoteAliasedUse(*depth, whole);
+        if (depth->restore_key) RestoreAliasedDepth(*depth, whole);
+        if (whole) depth->depth_undefined = false;  // this clear takes both aspects
+      }
       Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
       std::array<Target*, 4> none{};
       SetFramebuffer(GetFramebuffer(none, 0, depth));
       const uint32_t d = info.rb_depth_clear;
-      const RenderRect depth_rect(int32_t(HostFloor(depth, surfaces.x)), int32_t(HostFloor(depth, surfaces.y)),
-                                  int32_t(HostCeil(depth, surfaces.x + surfaces.width)),
-                                  int32_t(HostCeil(depth, surfaces.y + surfaces.height)));
       L()->clearDepthStencil(true, true, float(d >> 8) / float(0xFFFFFF), d & 0xFF, &depth_rect, 1);
       ++stats_.clears;
     }
@@ -9621,6 +9849,19 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       fetch_spec_mode_ = uint32_t(fetch_spec);
     }
     {
+      // 1 (default): a shadow map resolved whole is sampled in place, not copied.
+      int alias = 1;
+      if (FILE* file = std::fopen((root + "/plume-depthalias").c_str(), "r")) {
+        int value = alias;
+        if (std::fscanf(file, "%d", &value) == 1) alias = std::clamp(value, 0, 1);
+        std::fclose(file);
+      }
+      if ((alias != 0) != depth_alias_) {
+        REXLOG_INFO("Renut: Plume depth maps resolved {}", alias ? "in place (no copy)" : "by copy");
+      }
+      depth_alias_ = alias != 0;
+    }
+    {
       int bc = std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1);
       if (FILE* file = std::fopen((root + "/plume-bc").c_str(), "r")) {
         int value = bc;
@@ -10163,6 +10404,10 @@ void PlumeCommandProcessor::Report() {
   if (shadow_min_indices_) {
     REXLOG_INFO("Renut: Plume shadow casters under {} indices dropped: {}", shadow_min_indices_,
                 stats_.shadow_culled);
+  }
+  if (depth_alias_ || stats_.depth_aliased) {
+    REXLOG_INFO("Renut: Plume depth maps in place ({}): {} resolves without a copy, {} copied back, {} dropped by a clear",
+                depth_alias_ ? "on" : "off", stats_.depth_aliased, stats_.depth_restored, stats_.depth_dropped);
   }
   // Keep what the driver compiled this interval, so the next run of this scene
   // does not spend its frames inside vkCreateGraphicsPipelines. Android rarely
