@@ -750,7 +750,6 @@ private val SKIN_LABELS = listOf(
                     textureQuality = level
                     activity.uiSetRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, level.toString())
                 }
-                Text(stringResource(R.string.settings_texture_quality_note), color = Muted, fontSize = 12.sp)
                 ToggleRow(stringResource(R.string.settings_no_shadows), noShadows, !busy) {
                     activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
                 }

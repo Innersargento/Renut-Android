@@ -119,7 +119,6 @@
     <string name="texture_quality_full">Full</string>
     <string name="texture_quality_half">Half</string>
     <string name="texture_quality_quarter">Quarter</string>
-    <string name="settings_texture_quality_note">Lowers the resolution of the world\'s textures (less memory and bandwidth); the interface and fonts are unchanged.</string>
     <string name="settings_temp">Temperature</string>
     <string name="layout_title">Edit layout</string>
     <string name="layout_edit_button">Edit layout…</string>

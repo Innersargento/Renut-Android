@@ -119,7 +119,6 @@
     <string name="texture_quality_full">Completa</string>
     <string name="texture_quality_half">Mitad</string>
     <string name="texture_quality_quarter">Un cuarto</string>
-    <string name="settings_texture_quality_note">Reduce la resolución de las texturas del mundo (menos memoria y ancho de banda); la interfaz y las fuentes no cambian.</string>
     <string name="settings_temp">Temperatura</string>
     <string name="layout_title">Editar diseño</string>
     <string name="layout_edit_button">Editar diseño…</string>
