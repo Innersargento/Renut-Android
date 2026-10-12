@@ -44,7 +44,7 @@ XEX_PACKAGE = "org.renut.android"
 # name -> (url, pinned commit, submodule paths or None for "all, recursively", patch to apply)
 DEPENDENCIES = {
     "rexglue-android": ("https://github.com/rexglue/rexglue-sdk.git", "f5337cdc947ff6d4c4196737e2c807a48f2a1fc2",
-                        ["thirdparty/" + n for n in ("libmspack", "tomlplusplus", "simde", "xxHash", "spdlog", "fmt", "utfcpp",
+                        ["thirdparty/" + n for n in ("libmspack", "tomlplusplus", "simde", "xxHash", "spdlog", "fmt", "utfcpp", "cli11",
                                                      "o1heap", "sdl3", "imgui", "FFmpeg", "glslang", "vulkan-headers",
                                                      "vulkan-memory-allocator", "spirv-tools", "spirv-headers")],
                         "android/rexglue/android-platform.patch"),

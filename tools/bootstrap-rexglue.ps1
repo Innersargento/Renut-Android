@@ -15,7 +15,7 @@ foreach ($dep in $deps) {
     if ((git -C $path rev-parse HEAD) -ne $dep[2]) { throw "Revisão inesperada em $path; alterações locais preservadas." }
 }
 $sdk = Join-Path $renutRoot 'external/rexglue-android'
-$submodules = @('libmspack','tomlplusplus','simde','xxHash','spdlog','fmt','utfcpp','o1heap','sdl3','imgui','FFmpeg','glslang','vulkan-headers','vulkan-memory-allocator','spirv-tools','spirv-headers') | ForEach-Object {'thirdparty/'+$_}
+$submodules = @('libmspack','tomlplusplus','simde','xxHash','spdlog','fmt','utfcpp','cli11','o1heap','sdl3','imgui','FFmpeg','glslang','vulkan-headers','vulkan-memory-allocator','spirv-tools','spirv-headers') | ForEach-Object {'thirdparty/'+$_}
 git -C $sdk submodule update --init --depth 1 -- $submodules
 if ($LASTEXITCODE) { throw 'Falha ao obter submódulos.' }
 $patch = Join-Path $renutRoot 'android/rexglue/android-platform.patch'
