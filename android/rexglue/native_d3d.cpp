@@ -24,6 +24,7 @@
 // the next bit the next register, and so on (SetPending_RenderStates,
 // sub_8222CB90).
 #include "native_d3d.h"
+#include "guest_address.h"
 
 #include "d3d_layer.h"
 
@@ -74,30 +75,30 @@ using renut::d3d::Function;
 // ---------------------------------------------------------------------------
 // Guest memory (big-endian; on Android base + address is the mapping).
 
-inline uint8_t U8(const uint8_t* base, uint32_t a) { return base[a]; }
+inline uint8_t U8(const uint8_t* base, uint32_t a) { return *GuestPtr(base, a); }
 inline uint16_t U16(const uint8_t* base, uint32_t a) {
   uint16_t v;
-  std::memcpy(&v, base + a, 2);
+  std::memcpy(&v, GuestPtr(base, a), 2);
   return __builtin_bswap16(v);
 }
 inline uint32_t U32(const uint8_t* base, uint32_t a) {
   uint32_t v;
-  std::memcpy(&v, base + a, 4);
+  std::memcpy(&v, GuestPtr(base, a), 4);
   return __builtin_bswap32(v);
 }
 inline uint64_t U64(const uint8_t* base, uint32_t a) {
   uint64_t v;
-  std::memcpy(&v, base + a, 8);
+  std::memcpy(&v, GuestPtr(base, a), 8);
   return __builtin_bswap64(v);
 }
-inline void S8(uint8_t* base, uint32_t a, uint8_t v) { base[a] = v; }
+inline void S8(uint8_t* base, uint32_t a, uint8_t v) { *GuestPtr(base, a) = v; }
 inline void S32(uint8_t* base, uint32_t a, uint32_t v) {
   v = __builtin_bswap32(v);
-  std::memcpy(base + a, &v, 4);
+  std::memcpy(GuestPtr(base, a), &v, 4);
 }
 inline void S64(uint8_t* base, uint32_t a, uint64_t v) {
   v = __builtin_bswap64(v);
-  std::memcpy(base + a, &v, 8);
+  std::memcpy(GuestPtr(base, a), &v, 8);
 }
 
 // A guest pointer as the GPU addresses it: Direct3D's own conversion,
@@ -197,7 +198,7 @@ class Builder {
     uint32_t* p = Grow(2 + size_t(count));
     p[0] = kOpRegs | (count << 8);
     p[1] = first;
-    const uint8_t* source = base + address;
+    const uint8_t* source = GuestPtr(base, address);
     for (uint32_t i = 0; i < count; ++i) {
       uint32_t v;
       std::memcpy(&v, source + size_t(i) * 4, 4);
@@ -437,6 +438,25 @@ void RenderStates(Device& d, uint64_t mask, uint32_t first, uint32_t shadow) {
 // SetDepthStencilSurface, sub_8227AB68 / sub_8227AF40), which keep the
 // objects at +12440..+12452 and +12456. Every SetRenderTarget marks its
 // register, so each change of object comes through here.
+// Whether `address` lies in committed guest memory. The device keeps object
+// pointers in arrays that can hold something else (the stream array has two
+// slots past the sixteen streams, and slots the game never set): dereferencing
+// those faults where the low guest range is not mapped (Windows), and merely
+// reads garbage where it is (Android, where it is left as it was).
+#if defined(_WIN32)
+bool GuestCommitted(uint32_t address) {
+  auto* memory = rex::system::kernel_memory();
+  if (!memory) return false;
+  const auto* heap = memory->LookupHeap(address);
+  if (!heap) return false;
+  rex::memory::HeapAllocationInfo info{};
+  return const_cast<rex::memory::BaseHeap*>(heap)->QueryRegionInfo(address, &info) &&
+         (info.state & rex::memory::kMemoryAllocationCommit);
+}
+#else
+constexpr bool GuestCommitted(uint32_t) { return true; }
+#endif
+
 void Surfaces(Device& d, uint64_t mask) {
   static constexpr uint32_t kSlotOfRegister[6] = {0, 0, 4, 1, 2, 3};
   uint32_t slots = 0;
@@ -448,7 +468,8 @@ void Surfaces(Device& d, uint64_t mask) {
   list.words.push_back(kOpSurfaces | (slots << 8));
   for (uint32_t slot = 0; slot < 5; ++slot) {
     if (!((slots >> slot) & 1)) continue;
-    const uint32_t surface = U32(d.base, d.dev + (slot < 4 ? 12440 + slot * 4 : 12456));
+    uint32_t surface = U32(d.base, d.dev + (slot < 4 ? 12440 + slot * 4 : 12456));
+    if (surface && !GuestCommitted(surface)) surface = 0;
     list.words.push_back(surface);
     for (uint32_t at : {24u, 28u, 36u}) list.words.push_back(surface ? U32(d.base, surface + at) : 0);
   }
@@ -503,7 +524,10 @@ void Streams(Device& d, uint32_t slots) {
   list.words.push_back(kOpStreams | (mask << 8));
   for (uint32_t s = 0; s < 18; ++s) {
     if (!((mask >> s) & 1)) continue;
-    const uint32_t vb = U32(d.base, d.dev + 12460 + s * 4);
+    uint32_t vb = U32(d.base, d.dev + 12460 + s * 4);
+    // Streams 16 and 17 ride along with the fetch slot they share with stream
+    // 15, and what sits past the device's sixteen sources is not an object.
+    if (vb && !GuestCommitted(vb)) vb = 0;
     const uint32_t address = vb ? U32(d.base, vb + 24) & ~3u : 0;
     list.words.push_back(address ? Phys(address) : 0);
     list.words.push_back(address ? U32(d.base, vb + 28) & 0x03FFFFFCu : 0);
@@ -515,6 +539,7 @@ void Streams(Device& d, uint32_t slots) {
 // when it changes.
 void Indices(Device& d, uint32_t ib) {
   List& list = d.out.list();
+  if (ib && !GuestCommitted(ib)) ib = 0;
   const uint32_t address = ib ? U32(d.base, ib + 24) : 0;
   const uint32_t base = address ? Phys(address) : 0, size = address ? U32(d.base, ib + 28) : 0;
   if (list.indices_named && list.indices_base == base && list.indices_size == size) return;
@@ -586,7 +611,7 @@ void PatchAndLoad(Device& d, uint32_t match_ps, uint32_t shader, uint32_t progra
   const uint32_t copy = ScratchAlloc(bytes);
   if (!copy) return;
   const uint32_t source = Cpu(Phys(U32(d.base, info + 872) + U32(d.base, shader + 32)));
-  std::memcpy(d.base + copy, d.base + source, bytes);
+  std::memcpy(GuestPtr(d.base, copy), GuestPtr(d.base, source), bytes);
   if (match_ps && (U8(d.base, vs_info + 8) & 7) != 7) {
     d.ctx.r3.u64 = vs_info;
     d.ctx.r4.u64 = copy;
@@ -1417,7 +1442,7 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     ctx.r3.u64 = dev;
     ctx.r4.u64 = params;
     ctx.r5.u64 = control & 7;
-    for (uint32_t i = 0; i < 16; ++i) ctx.v1.u8[i] = base[clear_color + 15 - i];  // as lvx128 loads it
+    for (uint32_t i = 0; i < 16; ++i) ctx.v1.u8[i] = GuestPtr(base, clear_color)[15 - i];  // as lvx128 loads it
     sub_82290DE0(ctx, base);
     ctx = saved;
   }

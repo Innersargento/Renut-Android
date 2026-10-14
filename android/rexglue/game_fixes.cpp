@@ -3,6 +3,7 @@
 
 #include "native_engine.h"
 #include "native_probe.h"
+#include "guest_address.h"
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
+#include <rex/hook.h>
 
 #include "plume_gpu.h"
 
@@ -42,7 +44,7 @@ constexpr uint32_t kSceneMsaaMode = 0x82F9EC18;
 
 void ForceSceneSinglePass(uint8_t* base) {
   if (REXCVAR_GET(renut_scene_msaa)) return;
-  auto* mode = reinterpret_cast<uint32_t*>(base + kSceneMsaaMode);
+  auto* mode = reinterpret_cast<uint32_t*>(renut::GuestPtr(base, kSceneMsaaMode));
   if (*mode != 0) {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true)) {
@@ -58,7 +60,7 @@ void ForceSceneSinglePass(uint8_t* base) {
 // The game selects a presentation interval through this routine. Index 0 is
 // its immediate mode; preserve the original routine's device bookkeeping.
 extern "C" void __imp__rex_setParamInterval(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(rex_setParamInterval) {
+REX_HOOK_RAW(rex_setParamInterval) {
   if (REXCVAR_GET(renut_plume_uncap_fps) && ctx.r3.u32 != 0) {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
@@ -66,6 +68,25 @@ REX_EXTERN(rex_setParamInterval) {
     ctx.r3.u32 = 0;
   }
   __imp__rex_setParamInterval(ctx, base);
+}
+
+// The game's heap free (sub_8223FD48, called from meInternalFree with the heap
+// that owns the block) is sometimes handed no heap at all: the lookup of the
+// block's owner (sub_82240178) came back empty and the caller went on with a
+// null heap, whose lock is then entered at guest address 0x580. On the PC build
+// that is a host null dereference about one launch in six, a few seconds in;
+// the cause is not known yet. A free that has no heap releases nothing and
+// reports success, as a free of NULL does: the block is leaked, not corrupted.
+extern "C" void __imp__sub_8223FD48(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_8223FD48) {
+  if (ctx.r3.u32 == 0) {
+    static std::atomic<uint32_t> reported{0};
+    if (reported.fetch_add(1) < 8)
+      REXLOG_WARN("Renut: heap free without an owning heap (block {:08X}) skipped", ctx.r5.u32);
+    ctx.r3.u32 = 1;
+    return;
+  }
+  __imp__sub_8223FD48(ctx, base);
 }
 
 // Scene changes, held until the new scene's pipelines exist - as
@@ -86,21 +107,21 @@ thread_local uint32_t pending_scene_ref = 0;
 uint32_t GuestWord(uint8_t* base, uint32_t address) {
   if (!address) return 0;
   uint32_t value;
-  std::memcpy(&value, base + address, sizeof(value));
+  std::memcpy(&value, renut::GuestPtr(base, address), sizeof(value));
   return __builtin_bswap32(value);
 }
 
 }  // namespace
 
 extern "C" void __imp__supportGameLoadNewScene(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(supportGameLoadNewScene) {
+REX_HOOK_RAW(supportGameLoadNewScene) {
   pending_scene_ref = GuestWord(base, ctx.r4.u32);
   __imp__supportGameLoadNewScene(ctx, base);
   pending_scene_ref = 0;
 }
 
 extern "C" void __imp__sub_822BC0D8(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(sub_822BC0D8) {
+REX_HOOK_RAW(sub_822BC0D8) {
   const uint32_t asset = GuestWord(base, ctx.r3.u32);
   const uint32_t ref = pending_scene_ref;
   // 0 is the boot's; a scene that hashes to it takes 1.
@@ -114,7 +135,7 @@ REX_EXTERN(sub_822BC0D8) {
 // game still submits every caster normally. This seam lets the native backend
 // measure each category before it takes ownership of any draw.
 extern "C" void __imp__sub_823B3598(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(sub_823B3598) {
+REX_HOOK_RAW(sub_823B3598) {
   renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B3598, ctx, base);
   if (!REXCVAR_GET(renut_shadow_engine_profile)) {
     __imp__sub_823B3598(ctx, base);
@@ -126,7 +147,7 @@ REX_EXTERN(sub_823B3598) {
 }
 
 extern "C" void __imp__sub_823B3CE0(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(sub_823B3CE0) {
+REX_HOOK_RAW(sub_823B3CE0) {
   renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B3CE0, ctx, base);
   if (!REXCVAR_GET(renut_shadow_engine_profile)) {
     __imp__sub_823B3CE0(ctx, base);
@@ -141,7 +162,7 @@ REX_EXTERN(sub_823B3CE0) {
 // thread-local because game jobs can run concurrently. No guest state is
 // changed, and an unclassified invocation is left alone.
 extern "C" void __imp__sub_823B0698(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(sub_823B0698) {
+REX_HOOK_RAW(sub_823B0698) {
   renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B0698, ctx, base);
   if (shadow_pass == ShadowPass::Dynamic) {
     shadow_dynamic_casters.fetch_add(1, std::memory_order_relaxed);
@@ -176,7 +197,7 @@ void renutReportShadowEngineProfile() {
 // mode before the surfaces are sized. Plume never kept the samples: it renders
 // one sample per pixel either way.
 extern "C" void __imp__sub_823ED2A8(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(sub_823ED2A8) {
+REX_HOOK_RAW(sub_823ED2A8) {
   ForceSceneSinglePass(base);
   __imp__sub_823ED2A8(ctx, base);
 }
@@ -184,7 +205,7 @@ REX_EXTERN(sub_823ED2A8) {
 // Tile count @ 0x8222A990, asked each frame by the tiling code: keep it on the
 // same single band the surfaces were sized for.
 extern "C" void __imp__sub_8222A990(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(sub_8222A990) {
+REX_HOOK_RAW(sub_8222A990) {
   ForceSceneSinglePass(base);
   __imp__sub_8222A990(ctx, base);
 }
@@ -209,19 +230,19 @@ extern "C" void __imp__sub_823B18C8(PPCContext& __restrict, uint8_t*);
 // band jobs the whole-screen projection, 5 is 2 plus a scissor to each band
 // (wrong: with one tile the game predicates almost everything to mask 3).
 std::atomic<int> g_renut_scene_split_mode{2};
-REX_EXTERN(sub_823B18C8) {
+REX_HOOK_RAW(sub_823B18C8) {
   renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B18C8, ctx, base);
   const int mode = g_renut_scene_split_mode.load(std::memory_order_relaxed);
   if (!REXCVAR_GET(renut_scene_msaa) && (mode == 0 || mode == 2 || mode == 5)) {
-    const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r3.u32 + 40));
-    auto* split = reinterpret_cast<uint32_t*>(base + scene + 44);
+    const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(renut::GuestPtr(base, ctx.r3.u32 + 40)));
+    auto* split = reinterpret_cast<uint32_t*>(renut::GuestPtr(base, scene + 44));
     if (scene && *split == __builtin_bswap32(1)) {
       if (mode == 0) {
         *split = 0;
       } else {
         // The view's matrices: +128 whole screen, +192 upper band, +256 lower.
-        const uint32_t view = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r3.u32 + 52));
-        uint8_t* block = base + scene + (view << 9);
+        const uint32_t view = __builtin_bswap32(*reinterpret_cast<uint32_t*>(renut::GuestPtr(base, ctx.r3.u32 + 52)));
+        uint8_t* block = renut::GuestPtr(base, scene + (view << 9));
         std::memcpy(block + 192, block + 128, 64);
         std::memcpy(block + 256, block + 128, 64);
       }
@@ -240,7 +261,7 @@ REX_EXTERN(sub_823B18C8) {
 // creates ~330 at once). The handler then dumps registers, marks the device as
 // hung and rewrites the ring read pointer, after which nothing renders. Return
 // 0 instead: the watchdog rearms its deadline and keeps waiting for the fence.
-REX_EXTERN(sub_8265AB70) {
+REX_HOOK_RAW(sub_8265AB70) {
   static std::atomic<uint32_t> count{0};
   uint32_t n = ++count;
   if (n <= 3 || (n & (n - 1)) == 0) {

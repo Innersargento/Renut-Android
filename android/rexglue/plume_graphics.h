@@ -14,7 +14,7 @@ class PlumeGraphics final : public rex::system::IGraphicsSystem {
   rex::X_STATUS SetupPresentation(rex::ui::WindowedAppContext*) override;
   rex::X_STATUS SetupGuestGpu(rex::runtime::FunctionDispatcher*, rex::system::KernelState*) override;
   bool has_presentation() const override;
-  bool PresentFrontBuffer(const uint32_t*, uint32_t width, uint32_t height) override;
+  bool PresentFrontBuffer(const uint32_t*, uint32_t width, uint32_t height);
   void InitializeRingBuffer(uint32_t, uint32_t) override;
   void EnableReadPointerWriteBack(uint32_t, uint32_t) override;
   void SetInterruptCallback(uint32_t, uint32_t) override;

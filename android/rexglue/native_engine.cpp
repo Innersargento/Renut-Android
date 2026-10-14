@@ -18,6 +18,7 @@
 // them into the command buffer ahead of itself. The Plume renderer reads them
 // back at the draw (plume_gpu.cpp) and knows which engine draw it has.
 #include "native_engine.h"
+#include "guest_address.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,7 @@
 #include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/ppc/func.h>
+#include <rex/hook.h>
 
 #include "native_probe.h"
 
@@ -65,12 +67,12 @@ uint32_t g_sample_count = 0;
 
 uint32_t Load32(const uint8_t* base, uint32_t address) {
   uint32_t v;
-  std::memcpy(&v, base + address, 4);
+  std::memcpy(&v, GuestPtr(base, address), 4);
   return __builtin_bswap32(v);
 }
 void Store32(uint8_t* base, uint32_t address, uint32_t value) {
   value = __builtin_bswap32(value);
-  std::memcpy(base + address, &value, 4);
+  std::memcpy(GuestPtr(base, address), &value, 4);
 }
 
 float LoadFloat(const uint8_t* base, uint32_t address) {
@@ -224,7 +226,7 @@ void Report(std::string& out, uint64_t frames) {
 }  // namespace renut::native_engine
 
 extern "C" void __imp__sub_823A9C38(PPCContext& __restrict, uint8_t*);
-REX_EXTERN(sub_823A9C38) {
+REX_HOOK_RAW(sub_823A9C38) {
   renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823A9C38, ctx, base);
   renut::native_engine::Tag(ctx, base);
   __imp__sub_823A9C38(ctx, base);

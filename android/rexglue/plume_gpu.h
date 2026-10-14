@@ -4,6 +4,7 @@
 // D3DDevice_Draw*), but every draw, resolve and swap is executed by a native
 // Plume renderer with the offline-recompiled shaders (generated/shaders)
 // instead of RexGlue's Xenos emulation (EDRAM, shader translation).
+#include <cstdint>
 #include <string>
 
 namespace rex::system {

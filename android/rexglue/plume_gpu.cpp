@@ -1,4 +1,5 @@
 #include "plume_gpu.h"
+#include "d3d_layer.h"
 #include "native_d3d.h"
 #include "native_engine.h"
 
@@ -17,11 +18,28 @@
 #include "spirv_fetch_spec.h"
 
 #include <pthread.h>
-#include <sys/resource.h>
 #include <thread>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+// Lowers the calling thread's priority by `nice` (Unix niceness: 0 is the
+// default, 10 the most background). Windows maps it in windows/platform_windows.cpp.
+#if defined(_WIN32)
+void renutSetThreadNice(int nice);
+uint64_t renutPhysicalMemoryBytes();
+static inline void renutMakeDirectory(const std::string& path) {
+  std::error_code error;
+  std::filesystem::create_directory(path, error);
+}
+#else
+#include <sys/resource.h>
+static inline void renutSetThreadNice(int nice) { setpriority(PRIO_PROCESS, uint32_t(gettid()), nice); }
+static inline uint64_t renutPhysicalMemoryBytes() {
+  return uint64_t(sysconf(_SC_PHYS_PAGES)) * uint64_t(sysconf(_SC_PAGESIZE));
+}
+static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_str(), 0755); }
+#endif
 
 #include <algorithm>
 #include <array>
@@ -56,6 +74,9 @@
 #include <rex/logging.h>
 #include <rex/cvar.h>
 #include <rex/memory.h>
+#include <rex/system/kernel_state.h>
+#include <rex/memory/ring_buffer.h>
+#include <rex/thread.h>
 
 #include <fmt/format.h>
 
@@ -733,8 +754,6 @@ bool VisitRecipe(Io& io, Recipe& r) {
   io(d.depthBiasClamp);
   io(d.slopeScaledDepthBias);
   io(d.dynamicDepthBiasEnabled);
-  io(d.dynamicStencilEnabled);
-  io(d.dynamicBlendFactorEnabled);
   io(d.depthEnabled);
   io(d.depthWriteEnabled);
   io(d.stencilEnabled);
@@ -1033,6 +1052,37 @@ void DecodeLiveElements(HostShader& shader) {
 // Format and state translation
 // ---------------------------------------------------------------------------
 
+// A pipeline the driver would not build: Plume still hands back the object, with
+// a null Vulkan handle, and binding that hangs some drivers. The callers tell
+// failure from success by the pointer.
+std::unique_ptr<RenderPipeline> CreateGraphicsPipeline(RenderDevice* device, const RenderGraphicsPipelineDesc& desc) {
+  auto pipeline = device->createGraphicsPipeline(desc);
+  if (pipeline && static_cast<VulkanGraphicsPipeline*>(pipeline.get())->vk == VK_NULL_HANDLE) return nullptr;
+  return pipeline;
+}
+
+// A texture's subresource into a readback buffer, `row_texels` texels to a row.
+// Plume's copyTextureRegion goes the other way only, so this is Vulkan on the
+// command buffer itself; the texture is in COPY_SOURCE (transfer source).
+void CopyTextureToBuffer(RenderCommandList* list, RenderBuffer* buffer, RenderTexture* texture, uint32_t width,
+                         uint32_t height, uint32_t row_texels, uint32_t mip, uint32_t layer, const RenderBox* box) {
+  VkBufferImageCopy copy{};
+  copy.bufferRowLength = row_texels;
+  copy.bufferImageHeight = height;
+  const bool depth = static_cast<VulkanTexture*>(texture)->desc.flags & RenderTextureFlag::DEPTH_TARGET;
+  copy.imageSubresource.aspectMask = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+  copy.imageSubresource.mipLevel = mip;
+  copy.imageSubresource.baseArrayLayer = layer;
+  copy.imageSubresource.layerCount = 1;
+  if (box) {
+    copy.imageOffset.x = box->left;
+    copy.imageOffset.y = box->top;
+  }
+  copy.imageExtent = {width, height, 1};
+  vkCmdCopyImageToBuffer(static_cast<VulkanCommandList*>(list)->vk, static_cast<VulkanTexture*>(texture)->vk,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, static_cast<VulkanBuffer*>(buffer)->vk, 1, &copy);
+}
+
 RenderFormat ColorFormat(xenos::ColorRenderTargetFormat format) {
   switch (format) {
     case xenos::ColorRenderTargetFormat::k_8_8_8_8:
@@ -1062,6 +1112,17 @@ enum class InputDecode { kNone, kInteger, kPacked1010102, kPacked111110 };
 // The host format for a guest vertex format, and what unpackInput() (or
 // tfetchR11G11B10) must still do in the shader: integers read as numbers
 // arrive as raw bits, and the packed formats have no host equivalent.
+//
+// Plume has no names for the converted-to-float formats a vertex shader that
+// takes float inputs needs (UBYTE4, SHORT2, SHORT4 as numbers, and the packed
+// 2_10_10_10), so they are asked for as the integer formats of the same width
+// and the Vulkan layer (plume_renderer.cpp, LayerVertexFormat) creates the
+// pipeline with the converting one: the 8 and 16-bit UINT/SINT formats become
+// USCALED/SSCALED, and the two 8-bit two-channel formats nothing else uses as an
+// input stand for the 2_10_10_10 ones.
+constexpr RenderFormat kVertexUnorm1010102 = RenderFormat::R8G8_UINT;
+constexpr RenderFormat kVertexUscaled1010102 = RenderFormat::R8G8_SINT;
+
 RenderFormat VertexFormat(uint32_t format, bool is_signed, bool normalized, InputDecode& decode) {
   decode = InputDecode::kNone;
   // The shaders take every input as a float4 and, for the locations flagged
@@ -1082,14 +1143,14 @@ RenderFormat VertexFormat(uint32_t format, bool is_signed, bool normalized, Inpu
   switch (format) {
     case 6:
       return normalized ? (is_signed ? RenderFormat::R8G8B8A8_SNORM : RenderFormat::R8G8B8A8_UNORM)
-                        : scaled(RenderFormat::R8G8B8A8_USCALED, RenderFormat::R8G8B8A8_SSCALED);
+                        : scaled(RenderFormat::R8G8B8A8_UINT, RenderFormat::R8G8B8A8_SINT);
     case 25:
       return normalized ? (is_signed ? RenderFormat::R16G16_SNORM : RenderFormat::R16G16_UNORM)
-                        : scaled(RenderFormat::R16G16_USCALED, RenderFormat::R16G16_SSCALED);
+                        : scaled(RenderFormat::R16G16_UINT, RenderFormat::R16G16_SINT);
     case 26:
       return normalized
                  ? (is_signed ? RenderFormat::R16G16B16A16_SNORM : RenderFormat::R16G16B16A16_UNORM)
-                 : scaled(RenderFormat::R16G16B16A16_USCALED, RenderFormat::R16G16B16A16_SSCALED);
+                 : scaled(RenderFormat::R16G16B16A16_UINT, RenderFormat::R16G16B16A16_SINT);
     case 31: return RenderFormat::R16G16_FLOAT;
     case 32: return RenderFormat::R16G16B16A16_FLOAT;
     case 33: return integer(RenderFormat::R32_UINT, RenderFormat::R32_SINT);
@@ -1105,8 +1166,7 @@ RenderFormat VertexFormat(uint32_t format, bool is_signed, bool normalized, Inpu
       // -1 and its halves above 0.5 negative: the pieces of Banjo that fly
       // into a world portal (35D0D3DF02172D01) streaked across the screen.
       if (!is_signed) {
-        return normalized ? RenderFormat::R10G10B10A2_UNORM
-                          : scaled(RenderFormat::R10G10B10A2_USCALED, RenderFormat::R10G10B10A2_USCALED);
+        return normalized ? kVertexUnorm1010102 : kVertexUscaled1010102;
       }
       decode = InputDecode::kPacked1010102;
       return RenderFormat::R32_FLOAT;
@@ -1455,7 +1515,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool Drop(const char* reason, const HostShader* vs, const HostShader* ps);
   // Debug: a frame trace lists the draws the bin check drops, and
   // <files>/plume-pred-all "1" runs every predicated packet.
-  bool OnPredicatedSkip(uint32_t opcode) override {
+  bool OnPredicatedSkip(uint32_t opcode) {
     if (trace_ && (opcode == xenos::PM4_DRAW_INDX || opcode == xenos::PM4_DRAW_INDX_2)) {
       std::fprintf(trace_, "predicated %s op=%X select=%llX mask=%llX\n", pred_pass_all_ ? "passed" : "skip",
                    opcode, (unsigned long long)bin_select_, (unsigned long long)bin_mask_);
@@ -1467,20 +1527,20 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // with a register file of their own as the command processor reaches the
   // ring segments they go with. The ring's own register file is the GPU's as
   // the CPU sees it (scratch registers, the writeback the callbacks read).
-  void OnPacketStart() override {
+  void OnPacketStart() {
     if (!native_checked_) {
       native_on_ = native_d3d::GetMode() == native_d3d::Mode::kNative;
       native_checked_ = true;
     }
     if (!wake_registered_) {
       wake_registered_ = true;
-      native_d3d::SetWake([this] { WakeWorker(); });
+      native_d3d::SetWake([this] { write_ptr_index_event_->Set(); });
     }
   }
   // The ring's segments: the lists recorded with one run as the command
   // processor reaches it, and one recorded with native sync is not walked -
   // the list holds what it writes back. A segment no list names is walked.
-  bool OnIndirectBuffer(uint32_t ptr, uint32_t count, bool primary) override {
+  bool OnIndirectBuffer(uint32_t ptr, uint32_t count, bool primary) {
     if (!native_on_ || !primary) return false;
     ExecutorBusy busy;
     run_to_segment_ = ptr & 0x1FFFFFFF;
@@ -1507,6 +1567,23 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     ~ExecutorBusy() { native_d3d::SetExecutorBusy(false); }
   };
   uint32_t run_to_segment_ = 0;
+  // The ring packet being read (OnPacketCensus), and whether the draw being run
+  // came from a predicated packet. The SDK's command processor ignores ring
+  // draws here and the draws that count come from the native lists, which carry
+  // no such packet, so this stays false.
+  uint32_t census_packet_address_ = 0;
+  bool packet_predicated_ = false;
+  // The command processor's work loop. The SDK runs its own on the worker
+  // thread it creates, which calls SetupContext() first: this one runs from
+  // there until the processor is shut down, so the SDK's loop is never entered.
+  // It does what the SDK's does and, around the ring packets, the native work.
+  void RunWorkerLoop();
+  // GetResolveInfo for a rectangle that is already known (NativeResolve).
+  bool ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1, draw_util::ResolveInfo& info);
+  std::unique_ptr<RegisterFile> resolve_regs_;
+  uint32_t resolve_vertices_ = 0;
+  uint32_t ExecuteRing(uint32_t read_index, uint32_t write_index);
+  bool ExecuteRingPacket(rex::memory::RingBuffer* reader);
   bool segment_found_ = false;
   std::unordered_map<uint32_t, bool> segment_sync_;
   bool native_presenting_ = false;
@@ -1542,14 +1619,14 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
         break;
     }
   }
-  void OnPacketCensus(uint32_t packet, uint32_t depth) override {
+  void OnPacketCensus(uint32_t packet, uint32_t depth) {
     CensusCount(packet, depth ? 1 : 0);
     if (swaps_ < 4) CensusBootPacket(packet, depth);
   }
 
   void CensusBootPacket(uint32_t packet, uint32_t depth) {
     if (boot_log_.size() > (1u << 20)) return;
-    const uint32_t* at = memory_->TranslatePhysical<const uint32_t*>(cur_packet_address_);
+    const uint32_t* at = memory_->TranslatePhysical<const uint32_t*>(census_packet_address_);
     uint32_t n = 0;
     switch (packet >> 30) {
       case 0:
@@ -1559,7 +1636,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
       default:
         break;
     }
-    boot_log_ += fmt::format("{} {:08X} {:08X}", depth ? "seg" : "ring", cur_packet_address_, packet);
+    boot_log_ += fmt::format("{} {:08X} {:08X}", depth ? "seg" : "ring", census_packet_address_, packet);
     for (uint32_t i = 0; i < n && i < 6; ++i) boot_log_ += fmt::format(" {:08X}", __builtin_bswap32(at[1 + i]));
     if (n > 6) boot_log_ += fmt::format(" ...+{}", n - 6);
     boot_log_ += "\n";
@@ -1582,8 +1659,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool native_checked_ = false;
   // ---- PM4-less: work that does not come through the ring ----
   // Lists published while renut-pm4-doorbell is 1 are run by the worker itself.
-  bool NativeWorkPending() override { return native_d3d::WorkPending(); }
-  void RunNativeWork() override {
+  bool NativeWorkPending() { return native_d3d::WorkPending(); }
+  void RunNativeWork() {
     native_d3d::TakeWorkPending();
     if (!native_checked_) {
       native_on_ = native_d3d::GetMode() == native_d3d::Mode::kNative;
@@ -2777,7 +2854,7 @@ void PlumeCommandProcessor::StartPipelineWorker() {
         // that only replaces a stand-in yields to the game further.
         const int wanted = job->urgent ? 4 : 10;
         if (wanted != nice) {
-          setpriority(PRIO_PROCESS, uint32_t(gettid()), wanted);
+          renutSetThreadNice(wanted);
           nice = wanted;
         }
         job->desc.inputElements = job->elements.data();
@@ -2795,7 +2872,7 @@ void PlumeCommandProcessor::StartPipelineWorker() {
         if (lookup_on_workers_ && !job->looked_up) {
           {
             PlumePipelineLookupOnly only;
-            try { job->result = device_->createGraphicsPipeline(job->desc); } catch (const std::exception&) {}
+            try { job->result = CreateGraphicsPipeline(device_, job->desc); } catch (const std::exception&) {}
           }
           job->looked_up = true;
           if (job->result) {
@@ -2821,7 +2898,7 @@ void PlumeCommandProcessor::StartPipelineWorker() {
             continue;
           }
         }
-        try { job->result = device_->createGraphicsPipeline(job->desc); }
+        try { job->result = CreateGraphicsPipeline(device_, job->desc); }
         catch (const std::exception& e) { REXLOG_WARN("Renut: Plume async pipeline failed: {}", e.what()); }
         const uint64_t program = job->program;
         finish();
@@ -3026,7 +3103,7 @@ void PlumeCommandProcessor::StartRecipes() {
         // waits for these.
         const int wanted = g_precompile.waiting.load(std::memory_order_relaxed) ? 0 : 10;
         if (wanted != nice) {
-          setpriority(PRIO_PROCESS, uint32_t(gettid()), wanted);
+          renutSetThreadNice(wanted);
           nice = wanted;
         }
         const std::vector<uint32_t>& group = (*groups)[g];
@@ -3056,7 +3133,7 @@ void PlumeCommandProcessor::StartRecipes() {
             desc.inputSlotsCount = uint32_t(recipe.slots.size());
             desc.specConstants = recipe.constants.data();
             desc.specConstantsCount = uint32_t(recipe.constants.size());
-            try { pipeline = device_->createGraphicsPipeline(desc); } catch (const std::exception&) {}
+            try { pipeline = CreateGraphicsPipeline(device_, desc); } catch (const std::exception&) {}
           }
           if (pipeline) {
             std::lock_guard lock(prebuilt_mutex_);
@@ -3202,7 +3279,7 @@ bool PlumeCommandProcessor::SetupContext() {
   next_sampler_ = kSamplerDefault + 1;
 
   {
-    const uint64_t total_ram = uint64_t(sysconf(_SC_PHYS_PAGES)) * uint64_t(sysconf(_SC_PAGESIZE));
+    const uint64_t total_ram = renutPhysicalMemoryBytes();
     const int32_t mode = REXCVAR_GET(renut_plume_low_memory);
     low_memory_ = mode < 0 ? total_ram < (6ull << 30) : mode > 0;
     if (low_memory_) {
@@ -3220,7 +3297,13 @@ bool PlumeCommandProcessor::SetupContext() {
                 low_memory_ ? "low" : "full", total_ram >> 20, upload_slice_size_ >> 20, kept_budget_ >> 20,
                 texture_budget_ >> 20, max_texture_dim_);
   }
-  bc_supported_ = device_->getCapabilities().textureCompressionBC;
+  {
+    // Adreno has BC1-BC5 sampling, Mali does not: asked of the driver, since
+    // Plume does not report it.
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(static_cast<VulkanDevice*>(device_)->physicalDevice, &features);
+    bc_supported_ = features.textureCompressionBC == VK_TRUE;
+  }
   bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
   REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
               bc_mode_ ? "on" : "off");
@@ -3390,14 +3473,88 @@ bool PlumeCommandProcessor::SetupContext() {
   device_watch_stop_ = false;
   device_watch_.thread = std::thread([this] {
     while (!device_watch_stop_.load()) {
-      if (plume::g_plumeDeviceLost.load()) {
+      if (PlumeDeviceLost()) {
         ReportDeviceLost();
         return;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
   });
+  RunWorkerLoop();
   return true;
+}
+
+void PlumeCommandProcessor::RunWorkerLoop() {
+  while (worker_running_) {
+    while (!pending_fns_.empty()) {
+      auto fn = std::move(pending_fns_.front());
+      pending_fns_.pop();
+      fn();
+    }
+    if (NativeWorkPending()) RunNativeWork();
+
+    uint32_t write_ptr_index = write_ptr_index_.load();
+    if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+      // Out of commands: spin for new ones, as the SDK does, since waiting on
+      // the event costs more than the wait is worth; it is waited on after a
+      // while to let the core rest.
+      PrepareForWait();
+      uint32_t loop_count = 0;
+      do {
+        if (loop_count > 500) {
+          rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
+        }
+        rex::thread::MaybeYield();
+        loop_count++;
+        write_ptr_index = write_ptr_index_.load();
+      } while (worker_running_ && pending_fns_.empty() && !NativeWorkPending() &&
+               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      ReturnFromWait();
+      if (!worker_running_ || !pending_fns_.empty() || NativeWorkPending()) continue;
+    }
+    read_ptr_index_ = ExecuteRing(read_ptr_index_, write_ptr_index);
+    if (read_ptr_writeback_ptr_) {
+      StoreBig(read_ptr_writeback_ptr_, read_ptr_index_);
+    }
+  }
+}
+
+uint32_t PlumeCommandProcessor::ExecuteRing(uint32_t read_index, uint32_t write_index) {
+  rex::memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+  reader.set_read_offset(read_index * sizeof(uint32_t));
+  reader.set_write_offset(write_index * sizeof(uint32_t));
+  do {
+    OnPacketStart();
+    census_packet_address_ = uint32_t(reader.read_ptr() - uintptr_t(memory_->physical_membase()));
+    if (!ExecuteRingPacket(&reader)) {
+      REXLOG_ERROR("Renut: primary ring buffer: failed to execute a packet");
+      break;
+    }
+  } while (reader.read_count());
+  OnPrimaryBufferEnd();
+  return write_index;
+}
+
+// One packet of the primary ring. An INDIRECT_BUFFER (the segments the game's
+// Direct3D submits) is what the native lists are synchronized with; the rest is
+// the SDK's.
+bool PlumeCommandProcessor::ExecuteRingPacket(rex::memory::RingBuffer* reader) {
+  const auto at = reader->read_offset();
+  const uint32_t header = reader->ReadAndSwap<uint32_t>();
+  OnPacketCensus(header, 0);
+  if ((header >> 30) == 3 && !(header & 1)) {
+    const uint32_t opcode = (header >> 8) & 0x7F;
+    if ((opcode == xenos::PM4_INDIRECT_BUFFER || opcode == xenos::PM4_INDIRECT_BUFFER_PFD) &&
+        ((header >> 16) & 0x3FFF) == 1 && reader->read_count() >= 2 * sizeof(uint32_t)) {
+      const uint32_t list_ptr = reader->ReadAndSwap<uint32_t>();
+      const uint32_t list_length = reader->ReadAndSwap<uint32_t>() & 0xFFFFF;
+      if (OnIndirectBuffer(list_ptr, list_length, true)) return true;
+      ExecuteIndirectBuffer(xenos::GpuToCpu(list_ptr), list_length);
+      return true;
+    }
+  }
+  reader->set_read_offset(at);
+  return ExecutePacket(reader);
 }
 
 void PlumeCommandProcessor::ShutdownContext() {
@@ -5786,7 +5943,7 @@ void DumpPipelineInternals(RenderPipeline& pipeline, const HostShader* vs, const
   if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, nullptr) != VK_SUCCESS) return;
   std::vector<VkPipelineExecutablePropertiesKHR> executables(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
   vkGetPipelineExecutablePropertiesKHR(device, &info, &count, executables.data());
-  mkdir((dir + "/ir").c_str(), 0755);
+  renutMakeDirectory(dir + "/ir");
   FILE* file = std::fopen(fmt::format("{}/ir/{:016X}_{:016X}.txt", dir, vs_hash, ps_hash).c_str(), "w");
   if (!file) return;
   for (uint32_t i = 0; i < count; ++i) {
@@ -5876,7 +6033,7 @@ void PlumeCommandProcessor::NativeWrite(uint32_t first, const uint32_t* values, 
 // A draw record, as the command processor runs a DRAW_INDX packet.
 void PlumeCommandProcessor::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
   if ((flags & native_d3d::kDrawPredicated) &&
-      !((bin_select_ & bin_mask_) != 0 || (bin_mask_ != 0 && gfx::GetSingleBinTiling())) &&
+      !((bin_select_ & bin_mask_) != 0 || (bin_mask_ != 0 && renut::d3d::GetSingleBinTiling())) &&
       !OnPredicatedSkip(xenos::PM4_DRAW_INDX)) {
     return;
   }
@@ -6537,9 +6694,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         depth_dump_ = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(depth_dump_row_) * r.height * bytes));
         if (depth_dump_) {
           Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
-          L()->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(depth_dump_.get(), r.format, r.width,
-                                                                              r.height, 1, depth_dump_row_),
-                                   RenderTextureCopyLocation::Subresource(r.texture.get()));
+          CopyTextureToBuffer(L(), depth_dump_.get(), r.texture.get(), r.width, r.height, depth_dump_row_, 0, 0,
+                              nullptr);
           Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
           depth_dump_w_ = r.width;
           depth_dump_h_ = r.height;
@@ -7887,10 +8043,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.depthTargetFormat = depth ? depth->format : RenderFormat::UNKNOWN;
     desc.depthBias = depth_bias;
     desc.slopeScaledDepthBias = depth_slope;
-    desc.dynamicBlendFactorEnabled = blend_constants;
     desc.stencilEnabled = stencil_enabled;
     if (stencil_enabled) {
-      desc.dynamicStencilEnabled = true;
       desc.stencilFrontFace = stencil_front;
       desc.stencilBackFace = stencil_back;
     }
@@ -7985,7 +8139,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
           const auto lookup_start = std::chrono::steady_clock::now();
           {
             PlumePipelineLookupOnly only;
-            pipeline = device_->createGraphicsPipeline(desc);
+            pipeline = CreateGraphicsPipeline(device_, desc);
           }
           const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now() - lookup_start).count());
@@ -8040,7 +8194,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     if (!pipeline && !standin && !failed_pipelines_.count(key) && !pending_pipelines_.count(key)) {
       const auto pipeline_start = std::chrono::steady_clock::now();
-      pipeline = device_->createGraphicsPipeline(desc);
+      pipeline = CreateGraphicsPipeline(device_, desc);
       stats_.pipeline_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::steady_clock::now() - pipeline_start)
                                          .count());
@@ -8478,8 +8632,18 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
     bound_interface_key_ = pk.interface_key;
     ++stats_.pipeline_binds;
   }
-  if (pk.blend_constants) L()->setBlendFactor(pk.blend_factor);
-  if (pk.stencil) L()->setStencilState(pk.stencil_ref, pk.stencil_mask, pk.stencil_write_mask);
+  // Dynamic state of the pipelines that use it (the Vulkan layer makes it so,
+  // see plume_renderer.cpp): not part of Plume's interface, so on the command
+  // buffer itself.
+  if (pk.blend_constants || pk.stencil) {
+    const VkCommandBuffer commands = static_cast<VulkanCommandList*>(L())->vk;
+    if (pk.blend_constants) vkCmdSetBlendConstants(commands, pk.blend_factor);
+    if (pk.stencil) {
+      vkCmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_AND_BACK, pk.stencil_ref);
+      vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, pk.stencil_mask);
+      vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, pk.stencil_write_mask);
+    }
+  }
   // A native draw reads nothing but its own push constants: the guest's
   // addresses and constant blocks stay as the last guest draw left them.
   if (pk.native) {
@@ -8640,9 +8804,6 @@ void PlumeCommandProcessor::ReportDeviceLost() {
       }
       std::fclose(out);
     }
-    if (plume::g_plumeMemTrace.load()) {
-      plume::plumeMemTraceDump((miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/plume-mem.txt").c_str());
-    }
   }
   struct Group {
     RecentDraw draw;
@@ -8690,8 +8851,7 @@ void PlumeCommandProcessor::SyncEvery() {
   VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
   VkFence vk_fence = static_cast<VulkanCommandFence*>(fence_.get())->vk;
   const VkResult result = vkWaitForFences(vk_device, 1, &vk_fence, VK_TRUE, 3000000000ull);
-  if (result == VK_ERROR_DEVICE_LOST) plume::g_plumeDeviceLost.store(int(result));
-  else if (result == VK_SUCCESS) vkResetFences(vk_device, 1, &vk_fence);
+  if (result == VK_SUCCESS) vkResetFences(vk_device, 1, &vk_fence);
   StartList();
 }
 
@@ -8708,7 +8868,6 @@ void PlumeCommandProcessor::SyncAfterDraw(const DrawPacket& pk) {
   const auto wait_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start).count();
   ++sync_draw_count_;
-  if (result == VK_ERROR_DEVICE_LOST) plume::g_plumeDeviceLost.store(int(result));
   sync_recent_[sync_draw_count_ % sync_recent_.size()] = fmt::format("#{}: {}", sync_draw_count_, sync_draw_info_);
   if (result != VK_SUCCESS) {
     {
@@ -8848,6 +9007,63 @@ void PlumeCommandProcessor::FlushDeferred() {
 }
 
 
+// The SDK works a resolve out from the registers and from the three vertices of
+// the rectangle the guest's copy draw would have drawn (fetch constant 0), which
+// it applies the window offset and the scissor to. Here the rectangle is known
+// (x0/y0 inclusive, x1/y1 exclusive, from the Direct3D call itself), so the SDK
+// is handed a register file that says exactly that: the same registers, with
+// fetch constant 0 pointing at three vertices of the rectangle, and no window
+// offset or scissor to apply.
+bool PlumeCommandProcessor::ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                                               draw_util::ResolveInfo& info) {
+  if (!resolve_regs_) resolve_regs_ = std::make_unique<RegisterFile>();
+  if (!resolve_vertices_) {
+    // Guest physical memory the SDK reads the vertices from.
+    resolve_vertices_ = rex::system::kernel_memory()->SystemHeapAlloc(64, 16, rex::memory::kSystemHeapPhysical);
+    if (!resolve_vertices_) return false;
+  }
+  const uint32_t physical = memory_->GetPhysicalAddress(resolve_vertices_);
+  if (physical == UINT32_MAX) return false;
+  const float vertices[6] = {float(x0), float(y0), float(x1), float(y0), float(x0), float(y1)};
+  std::memcpy(memory_->TranslatePhysical<uint8_t*>(physical), vertices, sizeof(vertices));
+
+  RegisterFile& regs = *resolve_regs_;
+  std::memcpy(regs.values, register_file_->values, sizeof(regs.values));
+  xenos::xe_gpu_vertex_fetch_t fetch{};
+  fetch.type = xenos::FetchConstantType::kVertex;
+  fetch.address = physical >> 2;
+  fetch.endian = xenos::Endian::kNone;
+  fetch.size = 6;
+  regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0] = fetch.dword_0;
+  regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1] = fetch.dword_1;
+  reg::PA_SU_VTX_CNTL vertex_control;
+  vertex_control.value = regs.values[XE_GPU_REG_PA_SU_VTX_CNTL];
+  vertex_control.pix_center = xenos::PixelCenter::kOGLHalf;  // no half-pixel offset to undo
+  regs.values[XE_GPU_REG_PA_SU_VTX_CNTL] = vertex_control.value;
+  reg::PA_SU_SC_MODE_CNTL mode_control;
+  mode_control.value = regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+  mode_control.vtx_window_offset_enable = 0;
+  regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL] = mode_control.value;
+  reg::PA_SC_WINDOW_SCISSOR_TL window_tl;
+  window_tl.value = 0;
+  window_tl.window_offset_disable = 1;
+  regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] = window_tl.value;
+  reg::PA_SC_WINDOW_SCISSOR_BR window_br;
+  window_br.value = 0;
+  window_br.br_x = 8192;
+  window_br.br_y = 8192;
+  regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = window_br.value;
+  reg::PA_SC_SCREEN_SCISSOR_TL screen_tl;
+  screen_tl.value = 0;
+  regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL] = screen_tl.value;
+  reg::PA_SC_SCREEN_SCISSOR_BR screen_br;
+  screen_br.value = 0;
+  screen_br.br_x = 8192;
+  screen_br.br_y = 8192;
+  regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR] = screen_br.value;
+  return draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, info);
+}
+
 // A resolve record: the copy registers Direct3D worked out, and the
 // rectangle its copy draw would have covered.
 void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
@@ -8855,8 +9071,7 @@ void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
   for (uint32_t i = 0; i < 12; ++i) WriteRegister(0x2318 + i, w[5 + i]);
   for (uint32_t i = 0; i < 6; ++i) WriteRegister(0x2000 + i, w[17 + i]);
   draw_util::ResolveInfo info;
-  if (!draw_util::GetResolveInfoFromRect(*register_file_, *memory_, int32_t(w[1]), int32_t(w[2]), int32_t(w[3]),
-                                         int32_t(w[4]), 1, 1, false, false, info)) {
+  if (!ResolveInfoForRect(int32_t(w[1]), int32_t(w[2]), int32_t(w[3]), int32_t(w[4]), info)) {
     ++native_bad_;
     return;
   }
@@ -9133,8 +9348,7 @@ void PlumeCommandProcessor::ReadbackResolve(Resolved& dest, const draw_util::Res
   if (!buffer) return;
   Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_SOURCE);
   RenderBox box(int32_t(dest_x), int32_t(dest_y), int32_t(dest_x + w), int32_t(dest_y + h), 0, 1);
-  L()->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(buffer.get(), dest.format, w, h, 1, row_texels),
-                         RenderTextureCopyLocation::Subresource(dest.texture.get()), 0, 0, 0, &box);
+  CopyTextureToBuffer(L(), buffer.get(), dest.texture.get(), w, h, row_texels, 0, 0, &box);
   Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
   Flush();
   const auto* pixels = static_cast<const uint8_t*>(buffer->map());
@@ -9288,7 +9502,7 @@ bool PlumeCommandProcessor::ExpandAdaptivePatches(uint32_t factors_base, xenos::
     const uint64_t capacity = std::max({need, patch_out_capacity_[slot_] * 2, uint64_t(4) << 20});
     auto made = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
         capacity, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::STORAGE |
-                      RenderBufferFlag::INDIRECT | RenderBufferFlag::DEVICE_ADDRESSABLE));
+                      RenderBufferFlag::DEVICE_ADDRESSABLE));  // the layer adds the indirect usage
     if (!made) return false;
     // Draws recorded earlier this frame may still read the old one.
     if (buffer) retired_buffers_[slot_].push_back(std::move(buffer));
@@ -9599,9 +9813,8 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       snap_dump_row_ = (snap_width_ + 63) & ~63u;
       snap_dump_ = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(snap_dump_row_) * snap_height_ * 4));
       if (snap_dump_) {
-        L()->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(snap_dump_.get(), snap_format_, snap_width_,
-                                                                            snap_height_, 1, snap_dump_row_),
-                                 RenderTextureCopyLocation::Subresource(snap_.get()));
+        CopyTextureToBuffer(L(), snap_dump_.get(), snap_.get(), snap_width_, snap_height_, snap_dump_row_, 0, 0,
+                            nullptr);
         snap_dump = true;
       }
     }
@@ -9724,7 +9937,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       renderer->WaitForAllSlots();
       const std::string directory =
           miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/" + trace_dump_name_;
-      mkdir(directory.c_str(), 0755);
+      renutMakeDirectory(directory);
       const auto* data = static_cast<const uint8_t*>(export_dump->map());
       for (const auto& [at, range] : export_dump_at) {
         const std::string name = fmt::format("{}/{:08X}", directory, range->base);
@@ -9742,7 +9955,6 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
   }
   ++swaps_;
-  plume::g_plumeFrame.store(swaps_, std::memory_order_relaxed);
   if (!pending_pipelines_.empty()) ReapPipelines();
   lookup_spent_us_ = 0;
   pipeline_frame_.store(swaps_, std::memory_order_relaxed);
@@ -9799,7 +10011,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     texdump_directory_.clear();
     if (std::remove((root + "/plume-texdump-request").c_str()) == 0) {
       texdump_directory_ = root + "/texdump";
-      mkdir(texdump_directory_.c_str(), 0755);
+      renutMakeDirectory(texdump_directory_);
       dumped_.clear();
       REXLOG_INFO("Renut: Plume dumping the next frame's textures");
     }
@@ -10494,15 +10706,6 @@ class PlumeGraphicsSystem final : public gfx::GraphicsSystem {
   std::unique_ptr<gfx::CommandProcessor> CreateCommandProcessor() override {
     return std::make_unique<PlumeCommandProcessor>(this, kernel_state_);
   }
-
- public:
-  // VdSwap: with native sync the frame goes into the swapping device's list
-  // and the ring gets no swap packet.
-  bool PresentFrontBuffer(const uint32_t* fetch_words, uint32_t width, uint32_t height) override {
-    xenos::xe_gpu_texture_fetch_t fetch;
-    std::memcpy(&fetch, fetch_words, sizeof(fetch));
-    return native_d3d::RecordPresent(fetch.base_address << 12, width, height);
-  }
 };
 
 }  // namespace
@@ -10516,10 +10719,7 @@ void SetPlumeMissDumpDirectory(const std::string& directory) {
 }
 
 void ArmPlumeMemoryTrace(const std::string& root) {
-  if (access((root + "/plume-memtrace").c_str(), F_OK) == 0) plume::g_plumeMemTrace.store(true);
-  if (access((root + "/plume-persistmap").c_str(), F_OK) == 0) plume::g_plumePersistentMap.store(true);
   g_dedupe_descriptors = access((root + "/plume-dedupe-desc").c_str(), F_OK) == 0;
-  if (access((root + "/plume-nocompress").c_str(), F_OK) == 0) plume::g_plumeNoCompression.store(true);
   g_validate_windows = access((root + "/plume-validate").c_str(), F_OK) == 0;
 }
 

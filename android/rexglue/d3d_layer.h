@@ -34,5 +34,11 @@ void SetRuntimeFilesDirectory(std::string directory);
 void SetBackground(bool background);
 // Installs the plume-mode handlers (plume_d3d.cpp).
 void RegisterPlumeHandlers();
+// Set while Direct3D's predicated tiling is collapsed to one band (the host has
+// no EDRAM limit). A predicated draw then runs if it is marked for any band: the
+// game culls its objects per band, and a draw marked only for a lower band
+// would otherwise never be drawn.
+void SetSingleBinTiling(bool single);
+bool GetSingleBinTiling();
 
 }  // namespace renut::d3d

@@ -34,10 +34,12 @@
 #include <rex/ppc/func.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
+#include <rex/hook.h>
 
 #include "d3d_layer.h"
 #include "native_engine.h"
 #include "native_probe.h"
+#include "guest_address.h"
 
 // The Plume renderer's native mode (plume_gpu.cpp): 0 off, 1 rigid depth
 // draws, 2 also the native view.
@@ -78,7 +80,7 @@ std::mutex g_mutex;
 
 uint32_t Load32(const uint8_t* base, uint32_t address) {
   uint32_t v;
-  std::memcpy(&v, base + address, 4);
+  std::memcpy(&v, GuestPtr(base, address), 4);
   return __builtin_bswap32(v);
 }
 
@@ -422,7 +424,7 @@ void EngineEnter(uint32_t which, PPCContext& ctx, uint8_t* base) {
 // the original.
 #define X(symbol)                                                                      \
   extern "C" void __imp__##symbol(PPCContext& __restrict, uint8_t*);                   \
-  REX_EXTERN(symbol) {                                                                 \
+  REX_HOOK_RAW(symbol) {                                                                 \
     renut::native_probe::EngineEnter(renut::native_probe::kEngine_##symbol, ctx, base); \
     __imp__##symbol(ctx, base);                                                        \
   }

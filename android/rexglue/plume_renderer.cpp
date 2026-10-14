@@ -18,18 +18,44 @@
 #include <system_error>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
+#if defined(__ANDROID__)
+// The session's own Vulkan loader (the bundled driver), opened by android_vulkan_loader.cpp.
 void* renutXenosVulkanSymbol(const char* name);
 void renutSetPlumeVulkanEntry(PFN_vkGetInstanceProcAddr entry);
+#endif
+
+REXCVAR_DEFINE_BOOL(renut_plume_vsync, true, "reNut/Plume",
+                    "Present through the display's vertical sync (FIFO). Off asks for immediate "
+                    "presentation where the driver has it, so frames are not held to the refresh rate");
 
 namespace renut {
 using namespace plume;
+
+namespace {
+// The platform window as Plume's swapchain wants it, and the reference the
+// renderer keeps on it (the Android surface is reference counted; an HWND is not).
+#if defined(__ANDROID__)
+RenderWindow ToRenderWindow(PlumeWindow* window) { return window; }
+void AcquireWindow(PlumeWindow* window) { ANativeWindow_acquire(window); }
+void ReleaseWindow(PlumeWindow* window) { ANativeWindow_release(window); }
+#else
+RenderWindow ToRenderWindow(PlumeWindow* window) { return reinterpret_cast<RenderWindow>(window); }
+void AcquireWindow(PlumeWindow*) {}
+void ReleaseWindow(PlumeWindow*) {}
+#endif
+}  // namespace
 
 namespace {
 std::mutex instance_mutex;
@@ -41,7 +67,7 @@ void Require(bool ok, const char* message) {
 }  // namespace
 
 struct PlumeRenderer::State {
-  ANativeWindow* window = nullptr;
+  PlumeWindow* window = nullptr;
   std::string gpu;
   std::unique_ptr<VulkanInterface> api;
   std::unique_ptr<RenderDevice> device;
@@ -88,20 +114,19 @@ struct PlumeRenderer::State {
     queue.reset();
     device.reset();
     api.reset();
-    if (window) ANativeWindow_release(window);
+    if (window) ReleaseWindow(window);
   }
 };
 
 namespace {
 
-// The pipeline cache kept on disk between runs. Upstream Plume passes no cache,
-// which makes the driver recompile every pipeline on every launch: the first
-// pass through Showdown Town spent 67% of its frame time inside
+// The pipeline cache kept on disk between runs. Plume passes no cache, which
+// makes the driver recompile every pipeline on every launch: the first pass
+// through Showdown Town spent 67% of its frame time inside
 // vkCreateGraphicsPipelines, and none of that work survived.
 //
-// Every pipeline the generated copy of plume_vulkan.cpp creates comes through
-// renutCreateGraphicsPipelines below (the seam is in
-// android/app/src/main/cpp/CMakeLists.txt). When the driver can be asked for a
+// Every pipeline Plume creates comes through the Vulkan layer at the end of this
+// file (it stands in for the two vkCreate*Pipelines entry points). When the driver can be asked for a
 // pipeline without compiling one (VK_EXT_pipeline_creation_cache_control), it
 // is looked up in `shared` first, which holds everything compiled so far; one
 // that is not there is compiled into an empty cache of its own and then merged
@@ -132,6 +157,22 @@ struct PipelineCache {
 PipelineCache pipeline_cache;
 thread_local bool pipeline_lookup_only = false;
 
+// What the Vulkan layer (end of the file) keeps: the entry points it replaced,
+// and what it found out about the device.
+struct VulkanLayerState {
+  PFN_vkCreateDevice create_device = nullptr;
+  PFN_vkCreateGraphicsPipelines create_graphics = nullptr;
+  PFN_vkCreateComputePipelines create_compute = nullptr;
+  PFN_vkCreateBuffer create_buffer = nullptr;
+  PFN_vkQueueSubmit queue_submit = nullptr;
+  PFN_vkWaitForFences wait_for_fences = nullptr;
+  bool installed = false;
+  bool cache_control = false;               // VK_EXT_pipeline_creation_cache_control is on
+  std::atomic<bool> buffer_address{false};  // buffers get the device address usage
+  std::atomic<bool> device_lost{false};
+};
+VulkanLayerState layer;
+
 // plume-pipelines.bin -> plume-pipelines.delta.bin
 std::string DeltaPath(const std::string& path) {
   const std::string suffix = ".bin";
@@ -155,6 +196,24 @@ VkPipelineCache LoadCacheFile(VkDevice device, const std::string& path, size_t* 
   *bytes = 0;
   void* data = nullptr;
   size_t size = 0;
+#if defined(_WIN32)
+  // No mapping here: the file is read into memory.
+  std::vector<uint8_t> contents;
+  if (!path.empty()) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (file) {
+      const auto length = file.tellg();
+      if (length > 0) {
+        contents.resize(size_t(length));
+        file.seekg(0);
+        if (file.read(reinterpret_cast<char*>(contents.data()), std::streamsize(length))) {
+          data = contents.data();
+          size = contents.size();
+        }
+      }
+    }
+  }
+#else
   const int fd = path.empty() ? -1 : open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
     struct stat st {};
@@ -168,6 +227,7 @@ VkPipelineCache LoadCacheFile(VkDevice device, const std::string& path, size_t* 
     }
     close(fd);
   }
+#endif
   VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
   info.initialDataSize = size;
   info.pInitialData = data;
@@ -177,7 +237,9 @@ VkPipelineCache LoadCacheFile(VkDevice device, const std::string& path, size_t* 
   } else {
     cache = CreateEmptyCache(device);
   }
+#if !defined(_WIN32)
   if (data) munmap(data, size);
+#endif
   return cache;
 }
 
@@ -192,6 +254,23 @@ bool WriteCacheFile(VkDevice device, VkPipelineCache cache, const std::string& p
   // Room for what other threads add between the two calls.
   const size_t room = size + size / 16 + (size_t(1) << 20);
   const std::string temporary = path + ".tmp";
+#if defined(_WIN32)
+  std::vector<uint8_t> data(room);
+  size = room;
+  if (vkGetPipelineCacheData(device, cache, &size, data.data()) != VK_SUCCESS) return false;
+  {
+    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+    if (!file.write(reinterpret_cast<const char*>(data.data()), std::streamsize(size))) return false;
+  }
+  std::error_code error;
+  std::filesystem::rename(temporary, path, error);
+  if (error) {
+    std::filesystem::remove(temporary, error);
+    return false;
+  }
+  if (written) *written = size;
+  return true;
+#else
   const int fd = open(temporary.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   if (fd < 0) return false;
   bool ok = false;
@@ -218,6 +297,7 @@ bool WriteCacheFile(VkDevice device, VkPipelineCache cache, const std::string& p
     *written = size;
   }
   return ok;
+#endif
 }
 
 // Called with `mutex` held, before anything else can use the caches.
@@ -350,35 +430,52 @@ void PlumePipelineCacheCounts(uint64_t* found, uint64_t* compiled) {
   *compiled = pipeline_cache.compiled.load(std::memory_order_relaxed);
 }
 
+void InstallVulkanLayer();
+void VulkanLayerDeviceCreated(bool buffer_device_address);
+
 PlumeRenderer::PlumeRenderer() : state_(std::make_unique<State>()) {}
 PlumeRenderer::~PlumeRenderer() = default;
 
-bool PlumeRenderer::Start(ANativeWindow* window, std::string* error) {
+bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
   std::lock_guard lock(instance_mutex);
   if (instance) return true;
   try {
+#if defined(__ANDROID__)
     auto entry = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
         renutXenosVulkanSymbol("vkGetInstanceProcAddr"));
     Require(entry, "Plume: carregador Vulkan da sessão indisponível.");
     renutSetPlumeVulkanEntry(entry);
+#endif
     std::unique_ptr<PlumeRenderer> renderer(new PlumeRenderer());
     auto& s = *renderer->state_;
     s.window = window;
-    ANativeWindow_acquire(window);
+    AcquireWindow(window);
     s.api = std::make_unique<VulkanInterface>();
     Require(s.api->isValid(), "Plume: instância Vulkan inválida.");
+    // The instance has loaded the entry points; the layer replaces the few it
+    // needs to see before the device is made.
+    InstallVulkanLayer();
     s.device = s.api->createDevice("");
     Require(bool(s.device), "Plume: dispositivo indisponível.");
+    VulkanLayerDeviceCreated(s.device->getCapabilities().bufferDeviceAddress);
     s.gpu = s.device->getDescription().name;
     s.queue = s.device->createCommandQueue(RenderCommandListType::DIRECT);
     Require(bool(s.queue), "Plume: fila indisponível.");
     // The Android surface reports RGBA8 on the tested devices; fall back to BGRA8.
     auto* device = static_cast<VulkanDevice*>(s.device.get());
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+#if defined(__ANDROID__)
     VkAndroidSurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
     info.window = window;
-    VkSurfaceKHR surface = VK_NULL_HANDLE;
     Require(vkCreateAndroidSurfaceKHR(s.api->instance, &info, nullptr, &surface) == VK_SUCCESS,
             "Plume: superfície indisponível.");
+#else
+    VkWin32SurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    info.hinstance = GetModuleHandleW(nullptr);
+    info.hwnd = reinterpret_cast<HWND>(window);
+    Require(vkCreateWin32SurfaceKHR(s.api->instance, &info, nullptr, &surface) == VK_SUCCESS,
+            "Plume: superfície indisponível.");
+#endif
     uint32_t count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(device->physicalDevice, surface, &count, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(count);
@@ -392,7 +489,8 @@ bool PlumeRenderer::Start(ANativeWindow* window, std::string* error) {
       if (f.format == VK_FORMAT_B8G8R8A8_UNORM) s.format = RenderFormat::B8G8R8A8_UNORM;
     }
     Require(s.format != RenderFormat::UNKNOWN, "Plume: superfície sem RGBA8/BGRA8.");
-    s.swap = s.queue->createSwapChain(RenderSwapChainDesc(window, s.format, 3));
+    s.swap = s.queue->createSwapChain(RenderSwapChainDesc(ToRenderWindow(window), s.format, 3));
+    if (s.swap) s.swap->setVsyncEnabled(REXCVAR_GET(renut_plume_vsync));
     Require(s.swap && s.swap->resize() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
     for (auto& slot : s.slots) {
       slot.commands = s.queue->createCommandList();
@@ -408,7 +506,7 @@ bool PlumeRenderer::Start(ANativeWindow* window, std::string* error) {
                 s.swap->getHeight());
     {
       std::lock_guard cache_lock(pipeline_cache.mutex);
-      pipeline_cache.lookup = s.device->getCapabilities().pipelineCacheLookup;
+      pipeline_cache.lookup = layer.cache_control;
     }
     PreloadPipelineCache(device->vk);
     instance = std::move(renderer);
@@ -581,22 +679,23 @@ void PlumeRenderer::ReleaseForShutdown() {
   state_->pause_cv.notify_all();
 }
 
-bool PlumeRenderer::AttachWindow(ANativeWindow* window) {
+bool PlumeRenderer::AttachWindow(PlumeWindow* window) {
   auto& s = *state_;
   if (!window) return false;
   // Waits for a present that was already under way when the surface died.
   std::lock_guard swap_lock(s.swap_mutex);
   try {
-    ANativeWindow_acquire(window);
+    AcquireWindow(window);
     // Everything queued before the pause has to finish before the old swapchain
     // goes: it may still hold images the presentation engine is showing.
     WaitForAllSlots();
     vkDeviceWaitIdle(static_cast<VulkanDevice*>(s.device.get())->vk);
     s.release.clear();
     s.swap.reset();
-    if (s.window) ANativeWindow_release(s.window);
+    if (s.window) ReleaseWindow(s.window);
     s.window = window;
-    s.swap = s.queue->createSwapChain(RenderSwapChainDesc(window, s.format, 3));
+    s.swap = s.queue->createSwapChain(RenderSwapChainDesc(ToRenderWindow(window), s.format, 3));
+    if (s.swap) s.swap->setVsyncEnabled(REXCVAR_GET(renut_plume_vsync));
     Require(s.swap && s.swap->resize() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
     for (uint32_t i = 0; i < s.swap->getTextureCount(); ++i) {
       s.release.push_back(s.device->createCommandSemaphore());
@@ -674,17 +773,224 @@ VkResult CreatePipelines(VkDevice device, uint32_t count, const Info* infos, con
 }
 }  // namespace
 
-// The seams in the generated copy of plume_vulkan.cpp, in place of its
-// vkCreateGraphicsPipelines and vkCreateComputePipelines calls (which pass no
-// cache).
-VkResult renutCreateGraphicsPipelines(VkDevice device, VkPipelineCache, uint32_t count,
-                                      const VkGraphicsPipelineCreateInfo* infos,
-                                      const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
-  return CreatePipelines(device, count, infos, allocator, pipelines, vkCreateGraphicsPipelines);
+// ---------------------------------------------------------------------------
+// The Vulkan layer.
+//
+// Plume is used exactly as released. What the renderer needs from Vulkan and
+// Plume's interface does not carry is done where Plume meets the driver, the
+// way a Vulkan layer would: Plume calls the entry points through volk's global
+// function pointers, so the few below are replaced once the instance has loaded
+// them (InstallVulkanLayer), before the device is made.
+//
+//  - vkCreateDevice: enables VK_EXT_pipeline_creation_cache_control when the
+//    driver has it, which is what lets a pipeline be asked for without being
+//    compiled (the pipeline cache above).
+//  - vkCreateGraphicsPipelines / vkCreateComputePipelines: the on-disk cache;
+//    and, for graphics pipelines, what Plume's description cannot say: the
+//    stencil reference and masks and the blend constants are dynamic state
+//    (the Xbox sets them per draw), and the 8 and 16-bit integer vertex
+//    attributes the shaders read as numbers are converted to float by the
+//    hardware (the *_USCALED/_SSCALED formats Plume has no name for).
+//  - vkCreateBuffer: storage buffers can also feed indirect draws and be
+//    addressed by the shaders.
+//  - vkQueueSubmit / vkWaitForFences: remember that the device was lost, which
+//    every later call answers the same way.
+// ---------------------------------------------------------------------------
+namespace renut {
+namespace {
+
+// The vertex formats the renderer asks Plume for, by the names Plume has, and
+// the Vulkan format each one stands for. UBYTE4/SHORT2/SHORT4 and the packed
+// 2_10_10_10 arrive in the vertex shader as converted floats.
+VkFormat LayerVertexFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_UINT: return VK_FORMAT_R8G8B8A8_USCALED;
+    case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_SSCALED;
+    case VK_FORMAT_R16G16_UINT: return VK_FORMAT_R16G16_USCALED;
+    case VK_FORMAT_R16G16_SINT: return VK_FORMAT_R16G16_SSCALED;
+    case VK_FORMAT_R16G16B16A16_UINT: return VK_FORMAT_R16G16B16A16_USCALED;
+    case VK_FORMAT_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_SSCALED;
+    // Used as vertex attributes by nothing else: R8G8_UINT stands for the
+    // unsigned normalized 2_10_10_10, R8G8_SINT for the unsigned scaled one.
+    case VK_FORMAT_R8G8_UINT: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case VK_FORMAT_R8G8_SINT: return VK_FORMAT_A2B10G10R10_USCALED_PACK32;
+    default: return format;
+  }
 }
 
-VkResult renutCreateComputePipelines(VkDevice device, VkPipelineCache, uint32_t count,
-                                     const VkComputePipelineCreateInfo* infos,
-                                     const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
-  return CreatePipelines(device, count, infos, allocator, pipelines, vkCreateComputePipelines);
+bool UsesBlendConstant(const VkPipelineColorBlendAttachmentState& attachment) {
+  auto constant = [](VkBlendFactor f) {
+    return f == VK_BLEND_FACTOR_CONSTANT_COLOR || f == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR ||
+           f == VK_BLEND_FACTOR_CONSTANT_ALPHA || f == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+  };
+  return attachment.blendEnable &&
+         (constant(attachment.srcColorBlendFactor) || constant(attachment.dstColorBlendFactor) ||
+          constant(attachment.srcAlphaBlendFactor) || constant(attachment.dstAlphaBlendFactor));
 }
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
+                                                 const VkAllocationCallbacks* allocator, VkDevice* device) {
+  VkDeviceCreateInfo edited = *info;
+  std::vector<const char*> extensions(info->ppEnabledExtensionNames,
+                                      info->ppEnabledExtensionNames + info->enabledExtensionCount);
+  VkPhysicalDevicePipelineCreationCacheControlFeatures control{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES};
+  uint32_t count = 0;
+  vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
+  std::vector<VkExtensionProperties> available(count);
+  vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, available.data());
+  const auto named = [](const char* a, const char* b) { return std::strcmp(a, b) == 0; };
+  const bool present = std::any_of(available.begin(), available.end(), [&](const VkExtensionProperties& e) {
+    return named(e.extensionName, VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
+  });
+  const bool requested = std::any_of(extensions.begin(), extensions.end(), [&](const char* e) {
+    return named(e, VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
+  });
+  bool control_wanted = false;
+  if (present && !requested) {
+    VkPhysicalDevicePipelineCreationCacheControlFeatures supported{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &supported;
+    vkGetPhysicalDeviceFeatures2(physical, &features);
+    if (supported.pipelineCreationCacheControl) {
+      control.pipelineCreationCacheControl = VK_TRUE;
+      control.pNext = const_cast<void*>(info->pNext);
+      edited.pNext = &control;
+      extensions.push_back(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
+      edited.enabledExtensionCount = uint32_t(extensions.size());
+      edited.ppEnabledExtensionNames = extensions.data();
+      control_wanted = true;
+    }
+  }
+  const VkResult result = layer.create_device(physical, &edited, allocator, device);
+  layer.cache_control = result == VK_SUCCESS && control_wanted;
+  return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerCreateGraphicsPipelines(VkDevice device, VkPipelineCache, uint32_t count,
+                                                            const VkGraphicsPipelineCreateInfo* infos,
+                                                            const VkAllocationCallbacks* allocator,
+                                                            VkPipeline* pipelines) {
+  // Copies of the descriptions that change; what they point to is kept here
+  // until the pipelines exist.
+  struct Edited {
+    VkPipelineDynamicStateCreateInfo dynamic;
+    std::vector<VkDynamicState> states;
+    VkPipelineVertexInputStateCreateInfo vertex;
+    std::vector<VkVertexInputAttributeDescription> attributes;
+  };
+  thread_local std::vector<Edited> edited;
+  thread_local std::vector<VkGraphicsPipelineCreateInfo> list;
+  edited.assign(count, Edited{});
+  list.assign(infos, infos + count);
+  for (uint32_t i = 0; i < count; ++i) {
+    Edited& e = edited[i];
+    VkGraphicsPipelineCreateInfo& info = list[i];
+    if (info.pDynamicState) {
+      e.states.assign(info.pDynamicState->pDynamicStates,
+                      info.pDynamicState->pDynamicStates + info.pDynamicState->dynamicStateCount);
+      bool changed = false;
+      if (info.pDepthStencilState && info.pDepthStencilState->stencilTestEnable) {
+        e.states.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
+        e.states.push_back(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK);
+        e.states.push_back(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
+        changed = true;
+      }
+      if (info.pColorBlendState) {
+        const auto* blend = info.pColorBlendState;
+        for (uint32_t a = 0; a < blend->attachmentCount; ++a) {
+          if (UsesBlendConstant(blend->pAttachments[a])) {
+            e.states.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (changed) {
+        e.dynamic = *info.pDynamicState;
+        e.dynamic.dynamicStateCount = uint32_t(e.states.size());
+        e.dynamic.pDynamicStates = e.states.data();
+        info.pDynamicState = &e.dynamic;
+      }
+    }
+    if (info.pVertexInputState) {
+      const auto* vertex = info.pVertexInputState;
+      bool rewrite = false;
+      for (uint32_t a = 0; a < vertex->vertexAttributeDescriptionCount; ++a) {
+        rewrite |= LayerVertexFormat(vertex->pVertexAttributeDescriptions[a].format) !=
+                   vertex->pVertexAttributeDescriptions[a].format;
+      }
+      if (rewrite) {
+        e.attributes.assign(vertex->pVertexAttributeDescriptions,
+                            vertex->pVertexAttributeDescriptions + vertex->vertexAttributeDescriptionCount);
+        for (auto& attribute : e.attributes) attribute.format = LayerVertexFormat(attribute.format);
+        e.vertex = *vertex;
+        e.vertex.pVertexAttributeDescriptions = e.attributes.data();
+        info.pVertexInputState = &e.vertex;
+      }
+    }
+  }
+  return CreatePipelines(device, count, list.data(), allocator, pipelines, layer.create_graphics);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerCreateComputePipelines(VkDevice device, VkPipelineCache, uint32_t count,
+                                                           const VkComputePipelineCreateInfo* infos,
+                                                           const VkAllocationCallbacks* allocator,
+                                                           VkPipeline* pipelines) {
+  return CreatePipelines(device, count, infos, allocator, pipelines, layer.create_compute);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerCreateBuffer(VkDevice device, const VkBufferCreateInfo* info,
+                                                 const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
+  if (!(info->usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+    return layer.create_buffer(device, info, allocator, buffer);
+  }
+  VkBufferCreateInfo edited = *info;
+  edited.usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+  if (layer.buffer_address.load(std::memory_order_relaxed)) {
+    edited.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  }
+  return layer.create_buffer(device, &edited, allocator, buffer);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits,
+                                                VkFence fence) {
+  const VkResult result = layer.queue_submit(queue, count, submits, fence);
+  if (result == VK_ERROR_DEVICE_LOST) layer.device_lost.store(true);
+  return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerWaitForFences(VkDevice device, uint32_t count, const VkFence* fences,
+                                                  VkBool32 wait_all, uint64_t timeout) {
+  const VkResult result = layer.wait_for_fences(device, count, fences, wait_all, timeout);
+  if (result == VK_ERROR_DEVICE_LOST) layer.device_lost.store(true);
+  return result;
+}
+
+}  // namespace
+
+void InstallVulkanLayer() {
+  if (layer.installed) return;
+  layer.installed = true;
+  layer.create_device = vkCreateDevice;
+  layer.create_graphics = vkCreateGraphicsPipelines;
+  layer.create_compute = vkCreateComputePipelines;
+  layer.create_buffer = vkCreateBuffer;
+  layer.queue_submit = vkQueueSubmit;
+  layer.wait_for_fences = vkWaitForFences;
+  vkCreateDevice = LayerCreateDevice;
+  vkCreateGraphicsPipelines = LayerCreateGraphicsPipelines;
+  vkCreateComputePipelines = LayerCreateComputePipelines;
+  vkCreateBuffer = LayerCreateBuffer;
+  vkQueueSubmit = LayerQueueSubmit;
+  vkWaitForFences = LayerWaitForFences;
+}
+
+void VulkanLayerDeviceCreated(bool buffer_device_address) {
+  layer.buffer_address.store(buffer_device_address);
+}
+
+bool PlumeDeviceLost() { return layer.device_lost.load(); }
+
+}  // namespace renut

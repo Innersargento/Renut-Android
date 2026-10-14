@@ -5,6 +5,8 @@
 // clear colour, which the renderer shows while no frame has been resolved.
 #include "d3d_layer.h"
 #include "plume_renderer.h"
+#include "guest_address.h"
+#include "host_support.h"
 
 #include <algorithm>
 #include <atomic>
@@ -29,11 +31,11 @@ constexpr uint32_t kClearDepthStencil = 0x2 | 0x4;
 // no physical-window offset, so the address is the mapping offset. Volatile
 // because the fence below is written by the thread running the GPU.
 uint32_t GuestU32(const uint8_t* base, uint32_t address) {
-  return __builtin_bswap32(*reinterpret_cast<const volatile uint32_t*>(base + address));
+  return __builtin_bswap32(*reinterpret_cast<const volatile uint32_t*>(GuestPtr(base, address)));
 }
 
 uint8_t GuestU8(const uint8_t* base, uint32_t address) {
-  return *reinterpret_cast<const volatile uint8_t*>(base + address);
+  return *reinterpret_cast<const volatile uint8_t*>(GuestPtr(base, address));
 }
 
 // How long the fence wait sleeps once it is clear the GPU is not moving. Read
@@ -106,7 +108,7 @@ bool Clear(PPCContext& ctx, uint8_t*) {
 bool ClearF(PPCContext& ctx, uint8_t* base) {
   if (auto* renderer = PlumeRenderer::Get();
       renderer && (ctx.r4.u32 & ~kClearDepthStencil) && ctx.r6.u32) {
-    const uint8_t* color = base + ctx.r6.u32;
+    const uint8_t* color = GuestPtr(base, ctx.r6.u32);
     renderer->SetClearColor(LoadBEFloat(color), LoadBEFloat(color + 4), LoadBEFloat(color + 8),
                             LoadBEFloat(color + 12));
   }
@@ -130,7 +132,7 @@ bool BlockerCheck(PPCContext& ctx, uint8_t* base) {
   // One game thread drives this loop; thread_local keeps a second one honest.
   static thread_local uint32_t idle_checks = 0;
   // The player's pause: this loop calls no kernel wait, so it parks here.
-  rex::system::XThread::WaitIfTitlePaused();
+  renut::WaitIfTitlePaused();
   const uint32_t sleep_us = in_background.load(std::memory_order_relaxed)
       ? kBackgroundSleepMicroseconds : BlockerSleepMicroseconds();
   if (!sleep_us) {

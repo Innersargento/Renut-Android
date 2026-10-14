@@ -1,6 +1,7 @@
 #include "d3d_layer.h"
 #include "native_d3d.h"
 #include "native_probe.h"
+#include "guest_address.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,7 @@
 #include <rex/ppc/func.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/system/kernel_state.h>
+#include <rex/hook.h>
 
 REXCVAR_DEFINE_BOOL(renut_d3d_dump_shaders, true, "reNut",
                     "Save every shader the game creates or registers (Create*Shader, "
@@ -85,7 +87,7 @@ void DumpShaderObject(uint8_t* base, uint32_t object, bool vertex) {
   }
   uint32_t container = 0;
   for (uint32_t offset : {vertex ? 872u : 40u, vertex ? 40u : 872u}) {
-    if (IsContainer(base + object + offset)) {
+    if (IsContainer(renut::GuestPtr(base, object + offset))) {
       container = object + offset;
       break;
     }
@@ -97,15 +99,15 @@ void DumpShaderObject(uint8_t* base, uint32_t object, bool vertex) {
     }
     return;
   }
-  const uint8_t* header = base + container;
+  const uint8_t* header = renut::GuestPtr(base, container);
   uint32_t virtual_size = LoadBE32(header + 4);
   uint32_t physical_size = LoadBE32(header + 8);
-  uint32_t physical = LoadBE32(base + object + (vertex ? 32 : 24));
+  uint32_t physical = LoadBE32(renut::GuestPtr(base, object + (vertex ? 32 : 24)));
   if (!physical || virtual_size < 36 || virtual_size > (1u << 20) || physical_size > (1u << 20)) {
     return;
   }
   std::vector<uint8_t> blob(header, header + virtual_size);
-  blob.insert(blob.end(), base + physical, base + physical + physical_size);
+  blob.insert(blob.end(), renut::GuestPtr(base, physical), renut::GuestPtr(base, physical) + physical_size);
   // FNV-1a: stable across runs, good enough to deduplicate files.
   uint64_t hash = 0xCBF29CE484222325ull;
   for (uint8_t byte : blob) {
@@ -153,7 +155,7 @@ void SingleTile(PPCContext& ctx, uint8_t* base) {
   if (count < 2 || count > 16 || !rects || !REXCVAR_GET(renut_single_tile)) return;
   int32_t box[4] = {INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN};
   for (uint32_t i = 0; i < count; ++i) {
-    const uint8_t* rect = base + rects + i * 16;
+    const uint8_t* rect = renut::GuestPtr(base, rects + i * 16);
     for (uint32_t k = 0; k < 4; ++k) {
       const int32_t v = int32_t(LoadBE32(rect + k * 4));
       box[k] = k < 2 ? std::min(box[k], v) : std::max(box[k], v);
@@ -165,7 +167,7 @@ void SingleTile(PPCContext& ctx, uint8_t* base) {
   for (uint32_t k = 0; k < 4; ++k) {
     const uint32_t v = uint32_t(box[k]);
     const uint8_t bytes[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
-    std::memcpy(base + scratch + k * 4, bytes, 4);
+    std::memcpy(renut::GuestPtr(base, scratch + k * 4), bytes, 4);
   }
   static std::atomic<bool> logged{false};
   if (!logged.exchange(true)) {
@@ -176,7 +178,7 @@ void SingleTile(PPCContext& ctx, uint8_t* base) {
   ctx.r6.u32 = scratch;
   // The game still marks each object for the bands it falls in; with one band
   // every mark has to count.
-  rex::graphics::SetSingleBinTiling(true);
+  SetSingleBinTiling(true);
 }
 
 // Called for every intercepted function. Returns true if a handler took it.
@@ -233,6 +235,13 @@ bool PlumeActive() {
   return true;
 }
 
+namespace {
+std::atomic<bool> single_bin_tiling{false};
+}  // namespace
+
+void SetSingleBinTiling(bool single) { single_bin_tiling.store(single, std::memory_order_relaxed); }
+bool GetSingleBinTiling() { return single_bin_tiling.load(std::memory_order_relaxed); }
+
 void SetHandler(Function function, Handler handler) {
   handlers[function].store(handler, std::memory_order_release);
 }
@@ -256,7 +265,7 @@ void SetShaderDumpDirectory(std::string directory) {
 // Strong overrides of the weak recompiled definitions.
 #define X(symbol, name)                                                          \
   extern "C" void __imp__##symbol(PPCContext& __restrict, uint8_t*);             \
-  REX_EXTERN(symbol) {                                                           \
+  REX_HOOK_RAW(symbol) {                                                           \
     const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;                             \
     if (!renut::d3d::Enter(renut::d3d::k##name, ctx, base)) {                    \
       __imp__##symbol(ctx, base);                                                \

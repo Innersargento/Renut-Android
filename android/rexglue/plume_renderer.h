@@ -3,7 +3,9 @@
 // swapchain through Plume and is fed by the Direct3D interception layer.
 // Stage 1: presents the colour of the game's last clear, which proves the
 // path from the game's Direct3D calls to the screen.
+#if defined(__ANDROID__)
 #include <android/native_window.h>
+#endif
 
 #include <cstdint>
 #include <memory>
@@ -17,6 +19,15 @@ struct RenderTexture;
 }  // namespace plume
 
 namespace renut {
+
+// The platform's window: the Android surface, or on Windows the HWND, which the
+// callers hand over as an opaque pointer (windows/main_windows.cpp).
+#if defined(__ANDROID__)
+using PlumeWindow = ANativeWindow;
+#else
+struct PlumeWindowTag;
+using PlumeWindow = PlumeWindowTag;
+#endif
 
 // Frames the renderer keeps in flight. The command processor records frame N
 // while the GPU runs N-1, so a frame costs the larger of the two instead of
@@ -47,11 +58,14 @@ class PlumePipelineLookupOnly {
 };
 // Pipelines since launch that the cache already had, and that were compiled.
 void PlumePipelineCacheCounts(uint64_t* found, uint64_t* compiled);
+// Whether a queue submission or a fence wait has answered VK_ERROR_DEVICE_LOST: the
+// GPU faulted, and every later call says the same.
+bool PlumeDeviceLost();
 
 class PlumeRenderer {
  public:
   // Uses the Vulkan loader already opened for the session.
-  static bool Start(ANativeWindow* window, std::string* error);
+  static bool Start(PlumeWindow* window, std::string* error);
   static void Stop();
   static PlumeRenderer* Get();
 
@@ -88,7 +102,7 @@ class PlumeRenderer {
   // The player's own pause: the same parking at the next present, but the surface
   // is alive, so the last frame stays on screen and nothing is saved or replaced.
   void SetPaused(bool paused);
-  bool AttachWindow(ANativeWindow* window);
+  bool AttachWindow(PlumeWindow* window);
   void ReleaseForShutdown();
 
   ~PlumeRenderer();
