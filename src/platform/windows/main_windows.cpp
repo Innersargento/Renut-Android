@@ -1,6 +1,6 @@
 // Windows host for the recompiled game with reNut's native Plume renderer.
 //
-// The boot sequence is the one android/rexglue/runtime_jni.cpp runs in its
+// The boot sequence is the one src/platform/android/runtime_jni.cpp runs in its
 // "launch" branch, without the Android app around it: the window is a plain
 // Win32 window owned by the main thread, PlumeRenderer takes its HWND, the
 // emulated Xenos only keeps the control flow (fences, vertical blank, swaps),
@@ -32,14 +32,14 @@
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 
-#include "d3d_layer.h"
-#include "native_d3d.h"
-#include "native_probe.h"
-#include "plume_gpu.h"
-#include "plume_renderer.h"
+#include "d3d/d3d_layer.h"
+#include "d3d/native_d3d.h"
+#include "d3d/native_probe.h"
+#include "plume/plume_gpu.h"
+#include "plume/plume_renderer.h"
 
 using rex::X_STATUS;
-extern "C" uint64_t renut_guest_swap_count();  // frames the game presented (platform_windows.cpp)
+extern "C" uint64_t renut_guest_swap_count();  // frames the game presented (platform/windows/platform_windows.cpp)
 extern const rex::PPCImageInfo PPCImageConfig;
 extern PPCFuncMapping PPCFuncMappings[];
 

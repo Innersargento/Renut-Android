@@ -11,7 +11,7 @@ with no control flow and no other write to rP or rA before oPos. Whatever
 else the shader computes (texture coordinates, normals) is irrelevant for a
 draw that has no pixel shader: only the position reaches the depth buffer.
 
-Writes android/rexglue/native_vs_table.inc: X(hash, location, swizzle, k0, k1, k2, k3, has
+Writes src/d3d/native_vs_table.inc: X(hash, location, swizzle, k0, k1, k2, k3, has
 texcoord0, its swizzle, has normal, its swizzle), swizzles packed two bits per component
 (x=0 y=1 z=2 w=3).
 

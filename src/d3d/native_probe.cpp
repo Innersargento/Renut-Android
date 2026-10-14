@@ -39,7 +39,7 @@
 #include "d3d_layer.h"
 #include "native_engine.h"
 #include "native_probe.h"
-#include "guest_address.h"
+#include "guest/guest_address.h"
 
 // The Plume renderer's native mode (plume_gpu.cpp): 0 off, 1 rigid depth
 // draws, 2 also the native view.

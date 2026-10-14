@@ -104,25 +104,26 @@ target_compile_options(renut_plume PRIVATE -w)
 #=============================================================================
 # The recompiled game (generated/android is plain C++; nothing in it is ARM64).
 #=============================================================================
-set(RENUT_RT "${RENUT_ROOT}/android/rexglue")
+# src/ is shared with the Android build (android/native/CMakeLists.txt).
+set(RENUT_SRC "${RENUT_ROOT}/src")
 include("${RENUT_ROOT}/generated/android/sources.cmake")
 set(RENUT_COMMON_DEFINITIONS REX_PLATFORM_WINDOWS=1 REXGLUE_BUILD_CONFIG="Release" NOMINMAX WIN32_LEAN_AND_MEAN)
 set(RENUT_COMMON_OPTIONS -fno-strict-aliasing -ffp-model=strict -fno-char8_t -O2)
 
 add_library(renut_guest OBJECT ${GENERATED_SOURCES})
-target_include_directories(renut_guest PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_RT}")
+target_include_directories(renut_guest PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SRC}")
 target_link_libraries(renut_guest PRIVATE renut_rexruntime)
 target_compile_definitions(renut_guest PRIVATE ${RENUT_COMMON_DEFINITIONS})
 target_compile_options(renut_guest PRIVATE ${RENUT_COMMON_OPTIONS} -g0 -w)
-target_precompile_headers(renut_guest PRIVATE "${RENUT_RT}/renut_guest_pch.h")
-include("${RENUT_RT}/kernel_overrides.cmake")
+target_precompile_headers(renut_guest PRIVATE "${RENUT_SRC}/guest/renut_guest_pch.h")
+include("${RENUT_SRC}/guest/kernel_overrides.cmake")
 renut_kernel_overrides(renut_guest)
 
 #=============================================================================
 # Offline-recompiled shaders: the cache table plus the smol-v blob.
 #=============================================================================
 set(RENUT_SHADERS "${RENUT_ROOT}/generated/shaders")
-set_source_files_properties("${RENUT_RT}/shader_cache_blob.S" PROPERTIES
+set_source_files_properties("${RENUT_SRC}/plume/shader_cache_blob.S" PROPERTIES
     COMPILE_OPTIONS "-DRENUT_SHADER_BLOB=\"${RENUT_SHADERS}/shader_spirv.smolv\""
     OBJECT_DEPENDS "${RENUT_SHADERS}/shader_spirv.smolv")
 
@@ -131,18 +132,19 @@ set_source_files_properties("${RENUT_RT}/shader_cache_blob.S" PROPERTIES
 #=============================================================================
 enable_language(ASM)
 add_executable(renut_plume_exe
-    main_windows.cpp platform_windows.cpp
-    "${RENUT_RT}/game_fixes.cpp" "${RENUT_RT}/cheats.cpp"
-    "${RENUT_RT}/kernel_overrides.cpp" "${RENUT_RT}/host_support.cpp"
-    "${RENUT_RT}/d3d_layer.cpp" "${RENUT_RT}/native_d3d.cpp" "${RENUT_RT}/native_probe.cpp"
-    "${RENUT_RT}/native_engine.cpp" "${RENUT_RT}/plume_d3d.cpp" "${RENUT_RT}/plume_renderer.cpp"
-    "${RENUT_RT}/plume_gpu.cpp" "${RENUT_RT}/plume_textures.cpp"
-    "${RENUT_RT}/shader_cache_blob.S" "${RENUT_SHADERS}/shader_cache.cpp"
-    "${RENUT_RT}/thirdparty/smolv/smolv.cpp"
+    "${RENUT_SRC}/platform/windows/main_windows.cpp" "${RENUT_SRC}/platform/windows/platform_windows.cpp"
+    "${RENUT_SRC}/guest/game_fixes.cpp" "${RENUT_SRC}/guest/cheats.cpp"
+    "${RENUT_SRC}/guest/kernel_overrides.cpp" "${RENUT_SRC}/guest/host_support.cpp"
+    "${RENUT_SRC}/d3d/d3d_layer.cpp" "${RENUT_SRC}/d3d/native_d3d.cpp" "${RENUT_SRC}/d3d/native_probe.cpp"
+    "${RENUT_SRC}/d3d/native_engine.cpp" "${RENUT_SRC}/d3d/plume_d3d.cpp"
+    "${RENUT_SRC}/plume/plume_renderer.cpp" "${RENUT_SRC}/plume/plume_gpu.cpp"
+    "${RENUT_SRC}/plume/plume_textures.cpp" "${RENUT_SRC}/plume/shader_cache_blob.S"
+    "${RENUT_SHADERS}/shader_cache.cpp"
+    "${RENUT_SRC}/vendor/smolv/smolv.cpp"
     $<TARGET_OBJECTS:renut_guest>)
 set_target_properties(renut_plume_exe PROPERTIES OUTPUT_NAME renut_plume)
 target_include_directories(renut_plume_exe PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
-    "${RENUT_RT}" "${RENUT_RT}/thirdparty/smolv" "${CMAKE_CURRENT_SOURCE_DIR}")
+    "${RENUT_SRC}")
 target_compile_definitions(renut_plume_exe PRIVATE ${RENUT_COMMON_DEFINITIONS})
 target_compile_options(renut_plume_exe PRIVATE ${RENUT_COMMON_OPTIONS} -ferror-limit=0)
 target_link_libraries(renut_plume_exe PRIVATE renut_rexruntime renut_rexgpu renut_plume xxhash)

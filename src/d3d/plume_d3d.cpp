@@ -4,9 +4,9 @@
 // Plume command processor (plume_gpu.cpp) executes. These only mirror the
 // clear colour, which the renderer shows while no frame has been resolved.
 #include "d3d_layer.h"
-#include "plume_renderer.h"
-#include "guest_address.h"
-#include "host_support.h"
+#include "plume/plume_renderer.h"
+#include "guest/guest_address.h"
+#include "guest/host_support.h"
 
 #include <algorithm>
 #include <atomic>

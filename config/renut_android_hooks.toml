@@ -1,7 +1,7 @@
 # Cheats of the Android build (Jogar > Cheats). The addresses are the ones the
 # desktop build already hooks in renut_hooks.toml; they are valid for the
 # European XEX this build is generated from. The hook functions live in
-# android/rexglue/cheats.cpp and read cvars, so a cheat that is off costs one
+# src/guest/cheats.cpp and read cvars, so a cheat that is off costs one
 # flag test where the hook sits.
 
 # Infinite health: skip the call that applies the health amount

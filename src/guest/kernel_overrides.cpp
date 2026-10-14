@@ -22,9 +22,9 @@
 
 #include "guest_address.h"
 #include "host_support.h"
-#include "native_d3d.h"
+#include "d3d/native_d3d.h"
 #if defined(__ANDROID__)
-#include "renut_audio.h"
+#include "platform/android/renut_audio.h"
 #endif
 
 // The SDK's X_STATUS_* macros are written with the unqualified type.

@@ -5,7 +5,7 @@ materials that is the surface's own texture; a shader with no such fetch (a
 flat-coloured material whose only 2D texture is, say, a reflection map looked
 up by a computed direction) gets none.
 
-Writes android/rexglue/native_ps_table.inc: X(hash, texture slot, interpolant).
+Writes src/d3d/native_ps_table.inc: X(hash, texture slot, interpolant).
 
 usage: python -I tools/native/scan_native_ps.py <generated/shaders/hlsl> <out.inc>
 """

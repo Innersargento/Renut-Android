@@ -22,7 +22,7 @@
 #include <chrono>
 #include <algorithm>
 
-#include "guest_address.h"
+#include "guest/guest_address.h"
 
 // The SDK's X_ERROR_* macros are written with the unqualified types.
 using rex::X_RESULT;

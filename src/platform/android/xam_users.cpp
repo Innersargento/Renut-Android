@@ -20,11 +20,11 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 
-#include "guest_address.h"
+#include "guest/guest_address.h"
 #include "touch_input.h"
 
 #define X(name) extern "C" void __imp__##name(PPCContext& __restrict ctx, uint8_t* base);
-#include "kernel_overrides.inc"
+#include "guest/kernel_overrides.inc"
 #undef X
 
 using rex::X_RESULT;

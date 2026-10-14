@@ -24,7 +24,7 @@
 // the next bit the next register, and so on (SetPending_RenderStates,
 // sub_8222CB90).
 #include "native_d3d.h"
-#include "guest_address.h"
+#include "guest/guest_address.h"
 
 #include "d3d_layer.h"
 

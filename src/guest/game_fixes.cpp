@@ -1,8 +1,8 @@
 // Game-specific overrides of recompiled functions. The generated definitions
 // are weak symbols, so a strong definition here replaces them at link time.
 
-#include "native_engine.h"
-#include "native_probe.h"
+#include "d3d/native_engine.h"
+#include "d3d/native_probe.h"
 #include "guest_address.h"
 #include <atomic>
 #include <cstdint>
@@ -14,7 +14,7 @@
 #include <rex/ppc/func.h>
 #include <rex/hook.h>
 
-#include "plume_gpu.h"
+#include "plume/plume_gpu.h"
 
 REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut",
                     "Keep the game's MSAA scene surfaces, which the Xbox 360 renders in two "

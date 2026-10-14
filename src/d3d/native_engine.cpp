@@ -18,7 +18,7 @@
 // them into the command buffer ahead of itself. The Plume renderer reads them
 // back at the draw (plume_gpu.cpp) and knows which engine draw it has.
 #include "native_engine.h"
-#include "guest_address.h"
+#include "guest/guest_address.h"
 
 #include <algorithm>
 #include <array>

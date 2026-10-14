@@ -10,7 +10,7 @@ against the runtime captures: 28,618 extracted containers are byte-identical to
 one, and every pairing passes xenos_ucode.exact_ucode.
 
 For each header this writes the container the way DumpShaderObject does
-(android/rexglue/d3d_layer.cpp): the virtual bytes followed by the physical
+(src/d3d/d3d_layer.cpp): the virtual bytes followed by the physical
 ones, named {vs,ps}_<FNV-1a of the blob>.bin, so a shader already captured at
 runtime lands on the same file name.
 

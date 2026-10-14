@@ -13,7 +13,7 @@ Regras:
 - Nada em `thirdparty/` é editado, corrigido por patch ou copiado para dentro do
   reNut. `git submodule status` mostra as revisões; qualquer diferença é erro.
 - O que o reNut precisa a mais deles fica **no código do reNut**
-  (`android/rexglue/`), usando o que o SDK e o Plume já expõem.
+  (`src/`), usando o que o SDK e o Plume já expõem.
 - Correções que valem para todo mundo (e não só para o reNut) devem ir para o
   projeto de origem como PR, e só voltar para cá quando forem aceitas.
 
@@ -63,10 +63,10 @@ git submodule update --init --recursive
   intactos: logo da Rare, abertura e tela-título (renderização conferida por
   captura da própria janela), ~2.100 quadros em 65 s sem queda.
 - **Android: compila e roda contra os dois submódulos intactos** (13/10/2026).
-  `android/rexglue/CMakeLists.txt` aponta para `thirdparty/rexglue-sdk` e o
+  `android/native/CMakeLists.txt` aponta para `thirdparty/rexglue-sdk` e o
   Plume é compilado de `thirdparty/plume`; `external/` só guarda o que não é
   SDK nem Plume (libadrenotools, libucontext). O que o Android precisa a mais
-  vem de `android/rexglue/shims/` (cabeçalhos incluídos à força em arquivos do
+  vem de `src/platform/android/shims/` (cabeçalhos incluídos à força em arquivos do
   SDK), de `kernel_overrides.*` e do áudio próprio (`renut_audio.cpp`). Chega à
   tela-título; o que ainda falta está na tabela abaixo.
 
@@ -106,7 +106,7 @@ git submodule update --init --recursive
 | Rastreio de memória, mapeamento persistente, sem compressão | **Descartados** (eram ferramentas de investigação) |
 | Carregador Vulkan do app Android (driver embutido) | A fazer (Android): a abertura do `libvulkan` do Plume é redirecionada na compilação do arquivo, sem editá-lo |
 
-## Áudio do Android (`android/rexglue/renut_audio.cpp`)
+## Áudio do Android (`src/platform/android/renut_audio.cpp`)
 
 O backend SDL do SDK e o laço de trabalho do `AudioSystem` do SDK não são
 usados no Android. O reNut registra o seu próprio `AudioSystem` em

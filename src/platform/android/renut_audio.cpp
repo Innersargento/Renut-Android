@@ -52,7 +52,7 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
-#include "host_support.h"
+#include "guest/host_support.h"
 
 // The SDK's X_STATUS_* macros are written with the unqualified type.
 using rex::X_STATUS;

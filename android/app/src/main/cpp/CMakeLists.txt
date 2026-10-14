@@ -23,4 +23,4 @@ add_library(renut_probe SHARED probe.cpp)
 target_link_libraries(renut_probe PRIVATE renut_plume adrenotools android log dl)
 target_link_options(renut_probe PRIVATE "-Wl,-z,max-page-size=16384")
 
-add_subdirectory("${RENUT_ROOT}/android/rexglue" rexglue)
+add_subdirectory("${RENUT_ROOT}/android/native" native)

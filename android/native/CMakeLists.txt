@@ -4,10 +4,13 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 get_filename_component(RENUT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+# The code reNut itself writes: src/, shared with the Windows build (windows/CMakeLists.txt).
+set(RENUT_SRC "${RENUT_ROOT}/src")
+set(RENUT_ANDROID "${RENUT_SRC}/platform/android")
 # The SDK is the git submodule thirdparty/rexglue-sdk (tag v0.10.0) exactly as
 # released: nothing under thirdparty/ is edited, patched or copied. What Android
-# needs on top of it is in this directory (shims/, kernel_overrides.*, the
-# audio output) or arrives as compile options below.
+# needs on top of it is under src/ (platform/android/shims/, guest/kernel_overrides.*,
+# the audio output) or arrives as compile options below.
 set(REXGLUE_ROOT "${RENUT_ROOT}/thirdparty/rexglue-sdk")
 set(PROJECT_SOURCE_DIR "${REXGLUE_ROOT}")
 set(REXGLUE_USE_D3D12 OFF)
@@ -27,8 +30,8 @@ add_compile_options(-fno-strict-aliasing -ffp-model=strict -fno-char8_t)
 add_compile_options(-O2)
 add_compile_definitions(NDEBUG)
 # libc++ in the NDK lacks clock_time_conversion/clock_cast, which the SDK's chrono.h
-# builds on (shims/android_chrono.h).
-add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/shims/android_chrono.h>")
+# builds on (platform/android/shims/android_chrono.h).
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${RENUT_ANDROID}/shims/android_chrono.h>")
 include("${REXGLUE_ROOT}/cmake/rex_pch.cmake")
 set(REXGLUE_DERIVED_MAJOR 0)
 set(REXGLUE_DERIVED_MINOR 10)
@@ -41,7 +44,7 @@ set(REXGLUE_VERSION_CHANNEL "renut-android")
 set(REX_PLATFORM "android-arm64")
 string(TIMESTAMP REXGLUE_BUILD_TIMESTAMP "%Y%m%d_%H%M")
 configure_file("${REXGLUE_ROOT}/include/rex/version.h.in" "${PROJECT_BINARY_DIR}/include/rex/version.h" @ONLY)
-include_directories("${REXGLUE_ROOT}/include" "${PROJECT_BINARY_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+include_directories("${REXGLUE_ROOT}/include" "${PROJECT_BINARY_DIR}/include" "${RENUT_ANDROID}/include" "${RENUT_SRC}")
 set(DEPS "${REXGLUE_ROOT}/thirdparty")
 set(FMT_TEST OFF CACHE BOOL "" FORCE)
 set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
@@ -91,16 +94,16 @@ set_property(TARGET rexcore PROPERTY INTERFACE_LINK_LIBRARIES "${CORE_INTERFACE}
 # defined ahead of it, not through an edit.
 set_source_files_properties("${REXGLUE_ROOT}/src/core/fiber_posix.cpp"
     TARGET_DIRECTORY rexcore PROPERTIES
-    COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/shims/android_ucontext.h")
-# The same for what the core files assume of glibc (shims/android_core.h).
+    COMPILE_OPTIONS "-include;${RENUT_ANDROID}/shims/android_ucontext.h")
+# The same for what the core files assume of glibc (platform/android/shims/android_core.h).
 set_source_files_properties("${REXGLUE_ROOT}/src/core/memory_posix.cpp"
     "${REXGLUE_ROOT}/src/core/threading_posix.cpp"
     TARGET_DIRECTORY rexcore PROPERTIES
-    COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/shims/android_core.h")
+    COMPILE_OPTIONS "-include;${RENUT_ANDROID}/shims/android_core.h")
 add_subdirectory("${REXGLUE_ROOT}/src/filesystem" filesystem)
 add_subdirectory("${REXGLUE_ROOT}/src/system" system)
 target_link_libraries(rexruntime PRIVATE rexcore rexfilesystem log android)
-target_sources(rexruntime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/android_content.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/android_vulkan_loader.cpp")
+target_sources(rexruntime PRIVATE "${RENUT_ANDROID}/android_content.cpp" "${RENUT_ANDROID}/android_vulkan_loader.cpp")
 target_link_libraries(rexruntime PRIVATE adrenotools)
 
 # Reuse the pinned SDK's FFmpeg source list, without its desktop dependency setup.
@@ -121,7 +124,7 @@ file(READ "${REXGLUE_ROOT}/src/ui/CMakeLists.txt" UI_CMAKE)
 string(FIND "${UI_CMAKE}" "# Platform-specific dependencies" UI_END)
 string(SUBSTRING "${UI_CMAKE}" 0 ${UI_END} UI_CMAKE)
 string(REPLACE "surface_gnulinux.cpp" "" UI_CMAKE "${UI_CMAKE}")
-# The window is GameWindow (android_game_window.h), a rex::ui::Window over the
+# The window is GameWindow (platform/android/android_game_window.h), a rex::ui::Window over the
 # Android surface (and GameContext its app context); the SDK's SDL window includes
 # Xlib unconditionally.
 string(REGEX REPLACE "[ ]+window_sdl[.]cpp" "" UI_CMAKE "${UI_CMAKE}")
@@ -147,9 +150,9 @@ include("${RENUT_ROOT}/generated/android/sources.cmake")
 add_library(renut_guest OBJECT ${GENERATED_SOURCES})
 target_include_directories(renut_guest PRIVATE "${RENUT_ROOT}/generated/android")
 target_link_libraries(renut_guest PRIVATE rexruntime)
-# The kernel exports reNut takes over (kernel_overrides.cpp): the game's calls to
+# The kernel exports reNut takes over (guest/kernel_overrides.cpp): the game's calls to
 # them are renamed at compile time, the SDK is not touched.
-include("${CMAKE_CURRENT_SOURCE_DIR}/kernel_overrides.cmake")
+include("${RENUT_SRC}/guest/kernel_overrides.cmake")
 renut_kernel_overrides(renut_guest)
 # The recompiled game is the hot path: a profile of the boot stall put ~90% of
 # CPU inside two guest functions, so this target's level matters most.
@@ -167,23 +170,32 @@ foreach(table VectorMaskL VectorMaskR VectorShiftTableL VectorShiftTableR)
 endforeach()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/renut_vector_tables.inc" "${RENUT_VECTOR_TABLES}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${REXGLUE_ROOT}/include/rex/ppc/intrinsics.h")
-target_include_directories(renut_guest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(renut_guest PRIVATE "${RENUT_SRC}" "${CMAKE_CURRENT_BINARY_DIR}")
 # The generated header, then the AArch64 forms of the SSE intrinsics the game
 # uses (clang scalarizes SIMDe's vector compares under -ffp-model=strict).
-target_precompile_headers(renut_guest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/renut_guest_pch.h")
+target_precompile_headers(renut_guest PRIVATE "${RENUT_SRC}/guest/renut_guest_pch.h")
 # Native Plume renderer: the offline-recompiled shaders (generated/shaders, from
 # tools/shaders/recompile_shaders.sh) are compiled in; their smol-v blob is
 # embedded with .incbin.
 set(RENUT_SHADERS "${RENUT_ROOT}/generated/shaders")
-set_source_files_properties(shader_cache_blob.S PROPERTIES
+set_source_files_properties("${RENUT_SRC}/plume/shader_cache_blob.S" PROPERTIES
     COMPILE_OPTIONS "-DRENUT_SHADER_BLOB=\"${RENUT_SHADERS}/shader_spirv.smolv\""
     OBJECT_DEPENDS "${RENUT_SHADERS}/shader_spirv.smolv")
-add_library(renut_runtime SHARED runtime_jni.cpp achievements_bridge.cpp text_input_bridge.cpp adpf.cpp plume_graphics.cpp game_fixes.cpp cheats.cpp
-    kernel_overrides.cpp host_support.cpp renut_audio.cpp xam_users.cpp
-    d3d_layer.cpp native_d3d.cpp native_probe.cpp native_engine.cpp plume_d3d.cpp plume_renderer.cpp plume_gpu.cpp plume_textures.cpp shader_cache_blob.S
-    "${RENUT_SHADERS}/shader_cache.cpp" thirdparty/smolv/smolv.cpp $<TARGET_OBJECTS:renut_guest>)
+set(RENUT_RUNTIME_SOURCES
+    # Shared with the Windows build
+    guest/game_fixes.cpp guest/cheats.cpp guest/kernel_overrides.cpp guest/host_support.cpp
+    d3d/d3d_layer.cpp d3d/native_d3d.cpp d3d/native_probe.cpp d3d/native_engine.cpp d3d/plume_d3d.cpp
+    plume/plume_renderer.cpp plume/plume_gpu.cpp plume/plume_textures.cpp plume/shader_cache_blob.S
+    vendor/smolv/smolv.cpp
+    # Android only
+    platform/android/runtime_jni.cpp platform/android/achievements_bridge.cpp
+    platform/android/text_input_bridge.cpp platform/android/adpf.cpp platform/android/plume_graphics.cpp
+    platform/android/renut_audio.cpp platform/android/xam_users.cpp)
+list(TRANSFORM RENUT_RUNTIME_SOURCES PREPEND "${RENUT_SRC}/")
+add_library(renut_runtime SHARED ${RENUT_RUNTIME_SOURCES}
+    "${RENUT_SHADERS}/shader_cache.cpp" $<TARGET_OBJECTS:renut_guest>)
 target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
-    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/smolv")
+    "${RENUT_SRC}")
 target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume adrenotools
     xxHash::xxhash android log dl aaudio)
 # Every call between recompiled guest functions, and to the __savegprlr/

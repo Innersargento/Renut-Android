@@ -1,7 +1,7 @@
 #include "plume_gpu.h"
-#include "d3d_layer.h"
-#include "native_d3d.h"
-#include "native_engine.h"
+#include "d3d/d3d_layer.h"
+#include "d3d/native_d3d.h"
+#include "d3d/native_engine.h"
 
 #include "plume_renderer.h"
 
@@ -12,7 +12,7 @@
 #include "plume_vulkan.h"
 #include "shader_cache.h"
 #include "xenos_ucode_key.h"
-#include "smolv.h"
+#include "vendor/smolv/smolv.h"
 #include "spirv_depth_only.h"
 #include "spirv_dynamic_bools.h"
 #include "spirv_fetch_spec.h"
@@ -228,7 +228,7 @@ const std::unordered_map<uint64_t, NativeRigid>& NativeRigidShaders() {
   static const std::unordered_map<uint64_t, NativeRigid> table = {
 #define X(hash, location, swizzle, k0, k1, k2, k3, tc, tc_swizzle, n, n_swizzle, tc_out) \
   {hash, {location, swizzle, {k0, k1, k2, k3}, tc, tc_swizzle, n, n_swizzle, tc_out}},
-#include "native_vs_table.inc"
+#include "d3d/native_vs_table.inc"
 #undef X
   };
   return table;
@@ -243,7 +243,7 @@ struct NativeSurface {
 const std::unordered_map<uint64_t, NativeSurface>& NativeSurfaceTextures() {
   static const std::unordered_map<uint64_t, NativeSurface> table = {
 #define X(hash, slot, interpolant) {hash, {slot, interpolant}},
-#include "native_ps_table.inc"
+#include "d3d/native_ps_table.inc"
 #undef X
   };
   return table;
@@ -256,7 +256,7 @@ struct NativeLit {
 const std::unordered_map<uint64_t, NativeLit>& NativeLitShaders() {
   static const std::unordered_map<uint64_t, NativeLit> table = {
 #define X(hash, power, specular, alpha, bias) {hash, {power, specular, alpha, bias}},
-#include "native_lit_table.inc"
+#include "d3d/native_lit_table.inc"
 #undef X
   };
   return table;

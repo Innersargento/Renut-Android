@@ -1,7 +1,7 @@
 #include "d3d_layer.h"
 #include "native_d3d.h"
 #include "native_probe.h"
-#include "guest_address.h"
+#include "guest/guest_address.h"
 
 #include <algorithm>
 #include <array>

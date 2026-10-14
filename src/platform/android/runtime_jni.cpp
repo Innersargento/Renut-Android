@@ -16,14 +16,14 @@
 #include <atomic>
 #include <android/native_window_jni.h>
 #include <rex/graphics/xenos.h>
-#include "native_d3d.h"
-#include "native_probe.h"
+#include "d3d/native_d3d.h"
+#include "d3d/native_probe.h"
 #include "plume_graphics.h"
 #include "android_game_window.h"
 #include "touch_input.h"
-#include "d3d_layer.h"
-#include "plume_renderer.h"
-#include "plume_gpu.h"
+#include "d3d/d3d_layer.h"
+#include "plume/plume_renderer.h"
+#include "plume/plume_gpu.h"
 #include <rex/chrono/clock.h>
 #include <rex/ui/presenter.h>
 #include <rex/audio/audio_system.h>
@@ -32,7 +32,7 @@
 #include <rex/input/input_system.h>
 #include "renut_android_init.h"
 #include "adpf.h"
-#include "host_support.h"
+#include "guest/host_support.h"
 using rex::X_STATUS;
 extern const rex::PPCImageInfo PPCImageConfig;
 void renutSetContentActivity(JNIEnv*, jobject);

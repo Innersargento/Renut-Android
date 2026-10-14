@@ -7,7 +7,7 @@
 #
 # <input dir> holds files with complete shader containers (header followed by
 # microcode): the decrypted xex.bin and the runtime capture (files/shader-dump
-# on the device, written by android/rexglue/d3d_layer.cpp), and the output of
+# on the device, written by src/d3d/d3d_layer.cpp), and the output of
 # tools/shaders/extract_caff_shaders.py. Do not point it at the game data
 # itself - the CAFF bundles keep a shader's header apart from its microcode,
 # and XenosRecomp would turn whatever bytes follow each header into a shader
@@ -50,7 +50,7 @@ mkdir -p "$OUT_DIR"
 cp XenosRecomp/shader_common.h "$OUT_DIR/shader_common.h"
 
 # Decode every entry and validate its SPIR-V.
-cp "$HERE/../../android/rexglue/shader_cache.h" "$OUT_DIR/"
+cp "$HERE/../../src/plume/shader_cache.h" "$OUT_DIR/"
 clang++ -std=c++17 -O1 -I"$OUT_DIR" -Ithirdparty/smol-v/source -Ithirdparty/zstd/lib \
     "$HERE/verify_cache.cpp" "$OUT_DIR/shader_cache.cpp" thirdparty/smol-v/source/smolv.cpp \
     build/thirdparty/zstd/build/cmake/lib/libzstd.a -o "$OUT_DIR/verify"
@@ -64,7 +64,7 @@ echo "spirv-val failures: $failures"
 rm -f "$OUT_DIR/shader_cache.h"
 [ "$failures" -eq 0 ]
 
-# What the Android build consumes (android/rexglue/shader_cache.h):
+# What the Android build consumes (src/plume/shader_cache.h):
 #   shader_cache.cpp      the entry and input-element tables, without the
 #                         compressed blob - the decompressed smol-v blob is
 #                         embedded with .incbin instead (no zstd on device)
@@ -74,5 +74,5 @@ rm -f "$OUT_DIR/shader_cache.h"
 grep -v -e "^const uint8_t g_compressedSpirvCache" -e "g_spirvCacheCompressedSize" \
     -e "g_spirvCacheDecompressedSize" "$OUT_DIR/shader_cache.cpp" > "$OUT_DIR/shader_cache.tmp"
 mv "$OUT_DIR/shader_cache.tmp" "$OUT_DIR/shader_cache.cpp"
-clang++ -std=c++17 -O2 -Ithirdparty/xxHash -I"$HERE/../../android/rexglue" "$HERE/ucode_map.cpp" thirdparty/xxHash/xxhash.c -o "$OUT_DIR/ucode_map"
+clang++ -std=c++17 -O2 -Ithirdparty/xxHash -I"$HERE/../../src/plume" "$HERE/ucode_map.cpp" thirdparty/xxHash/xxhash.c -o "$OUT_DIR/ucode_map"
 "$OUT_DIR/ucode_map" "$INPUT" > "$OUT_DIR/shader_ucode_map.inc"

@@ -6,7 +6,7 @@ and whose literal constants are the reference's. For each, the registers that
 hold its material parameters, in the reference's order: specular power,
 specular colour, alpha.
 
-Writes android/rexglue/native_lit_table.inc: X(hash, power, specular, alpha, bias).
+Writes src/d3d/native_lit_table.inc: X(hash, power, specular, alpha, bias).
 
 usage: python -I tools/native/lit_table.py <generated/shaders/hlsl> <out.inc>
 """

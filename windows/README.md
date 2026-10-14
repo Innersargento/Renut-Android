@@ -7,16 +7,16 @@ offline pelo XenosRecomp). Não substitui o build desktop do upstream.
 **RexGlue e Plume entram como submódulos Git, sem nenhuma alteração:**
 `thirdparty/rexglue-sdk` (tag `v0.10.0`) e `thirdparty/plume` (revisão fixa).
 Nada do que o reNut precisa a mais deles está num patch: fica no código do
-próprio reNut (`android/rexglue/`):
+próprio reNut (`src/`):
 
 - o que o renderizador precisa do SDK sai de classes e ganchos que o SDK já
   expõe (a thread do command processor é a do SDK; o loop dela é nosso);
 - as exportações do kernel que o reNut troca (ex.: `VdSwap`) são renomeadas na
-  compilação do código do jogo (`kernel_overrides.*`), sem tocar no SDK;
+  compilação do código do jogo (`guest/kernel_overrides.*`), sem tocar no SDK;
 - o que o Plume não expõe (estado dinâmico de stencil/blend, formatos de vértice
   convertidos, cache de pipelines em disco) é feito numa camada Vulkan nossa,
   que troca os ponteiros de função do volk depois que o Plume cria a instância
-  (`plume_renderer.cpp`).
+  (`plume/plume_renderer.cpp`).
 
 Estado (13/10/2026): compila, inicia, mostra a logo da Rare e a tela-título e
 roda a ~30 FPS numa RTX 3060 por minutos sem cair. Não foi jogado além do menu,
@@ -73,7 +73,7 @@ renut_plume.exe --game "<pasta com default.xex e Bundle>" [--data <pasta>] [--co
 Cerca de uma em cada seis aberturas cai alguns segundos depois: o jogo libera
 blocos de um heap que já não está registrado (todos de uma vez, de duas threads),
 e o `free` do alocador dele entra numa seção crítica nula. `sub_8223FD48` em
-`game_fixes.cpp` descarta esse free (vaza o bloco), o que evita essa queda, mas
+`guest/game_fixes.cpp` descarta esse free (vaza o bloco), o que evita essa queda, mas
 em parte das vezes o jogo cai logo depois por outro motivo (pilha corrompida).
 A causa não foi encontrada; o padrão aponta para uma corrida entre threads do
 jogo ao descarregar uma cena, e não para o FPS liberado.
@@ -84,12 +84,12 @@ jogo ao descarregar uma cena, e não para o FPS liberado.
 | --- | --- | --- |
 | Toolchain | clang do NDK + MSYS2, sem MSVC | `toolchain-ndk-clang.cmake` |
 | SDK | `rexruntime`/`rexgpu-xenos` viram bibliotecas estáticas dentro do `.exe` | `CMakeLists.txt` (`renut_static_copy`) |
-| Janela | HWND Win32 passado ao Plume | `main_windows.cpp`, `plume_renderer.*` |
-| Carregador Vulkan | `vulkan-1.dll` | `platform_windows.cpp` |
-| Memória do guest | a vista `0xE0000000` fica 0x1000 acima; `GuestPtr()` aplica o deslocamento nas leituras diretas | `android/rexglue/guest_address.h` |
-| Página zero | `protect_zero=false` (o jogo lê campos de ponteiros nulos) | `main_windows.cpp` |
-| Ponteiros inválidos no device | `GuestCommitted()` antes de desreferenciar streams/superfícies/índices | `native_d3d.cpp` |
-| Canário de pilha | valor constante; o do libssp mudava sob uma thread que o SDK inicia em construtor estático ("stack smashing detected") | `platform_windows.cpp` |
+| Janela | HWND Win32 passado ao Plume | `platform/windows/main_windows.cpp`, `plume/plume_renderer.*` |
+| Carregador Vulkan | `vulkan-1.dll` | `platform/windows/platform_windows.cpp` |
+| Memória do guest | a vista `0xE0000000` fica 0x1000 acima; `GuestPtr()` aplica o deslocamento nas leituras diretas | `src/guest/guest_address.h` |
+| Página zero | `protect_zero=false` (o jogo lê campos de ponteiros nulos) | `platform/windows/main_windows.cpp` |
+| Ponteiros inválidos no device | `GuestCommitted()` antes de desreferenciar streams/superfícies/índices | `d3d/native_d3d.cpp` |
+| Canário de pilha | valor constante; o do libssp mudava sob uma thread que o SDK inicia em construtor estático ("stack smashing detected") | `platform/windows/platform_windows.cpp` |
 
 ## Armadilhas já resolvidas
 

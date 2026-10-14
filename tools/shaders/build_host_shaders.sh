@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Compiles the renderer's own shaders (android/rexglue/shaders/*) to SPIR-V and
+# Compiles the renderer's own shaders (src/plume/shaders/*) to SPIR-V and
 # writes them as C arrays next to the sources. Needs glslangValidator (WSL:
 # apt install glslang-tools). The outputs are committed, so the Android build
 # does not need glslang.
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")/../../android/rexglue/shaders" && pwd)"
+DIR="$(cd "$(dirname "$0")/../../src/plume/shaders" && pwd)"
 for src in "$DIR"/*.geom "$DIR"/*.frag "$DIR"/*.vert "$DIR"/*.comp; do
     # Built in four variants below.
     [[ "$(basename "$src")" == native_view.vert || "$(basename "$src")" == native_surface.frag ]] && continue
