@@ -43,8 +43,11 @@ uint32_t LoadBE32(const uint8_t* p) {
 extern "C" void renut_imp_VdSwap(PPCContext& __restrict ctx, uint8_t* base) {
   const uint32_t buffer_address = ctx.r3.u32;
   const uint32_t fetch_address = ctx.r4.u32;
-  const uint32_t width_address = ctx.r11.u32;
-  const uint32_t height_address = ctx.r12.u32;
+  // The ninth and tenth arguments are on the stack (r1 + 0x54 and + 0x5C, the
+  // ABI the SDK's own argument translator reads): they are not r11 and r12,
+  // which are scratch at the call and held a pointer into the device.
+  const uint32_t width_address = LoadBE32(renut::GuestPtr(base, ctx.r1.u32 + 0x54));
+  const uint32_t height_address = LoadBE32(renut::GuestPtr(base, ctx.r1.u32 + 0x5C));
   if (buffer_address && fetch_address && width_address && height_address) {
     // The texture header's fetch constant holds the virtual address of the
     // frontbuffer, shifted right 12 (dword 1, bits 12 and up).
