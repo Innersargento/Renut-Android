@@ -273,7 +273,5 @@ conversor de shaders é compilado (padrão `~/.cache/renut-xenosrecomp`).
   `default.xex`; os bundles do jogo (inclusive os `.xctd`, descomprimidos por
   `tools/shaders/xctd_decompress.c`) trazem o resto. O conversor
   (reNut-XenosRecomp + `tools/shaders/renut-xenosrecomp.patch`) produz SPIR-V.
-- **Scripts anteriores:** `tools/bootstrap-*.ps1`, `tools/generate-android.ps1` e
-  `tools/fix-android-codegen.ps1` fazem partes do mesmo trabalho só no Windows;
-  `prepare.py` os substitui. A investigação dos shaders está em
-  `docs/SHADERS-PLUME.md`.
+- **Scripts anteriores:** os `bootstrap-*.ps1`, `generate-android.ps1` e
+  `fix-android-codegen.ps1` (só Windows) foram substituídos por `prepare.py`.

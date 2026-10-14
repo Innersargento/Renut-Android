@@ -51,7 +51,7 @@ src/
 | `plume_gpu.{h,cpp}` | Sistema gráfico: lê o PM4 do jogo e executa cada draw, resolve e swap com Plume e os shaders recompilados offline |
 | `plume_renderer.{h,cpp}` | Dono da janela/swapchain via Plume; alimentado pela camada D3D; camada Vulkan própria (estado dinâmico, cache de pipelines) |
 | `plume_textures.{h,cpp}` | Decodifica no CPU as texturas do jogo (destile, byte swap, RGBA8) |
-| `spirv_*.h`, `xenos_ucode_key.h`, `shader_cache.h`, `shader_cache_blob.S` | Transformações de SPIR-V, chave do microcódigo, cache de shaders embutido |
+| `spirv_rewrites.h`, `xenos_ucode_key.h`, `shader_cache.h`, `shader_cache_blob.S` | Transformações de SPIR-V, chave do microcódigo, cache de shaders embutido |
 | `shaders/` | Shaders próprios do renderizador (`.vert/.frag/.comp/.geom` e o `.inc` com o SPIR-V; regerados por `tools/shaders/build_host_shaders.sh`) |
 
 ## Onde ficam os scripts de build

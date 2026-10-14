@@ -11,7 +11,7 @@ Originally created with <a href="https://github.com/rexglue/rexglue-sdk">Rexglue
 
 **Building for Android (Windows or Linux):** see [docs/BUILD.md](docs/BUILD.md) (`python tools/prepare.py all --game <your ISO>`, then Android Studio).
 
-Android development: see [the Android prototype](android/README.md) for the ARM64 importer, RexGlue runtime, locally recompiled game code, Xenos/Vulkan backend and Plume diagnostics. The European executable now starts and renders opening images; the menu and gameplay are **not yet validated**. Resume from [the development handoff](docs/RETOMADA-2026-09-13.md). Existing desktop instructions below remain separate.
+**Layout:** the code reNut writes is in [src/](src/README.md) and is shared by the Windows build ([windows/](windows/README.md), the PC build with the Plume renderer) and the Android build ([android/](android/README.md)). Existing desktop instructions below remain separate.
 
 
 

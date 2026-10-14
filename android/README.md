@@ -1,8 +1,6 @@
 # Renut Android — runtime ARM64 e apresentação Plume
 
-APK de desenvolvimento ARM64 com importação local, identificação do XEX europeu, runtime RexGlue 0.10.0, código do jogo recompilado, backend Xenos/Vulkan, teste Plume e integração opcional com adrenotools. **Já inicia o executável e renderiza imagens reais da abertura; menu e jogabilidade ainda não foram confirmados.** O build local contém código máquina derivado do XEX; não empacota a ISO, o XEX nem os assets. Código gerado e binários permanecem fora do Git.
-
-Estado de retomada: [RETOMADA-2026-09-13.md](../docs/RETOMADA-2026-09-13.md).
+APK de desenvolvimento ARM64 com importação local, identificação do XEX europeu, runtime RexGlue 0.10.0, código do jogo recompilado, backend Xenos/Vulkan, teste Plume e integração opcional com adrenotools. O jogo recompilado roda com o renderizador nativo Plume. O build local contém código máquina derivado do XEX; não empacota a ISO, o XEX nem os assets. Código gerado e binários permanecem fora do Git.
 
 ## Compilar no Windows
 
@@ -11,10 +9,7 @@ Instalar JDK 17 ou 21, SDK Android plataforma 35, NDK 29.0.14206865 e CMake Andr
 Na raiz do repositório:
 
 ```powershell
-./tools/bootstrap-android.ps1
-./tools/bootstrap-rexglue.ps1
-# Coloque o default.xex europeu em assets/default.xex.
-./tools/generate-android.ps1
+python tools/prepare.py all --game <seu jogo>   # dependências, código gerado e shaders (docs/BUILD.md)
 # Crie android/local.properties com sdk.dir apontando para seu SDK.
 ./tools/build-android.ps1 -JavaHome 'C:/Program Files/Java/jdk-17'
 ```
@@ -60,11 +55,11 @@ O APK é um projeto Android separado e preserva o build desktop. `renut_android_
 
 SDK fixado em `f5337cdc947ff6d4c4196737e2c807a48f2a1fc2` (0.10.0), gerador Windows oficial com SHA-256 verificado. O C++ gerado em `generated/android` é compilado pelo NDK para `librenut_runtime.so`; `librexruntime.so` reúne core, filesystem, system, kernel, UI sem backends desktop, entrada e áudio/XMA. A ligação usa a verificação de símbolos indefinidos do NDK, sem imports do jogo substituídos por funções vazias.
 
-`android/native/CMakeLists.txt` reutiliza as listas de fontes do SDK fixado. `android-platform.patch` adapta chrono/libc++, ucontext, mutexes Bionic e janela nativa Android. `libucontext` está fixado em `49e671dd52ff6791295d8161ad3b6da7dc5f6f9d`; os offsets da ABI são conferidos por static_assert e o teste faz suspensão/retomada de uma fiber. Arquivos importados usam armazenamento privado; a ponte de ContentResolver também implementa o acesso a content URIs do runtime.
+`android/native/CMakeLists.txt` reutiliza as listas de fontes do SDK fixado. Os `shims/` de `src/platform/android/` adaptam chrono/libc++, ucontext e o que o core do SDK assume da glibc; a janela é a `GameWindow` de `android_game_window.h`. O SDK não é alterado. `libucontext` está fixado em `49e671dd52ff6791295d8161ad3b6da7dc5f6f9d`; os offsets da ABI são conferidos por static_assert e o teste faz suspensão/retomada de uma fiber. Arquivos importados usam armazenamento privado; a ponte de ContentResolver também implementa o acesso a content URIs do runtime.
 
 As classes Java da SDL vêm do mesmo submódulo fixado, com inicialização explícita antes do RexGlue. A biblioteca JNI do reNut define seu próprio `JNI_OnLoad`. O teste no aparelho detectou e permitiu corrigir a ausência dessas classes e a diferença de aliases `/data/user/0` versus `/data/data`. A ponte content URI está compilada, mas o teste de XEX exercitou arquivos privados, não essa ponte.
 
-O gerador 0.10.0 emite um desvio não resolvido em `0x82C79F68` para um rótulo existente na mesma função (`0x82C79EE4`). `fix-android-codegen.ps1` verifica a função e o rótulo antes de substituir somente esse erro por um salto interno. Falha se encontrar outros desvios não resolvidos. O aviso de tamanho da função `0x82D37708` significa que a unidade gerada excede o tamanho de divisão configurado; não é erro de compilação.
+O gerador 0.10.0 emite um desvio não resolvido em `0x82C79F68` para um rótulo existente na mesma função (`0x82C79EE4`). `tools/prepare.py` verifica a função e o rótulo antes de substituir somente esse erro por um salto interno. Falha se encontrar outros desvios não resolvidos. O aviso de tamanho da função `0x82D37708` significa que a unidade gerada excede o tamanho de divisão configurado; não é erro de compilação.
 
 O compilador produz AArch64 diretamente no Windows; Termux não é necessário para este fluxo. Não existe ainda um fluxo de build Termux validado. O pool de compilação limita quatro tarefas simultâneas; a primeira compilação recompila centenas de unidades C/C++.
 
@@ -72,7 +67,7 @@ O botão de validação somente CPU continua usando o modo de análise do SDK. O
 
 ## Ponte RexGlue → Plume (0.3)
 
-`src/platform/android/plume_graphics.cpp` implementa `IGraphicsSystem`. O patch do SDK acrescenta o ponto opcional `PresentFrontBuffer` e o chama dentro do kernel `VdSwap`, depois da conversão do descritor de textura. Quando o backend consome o quadro, o buffer de comandos recebe NOPs; os demais backends preservam o caminho PM4 anterior.
+`src/platform/android/plume_graphics.cpp` implementa `IGraphicsSystem`. A apresentação do quadro acontece na troca de `VdSwap` (`src/guest/kernel_overrides.cpp`), sem alterar o SDK.
 
 O teste percorre memória física do runtime → ABI real de `VdSwap` → backend Plume → Vulkan → superfície Android. A apresentação aceita RGBA8 linear ou tiled 2D, conversões de endian e swizzle, com validação de formato, dimensões, pitch, limites e acesso à memória. O ajuste de proporção e a conversão de pixels são feitos na CPU, com barras pretas. Trata-se de uma ponte inicial de framebuffer, não de uma implementação de processamento gráfico Xenos.
 

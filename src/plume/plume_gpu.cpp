@@ -13,9 +13,7 @@
 #include "shader_cache.h"
 #include "xenos_ucode_key.h"
 #include "vendor/smolv/smolv.h"
-#include "spirv_depth_only.h"
-#include "spirv_dynamic_bools.h"
-#include "spirv_fetch_spec.h"
+#include "spirv_rewrites.h"
 
 #include <pthread.h>
 #include <thread>
@@ -286,7 +284,7 @@ int NativeModeFromCvars() {
 // Where microcode without a recompiled shader is saved (SetPlumeMissDumpDirectory).
 std::string g_miss_dump_directory;
 bool g_dedupe_descriptors = false;  // files/plume-dedupe-desc (see SetTexture2D)
-bool g_validate_windows = false;    // files/plume-validate (see ValidateKeptWindows)
+bool g_validate_windows = false;    // files/plume-validate (see ValidateRange)
 
 // The game's own VdSwap count, which is what the on-screen counter shows. Plume
 // presents more often than the game swaps, so the two rates have to be read
@@ -472,16 +470,16 @@ std::vector<std::pair<uint32_t, bool>> ReflectInputs(const std::vector<uint32_t>
 struct CompiledShader {
   std::unique_ptr<RenderShader> module;
   // The same module with its live vertex fetch table read from specialization
-  // constants instead of the uniform block (spirv_fetch_spec.h). Only vertex
+  // constants instead of the uniform block (spirv_rewrites.h). Only vertex
   // and domain shaders with live fetches have one.
   std::unique_ptr<RenderShader> fetch_spec_module;
   // The vertex shader's two forms again without its interpolant outputs
-  // (spirv_depth_only.h), for draws that have no fragment shader.
+  // (spirv_rewrites.h), for draws that have no fragment shader.
   std::unique_ptr<RenderShader> depth_module;
   std::unique_ptr<RenderShader> depth_fetch_spec_module;
   std::vector<std::pair<uint32_t, bool>> inputs;  // vertex shaders only
   // Its boolean registers are read from the shared block rather than
-  // specialized on (spirv_dynamic_bools.h), so they stay out of the pipeline.
+  // specialized on (spirv_rewrites.h), so they stay out of the pipeline.
   bool dynamic_bools = false;
   bool failed = false;
 };
@@ -1821,10 +1819,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     uint32_t drops = 0, endian = 0;
     bool valid = false;
   };
-  // Debug (files/plume-validate): at every swap from frame 800, each kept window used in the last two
-  // frames is compared with guest memory; one that differs was missed by the write watch.
-  void ValidateKeptWindows();
-  // The same check at the moment of a draw, on the bytes it is about to read: a kept range that
+  // Debug (files/plume-validate): the check at the moment of a draw, on the bytes it is about to read: a kept range that
   // differs from guest memory while no write hit is pending is one the GPU would read wrong.
   void ValidateRange(const char* what, uint64_t draw_hash, RenderBuffer* buffer, uint64_t offset, uint32_t guest_address,
                      uint32_t size, xenos::Endian endian);
@@ -7767,7 +7762,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     if (value) spec_constants.emplace_back(RENUT_SPEC_BOOLS_BASE + word, value);
   }
   // The live vertex fetch table, if the shader's module has a form that reads
-  // it from specialization constants (spirv_fetch_spec.h): what the table holds
+  // it from specialization constants (spirv_rewrites.h): what the table holds
   // comes from the shader's own vfetch instructions, so it is the same on every
   // draw that uses this shader and adds no pipelines of its own.
   CompiledShader* vertex_compiled = patch_list ? vs->domain_compiled : vs->compiled;
@@ -7960,7 +7955,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   const bool plain_draw = !rect_list && !point_list && !patch_list;
   // A draw with no fragment shader reads none of the vertex shader's outputs
   // but its position, so it can have the form that does not write them
-  // (spirv_depth_only.h).
+  // (spirv_rewrites.h).
   RenderShader* depth_module = nullptr;
   if (depth_strip_mode_ && !ps && plain_draw && vertex_compiled) {
     depth_module = fetch_spec ? vertex_compiled->depth_fetch_spec_module.get() : vertex_compiled->depth_module.get();
@@ -9732,40 +9727,6 @@ void PlumeCommandProcessor::ValidateRange(const char* what, uint64_t draw_hash, 
     ++validate_logged_;
     REXLOG_ERROR("Renut: Plume STALE {} at draw: frame {} vs/ps hash {:016X} guest {:08X}+{:X}: {} bytes differ, first at +{:X}",
                  what, swaps_, draw_hash, guest_address, size, differ, first);
-  }
-}
-
-void PlumeCommandProcessor::ValidateKeptWindows() {
-  DrainWatchHits();
-  uint32_t checked = 0, stale = 0;
-  std::vector<uint8_t> guest;
-  for (auto& [key, kept] : kept_streams_) {
-    if (!kept.valid || !kept.buffer || kept.last_used + 1 < swaps_) continue;
-    guest.resize(kept.size);
-    CopySwapped(guest.data(), memory_->TranslatePhysical<const uint8_t*>(kept.base), kept.size,
-                static_cast<xenos::Endian>(kept.endian));
-    const auto* window = static_cast<const uint8_t*>(kept.buffer->map());
-    if (!window) continue;
-    ++checked;
-    uint32_t differ = 0, first = UINT32_MAX;
-    for (uint32_t i = 0; i < kept.size; ++i) {
-      if (window[i] != guest[i]) {
-        if (first == UINT32_MAX) first = i;
-        ++differ;
-      }
-    }
-    kept.buffer->unmap();
-    if (differ) {
-      ++stale;
-      if (validate_logged_ < 120) {
-        ++validate_logged_;
-        REXLOG_ERROR("Renut: Plume STALE kept window {:08X}+{:X} frame {} (made {}, used {}, dropped {}x): {} of {} bytes differ, first at +{:X}",
-                     kept.base, kept.size, swaps_, kept.made_frame, kept.last_used, kept.drops, differ, kept.size, first);
-      }
-    }
-  }
-  if (stale || swaps_ % 10 == 0) {
-    REXLOG_INFO("Renut: Plume kept windows checked at swap {}: {} used recently, {} stale", swaps_, checked, stale);
   }
 }
 
