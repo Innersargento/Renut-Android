@@ -52,6 +52,10 @@
 #include <rex/system/xmemory.h>
 
 
+REXCVAR_DEFINE_INT32(renut_native_sync_after_swaps, 0, "reNut",
+                     "Native sync starts once the game has swapped this many times; before that the "
+                     "command processor walks the game's segments. 0 (the default) = from the device's "
+                     "first act, so no PM4 is read at all; 3 was the boot walked by the command processor");
 REXCVAR_DEFINE_BOOL(renut_native_sync, true, "reNut",
                     "Native Direct3D lists: they also carry the fences, "
                     "swaps and callbacks, and the command processor no longer walks the game's "
@@ -1611,7 +1615,8 @@ void Swap(PPCContext& ctx) {
 // asks for it, so the command processor need not walk the game's segments.
 
 bool SyncWanted() {
-  return GetMode() == Mode::kNative && REXCVAR_GET(renut_native_sync) && g_front.swaps_seen >= 3 &&
+  return GetMode() == Mode::kNative && REXCVAR_GET(renut_native_sync) &&
+         g_front.swaps_seen >= uint32_t(std::max(0, REXCVAR_GET(renut_native_sync_after_swaps))) &&
          !g_sync_fallback.load(std::memory_order_relaxed);
 }
 
@@ -1625,6 +1630,7 @@ using Effects = std::vector<std::pair<uint32_t, uint32_t>>;
 constexpr uint32_t kEffectInterrupt = 0xFFFFFFFFu;
 constexpr uint32_t kRegCallbackAck = 0x045E, kRegScratch0 = 0x0578, kRegScratch1 = 0x0579,
                    kRegCallbackAddress = 0x057C, kRegCallbackContext = 0x057D, kRegWaitUntil = 0x05C8;
+constexpr uint32_t kRegScratchUmsk = 0x01DC, kRegScratchAddr = 0x01DD;
 
 Effects CallbackEffects(uint32_t flags, uint32_t function, uint32_t context) {
   Effects out;
@@ -1844,6 +1850,13 @@ void CheckWait(PPCContext& ctx, uint8_t* base) {
   if (g_executor_busy.load(std::memory_order_relaxed) > 0 ||
       g_counts.lists_executed.load(std::memory_order_relaxed) <
           g_counts.lists_published.load(std::memory_order_relaxed)) {
+    // A wait that stands still while the executor still owes work: not stuck yet.
+    REXLOG_DEBUG("Renut: native sync: wait kind {} still after 1.5 s, executor busy {}, lists run {} of {} published, "
+                "fence {:X} (issued {:X}), position {:X}",
+                U32(base, blocker + 4), g_executor_busy.load(std::memory_order_relaxed),
+                g_counts.lists_executed.load(std::memory_order_relaxed),
+                g_counts.lists_published.load(std::memory_order_relaxed), done, U32(base, dev + 10908) - 2,
+                U32(base, block + 4));
     wait.since = now;
     return;
   }
@@ -1934,7 +1947,32 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
   }
 }
 
-void OnLeave(uint32_t, uint32_t, PPCContext&, uint8_t*) {}
+// D3DDevice_SetRingBufferParameters(device, ...) (sub_82657508), the device's first act: it
+// writes the first segment, whose type-0 packets set up the command processor. The one the CPU
+// depends on is the scratch register writeback: SCRATCH_ADDR names the block (device + 10900,
+// which SynchronizeToPresentationInterval waits on at +4) and SCRATCH_UMSK (0x20037) which
+// registers are written back to it. Every later scratch write the lists carry (callbacks, the
+// present interval) lands where this says, so it is a record of its own, ahead of the first
+// doorbell, whether or not that segment is walked.
+void RingBufferParameters(PPCContext& ctx, uint32_t dev, uint8_t* base) {
+  if (ctx.r3.u32 != 0 || !dev) return;  // not S_OK
+  const uint32_t block = U32(base, dev + 10900);
+  if (!block) return;
+  std::lock_guard lock(g_front.mutex);
+  PushEffects(Current(dev), {{kRegScratchAddr, Phys(block)}, {kRegScratchUmsk, 0x00020037u}});
+  // The only device that sets a ring up is the one that draws and swaps, so from here its
+  // doorbells are the main ones; and the lists carry their sync records from the first doorbell
+  // when the boot is native (renut_native_sync_after_swaps = 0).
+  if (!g_front.main_device) g_front.main_device = dev;
+  if (!g_front.sync_recording && SyncWanted()) {
+    g_front.sync_recording = true;
+    REXLOG_INFO("Renut: native sync on from the device's first act (swap {})", g_front.swaps_seen);
+  }
+}
+
+void OnLeave(uint32_t function, uint32_t r3, PPCContext& ctx, uint8_t* base) {
+  if (function == renut::d3d::kD3DDevice_SetRingBufferParameters) RingBufferParameters(ctx, r3, base);
+}
 
 void TakePublished(std::vector<std::shared_ptr<const List>>& out) {
   std::lock_guard lock(g_front.published_mutex);

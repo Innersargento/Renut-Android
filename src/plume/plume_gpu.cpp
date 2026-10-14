@@ -1582,6 +1582,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint32_t resolve_vertices_ = 0;
   uint32_t ExecuteRing(uint32_t read_index, uint32_t write_index);
   bool ExecuteRingPacket(rex::memory::RingBuffer* reader);
+  // One segment (an indirect buffer), packet by packet, so that each is counted as it is read.
+  void WalkSegment(uint32_t cpu_ptr, uint32_t count, uint32_t depth);
   bool segment_found_ = false;
   std::unordered_map<uint32_t, bool> segment_sync_;
   bool native_presenting_ = false;
@@ -3544,12 +3546,41 @@ bool PlumeCommandProcessor::ExecuteRingPacket(rex::memory::RingBuffer* reader) {
       const uint32_t list_ptr = reader->ReadAndSwap<uint32_t>();
       const uint32_t list_length = reader->ReadAndSwap<uint32_t>() & 0xFFFFF;
       if (OnIndirectBuffer(list_ptr, list_length, true)) return true;
-      ExecuteIndirectBuffer(xenos::GpuToCpu(list_ptr), list_length);
+      WalkSegment(xenos::GpuToCpu(list_ptr), list_length, 1);
       return true;
     }
   }
   reader->set_read_offset(at);
   return ExecutePacket(reader);
+}
+
+void PlumeCommandProcessor::WalkSegment(uint32_t cpu_ptr, uint32_t count, uint32_t depth) {
+  rex::memory::RingBuffer reader(memory_->TranslatePhysical(cpu_ptr), count * sizeof(uint32_t));
+  reader.set_write_offset(count * sizeof(uint32_t));
+  const uint32_t saved_address = census_packet_address_;
+  do {
+    const auto at = reader.read_offset();
+    census_packet_address_ =
+        uint32_t(reader.read_ptr() - uintptr_t(memory_->physical_membase()));
+    const uint32_t header = reader.ReadAndSwap<uint32_t>();
+    OnPacketCensus(header, depth);
+    if ((header >> 30) == 3 && !(header & 1)) {
+      const uint32_t opcode = (header >> 8) & 0x7F;
+      if ((opcode == xenos::PM4_INDIRECT_BUFFER || opcode == xenos::PM4_INDIRECT_BUFFER_PFD) &&
+          ((header >> 16) & 0x3FFF) == 1 && reader.read_count() >= 2 * sizeof(uint32_t)) {
+        const uint32_t list_ptr = reader.ReadAndSwap<uint32_t>();
+        const uint32_t list_length = reader.ReadAndSwap<uint32_t>() & 0xFFFFF;
+        WalkSegment(xenos::GpuToCpu(list_ptr), list_length, depth + 1);
+        continue;
+      }
+    }
+    reader.set_read_offset(at);
+    if (!ExecutePacket(&reader)) {
+      REXLOG_ERROR("Renut: indirect buffer: failed to execute a packet");
+      break;
+    }
+  } while (reader.read_count());
+  census_packet_address_ = saved_address;
 }
 
 void PlumeCommandProcessor::ShutdownContext() {
