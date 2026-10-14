@@ -144,7 +144,7 @@ add_executable(renut_plume_exe
     $<TARGET_OBJECTS:renut_guest>)
 set_target_properties(renut_plume_exe PROPERTIES OUTPUT_NAME renut_plume)
 target_include_directories(renut_plume_exe PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
-    "${RENUT_SRC}")
+    "${RENUT_SRC}" "${RENUT_SRC}/plume")
 target_compile_definitions(renut_plume_exe PRIVATE ${RENUT_COMMON_DEFINITIONS})
 target_compile_options(renut_plume_exe PRIVATE ${RENUT_COMMON_OPTIONS} -ferror-limit=0)
 target_link_libraries(renut_plume_exe PRIVATE renut_rexruntime renut_rexgpu renut_plume xxhash)

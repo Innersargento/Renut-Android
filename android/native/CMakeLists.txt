@@ -194,8 +194,9 @@ set(RENUT_RUNTIME_SOURCES
 list(TRANSFORM RENUT_RUNTIME_SOURCES PREPEND "${RENUT_SRC}/")
 add_library(renut_runtime SHARED ${RENUT_RUNTIME_SOURCES}
     "${RENUT_SHADERS}/shader_cache.cpp" $<TARGET_OBJECTS:renut_guest>)
+# generated/shaders/shader_cache.cpp includes "shader_cache.h" by bare name.
 target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
-    "${RENUT_SRC}")
+    "${RENUT_SRC}" "${RENUT_SRC}/plume")
 target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume adrenotools
     xxHash::xxhash android log dl aaudio)
 # Every call between recompiled guest functions, and to the __savegprlr/
