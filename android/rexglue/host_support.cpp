@@ -4,8 +4,14 @@
 #include <condition_variable>
 #include <mutex>
 
+#include <algorithm>
+#if defined(__ANDROID__) || defined(__linux__)
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #include <rex/chrono/clock.h>
 #include <rex/memory/utils.h>
@@ -14,6 +20,9 @@
 
 namespace renut {
 namespace {
+#if !defined(__ANDROID__) && !defined(__linux__)
+inline int gettid() { return 0; }
+#endif
 std::atomic<bool> g_paused{false};
 std::mutex g_mutex;
 std::condition_variable g_resumed;
@@ -39,6 +48,71 @@ void WaitIfTitlePaused() {
   g_resumed.wait(lock, [&] {
     return !g_paused.load(std::memory_order_acquire) || (kernel && kernel->is_terminating_title());
   });
+}
+
+namespace {
+constexpr uint32_t kWatchSlots = 4;
+std::atomic<uint32_t> g_watched[kWatchSlots];
+std::atomic<void (*)(int)> g_signaler_callback{nullptr};
+thread_local bool tls_signaler_told = false;
+}  // namespace
+
+bool WatchSignalObject(uint32_t slot, uint32_t guest_address) {
+  if (slot >= kWatchSlots) return false;
+  return g_watched[slot].exchange(guest_address, std::memory_order_relaxed) != guest_address;
+}
+
+bool AnyWatched() {
+  for (uint32_t i = 0; i < kWatchSlots; ++i) {
+    if (g_watched[i].load(std::memory_order_relaxed)) return true;
+  }
+  return false;
+}
+
+void SetSignalerCallback(void (*callback)(int tid)) { g_signaler_callback.store(callback); }
+
+void NoteSignal(uint32_t guest_address) {
+  if (tls_signaler_told) return;
+  for (uint32_t i = 0; i < kWatchSlots; ++i) {
+    if (g_watched[i].load(std::memory_order_relaxed) == guest_address && guest_address) {
+      tls_signaler_told = true;
+      if (auto callback = g_signaler_callback.load()) callback(static_cast<int>(gettid()));
+      return;
+    }
+  }
+}
+
+namespace {
+thread_local bool tls_wait_probe = false;
+std::mutex g_probe_mutex;
+std::vector<WaitProbeEntry> g_probe;
+}  // namespace
+
+void MarkWaitProbeThread() { tls_wait_probe = true; }
+bool IsWaitProbeThread() { return tls_wait_probe; }
+
+void NoteProbedWait(uint32_t what, uint32_t object, uint32_t caller, uint64_t nanoseconds) {
+  std::lock_guard<std::mutex> lock(g_probe_mutex);
+  for (WaitProbeEntry& entry : g_probe) {
+    if (entry.what == what && entry.object == object && entry.caller == caller) {
+      ++entry.count;
+      entry.nanoseconds += nanoseconds;
+      return;
+    }
+  }
+  if (g_probe.size() < 64) g_probe.push_back({what, object, caller, 1, nanoseconds});
+}
+
+void TakeWaitProbe(WaitProbeEntry* out, size_t limit, size_t* count) {
+  std::vector<WaitProbeEntry> taken;
+  {
+    std::lock_guard<std::mutex> lock(g_probe_mutex);
+    taken.swap(g_probe);
+  }
+  std::sort(taken.begin(), taken.end(),
+            [](const WaitProbeEntry& a, const WaitProbeEntry& b) { return a.nanoseconds > b.nanoseconds; });
+  *count = std::min(limit, taken.size());
+  for (size_t i = 0; i < *count; ++i) out[i] = taken[i];
 }
 
 namespace {

@@ -23,6 +23,7 @@
 #include <arm_neon.h>
 #include <dirent.h>
 #include <linux/futex.h>
+#include <sched.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -91,6 +92,68 @@ void RaiseThread(const char* what, pid_t tid) {
   }
 }
 
+// The title's mixer costs 4-6 ms of CPU for every 5.33 ms frame it has to make:
+// nearly all of a core, so whether it lands on a slow core decides whether the
+// output keeps up. The scheduler places a thread that sleeps most of the time on
+// the efficiency cores, where the same work takes half again as long. Pin the
+// audio threads to the cores whose top frequency is within 70% of the fastest.
+void PinToFastCores(const char* what, pid_t tid) {
+  uint32_t top[CPU_SETSIZE] = {};
+  uint32_t fastest = 0;
+  int cores = 0;
+  for (int cpu = 0; cpu < 32; ++cpu) {
+    char path[96];
+    std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+    FILE* file = std::fopen(path, "r");
+    if (!file) break;
+    unsigned value = 0;
+    if (std::fscanf(file, "%u", &value) == 1) top[cpu] = value;
+    std::fclose(file);
+    fastest = std::max(fastest, top[cpu]);
+    cores = cpu + 1;
+  }
+  if (!fastest) return;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  int chosen = 0;
+  for (int cpu = 0; cpu < cores; ++cpu) {
+    if (top[cpu] >= fastest * 7 / 10) {
+      CPU_SET(cpu, &set);
+      ++chosen;
+    }
+  }
+  if (chosen < 2 || chosen == cores) return;
+  if (sched_setaffinity(tid, sizeof set, &set) == 0) {
+    RENUT_AUDIO_LOG(INFO, "thread '%s' (tid %d) kept on the %d of %d cores at 70%% of the top frequency or more", what,
+                    tid, chosen, cores);
+  } else {
+    RENUT_AUDIO_LOG(WARN, "could not pin thread '%s': errno %d", what, errno);
+  }
+}
+
+// The thread that mixes: the one that signals what the render callback waits on
+// (host_support.h). Called from that thread, on its first signal; it is at
+// normal priority among the loading threads, and the callback's budget is its.
+void MixerFound(int tid) {
+  const std::string name = [&] {
+    char path[64];
+    std::snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
+    FILE* file = std::fopen(path, "r");
+    char comm[32] = {};
+    if (file) {
+      std::fgets(comm, sizeof comm, file);
+      std::fclose(file);
+    }
+    std::string text(comm);
+    while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) text.pop_back();
+    return text;
+  }();
+  RENUT_AUDIO_LOG(INFO, "the mixer is guest thread '%s' (tid %d): priority raised, kept on the fast cores",
+                  name.c_str(), tid);
+  RaiseThread(name.c_str(), tid);
+  PinToFastCores(name.c_str(), tid);
+}
+
 // The XMA decoder's thread belongs to the SDK; find it by the name it gave
 // itself and raise it from outside.
 bool RaiseThreadNamed(const char* name) {
@@ -112,6 +175,7 @@ bool RaiseThreadNamed(const char* name) {
     // The kernel keeps the first 15 characters of a thread's name ('XMA Decoder (F8').
     if (text.compare(0, std::strlen(name), name) == 0) {
       RaiseThread(name, tid);
+      PinToFastCores(name, tid);
       found = true;
     }
   }
@@ -193,9 +257,11 @@ class AAudioDriver final : public rex::audio::AudioDriver {
     }
     burst_ = std::max<int32_t>(AAudioStream_getFramesPerBurst(stream_), 1);
     capacity_ = AAudioStream_getBufferCapacityInFrames(stream_);
-    // Two bursts: the smallest buffer that keeps the device fed. Grown by a
-    // burst, from the worker, whenever the device reports an underrun.
-    buffer_frames_ = std::min<int32_t>(capacity_, burst_ * 2);
+    // Four bursts (8 ms at a burst of 96): small next to the queue the title
+    // keeps ahead, and enough that the device's own thread running late during
+    // a load does not leave it with nothing to read (that is a click). Grown by
+    // a burst, from the worker, whenever the device reports an underrun.
+    buffer_frames_ = std::min<int32_t>(capacity_, burst_ * 4);
     const int32_t granted = AAudioStream_setBufferSizeInFrames(stream_, buffer_frames_);
     if (granted > 0) buffer_frames_ = granted;
     last_xruns_ = 0;
@@ -255,6 +321,10 @@ class AAudioDriver final : public rex::audio::AudioDriver {
     }
   }
 
+  // Starvation episodes since the last call: the title's mixer did not hand over
+  // a frame in time. The worker answers them with a deeper queue.
+  uint32_t TakeUnderruns() { return underrun_events_.exchange(0, std::memory_order_relaxed); }
+
   // The title's mixer thread, under the system's lock (one producer at a time).
   void SubmitFrame(uint32_t samples_ptr) override {
     const uint32_t head = head_.load(std::memory_order_relaxed);
@@ -288,6 +358,11 @@ class AAudioDriver final : public rex::audio::AudioDriver {
   uint32_t read_pos_ = 0;                      // samples already played of slot `tail_` (callback only)
   std::atomic<uint32_t> dropped_{0};
   std::atomic<bool> got_frame_{false};
+  std::atomic<uint32_t> underrun_events_{0};
+  // The callback's own: the last stereo sample played, and whether the output is
+  // between a starvation and the first frame after it (see Render).
+  float last_left_ = 0.0f, last_right_ = 0.0f;
+  bool starved_ = false;
   std::atomic<bool> disconnected_{false};
 
   AAudioStream* stream_ = nullptr;
@@ -303,6 +378,11 @@ struct Slot {
   std::unique_ptr<AAudioDriver> driver;
   bool callback_running = false;               // worker is inside the title's callback
   std::atomic<uint32_t> credits{0};            // frames the title may still produce
+  // The worker's own: how far ahead of the device the title is allowed to run
+  // (credits at rest). It deepens when the output starves and settles back
+  // when it has not for a while, by letting returned credits go unissued.
+  uint32_t depth = 0, base_depth = 0, debt = 0;
+  std::chrono::steady_clock::time_point last_starved{};
 };
 
 class RenutAudioSystem final : public rex::audio::AudioSystem {
@@ -391,6 +471,9 @@ class RenutAudioSystem final : public rex::audio::AudioSystem {
     slot.wrapped_arg = wrapped;
     slot.driver = std::move(driver);
     slot.credits.store(queued_frames_, std::memory_order_release);
+    slot.depth = slot.base_depth = queued_frames_;
+    slot.debt = 0;
+    slot.last_starved = std::chrono::steady_clock::now();
     slot.state = Slot::State::kLive;
     rex::memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(driver_ptr),
                                           kHandleTag | static_cast<uint32_t>(index));
@@ -466,6 +549,27 @@ class RenutAudioSystem final : public rex::audio::AudioSystem {
   void DestroyDriver(rex::audio::AudioDriver* driver) override { delete driver; }
 
  private:
+  // Worker only, with the lock held. A starved output earns the title four more
+  // frames of lead (up to 40, 213 ms), at once; a second of calm per frame takes
+  // them back, so a loading screen is buffered deep and the game itself is not.
+  void AdaptDepth(Slot& slot) {
+    constexpr uint32_t kStep = 4, kMaxDepth = 40;
+    const auto now = std::chrono::steady_clock::now();
+    if (slot.driver->TakeUnderruns()) {
+      slot.last_starved = now;
+      const uint32_t grown = std::min(slot.depth + kStep, kMaxDepth);
+      slot.credits.fetch_add(grown - slot.depth, std::memory_order_acq_rel);
+      slot.depth = grown;
+      slot.debt = 0;
+    } else if (slot.depth > slot.base_depth && now - slot.last_starved >= std::chrono::seconds(1)) {
+      slot.last_starved = now;
+      --slot.depth;
+      ++slot.debt;
+    }
+    // A credit the title is no longer owed: take it back instead of issuing it.
+    while (slot.debt && TakeCredit(slot)) --slot.debt;
+  }
+
   bool TakeCredit(Slot& slot) {
     uint32_t credits = slot.credits.load(std::memory_order_acquire);
     while (credits) {
@@ -475,12 +579,18 @@ class RenutAudioSystem final : public rex::audio::AudioSystem {
   }
 
   void WorkerMain() {
+    renut::MarkWaitProbeThread();
+    renut::SetSignalerCallback(&MixerFound);
     RaiseThread("Audio Worker", gettid());
+    PinToFastCores("Audio Worker", gettid());
     bool xma_raised = RaiseThreadNamed("XMA Decoder");
     uint32_t tune_countdown = 0;
     auto last_report = std::chrono::steady_clock::now();
     uint64_t reported_silent = 0;
     uint32_t xma_retries = 0;
+    uint64_t callbacks = 0;
+    double callback_ms = 0.0, callback_max = 0.0, callback_cpu_ms = 0.0;
+    int last_cpu = -1;
     while (worker_running_) {
       const uint32_t seen = wake_.load(std::memory_order_acquire);
       bool did_work = false;
@@ -491,13 +601,29 @@ class RenutAudioSystem final : public rex::audio::AudioSystem {
           std::lock_guard<std::mutex> lock(mutex_);
           if (slot.state != Slot::State::kLive) continue;
           if (slot.driver->NeedsReopen()) slot.driver->Reopen();
+          AdaptDepth(slot);
           if (!TakeCredit(slot)) continue;
           callback = slot.callback;
           argument = slot.wrapped_arg;
           slot.callback_running = true;
         }
         uint64_t args[] = {argument};
+        const auto started = std::chrono::steady_clock::now();
+        timespec cpu_before{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_before);
         function_dispatcher_->Execute(worker_thread_->thread_state(), callback, args, std::size(args));
+        {
+          const double ms =
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+          timespec cpu_after{};
+          clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_after);
+          callback_cpu_ms += double(cpu_after.tv_sec - cpu_before.tv_sec) * 1e3 +
+                             double(cpu_after.tv_nsec - cpu_before.tv_nsec) / 1e6;
+          last_cpu = sched_getcpu();
+          ++callbacks;
+          callback_ms += ms;
+          callback_max = std::max(callback_max, ms);
+        }
         {
           std::lock_guard<std::mutex> lock(mutex_);
           slot.callback_running = false;
@@ -525,7 +651,7 @@ class RenutAudioSystem final : public rex::audio::AudioSystem {
         continue;
       }
 
-      if (++tune_countdown >= 64) {
+      if (++tune_countdown >= 8) {
         tune_countdown = 0;
         {
           std::lock_guard<std::mutex> lock(mutex_);
@@ -537,12 +663,40 @@ class RenutAudioSystem final : public rex::audio::AudioSystem {
         if (now - last_report >= std::chrono::seconds(5)) {
           last_report = now;
           const uint64_t total = g_silent_frames.load(std::memory_order_relaxed);
+          // What the worker waited on in these seconds: always taken, so that
+          // the window is these five seconds; printed only when they had silence,
+          // which is when it is wanted.
+          renut::WaitProbeEntry waits[4];
+          size_t wait_count = 0;
+          renut::TakeWaitProbe(waits, 4, &wait_count);
           if (total != reported_silent) {
-            RENUT_AUDIO_LOG(INFO, "%llu frames of silence in the last 5 s (%llu in all)",
+            uint32_t depth = 0;
+            for (Slot& slot : slots_) depth = std::max(depth, slot.depth);
+            RENUT_AUDIO_LOG(INFO,
+                            "%llu frames of silence in the last 5 s (%llu in all); %llu title callbacks, "
+                            "mean %.2f ms (cpu %.2f ms), max %.1f ms, on cpu %d; queue %u frames",
                             static_cast<unsigned long long>(total - reported_silent),
-                            static_cast<unsigned long long>(total));
+                            static_cast<unsigned long long>(total), static_cast<unsigned long long>(callbacks),
+                            callbacks ? callback_ms / double(callbacks) : 0.0,
+                            callbacks ? callback_cpu_ms / double(callbacks) : 0.0, callback_max, last_cpu, depth);
             reported_silent = total;
+            static const char* kKinds[] = {"?", "delay", "yield", "wait", "waitex", "waitmulti", "waitmultiex",
+                                           "signalwait"};
+            for (size_t i = 0; i < wait_count; ++i) {
+              if (waits[i].what >= 20) {
+                // A dispatcher header's type, noted when an address first showed up.
+                RENUT_AUDIO_LOG(INFO, "  waits on %08X: kernel object type %u (slot %u)", waits[i].object,
+                                waits[i].what - 20, waits[i].caller);
+                continue;
+              }
+              RENUT_AUDIO_LOG(INFO, "  worker wait: %s (%u objects) from %08X: %llu times, %.2f ms each",
+                              kKinds[waits[i].what < 8 ? waits[i].what : 0], waits[i].object, waits[i].caller,
+                              static_cast<unsigned long long>(waits[i].count),
+                              double(waits[i].nanoseconds) / double(waits[i].count) / 1e6);
+            }
           }
+          callbacks = 0;
+          callback_ms = callback_max = callback_cpu_ms = 0.0;
         }
       }
       if (!xma_raised && ++xma_retries % 256 == 0 && xma_retries <= 1024) xma_raised = RaiseThreadNamed("XMA Decoder");
@@ -572,6 +726,10 @@ void AAudioDriver::ErrorCallback(AAudioStream*, void* user, aaudio_result_t erro
 }
 
 void AAudioDriver::Render(float* out, int32_t frames) {
+  // A gap in the stream is a click wherever the signal is not already zero, so
+  // the edges of a gap are ramps: the output fades out from the last sample it
+  // played, and fades back in when frames return.
+  constexpr int32_t kRamp = 48;  // 1 ms
   int32_t done = 0;
   uint32_t finished = 0;
   uint32_t tail = tail_.load(std::memory_order_relaxed);
@@ -580,6 +738,15 @@ void AAudioDriver::Render(float* out, int32_t frames) {
     const float* slot = ring_.get() + (tail & (kRingFrames - 1)) * kFrameSamples * kOutChannels;
     const int32_t n = std::min<int32_t>(frames - done, kFrameSamples - read_pos_);
     std::memcpy(out + done * kOutChannels, slot + read_pos_ * kOutChannels, n * kOutChannels * sizeof(float));
+    if (starved_ && done == 0) {
+      const int32_t ramp = std::min(n, kRamp);
+      for (int32_t i = 0; i < ramp; ++i) {
+        const float gain = float(i + 1) / float(ramp + 1);
+        out[i * 2] *= gain;
+        out[i * 2 + 1] *= gain;
+      }
+      starved_ = false;
+    }
     done += n;
     read_pos_ += n;
     if (read_pos_ == kFrameSamples) {
@@ -589,9 +756,28 @@ void AAudioDriver::Render(float* out, int32_t frames) {
       tail_.store(tail, std::memory_order_release);  // the producer may reuse that slot now
     }
   }
+  if (done > 0) {
+    last_left_ = out[(done - 1) * 2];
+    last_right_ = out[(done - 1) * 2 + 1];
+  }
   if (done < frames) {
-    std::memset(out + done * kOutChannels, 0, (frames - done) * kOutChannels * sizeof(float));
-    // Silence before the title has sent anything is just the start of a stream.
+    int32_t at = done;
+    if (!starved_) {
+      starved_ = true;
+      const int32_t fade = std::min(frames - at, kRamp);
+      for (int32_t i = 0; i < fade; ++i) {
+        const float gain = 1.0f - float(i + 1) / float(fade + 1);
+        out[(at + i) * 2] = last_left_ * gain;
+        out[(at + i) * 2 + 1] = last_right_ * gain;
+      }
+      at += fade;
+      last_left_ = last_right_ = 0.0f;
+      // Silence before the title has sent anything is just the start of a stream.
+      if (got_frame_.load(std::memory_order_relaxed)) {
+        underrun_events_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    std::memset(out + at * kOutChannels, 0, (frames - at) * kOutChannels * sizeof(float));
     if (got_frame_.load(std::memory_order_relaxed)) {
       g_silent_frames.fetch_add((frames - done + kFrameSamples - 1) / kFrameSamples, std::memory_order_relaxed);
     }

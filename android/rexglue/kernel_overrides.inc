@@ -36,3 +36,8 @@ X(XamInputGetState)
 X(XamInputGetKeystroke)
 X(XamInputGetKeystrokeEx)
 X(XamUserGetDeviceContext)
+// The thread that signals what the audio worker waits on is the mixer (host_support.h).
+X(KeSetEvent)
+X(KeReleaseSemaphore)
+X(NtSetEvent)
+X(NtReleaseSemaphore)

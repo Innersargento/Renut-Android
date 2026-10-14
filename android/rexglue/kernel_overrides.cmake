@@ -6,6 +6,10 @@
 # which kernel_overrides.cpp defines. The SDK is not touched: its own function
 # keeps its name and is what an override calls for the cases it does not take.
 function(renut_kernel_overrides target)
+  # The list is read here, at configure time: an edit to it has to configure
+  # again, or the game keeps calling the exports it names under their own names.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/kernel_overrides.inc")
   file(STRINGS "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/kernel_overrides.inc" lines REGEX "^X\\(")
   foreach(line IN LISTS lines)
     string(REGEX REPLACE "^X\\(([A-Za-z0-9_]+)\\).*$" "\\1" name "${line}")
