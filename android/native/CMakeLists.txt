@@ -185,7 +185,7 @@ set(RENUT_RUNTIME_SOURCES
     # Shared with the Windows build
     guest/game_fixes.cpp guest/cheats.cpp guest/kernel_overrides.cpp guest/host_support.cpp
     d3d/d3d_layer.cpp d3d/native_d3d.cpp d3d/plume_d3d.cpp
-    plume/plume_renderer.cpp plume/plume_gpu.cpp plume/plume_textures.cpp plume/shader_cache_blob.S
+    plume/plume_renderer.cpp plume/plume_gpu.cpp plume/hiz_model.cpp plume/plume_textures.cpp plume/shader_cache_blob.S
     vendor/smolv/smolv.cpp
     # Android only
     platform/android/runtime_jni.cpp platform/android/achievements_bridge.cpp

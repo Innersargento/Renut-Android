@@ -1,0 +1,31 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// Hi-Z, the next level: the largest of each 2x2 of the level below.
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Floats { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Out { float v[]; };
+
+layout(push_constant) uniform Push {
+    Floats src;
+    Out dst;
+    uint sw;
+    uint sh;
+    uint dw;
+    uint dh;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.dw * p.dh) return;
+    uint x = (i % p.dw) * 2u, y = (i / p.dw) * 2u;
+    float m = p.src.v[y * p.sw + x];
+    if (x + 1u < p.sw) m = max(m, p.src.v[y * p.sw + x + 1u]);
+    if (y + 1u < p.sh) {
+        m = max(m, p.src.v[(y + 1u) * p.sw + x]);
+        if (x + 1u < p.sw) m = max(m, p.src.v[(y + 1u) * p.sw + x + 1u]);
+    }
+    p.dst.v[i] = m;
+}

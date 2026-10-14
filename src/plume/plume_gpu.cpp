@@ -13,6 +13,7 @@
 #include "xenos_ucode_key.h"
 #include "vendor/smolv/smolv.h"
 #include "spirv_rewrites.h"
+#include "hiz_model.h"
 
 #include <pthread.h>
 #include <thread>
@@ -61,6 +62,7 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/shader/interpreter.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -105,6 +107,9 @@ REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
                      "exact except for depth ties; measured 11/10: -37% pipeline binds, -3% GPU cycles, "
                      "image unchanged)")
     .range(0, 2);
+REXCVAR_DEFINE_INT32(renut_plume_hiz, 2, "reNut/Plume",
+                     "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
+                     "lies wholly outside the view frustum or the scissor (exact; files/plume-hiz overrides)");
 REXCVAR_DEFINE_INT32(renut_plume_fetch_spec, 1, "reNut/Plume",
                      "Give each vertex shader's live vertex fetch table to the driver as specialization "
                      "constants, so that the format switches of its fetch sites fold away: 0 off, 1 on")
@@ -184,6 +189,9 @@ using namespace rex::graphics;
 
 #include "shaders/point_list.geom.inc"
 #include "shaders/depth_stencil_pack.comp.inc"
+#include "shaders/hiz_reduce.comp.inc"
+#include "shaders/hiz_mips.comp.inc"
+#include "shaders/hiz_test.comp.inc"
 #include "shaders/patch_expand.comp.inc"
 #include "shaders/patch_levels.comp.inc"
 #include "shaders/rect_list.geom.inc"
@@ -442,6 +450,10 @@ class HostShader : public gfx::Shader {
   CompiledShader* domain_compiled = nullptr;
   std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> domain_live_fetches;
   bool domain_decoded = false;
+  // Hi-Z: the model entry last found for this shader and the (masked) booleans
+  // it was found under, so a draw does not hash and look them up again.
+  void* hiz_entry = nullptr;
+  uint32_t hiz_bools[8] = {};
 };
 
 class ShaderStore {
@@ -1372,6 +1384,24 @@ struct Stats {
            lookups_missed = 0, lookup_us = 0, compile_us = 0;
   // New pipelines the precompilation had built before their draw came.
   uint64_t pipelines_prebuilt = 0;
+  // Hi-Z (hiz_model.h): colour/depth-only draws looked at, the ones with a
+  // model and a box, the ones that could not be dropped for lack of either,
+  // and the ones whose box lay wholly outside the frustum or the scissor.
+  uint64_t hiz_seen[2] = {}, hiz_eligible[2] = {}, hiz_no_model[2] = {}, hiz_no_box[2] = {};
+  uint64_t hiz_frustum[2] = {}, hiz_scissor[2] = {};
+  uint64_t hiz_boxes_made = 0, hiz_box_us = 0, hiz_box_hits = 0, hiz_models = 0, hiz_models_valid = 0,
+           hiz_model_rejected = 0, hiz_model_us = 0;
+  uint64_t hiz_culled_total = 0;
+  // Windows closed, and the draws they held, by reason: 0 elsewhere, 1 state change, 2 full, 3 an immediate
+  // draw, 4 something the draw itself needed (a texture, a barrier).
+  uint64_t flush_windows[8] = {}, flush_draws[8] = {};
+  uint64_t hiz_boxed_draws = 0, hiz_why_not[4] = {}, hiz_small_windows = 0, hiz_small_draws = 0, hiz_windows_all = 0;
+  uint64_t hiz_cull_ns = 0;
+  uint64_t hiz_verified = 0, hiz_violations = 0, hiz_missed_hidden = 0, hiz_missed_empty = 0;
+  uint64_t hiz_windows_tested = 0, hiz_records = 0, hiz_held = 0, hiz_test_failed = 0, hiz_answered = 0,
+           hiz_occluded = 0, hiz_held_skipped = 0, hiz_held_visible = 0, hiz_predicated_draws = 0;
+  // Why a draw was not considered: no indices, primitive, memory export, clip/viewport state, constant base.
+  uint64_t hiz_why[5] = {};
 };
 
 class PlumeCommandProcessor final : public gfx::CommandProcessor {
@@ -2280,6 +2310,17 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     // The device address and size of each of the 17 streams the shaders read by address.
     uint64_t stream_addr[17] = {};
     uint32_t stream_size[17] = {};
+    // Hi-Z (see HizFlushWindow): the depth target this draw can be tested
+    // against, its image when the packet was made, the box's rectangle (target
+    // pixels) and nearest depth, the draw's identity from frame to frame, and,
+    // once tested, where its answer is in the slot's predicate buffer.
+    Target* hiz_depth = nullptr;
+    const RenderTexture* hiz_texture = nullptr;
+    float hiz_rect[4] = {};
+    float hiz_z = 0.f;
+    uint64_t hiz_key = 0;
+    uint32_t hiz_pred_offset = UINT32_MAX;
+    uint32_t hiz_query = UINT32_MAX;
   };
   // The draws recorded last, for the report a lost device prints (see
   // ReportDeviceLost). Written by this thread only; the watcher reads it after
@@ -2352,6 +2393,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void SyncEvery();
   uint32_t sync_every_ = 0, sync_every_counter_ = 0;
   static constexpr size_t kMaxDeferred = 384;
+  static constexpr size_t kMaxDeferredHiz = 1536;
   std::vector<DrawPacket> deferred_, flushing_;
   std::vector<DeferredSlot> deferred_slots_, flushing_slots_, draw_slots_;
   std::vector<uint32_t> defer_order_, defer_group_start_;
@@ -2373,11 +2415,114 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // with fewer indices than this are dropped; 0 keeps them all.
   uint32_t shadow_min_indices_ = 0;
   bool no_shadows_ = false, no_bloom_ = false;  // cvars renut_plume_no_shadows / _no_bloom
-  void FlushDeferred();
+  void FlushDeferred(uint32_t reason = 0);
+  bool in_issue_draw_ = false;
   void EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count);
+
+  // ---- Hi-Z (hiz_model.h) ----
+  // files/plume-hiz: 0 off, 1 counts what could be dropped, 2 drops the draws
+  // whose box lies wholly outside the frustum or the scissor (exact).
+  uint32_t hiz_mode_ = 0;
+  struct HizModelEntry {
+    std::shared_ptr<renut::hiz::Model> model;
+    bool validated = false;
+  };
+  std::unordered_map<uint64_t, HizModelEntry> hiz_models_;
+  // An object-space box of the fetched element over the vertices a draw reads,
+  // kept while guest memory under it is not written.
+  struct HizBox {
+    bool valid = false;
+    float lo[4] = {}, hi[4] = {};
+    uint32_t vertex_base = 0, vertex_size = 0, index_base = 0, index_size = 0;
+    uint32_t first_vertex = 0, last_vertex = 0;
+    uint64_t checksum = 0;
+    uint64_t checked_frame = 0;
+  };
+  std::unordered_map<uint64_t, HizBox> hiz_boxes_;
+  // 64 KB blocks of guest memory -> keys of the boxes made from them, so a write
+  // finds its boxes without walking all of them (entries of boxes already gone
+  // are left and ignored).
+  std::unordered_multimap<uint32_t, uint64_t> hiz_box_blocks_;
+  void HizIndexBox(uint64_t key, const HizBox& box);
+  void HizDropBoxes(uint32_t start, uint32_t length);
+  HizBox hiz_scratch_box_;
+  std::unordered_map<uint64_t, uint64_t> hiz_clip_states_;
+  HizModelEntry* HizModelFor(HostShader& vs);
+  const HizBox* HizBoxFor(const renut::hiz::Model& model, const xenos::xe_gpu_vertex_fetch_t& fetch,
+                          const IndexBufferInfo* index_info, uint32_t index_count, int32_t base_vertex);
+  bool HizValidate(HostShader& vs, renut::hiz::Model& model, const xenos::xe_gpu_vertex_fetch_t& fetch,
+                   uint32_t vertex_a, uint32_t vertex_b);
+  // True when nothing of the draw can reach the target.
+  bool HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t index_count,
+                   const IndexBufferInfo* index_info, bool color_pass);
+  // What HizCullDraw learned about the draw it did not drop, for the occlusion
+  // test: the screen rectangle (guest pixels) and nearest depth of its box.
+  struct HizTest {
+    bool valid = false;
+    float rect[4] = {};
+    float z = 0.f;
+    uint64_t key = 0;
+  } hiz_test_;
+  uint64_t hiz_last_box_key_ = 0;
+  uint32_t hiz_timer_phase_ = 0;
+  // ---- Hi-Z occlusion (see HizFlushWindow) ----
+  bool hiz_cond_ = false;  // the device has conditional rendering
+  static constexpr uint32_t kHizMaxRecords = 16384;
+  static constexpr uint32_t kHizMinWindow = 12;
+  VkPipeline hiz_pipelines_[3] = {};
+  VkShaderModule hiz_modules_[3] = {};
+  VkPipelineLayout hiz_layout_ = VK_NULL_HANDLE;
+  bool hiz_pipelines_failed_ = false;
+  std::unique_ptr<RenderBuffer> hiz_pyramid_;
+  std::array<std::unique_ptr<RenderBuffer>, kPlumeFramesInFlight> hiz_pred_, hiz_read_;
+  std::array<uint32_t, kPlumeFramesInFlight> hiz_pred_used_{};
+  bool hiz_debug_ = false;
+  // Debug, from the environment: RENUT_HIZ_FORCE holds every testable draw back,
+  // RENUT_HIZ_VERIFY runs the held draws regardless inside occlusion queries.
+  bool hiz_force_ = false, hiz_verify_ = false;
+  static constexpr uint32_t kHizMaxQueries = 4096;
+  VkQueryPool hiz_query_pool_ = VK_NULL_HANDLE;
+  std::array<uint32_t, kPlumeFramesInFlight> hiz_queries_used_{};
+  // Tests paid for this frame (windows with held draws, and learning ones), the
+  // first kind among them; the learning frames and how often they come.
+  uint32_t hiz_tests_frame_ = 0, hiz_tests_remembered_ = 0;
+  uint32_t hiz_learn_left_ = 0, hiz_learn_period_ = 8;
+  uint64_t hiz_gain_answered_ = 0, hiz_gain_hidden_ = 0, hiz_total_answered_ = 0, hiz_total_hidden_ = 0;
+  std::array<uint32_t, kPlumeFramesInFlight> hiz_debug_pending_{};
+  std::array<std::vector<std::array<float, 5>>, kPlumeFramesInFlight> hiz_debug_rects_;
+  struct HizRecord {
+    uint64_t key;
+    float rect[4];
+    float z;
+    bool held;
+    uint64_t vs = 0, ps = 0;
+  };
+  struct HizPending {
+    uint64_t key;
+    bool held;
+    uint32_t query;  // occlusion query of the verification run, or UINT32_MAX
+    uint64_t vs = 0, ps = 0;
+  };
+  // Verification runs: the shader pairs of the held draws that put out no
+  // samples although the test could not call them hidden, with their counts.
+  std::unordered_map<uint64_t, std::array<uint64_t, 3>> hiz_zero_pairs_;
+  struct HizHistory {
+    bool hidden = false;
+    uint64_t frame = 0;
+  };
+  std::vector<HizRecord> hiz_records_;
+  std::vector<uint32_t> hiz_held_;
+  std::array<std::vector<HizPending>, kPlumeFramesInFlight> hiz_pending_;
+  std::unordered_map<uint64_t, HizHistory> hiz_history_;
+  bool HizCreatePipelines();
+  bool HizEnsureResources();
+  bool HizRunTest(Target& target, uint32_t count, uint32_t* base_out);
+  bool HizFlushWindow(size_t n);
+  void HizReadResults(uint32_t slot);
+  void HizDestroy();
   // The command list, after recording any draws that are waiting.
   RenderCommandList* L() {
-    if (!deferred_.empty()) FlushDeferred();
+    if (!deferred_.empty()) FlushDeferred(in_issue_draw_ ? 4 : 0);
     return list_;
   }
 
@@ -3207,6 +3352,20 @@ bool PlumeCommandProcessor::SetupContext() {
   for (auto& list : lists_) list = queue_->createCommandList();
   list_ = lists_[0].get();
   defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
+  hiz_cond_ = PlumeConditionalRenderingSupported();
+  hiz_force_ = getenv("RENUT_HIZ_FORCE") != nullptr;
+  hiz_verify_ = getenv("RENUT_HIZ_VERIFY") != nullptr;
+  hiz_debug_ = getenv("RENUT_HIZ_DEBUG") != nullptr;
+  if (hiz_verify_) {
+    VkQueryPoolCreateInfo query_info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    query_info.queryType = VK_QUERY_TYPE_OCCLUSION;
+    query_info.queryCount = kHizMaxQueries * kPlumeFramesInFlight;
+    if (vkCreateQueryPool(static_cast<VulkanDevice*>(device_)->vk, &query_info, nullptr, &hiz_query_pool_) !=
+        VK_SUCCESS) {
+      hiz_query_pool_ = VK_NULL_HANDLE;
+    }
+  }
+  hiz_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 4));
   fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
   depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
   rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
@@ -3464,6 +3623,7 @@ void PlumeCommandProcessor::ShutdownContext() {
       patch_modules_[i] = VK_NULL_HANDLE;
     }
     if (patch_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, patch_layout_, nullptr);
+    HizDestroy();
     patch_layout_ = VK_NULL_HANDLE;
     for (auto& buffer : patch_out_) buffer.reset();
     stencil_staging_.reset();
@@ -3662,6 +3822,10 @@ void PlumeCommandProcessor::DrainWatchHits() {
         break;
       }
     }
+  }
+  // Boxes the Hi-Z culling made from memory the guest has written.
+  if (!hiz_boxes_.empty()) {
+    for (const auto& [start, length] : hits) HizDropBoxes(start, length);
   }
 }
 
@@ -4415,6 +4579,9 @@ void PlumeCommandProcessor::BeginFrame() {
                                       .count());
   ReadTimestamps(slot_);
   ReadPairTimestamps(slot_);
+  HizReadResults(slot_);
+  hiz_tests_frame_ = hiz_tests_remembered_ = 0;
+  hiz_learn_left_ = 3;
   ApplyWritebacks(slot_);
   list_ = lists_[slot_].get();
   slice_base_ = slice_origin_ + uint64_t(slot_) * upload_slice_size_;
@@ -6295,6 +6462,11 @@ void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
 
 bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool) {
+  struct InDraw {
+    bool& flag;
+    explicit InDraw(bool& f) : flag(f) { flag = true; }
+    ~InDraw() { flag = false; }
+  } in_draw(in_issue_draw_);
   // Only the native lists draw: a draw packet in the ring draws nothing.
   if (!native_swapped_) {
     ++native_ring_draws_dropped_;
@@ -6427,6 +6599,30 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     return true;
   }
 
+  // Hi-Z: a draw whose box lies wholly outside the frustum or the scissor puts
+  // nothing on the target; it is dropped before its targets, textures, streams,
+  // constants and pipeline cost anything. Exact (hiz_model.h). The resolves a
+  // dropped draw would have fetched are fetched by the draws that remain: only
+  // mesh draws (triangles through a vertex model) are ever dropped, never the
+  // full-screen passes that read the scene's copies.
+  hiz_test_.valid = false;
+  if (hiz_mode_ && !trace_ && !skip_mask_ && !bind_skip_ && !sync_draws_ && !patch_list && !rect_list &&
+      !point_list && vs->compiled && (!debug_shader_ || (vs->entry->hash != debug_shader_ &&
+                                                          (!ps || ps->entry->hash != debug_shader_)))) {
+    // One call in 16 is timed (the clock reads are a cost of their own).
+    const bool timed = (++hiz_timer_phase_ & 15) == 0;
+    std::chrono::steady_clock::time_point cull_start;
+    if (timed) cull_start = std::chrono::steady_clock::now();
+    const bool dropped = HizCullDraw(*vs, prim_type, index_count, index_buffer_info, color_pass);
+    if (timed) {
+      stats_.hiz_cull_ns += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - cull_start).count());
+    }
+    if (dropped) {
+      ++stats_.hiz_culled_total;
+      return true;
+    }
+  }
   // Render targets.
   const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
   const uint32_t pitch = surface.surface_pitch;
@@ -8226,6 +8422,31 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     // a bias too, and do not care.
     const bool biased = raster.poly_offset_front_enable || raster.poly_offset_back_enable;
     defer = strict && stencil_ok && (!color_pass || (defer_mode_ >= 2 && opaque && !biased));
+    // Hi-Z: tested against the depth the pass holds when the window closes. Not
+    // biased draws (the bias moves their depth), and only the "closer wins"
+    // functions, whose fragments pass when they are nearer.
+    if (hiz_mode_ >= 3 && hiz_test_.valid) {
+      // Where the boxed draws go: not deferred, biased, other depth function, no depth.
+      ++stats_.hiz_boxed_draws;
+      if (!defer) ++stats_.hiz_why_not[0];
+      else if (biased) ++stats_.hiz_why_not[1];
+      else if (!(zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual)) ++stats_.hiz_why_not[2];
+      else if (!depth || !depth->texture) ++stats_.hiz_why_not[3];
+    }
+    if (defer && hiz_mode_ >= 3 && hiz_cond_ && hiz_test_.valid && !biased && depth && depth->texture &&
+        (zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual) &&
+        (color_pass || hiz_mode_ >= 4)) {
+      const float fraction = float(depth->scale) / 4.f;
+      pk.hiz_depth = depth;
+      pk.hiz_texture = depth->texture.get();
+      pk.hiz_rect[0] = std::clamp(hiz_test_.rect[0] * fraction, 0.f, float(depth->width));
+      pk.hiz_rect[1] = std::clamp(hiz_test_.rect[1] * fraction, 0.f, float(depth->height));
+      pk.hiz_rect[2] = std::clamp(hiz_test_.rect[2] * fraction, 0.f, float(depth->width));
+      pk.hiz_rect[3] = std::clamp(hiz_test_.rect[3] * fraction, 0.f, float(depth->height));
+      pk.hiz_z = hiz_test_.z;
+      pk.hiz_key = hiz_test_.key ^ (pk.ps_hash * 0xC2B2AE3D27D4EB4Full);
+      if (pk.hiz_rect[2] < pk.hiz_rect[0] || pk.hiz_rect[3] < pk.hiz_rect[1]) pk.hiz_depth = nullptr;
+    }
     if (defer) {
       HashCombine(window_signature, framebuffer);
       HashCombine(window_signature, color_mask);
@@ -8235,16 +8456,16 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   if (defer) {
-    if (!deferred_.empty() && deferred_signature_ != window_signature) FlushDeferred();
+    if (!deferred_.empty() && deferred_signature_ != window_signature) FlushDeferred(1);
     deferred_signature_ = window_signature;
     pk.first_slot = uint32_t(deferred_slots_.size());
     deferred_slots_.insert(deferred_slots_.end(), draw_slots_.begin(), draw_slots_.end());
     deferred_.push_back(pk);
     ++stats_.deferred_draws;
-    if (deferred_.size() >= kMaxDeferred) FlushDeferred();
+    if (deferred_.size() >= (hiz_mode_ >= 3 ? kMaxDeferredHiz : kMaxDeferred)) FlushDeferred(2);
     return true;
   }
-  FlushDeferred();
+  FlushDeferred(3);
   EmitDraw(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
   return true;
 }
@@ -8323,6 +8544,27 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
       bound.offset = view.buffer.offset;
     }
   }
+  // A draw the Hi-Z test answered for runs only where the answer is non-zero.
+  const bool predicated = pk.hiz_pred_offset != UINT32_MAX && hiz_pred_[slot_] != nullptr &&
+                          pk.kind != DrawPacket::Kind::kNone;
+  VkCommandBuffer predicate_cb = VK_NULL_HANDLE;
+  const bool queried = pk.hiz_query != UINT32_MAX && hiz_query_pool_ != VK_NULL_HANDLE &&
+                       pk.kind != DrawPacket::Kind::kNone;
+  if (queried) {
+    auto* vulkan = static_cast<VulkanCommandList*>(L());
+    vulkan->checkActiveRenderPass();
+    predicate_cb = vulkan->vk;
+    vkCmdBeginQuery(predicate_cb, hiz_query_pool_, pk.hiz_query, 0);
+  }
+  if (predicated) {
+    auto* vulkan = static_cast<VulkanCommandList*>(L());
+    vulkan->checkActiveRenderPass();
+    predicate_cb = vulkan->vk;
+    VkConditionalRenderingBeginInfoEXT info = {VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+    info.buffer = static_cast<VulkanBuffer*>(hiz_pred_[slot_].get())->vk;
+    info.offset = pk.hiz_pred_offset;
+    vkCmdBeginConditionalRenderingEXT(predicate_cb, &info);
+  }
   switch (pk.kind) {
     case DrawPacket::Kind::kNone: break;
     case DrawPacket::Kind::kIndexed:
@@ -8343,6 +8585,11 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
     }
     case DrawPacket::Kind::kPlain: L()->drawInstanced(pk.count, 1, pk.first, 0); break;
   }
+  if (predicated) {
+    vkCmdEndConditionalRenderingEXT(predicate_cb);
+    ++stats_.hiz_predicated_draws;
+  }
+  if (queried) vkCmdEndQuery(predicate_cb, hiz_query_pool_, pk.hiz_query);
   if (pair_stamped) PairStamp();
   ++stats_.drawn;
   if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
@@ -8549,8 +8796,10 @@ void PlumeCommandProcessor::SyncAfterDraw(const DrawPacket& pk) {
 // Records the draws that are waiting, grouped by pipeline. The groups keep the
 // order in which each pipeline first appeared and the draws keep their order
 // inside a group, so a window whose draws share one pipeline is untouched.
-void PlumeCommandProcessor::FlushDeferred() {
+void PlumeCommandProcessor::FlushDeferred(uint32_t reason) {
   if (deferred_.empty()) return;
+  ++stats_.flush_windows[reason & 7];
+  stats_.flush_draws[reason & 7] += deferred_.size();
   // Taken out first: recording goes through L(), which must find nothing waiting.
   flushing_.swap(deferred_);
   flushing_slots_.swap(deferred_slots_);
@@ -8585,9 +8834,11 @@ void PlumeCommandProcessor::FlushDeferred() {
   ++stats_.defer_windows;
   stats_.defer_binds_before += before;
   stats_.defer_binds_after += after;
-  for (size_t i = 0; i < n; ++i) {
-    const DrawPacket& pk = flushing_[defer_order_[i]];
-    EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
+  if (!HizFlushWindow(n)) {
+    for (size_t i = 0; i < n; ++i) {
+      const DrawPacket& pk = flushing_[defer_order_[i]];
+      EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
+    }
   }
   flushing_.clear();
   flushing_slots_.clear();
@@ -8601,6 +8852,924 @@ void PlumeCommandProcessor::FlushDeferred() {
 // is handed a register file that says exactly that: the same registers, with
 // fetch constant 0 pointing at three vertices of the rectangle, and no window
 // offset or scissor to apply.
+// ---------------------------------------------------------------------------
+// Hi-Z: boxes, frustum and scissor culling (see hiz_model.h)
+// ---------------------------------------------------------------------------
+
+void PlumeCommandProcessor::HizIndexBox(uint64_t key, const HizBox& box) {
+  auto add = [&](uint32_t base, uint32_t size) {
+    if (!size) return;
+    for (uint32_t block = base >> 16; block <= (base + size - 1) >> 16; ++block) {
+      hiz_box_blocks_.emplace(block, key);
+    }
+  };
+  add(box.vertex_base, box.vertex_size);
+  add(box.index_base, box.index_size);
+  // Entries of dropped boxes pile up; rebuilt from the live ones now and then.
+  if (hiz_box_blocks_.size() > 400000) {
+    hiz_box_blocks_.clear();
+    for (const auto& [k, b] : hiz_boxes_) {
+      if (b.vertex_size) {
+        for (uint32_t block = b.vertex_base >> 16; block <= (b.vertex_base + b.vertex_size - 1) >> 16; ++block) {
+          hiz_box_blocks_.emplace(block, k);
+        }
+      }
+      if (b.index_size) {
+        for (uint32_t block = b.index_base >> 16; block <= (b.index_base + b.index_size - 1) >> 16; ++block) {
+          hiz_box_blocks_.emplace(block, k);
+        }
+      }
+    }
+  }
+}
+
+// The guest wrote [start, start + length): the boxes made from any of it go.
+void PlumeCommandProcessor::HizDropBoxes(uint32_t start, uint32_t length) {
+  if (!length) return;
+  const uint32_t first = start >> 16, last = uint32_t((uint64_t(start) + length - 1) >> 16);
+  if (last - first > 4096) {
+    // A huge range: cheaper to look at every box.
+    for (auto it = hiz_boxes_.begin(); it != hiz_boxes_.end();) {
+      const HizBox& box = it->second;
+      const bool hit = (box.vertex_size && box.vertex_base < uint64_t(start) + length &&
+                        start < box.vertex_base + box.vertex_size) ||
+                       (box.index_size && box.index_base < uint64_t(start) + length &&
+                        start < box.index_base + box.index_size);
+      it = hit ? hiz_boxes_.erase(it) : std::next(it);
+    }
+    return;
+  }
+  for (uint32_t block = first; block <= last; ++block) {
+    auto range = hiz_box_blocks_.equal_range(block);
+    for (auto it = range.first; it != range.second;) {
+      hiz_boxes_.erase(it->second);
+      it = hiz_box_blocks_.erase(it);
+    }
+  }
+}
+
+PlumeCommandProcessor::HizModelEntry* PlumeCommandProcessor::HizModelFor(HostShader& vs) {
+  if (!vs.bool_mask_decoded) {
+    rex::string::StringBuffer disassembly;
+    vs.AnalyzeUcode(disassembly);
+    std::memcpy(vs.bool_mask, vs.constant_register_map().bool_bitmap, sizeof(vs.bool_mask));
+    vs.bool_mask_decoded = true;
+  }
+  const gfx::RegisterFile& regs = *register_file_;
+  uint32_t bools[8];
+  bool same = vs.hiz_entry != nullptr;
+  for (uint32_t word = 0; word < 8; ++word) {
+    bools[word] = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + word] & vs.bool_mask[word];
+    same = same && bools[word] == vs.hiz_bools[word];
+  }
+  if (same) return static_cast<HizModelEntry*>(vs.hiz_entry);
+  uint64_t key = vs.ucode_data_hash() * 0x9E3779B97F4A7C15ull;
+  for (uint32_t word = 0; word < 8; ++word) key = (key ^ bools[word]) * 0x100000001B3ull;
+  auto it = hiz_models_.find(key);
+  if (it != hiz_models_.end()) {
+    vs.hiz_entry = &it->second;
+    std::memcpy(vs.hiz_bools, bools, sizeof(bools));
+    return &it->second;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  HizModelEntry entry;
+  entry.model = renut::hiz::BuildModel(vs.ucode_dwords(), vs.ucode_dword_count(), bools);
+  ++stats_.hiz_models;
+  if (entry.model->valid) ++stats_.hiz_models_valid;
+  stats_.hiz_model_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - start).count());
+  HizModelEntry* made = &hiz_models_.emplace(key, std::move(entry)).first->second;
+  vs.hiz_entry = made;
+  std::memcpy(vs.hiz_bools, bools, sizeof(bools));
+  return made;
+}
+
+// The model against the SDK's interpreter, on two vertices of the draw about to
+// use it: what the symbolic executor claims must be what the microcode does.
+bool PlumeCommandProcessor::HizValidate(HostShader& vs, renut::hiz::Model& model,
+                                        const xenos::xe_gpu_vertex_fetch_t& fetch, uint32_t vertex_a,
+                                        uint32_t vertex_b) {
+  if (!gfx::ShaderInterpreter::CanInterpretShader(vs)) return false;
+  struct Sink final : gfx::ShaderInterpreter::ExportSink {
+    float position[4] = {};
+    uint32_t written = 0;
+    void Export(rex::graphics::ucode::ExportRegister reg, const float* value, uint32_t mask) override {
+      if (reg != rex::graphics::ucode::ExportRegister::kVSPosition) return;
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (mask & (1u << i)) {
+          position[i] = value[i];
+          written |= 1u << i;
+        }
+      }
+    }
+  } sink;
+  auto interpreter = std::make_unique<gfx::ShaderInterpreter>(*register_file_, *memory_);
+  interpreter->SetShader(vs);
+  interpreter->SetExportSink(&sink);
+  const float* constants = reinterpret_cast<const float*>(&register_file_->values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+  float affine[4][5];
+  renut::hiz::Evaluate(model, constants, 0, affine);
+  const uint8_t* memory = memory_->TranslatePhysical<const uint8_t*>(0);
+  for (uint32_t vertex : {vertex_a, vertex_b}) {
+    sink.written = 0;
+    interpreter->temp_registers()[0] = float(vertex);
+    interpreter->Execute();
+    float p[4] = {};
+    if (!renut::hiz::FetchVertex(model.fetch, memory, fetch.address, fetch.size, uint32_t(fetch.endian), vertex, p)) {
+      return false;
+    }
+    if (sink.written != 0xF) return false;
+    for (int o = 0; o < 4; ++o) {
+      float predicted = affine[o][0];
+      for (int j = 0; j < 4; ++j) predicted += affine[o][1 + j] * p[j];
+      const float reference = sink.position[o];
+      if (!(std::fabs(predicted - reference) <= 2e-3f * (1.0f + std::fabs(predicted) + std::fabs(reference)))) {
+        static uint32_t logged = 0;
+        if (logged < 12) {
+          ++logged;
+          REXLOG_WARN("Renut: Plume Hi-Z model of vs {:016X} rejected: vertex {} clip[{}] model {} interpreter {}",
+                      vs.ucode_data_hash(), vertex, o, predicted, reference);
+        }
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+const PlumeCommandProcessor::HizBox* PlumeCommandProcessor::HizBoxFor(
+    const renut::hiz::Model& model, const xenos::xe_gpu_vertex_fetch_t& fetch, const IndexBufferInfo* index_info,
+    uint32_t index_count, int32_t base_vertex) {
+  DrainWatchHits();
+  const bool indexed = index_info && index_info->guest_base;
+  const renut::hiz::FetchDesc& f = model.fetch;
+  uint64_t parts[16];
+  uint32_t n = 0;
+  parts[n++] = (uint64_t(fetch.address) << 32) | fetch.size;
+  parts[n++] = (uint64_t(uint32_t(fetch.endian)) << 56) | (uint64_t(f.fetch_constant) << 48) |
+               (uint64_t(f.format) << 40) | (uint64_t(f.is_signed) << 32) | (uint64_t(f.normalized) << 33) |
+               (uint64_t(f.signed_no_zero) << 34) | (uint64_t(f.used_mask) << 36) |
+               uint64_t(uint32_t(f.exp_adjust) & 0x3F);
+  parts[n++] = (uint64_t(f.stride_dwords) << 32) | uint32_t(f.offset_dwords);
+  parts[n++] = indexed ? ((uint64_t(index_info->guest_base) << 32) | index_count) : index_count;
+  parts[n++] = indexed ? ((uint64_t(uint32_t(index_info->format)) << 8) | uint64_t(uint32_t(index_info->endianness)))
+                       : 0xFFFF;
+  parts[n++] = uint64_t(uint32_t(base_vertex));
+  const uint64_t key = XXH3_64bits(parts, n * sizeof(uint64_t));
+  hiz_last_box_key_ = key;
+
+  const uint8_t* memory = memory_->TranslatePhysical<const uint8_t*>(0);
+  auto checksum_of = [&](const HizBox& box) {
+    uint64_t h = 0;
+    auto add = [&](uint32_t base, uint32_t size) {
+      if (!size) return;
+      const uint32_t head = std::min<uint32_t>(size, 128);
+      h = XXH3_64bits_withSeed(memory + base, head, h);
+      if (size > head) h = XXH3_64bits_withSeed(memory + base + size - head, head, h);
+    };
+    add(box.vertex_base, box.vertex_size);
+    add(box.index_base, box.index_size);
+    return h;
+  };
+  auto found = hiz_boxes_.find(key);
+  if (found != hiz_boxes_.end()) {
+    HizBox& box = found->second;
+    // The write watch drops a box when the guest writes under it; the sample of
+    // its bytes is a second line, looked at every 30 frames rather than at every draw.
+    if (swaps_ - box.checked_frame < 30) {
+      ++stats_.hiz_box_hits;
+      return box.valid ? &box : nullptr;
+    }
+    if (checksum_of(box) == box.checksum) {
+      box.checked_frame = swaps_;
+      ++stats_.hiz_box_hits;
+      return box.valid ? &box : nullptr;
+    }
+    hiz_boxes_.erase(found);
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  HizBox box;
+  box.vertex_base = fetch.address << 2;
+  box.vertex_size = fetch.size << 2;
+  const bool is32 = indexed && index_info->format == xenos::IndexFormat::kInt32;
+  if (indexed) {
+    box.index_base = index_info->guest_base;
+    box.index_size = index_count * (is32 ? 4 : 2);
+  }
+  // `cache` false hands the box back through hiz_scratch_box_ instead of the map.
+  auto finish = [&](bool valid, bool cache) -> const HizBox* {
+    stats_.hiz_box_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - start).count());
+    ++stats_.hiz_boxes_made;
+    box.valid = valid;
+    if (!valid && !cache) return nullptr;
+    if (!cache) {
+      hiz_scratch_box_ = box;
+      return &hiz_scratch_box_;
+    }
+    box.checksum = checksum_of(box);
+    box.checked_frame = swaps_;
+    const HizBox* stored = &hiz_boxes_.emplace(key, box).first->second;
+    HizIndexBox(key, box);
+    return valid ? stored : nullptr;
+  };
+  if (!box.vertex_size || uint64_t(box.vertex_base) + box.vertex_size > 0x20000000ull ||
+      (indexed && (uint64_t(box.index_base) + box.index_size > 0x20000000ull || !index_count))) {
+    return finish(false, false);
+  }
+  // Index range.
+  int64_t lowest = INT64_MAX, highest = -1;
+  if (indexed) {
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(memory + box.index_base);
+    const uint16_t* halves = reinterpret_cast<const uint16_t*>(memory + box.index_base);
+    xenos::Endian endian = index_info->endianness;
+    if (!is32) {
+      if (endian == xenos::Endian::k8in32) endian = xenos::Endian::k8in16;
+      else if (endian == xenos::Endian::k16in32) endian = xenos::Endian::kNone;
+    }
+    for (uint32_t i = 0; i < index_count; ++i) {
+      uint32_t v = is32 ? words[i] : halves[i];
+      v = xenos::GpuSwap(v, endian);
+      if (!is32) v &= 0xFFFF;
+      if (v == (is32 ? 0xFFFFFFFFu : 0xFFFFu)) continue;  // primitive restart
+      v &= 0xFFFFFF;
+      lowest = std::min<int64_t>(lowest, v);
+      highest = std::max<int64_t>(highest, v);
+    }
+    if (highest < 0) return finish(false, true);
+  } else {
+    lowest = 0;
+    highest = int64_t(index_count) - 1;
+  }
+  const int64_t first = lowest + base_vertex, last = highest + base_vertex;
+  if (first < 0 || last - first > 20000) return finish(false, true);
+  float lo[4] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX}, hi[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
+  for (int64_t v = first; v <= last; ++v) {
+    float p[4];
+    if (!renut::hiz::FetchVertex(f, memory, fetch.address, fetch.size, uint32_t(fetch.endian), uint32_t(v), p)) {
+      return finish(false, true);
+    }
+    for (int j = 0; j < 4; ++j) {
+      if (!std::isfinite(p[j])) return finish(false, true);
+      lo[j] = std::min(lo[j], p[j]);
+      hi[j] = std::max(hi[j], p[j]);
+    }
+  }
+  std::memcpy(box.lo, lo, sizeof(lo));
+  std::memcpy(box.hi, hi, sizeof(hi));
+  box.first_vertex = uint32_t(first);
+  box.last_vertex = uint32_t(last);
+  // What the box was made from must be watched, or a guest rewrite of the mesh
+  // (streaming, a dynamic buffer) would leave it stale: the checksum above only
+  // samples the ends.
+  const auto access = [&](uint32_t base, uint32_t size) {
+    return !size || memory_->GetPhysicalHeap()->QueryRangeAccess(base, base + size - 1) ==
+                       rex::memory::PageAccess::kReadWrite;
+  };
+  if (!access(box.vertex_base, box.vertex_size) || !access(box.index_base, box.index_size)) {
+    // Made again for the next draw; the range is bounded above (20000 vertices).
+    return finish(true, false);
+  }
+  memory_->EnablePhysicalMemoryAccessCallbacks(box.vertex_base, box.vertex_size, true, false);
+  if (box.index_size) memory_->EnablePhysicalMemoryAccessCallbacks(box.index_base, box.index_size, true, false);
+  return finish(true, true);
+}
+
+bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        const IndexBufferInfo* index_info, bool color_pass) {
+  const uint32_t kind = color_pass ? 1 : 0;
+  hiz_test_.valid = false;
+  ++stats_.hiz_seen[kind];
+  if (!index_count) return ++stats_.hiz_why[0], false;
+  switch (prim_type) {
+    case xenos::PrimitiveType::kTriangleList:
+    case xenos::PrimitiveType::kTriangleStrip:
+    case xenos::PrimitiveType::kTriangleFan:
+    case xenos::PrimitiveType::kQuadList: break;
+    default: return ++stats_.hiz_why[1], false;
+  }
+  const gfx::RegisterFile& regs = *register_file_;
+  if (vs.entry && (vs.entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) return ++stats_.hiz_why[2], false;
+  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+  const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
+  // vtx_w0_fmt set is the usual case: the shader's W is W, not 1/W.
+  if (clip.clip_disable || vte.vtx_xy_fmt || vte.vtx_z_fmt || !vte.vtx_w0_fmt || !vte.vport_x_scale_ena ||
+      !vte.vport_x_offset_ena || !vte.vport_y_scale_ena || !vte.vport_y_offset_ena) {
+    ++hiz_clip_states_[(uint64_t(vte.value) << 32) | clip.value];
+    return ++stats_.hiz_why[3], false;
+  }
+  if (regs.Get<reg::SQ_VS_CONST>(XE_GPU_REG_SQ_VS_CONST).base != 0) return ++stats_.hiz_why[4], false;
+
+  HizModelEntry* entry = HizModelFor(vs);
+  if (!entry->model || !entry->model->valid) {
+    ++stats_.hiz_no_model[kind];
+    return false;
+  }
+  renut::hiz::Model& model = *entry->model;
+  const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(model.fetch.fetch_constant);
+  if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size) {
+    ++stats_.hiz_no_box[kind];
+    return false;
+  }
+  const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+  const HizBox* box = HizBoxFor(model, fetch, index_info, index_count, base_vertex);
+  if (!box) {
+    ++stats_.hiz_no_box[kind];
+    return false;
+  }
+  if (!entry->validated) {
+    // First use: the first and the last vertex of the draw through the SDK's
+    // interpreter against the model.
+    if (!HizValidate(vs, model, fetch, box->first_vertex, box->last_vertex)) {
+      model.valid = false;
+      ++stats_.hiz_model_rejected;
+      ++stats_.hiz_no_model[kind];
+      return false;
+    }
+    entry->validated = true;
+  }
+
+  // The constants as the shader sees them, and the model's affine map.
+  const float* constants = reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+  float affine[4][5];
+  renut::hiz::Evaluate(model, constants, 0, affine);
+  // The box in clip space is a parallelepiped: centre C and, along the element's
+  // components, the columns A[.][1 + j] * half_j. A plane's value over it ranges
+  // over centre +- sum |coefficient along j| * half_j, so "all of it outside" is
+  // one comparison per plane and no corner is formed.
+  float centre[4], half[4], mid[4];
+  uint32_t comps[4], ncomps = 0;
+  for (uint32_t j = 0; j < 4; ++j) {
+    mid[j] = 0.5f * (box->lo[j] + box->hi[j]);
+    half[j] = 0.5f * (box->hi[j] - box->lo[j]);
+    if (!(model.fetch.used_mask & (1u << j))) continue;
+    bool any = false;
+    for (int o = 0; o < 4; ++o) any = any || affine[o][1 + j] != 0.f;
+    if (any) comps[ncomps++] = j;
+  }
+  float magnitude = 0.f;
+  for (int o = 0; o < 4; ++o) {
+    float c = affine[o][0];
+    for (uint32_t i = 0; i < ncomps; ++i) {
+      const uint32_t j = comps[i];
+      c += affine[o][1 + j] * mid[j];
+      magnitude += std::fabs(affine[o][1 + j] * half[j]);
+    }
+    if (!std::isfinite(c)) return false;
+    centre[o] = c;
+    magnitude += std::fabs(c);
+  }
+  ++stats_.hiz_eligible[kind];
+  // [lowest, highest] of the plane s . clip over the box.
+  auto plane_range = [&](float sx, float sy, float sz, float sw, float* lowest, float* highest) {
+    float c = sx * centre[0] + sy * centre[1] + sz * centre[2] + sw * centre[3];
+    float r = 0.f;
+    for (uint32_t i = 0; i < ncomps; ++i) {
+      const uint32_t j = comps[i];
+      r += std::fabs(sx * affine[0][1 + j] + sy * affine[1][1 + j] + sz * affine[2][1 + j] + sw * affine[3][1 + j]) *
+           half[j];
+    }
+    *lowest = c - r;
+    *highest = c + r;
+  };
+  const float slack = 1e-4f * magnitude;
+  auto wholly_outside = [&](float sx, float sy, float sz, float sw) {
+    float low, high;
+    plane_range(sx, sy, sz, sw, &low, &high);
+    return high < -slack;
+  };
+  if (wholly_outside(1, 0, 0, 1) || wholly_outside(-1, 0, 0, 1) || wholly_outside(0, 1, 0, 1) ||
+      wholly_outside(0, -1, 0, 1) ||
+      (clip.dx_clip_space_def && (wholly_outside(0, 0, 1, 0) || wholly_outside(0, 0, -1, 1)))) {
+    ++stats_.hiz_frustum[kind];
+    return hiz_mode_ >= 2;
+  }
+  // Wholly in front of the eye: the scissor and the screen rectangle make sense.
+  float w_low, w_high;
+  plane_range(0, 0, 0, 1, &w_low, &w_high);
+  if (!(w_low > 1e-6f)) return false;
+  float window_x = 0.f, window_y = 0.f;
+  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+    const auto offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    window_x = float(offset.window_x_offset);
+    window_y = float(offset.window_y_offset);
+  }
+  if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
+    window_x += 0.5f;
+    window_y += 0.5f;
+  }
+  const float xs = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+  const float xo = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
+  const float ys = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+  const float yo = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  const float left = float(scissor.offset[0]), top = float(scissor.offset[1]);
+  const float right = left + float(scissor.extent[0]), bottom = top + float(scissor.extent[1]);
+  // x_screen = xo + window_x + xs * x / w. All of the box left of (left - 1):
+  // (left - 1 - xo - window_x) * w - xs * x > 0 everywhere, and so on.
+  auto all_positive = [&](float sx, float sy, float sw) {
+    float low, high;
+    plane_range(sx, sy, 0, sw, &low, &high);
+    return low > slack;
+  };
+  const float bx = xo + window_x, by = yo + window_y;
+  if (all_positive(-xs, 0, left - 1.0f - bx) || all_positive(xs, 0, -(right + 1.0f - bx)) ||
+      all_positive(0, -ys, top - 1.0f - by) || all_positive(0, ys, -(bottom + 1.0f - by))) {
+    ++stats_.hiz_scissor[kind];
+    return hiz_mode_ >= 2;
+  }
+  if (hiz_mode_ >= 3 && clip.dx_clip_space_def) {
+    // The occlusion test wants the rectangle and the nearest depth: corners.
+    const float zs = vte.vport_z_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE) : 1.f;
+    const float zo = vte.vport_z_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET) : 0.f;
+    const float depth_min = std::clamp(zo, 0.f, 1.f), depth_max = std::clamp(zo + zs, 0.f, 1.f);
+    float min_x = FLT_MAX, max_x = -FLT_MAX, min_y = FLT_MAX, max_y = -FLT_MAX, nearest = FLT_MAX;
+    const uint32_t corners = 1u << ncomps;
+    for (uint32_t c = 0; c < corners; ++c) {
+      float clip_v[4];
+      for (int o = 0; o < 4; ++o) {
+        float v = affine[o][0];
+        for (uint32_t i = 0; i < ncomps; ++i) {
+          const uint32_t j = comps[i];
+          v += affine[o][1 + j] * (((c >> i) & 1) ? box->hi[j] : box->lo[j]);
+        }
+        clip_v[o] = v;
+      }
+      const float inv = 1.0f / clip_v[3];
+      const float x = bx + xs * clip_v[0] * inv;
+      const float y = by + ys * clip_v[1] * inv;
+      min_x = std::min(min_x, x);
+      max_x = std::max(max_x, x);
+      min_y = std::min(min_y, y);
+      max_y = std::max(max_y, y);
+      const float z = std::clamp(clip_v[2] * inv, 0.f, 1.f);
+      nearest = std::min(nearest, depth_min + z * (depth_max - depth_min));
+    }
+    hiz_test_.valid = true;
+    // The rectangle is also cut to the scissor: nothing outside it is drawn.
+    hiz_test_.rect[0] = std::max(min_x - 1.0f, left);
+    hiz_test_.rect[1] = std::max(min_y - 1.0f, top);
+    hiz_test_.rect[2] = std::min(max_x + 1.0f, right);
+    hiz_test_.rect[3] = std::min(max_y + 1.0f, bottom);
+    hiz_test_.z = nearest;
+    hiz_test_.key = hiz_last_box_key_ ^ (vs.ucode_data_hash() * 0x9E3779B97F4A7C15ull);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Hi-Z: occlusion by the depth the pass has drawn so far
+//
+// A window of deferred draws may be recorded in any order (see IssueDraw). The
+// draws a window holds that were wholly hidden the last time they were tested
+// are kept back; the rest are recorded as usual. Then, with the pass closed, the
+// depth image is copied out, reduced to a pyramid of its farthest values, and
+// every boxed draw of the window is tested against it on the GPU (a rectangle
+// and the box's nearest depth). The kept-back draws are recorded last, each
+// inside conditional rendering on its own answer: a draw that is still hidden
+// costs the GPU next to nothing, one that is not hidden runs - in the same
+// frame, so nothing arrives late and nothing can be wrong by a frame. What the
+// tests found feeds the prediction for the frames after.
+// ---------------------------------------------------------------------------
+
+bool PlumeCommandProcessor::HizCreatePipelines() {
+  if (hiz_pipelines_[2] != VK_NULL_HANDLE) return true;
+  if (hiz_pipelines_failed_) return false;
+  hiz_pipelines_failed_ = true;
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  if (hiz_layout_ == VK_NULL_HANDLE) {
+    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};
+    VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(vk_device, &layout_info, nullptr, &hiz_layout_) != VK_SUCCESS) return false;
+  }
+  const std::pair<const uint32_t*, size_t> code[3] = {{k_hiz_reduce_comp, sizeof(k_hiz_reduce_comp)},
+                                                      {k_hiz_mips_comp, sizeof(k_hiz_mips_comp)},
+                                                      {k_hiz_test_comp, sizeof(k_hiz_test_comp)}};
+  for (uint32_t i = 0; i < 3; ++i) {
+    if (hiz_pipelines_[i] != VK_NULL_HANDLE) continue;
+    VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    module_info.codeSize = code[i].second;
+    module_info.pCode = code[i].first;
+    if (vkCreateShaderModule(vk_device, &module_info, nullptr, &hiz_modules_[i]) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo pipeline_info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline_info.stage.module = hiz_modules_[i];
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = hiz_layout_;
+    if (vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &hiz_pipelines_[i]) !=
+        VK_SUCCESS) {
+      hiz_pipelines_[i] = VK_NULL_HANDLE;
+      REXLOG_WARN("Renut: Plume Hi-Z compute pipelines unavailable; occlusion culling stays off");
+      return false;
+    }
+  }
+  hiz_pipelines_failed_ = false;
+  return true;
+}
+
+void PlumeCommandProcessor::HizDestroy() {
+  if (!device_) return;
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  for (auto& pipeline : hiz_pipelines_) {
+    if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, pipeline, nullptr);
+    pipeline = VK_NULL_HANDLE;
+  }
+  for (auto& module : hiz_modules_) {
+    if (module != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, module, nullptr);
+    module = VK_NULL_HANDLE;
+  }
+  if (hiz_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, hiz_layout_, nullptr);
+  hiz_layout_ = VK_NULL_HANDLE;
+  if (hiz_query_pool_ != VK_NULL_HANDLE) vkDestroyQueryPool(vk_device, hiz_query_pool_, nullptr);
+  hiz_query_pool_ = VK_NULL_HANDLE;
+  hiz_pyramid_.reset();
+  for (auto& buffer : hiz_pred_) buffer.reset();
+  for (auto& buffer : hiz_read_) buffer.reset();
+}
+
+// What a window's test needs, made once: the pipelines, the depth copy's
+// buffer (shared with the depth resolves), the pyramid, and this slot's
+// predicate and readback buffers.
+bool PlumeCommandProcessor::HizEnsureResources() {
+  if (!hiz_cond_ || !HizCreatePipelines()) return false;
+  constexpr uint64_t kStagingSize = 4096ull * 2048 * 4;
+  if (!depth_staging_) {
+    depth_staging_ = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+        kStagingSize, RenderBufferFlag::STORAGE | RenderBufferFlag::CONSTANT | RenderBufferFlag::DEVICE_ADDRESSABLE));
+    if (!depth_staging_) return false;
+  }
+  if (!hiz_pyramid_) {
+    // 4096x2048 reduced by 8, then halved four times: 1.34 x 512 x 256 floats.
+    hiz_pyramid_ = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+        uint64_t(1) << 20, RenderBufferFlag::STORAGE | RenderBufferFlag::DEVICE_ADDRESSABLE));
+    if (!hiz_pyramid_) return false;
+  }
+  if (!hiz_pred_[slot_]) {
+    hiz_pred_[slot_] = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+        uint64_t(kHizMaxRecords) * 8, RenderBufferFlag::STORAGE | RenderBufferFlag::DEVICE_ADDRESSABLE));
+    // The answers, then the farthest depth each test found, then a debug copy.
+    hiz_read_[slot_] = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(kHizMaxRecords) * 8 + 65536 * 4));
+    if (!hiz_pred_[slot_] || !hiz_read_[slot_]) {
+      hiz_pred_[slot_].reset();
+      hiz_read_[slot_].reset();
+      return false;
+    }
+  }
+  return true;
+}
+
+// Tests the records [first, first + count) of hiz_records_ against `target`'s
+// depth. On success the answers are in hiz_pred_[slot_] from record `base`
+// (hiz_pred_used_) on, and the render pass is closed (the next draw reopens it).
+bool PlumeCommandProcessor::HizRunTest(Target& target, uint32_t count, uint32_t* base_out) {
+  const uint32_t w = target.width, h = target.height;
+  if (!count || uint64_t(w) * h * 4 > 4096ull * 2048 * 4 || target.format != RenderFormat::D32_FLOAT_S8_UINT) {
+    return false;
+  }
+  if (hiz_pred_used_[slot_] + count > kHizMaxRecords) return false;
+  // Levels: 8 px blocks, then 16, 32, 64, 128.
+  constexpr uint32_t kLevels = 5;
+  uint32_t lw[kLevels], lh[kLevels], offset[kLevels];
+  uint32_t total = 0;
+  lw[0] = (w + 7) / 8;
+  lh[0] = (h + 7) / 8;
+  for (uint32_t l = 1; l < kLevels; ++l) {
+    lw[l] = (lw[l - 1] + 1) / 2;
+    lh[l] = (lh[l - 1] + 1) / 2;
+  }
+  for (uint32_t l = 0; l < kLevels; ++l) {
+    offset[l] = total;
+    total += lw[l] * lh[l];
+  }
+  if (uint64_t(total) * 4 > (uint64_t(1) << 20)) return false;
+  const uint64_t records_offset = Allocate(uint64_t(count) * 32, 256);
+  if (records_offset == UINT64_MAX) return false;
+  auto* out = reinterpret_cast<float*>(Pointer(records_offset));
+  for (uint32_t i = 0; i < count; ++i) {
+    const HizRecord& r = hiz_records_[i];
+    float* record = out + size_t(i) * 8;
+    record[0] = r.rect[0];
+    record[1] = r.rect[1];
+    record[2] = r.rect[2];
+    record[3] = r.rect[3];
+    record[4] = r.z;
+    record[5] = record[6] = record[7] = 0.f;
+  }
+  const uint32_t base = hiz_pred_used_[slot_];
+  // Closes the pass and puts the depth where it can be copied from.
+  L()->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(target.texture.get(), RenderTextureLayout::COPY_SOURCE));
+  ++stats_.barriers;
+  target.layout = RenderTextureLayout::COPY_SOURCE;
+  bound_framebuffer_ = nullptr;
+  VkCommandBuffer cb = static_cast<VulkanCommandList*>(L())->vk;
+  VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+  VkBufferImageCopy region = {};
+  region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  region.imageSubresource.layerCount = 1;
+  region.imageExtent = {w, h, 1};
+  vkCmdCopyImageToBuffer(cb, static_cast<VulkanTexture*>(target.texture.get())->vk,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, static_cast<VulkanBuffer*>(depth_staging_.get())->vk, 1,
+                         &region);
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0,
+                       nullptr, 0, nullptr);
+  const uint64_t depth_address = depth_staging_->getDeviceAddress();
+  const uint64_t pyramid_address = hiz_pyramid_->getDeviceAddress();
+  auto compute_barrier = [&]() {
+    VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0,
+                         nullptr, 0, nullptr);
+  };
+  // Level 0 from the depth, then each from the one before.
+  {
+    struct {
+      uint64_t src, dst;
+      uint32_t width, height, bw, bh;
+    } push = {depth_address, pyramid_address + uint64_t(offset[0]) * 4, w, h, lw[0], lh[0]};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, hiz_pipelines_[0]);
+    vkCmdPushConstants(cb, hiz_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cb, (lw[0] * lh[0] + 63) / 64, 1, 1);
+  }
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, hiz_pipelines_[1]);
+  for (uint32_t l = 1; l < kLevels; ++l) {
+    compute_barrier();
+    struct {
+      uint64_t src, dst;
+      uint32_t sw, sh, dw, dh;
+    } push = {pyramid_address + uint64_t(offset[l - 1]) * 4, pyramid_address + uint64_t(offset[l]) * 4,
+              lw[l - 1], lh[l - 1], lw[l], lh[l]};
+    vkCmdPushConstants(cb, hiz_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cb, (lw[l] * lh[l] + 63) / 64, 1, 1);
+  }
+  compute_barrier();
+  {
+    struct {
+      uint64_t records, predicate, pyramid;
+      uint32_t count, levels;
+      uint32_t offsets[6], widths[6], heights[6];
+    } push = {};
+    push.records = Address(records_offset);
+    push.predicate = hiz_pred_[slot_]->getDeviceAddress() + uint64_t(base) * 4;
+    push.pyramid = pyramid_address;
+    push.count = count;
+    push.levels = kLevels;
+    for (uint32_t l = 0; l < kLevels; ++l) {
+      push.offsets[l] = offset[l];
+      push.widths[l] = lw[l];
+      push.heights[l] = lh[l];
+    }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, hiz_pipelines_[2]);
+    vkCmdPushConstants(cb, hiz_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cb, (count + 63) / 64, 1, 1);
+  }
+  // The answers go to conditional rendering, and to the readback buffer.
+  {
+    VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b, 0,
+                         nullptr, 0, nullptr);
+  }
+  VkBufferCopy copies[2] = {{uint64_t(base) * 4, uint64_t(base) * 4, uint64_t(count) * 4},
+                            {uint64_t(kHizMaxRecords + base) * 4, uint64_t(kHizMaxRecords + base) * 4,
+                             uint64_t(count) * 4}};
+  vkCmdCopyBuffer(cb, static_cast<VulkanBuffer*>(hiz_pred_[slot_].get())->vk,
+                  static_cast<VulkanBuffer*>(hiz_read_[slot_].get())->vk, hiz_verify_ ? 2 : 1, copies);
+  // Debug: the first window of some frames also copies its level 0 out.
+  if (hiz_debug_ && !hiz_debug_pending_[slot_] && swaps_ % 60 == 0 && lw[0] * lh[0] <= 65536) {
+    VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b, 0,
+                         nullptr, 0, nullptr);
+    VkBufferCopy debug_copy = {uint64_t(offset[0]) * 4, uint64_t(kHizMaxRecords) * 8, uint64_t(lw[0]) * lh[0] * 4};
+    vkCmdCopyBuffer(cb, static_cast<VulkanBuffer*>(hiz_pyramid_.get())->vk,
+                    static_cast<VulkanBuffer*>(hiz_read_[slot_].get())->vk, 1, &debug_copy);
+    hiz_debug_pending_[slot_] = lw[0] * lh[0];
+    hiz_debug_rects_[slot_].clear();
+    for (uint32_t i = 0; i < count && i < 64; ++i) {
+      hiz_debug_rects_[slot_].push_back({hiz_records_[i].rect[0], hiz_records_[i].rect[1], hiz_records_[i].rect[2],
+                                         hiz_records_[i].rect[3], hiz_records_[i].z});
+    }
+  }
+  // The compute layout's push constants may disturb the graphics ones.
+  pushed_constants_[0] = pushed_constants_[1] = pushed_constants_[2] = UINT64_MAX;
+  hiz_pred_used_[slot_] += count;
+  *base_out = base;
+  ++stats_.hiz_windows_tested;
+  stats_.hiz_records += count;
+  // Back to a depth buffer the next draw can write.
+  Transition(target.texture.get(), target.layout, RenderTextureLayout::DEPTH_WRITE);
+  return true;
+}
+
+// Records a window with the Hi-Z test. False leaves it to the plain loop.
+//
+// A test costs a pass break, a copy of the depth and a few dispatches, so it is
+// only paid for where it can win: a window holding draws that were hidden
+// before (their answers are needed, in this frame, to run them or not), and now
+// and then a few windows that hold nothing back, to find out which draws are
+// hidden. When what the tests find drops under a few percent the second kind
+// becomes rare.
+bool PlumeCommandProcessor::HizFlushWindow(size_t n) {
+  if (hiz_mode_ < 3 || !hiz_cond_) return false;
+  Target* depth = nullptr;
+  uint32_t testable = 0, remembered = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const DrawPacket& pk = flushing_[i];
+    if (!pk.hiz_depth || !pk.hiz_depth->texture || pk.hiz_depth->texture.get() != pk.hiz_texture) continue;
+    if (!depth) depth = pk.hiz_depth;
+    if (pk.hiz_depth != depth) continue;
+    ++testable;
+    auto found = hiz_history_.find(pk.hiz_key);
+    if (hiz_force_ || (found != hiz_history_.end() && found->second.hidden && swaps_ - found->second.frame <= 90)) {
+      ++remembered;
+    }
+  }
+  ++stats_.hiz_windows_all;
+  if (!depth || !testable) return false;
+  const bool learning = testable >= 3 && hiz_learn_left_ > 0 && swaps_ % hiz_learn_period_ < 2;
+  if (!remembered && !learning) {
+    ++stats_.hiz_small_windows;
+    stats_.hiz_small_draws += testable;
+    return false;
+  }
+  if (hiz_tests_frame_ >= (remembered ? 12u : 3u) + (remembered ? 0u : hiz_tests_remembered_) ||
+      !HizEnsureResources()) {
+    return false;
+  }
+  ++hiz_tests_frame_;
+  if (remembered) ++hiz_tests_remembered_;
+  else --hiz_learn_left_;
+  auto usable = [&](const DrawPacket& pk) {
+    return pk.hiz_depth == depth && pk.hiz_texture == depth->texture.get();
+  };
+  // Recorded now, in the grouped order: whatever is not known to be hidden.
+  hiz_records_.clear();
+  hiz_held_.clear();
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t index = defer_order_[i];
+    const DrawPacket& pk = flushing_[index];
+    if (usable(pk)) {
+      auto found = hiz_history_.find(pk.hiz_key);
+      if (hiz_force_ || (found != hiz_history_.end() && found->second.hidden && swaps_ - found->second.frame <= 90)) {
+        hiz_held_.push_back(index);
+        continue;
+      }
+      hiz_records_.push_back({pk.hiz_key, {pk.hiz_rect[0], pk.hiz_rect[1], pk.hiz_rect[2], pk.hiz_rect[3]},
+                              pk.hiz_z, false, pk.vs_hash, pk.ps_hash});
+    }
+    EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
+  }
+  const uint32_t emitted_records = uint32_t(hiz_records_.size());
+  for (uint32_t index : hiz_held_) {
+    const DrawPacket& pk = flushing_[index];
+    hiz_records_.push_back({pk.hiz_key, {pk.hiz_rect[0], pk.hiz_rect[1], pk.hiz_rect[2], pk.hiz_rect[3]},
+                            pk.hiz_z, true, pk.vs_hash, pk.ps_hash});
+  }
+  stats_.hiz_held += hiz_held_.size();
+  uint32_t base = 0;
+  const bool tested = HizRunTest(*depth, uint32_t(hiz_records_.size()), &base);
+  // Debug (RENUT_HIZ_VERIFY): each held draw runs whatever the answer, inside an
+  // occlusion query, and a draw answered "hidden" that put samples out is a
+  // violation.
+  const bool verify = tested && hiz_verify_ && hiz_query_pool_ != VK_NULL_HANDLE &&
+                      hiz_queries_used_[slot_] + hiz_held_.size() <= kHizMaxQueries;
+  uint32_t first_query = 0;
+  if (verify && !hiz_held_.empty()) {
+    first_query = slot_ * kHizMaxQueries + hiz_queries_used_[slot_];
+    vkCmdResetQueryPool(static_cast<VulkanCommandList*>(L())->vk, hiz_query_pool_, first_query,
+                        uint32_t(hiz_held_.size()));
+    hiz_queries_used_[slot_] += uint32_t(hiz_held_.size());
+  }
+  if (tested) {
+    for (size_t r = 0; r < hiz_records_.size(); ++r) {
+      const bool held = hiz_records_[r].held;
+      const uint32_t query = verify && held ? first_query + uint32_t(r - emitted_records) : UINT32_MAX;
+      hiz_pending_[slot_].push_back({hiz_records_[r].key, held, query, hiz_records_[r].vs, hiz_records_[r].ps});
+    }
+  } else {
+    ++stats_.hiz_test_failed;
+  }
+  for (size_t k = 0; k < hiz_held_.size(); ++k) {
+    DrawPacket pk = flushing_[hiz_held_[k]];
+    if (tested && !verify) pk.hiz_pred_offset = (base + emitted_records + uint32_t(k)) * 4;
+    if (verify) pk.hiz_query = first_query + uint32_t(k);
+    EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
+  }
+  return true;
+}
+
+// The answers of a slot's last frame, once its fence has passed: what each key
+// was found to be, for the frames that follow.
+void PlumeCommandProcessor::HizReadResults(uint32_t slot) {
+  std::vector<HizPending>& pending = hiz_pending_[slot];
+  if (hiz_debug_pending_[slot] && hiz_read_[slot]) {
+    const auto* all = static_cast<const float*>(hiz_read_[slot]->map());
+    if (all) {
+      const float* tiles = all + 2 * kHizMaxRecords;
+      const uint32_t n = hiz_debug_pending_[slot];
+      uint32_t far_tiles = 0;
+      float lowest = 1.f, highest = 0.f;
+      for (uint32_t i = 0; i < n; ++i) {
+        far_tiles += tiles[i] >= 0.9999f;
+        lowest = std::min(lowest, tiles[i]);
+        highest = std::max(highest, tiles[i]);
+      }
+      std::string line = fmt::format("Renut: Plume Hi-Z debug: level 0 has {} tiles, {} at the far plane, range {}..{};",
+                                     n, far_tiles, lowest, highest);
+      for (const auto& r : hiz_debug_rects_[slot]) {
+        if (&r - hiz_debug_rects_[slot].data() >= 6) break;
+        line += fmt::format(" rect({:.0f},{:.0f})-({:.0f},{:.0f}) z={:.4f}", r[0], r[1], r[2], r[3], r[4]);
+      }
+      REXLOG_INFO("{}", line);
+      hiz_read_[slot]->unmap();
+    }
+    hiz_debug_pending_[slot] = 0;
+  }
+  if (pending.empty()) return;
+  if (hiz_read_[slot]) {
+    const auto* answers = static_cast<const uint32_t*>(hiz_read_[slot]->map());
+    if (answers) {
+      // One verdict a key per frame: hidden only if every instance was.
+      std::unordered_map<uint64_t, bool> hidden;
+      std::vector<uint64_t> samples;
+      if (hiz_verify_ && hiz_query_pool_ != VK_NULL_HANDLE && hiz_queries_used_[slot]) {
+        samples.assign(hiz_queries_used_[slot], 0);
+        vkGetQueryPoolResults(static_cast<VulkanDevice*>(device_)->vk, hiz_query_pool_, slot * kHizMaxQueries,
+                              hiz_queries_used_[slot], samples.size() * 8, samples.data(), 8,
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+      }
+      for (size_t i = 0; i < pending.size(); ++i) {
+        const bool occluded = answers[i] == 0;
+        if (pending[i].query != UINT32_MAX && !samples.empty()) {
+          const uint32_t q = pending[i].query - slot * kHizMaxQueries;
+          if (q < samples.size()) {
+            ++stats_.hiz_verified;
+            if (occluded && samples[q]) ++stats_.hiz_violations;
+            if (!occluded && !samples[q]) {
+              ++stats_.hiz_missed_hidden;
+              // Why the test could not tell: no depth there yet, or some.
+              const float m = reinterpret_cast<const float*>(answers)[kHizMaxRecords + i];
+              if (m >= 0.9999f) ++stats_.hiz_missed_empty;
+              auto& pair = hiz_zero_pairs_[pending[i].vs * 0x9E3779B97F4A7C15ull ^ pending[i].ps];
+              pair = {pair[0] + 1, pending[i].vs, pending[i].ps};
+            }
+          }
+        }
+        auto [it, fresh] = hidden.try_emplace(pending[i].key, occluded);
+        if (!fresh) it->second = it->second && occluded;
+        ++stats_.hiz_answered;
+        ++hiz_total_answered_;
+        if (occluded) {
+          ++stats_.hiz_occluded;
+          ++hiz_total_hidden_;
+          if (pending[i].held) ++stats_.hiz_held_skipped;
+        } else if (pending[i].held) {
+          ++stats_.hiz_held_visible;
+        }
+      }
+      for (const auto& [key, occluded] : hidden) {
+        HizHistory& h = hiz_history_[key];
+        h.hidden = occluded;
+        h.frame = swaps_;
+      }
+      hiz_read_[slot]->unmap();
+    }
+  }
+  pending.clear();
+  hiz_pred_used_[slot] = 0;
+  hiz_queries_used_[slot] = 0;
+  // What the tests find decides how often to look for more.
+  if (hiz_total_answered_ - hiz_gain_answered_ >= 600) {
+    const uint64_t answered = hiz_total_answered_ - hiz_gain_answered_;
+    const uint64_t hidden = hiz_total_hidden_ - hiz_gain_hidden_;
+    // Nothing (under 2%) found hidden: look every 600 frames instead of 8.
+    hiz_learn_period_ = hidden * 50 < answered ? 600 : 8;
+    hiz_gain_answered_ = hiz_total_answered_;
+    hiz_gain_hidden_ = hiz_total_hidden_;
+  }
+  // Keys that stopped appearing.
+  if (hiz_history_.size() > 20000) {
+    for (auto it = hiz_history_.begin(); it != hiz_history_.end();) {
+      it = swaps_ - it->second.frame > 600 ? hiz_history_.erase(it) : std::next(it);
+    }
+  }
+}
+
 bool PlumeCommandProcessor::ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
                                                draw_util::ResolveInfo& info) {
   if (!resolve_regs_) resolve_regs_ = std::make_unique<RegisterFile>();
@@ -9602,6 +10771,18 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       defer_mode_ = uint32_t(defer);
     }
     {
+      int hiz = std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 4);
+      if (FILE* file = std::fopen((root + "/plume-hiz").c_str(), "r")) {
+        int value = hiz;
+        if (std::fscanf(file, "%d", &value) == 1) hiz = std::clamp(value, 0, 4);
+        std::fclose(file);
+      }
+      if (uint32_t(hiz) != hiz_mode_) {
+        REXLOG_INFO("Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor, 3 + occlusion, 4 + occlusion of depth-only draws)", hiz);
+      }
+      hiz_mode_ = uint32_t(hiz);
+    }
+    {
       int fetch_spec = std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1);
       if (FILE* file = std::fopen((root + "/plume-fetchspec").c_str(), "r")) {
         int value = fetch_spec;
@@ -10099,9 +11280,68 @@ void PlumeCommandProcessor::Report() {
       stats_.kept_unwatchable, kept_bytes_ >> 20, kept_streams_.size(), stats_.band_skipped,
       stats_.band_moved, stats_.band_widened);
   if (stats_.defer_windows) {
+    REXLOG_INFO("Renut: Plume windows closed by: elsewhere {} ({} draws), state change {} ({}), full {} ({}), "
+                "immediate draw {} ({}), the draw's own needs {} ({})",
+                stats_.flush_windows[0], stats_.flush_draws[0], stats_.flush_windows[1], stats_.flush_draws[1],
+                stats_.flush_windows[2], stats_.flush_draws[2], stats_.flush_windows[3], stats_.flush_draws[3],
+                stats_.flush_windows[4], stats_.flush_draws[4]);
     REXLOG_INFO("Renut: Plume deferred draws (mode {}): {} draws in {} windows, pipeline changes {} -> {}",
                 defer_mode_, stats_.deferred_draws, stats_.defer_windows, stats_.defer_binds_before,
                 stats_.defer_binds_after);
+  }
+  if (hiz_mode_ && (stats_.hiz_seen[0] || stats_.hiz_seen[1])) {
+    REXLOG_INFO(
+        "Renut: Plume Hi-Z (mode {}): colour seen={} boxed={} no_model={} no_box={} frustum={} scissor={} | "
+        "depth-only seen={} boxed={} no_model={} no_box={} frustum={} scissor={} | dropped={} | models {}/{} valid "
+        "({} rejected, {} ms), boxes {} made ({} ms, {} reused) | skipped: no_indices={} prim={} memexport={} clip_state={} "
+        "const_base={}",
+        hiz_mode_, stats_.hiz_seen[1], stats_.hiz_eligible[1], stats_.hiz_no_model[1], stats_.hiz_no_box[1],
+        stats_.hiz_frustum[1], stats_.hiz_scissor[1], stats_.hiz_seen[0], stats_.hiz_eligible[0],
+        stats_.hiz_no_model[0], stats_.hiz_no_box[0], stats_.hiz_frustum[0], stats_.hiz_scissor[0],
+        stats_.hiz_culled_total, stats_.hiz_models_valid, stats_.hiz_models, stats_.hiz_model_rejected,
+        stats_.hiz_model_us / 1000, stats_.hiz_boxes_made, stats_.hiz_box_us / 1000, stats_.hiz_box_hits,
+        stats_.hiz_why[0], stats_.hiz_why[1], stats_.hiz_why[2], stats_.hiz_why[3], stats_.hiz_why[4]);
+  }
+  if (hiz_mode_ && !hiz_clip_states_.empty()) {
+    std::vector<std::pair<uint64_t, uint64_t>> ranked;
+    for (const auto& [state, count] : hiz_clip_states_) ranked.emplace_back(count, state);
+    std::sort(ranked.rbegin(), ranked.rend());
+    std::string line = "Renut: Plume Hi-Z skipped clip states (vte/clip):";
+    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 6); ++i) {
+      line += fmt::format(" [{:08X}/{:08X} x{}]", uint32_t(ranked[i].second >> 32), uint32_t(ranked[i].second),
+                          ranked[i].first);
+    }
+    REXLOG_INFO("{}", line);
+    hiz_clip_states_.clear();
+  }
+  if (hiz_mode_ >= 3) {
+    REXLOG_INFO(
+        "Renut: Plume Hi-Z occlusion: {} windows tested ({} failed), {} draws tested, {} held back, of which {} "
+        "answered hidden and {} visible; {} answered ({} hidden in all); {} draws run under conditional rendering; "
+        "history {} keys | boxed draws {} (not deferred {}, biased {}, other depth func {}, no depth {}); windows {} "
+        "(not tested {} holding {} draws); learning every {} frames; verified {} held draws: {} violations, {} "
+        "visible answers with no samples ({} of them over depth still at the far plane)",
+        stats_.hiz_windows_tested, stats_.hiz_test_failed, stats_.hiz_records, stats_.hiz_held,
+        stats_.hiz_held_skipped, stats_.hiz_held_visible, stats_.hiz_answered, stats_.hiz_occluded,
+        stats_.hiz_predicated_draws, hiz_history_.size(), stats_.hiz_boxed_draws, stats_.hiz_why_not[0],
+        stats_.hiz_why_not[1], stats_.hiz_why_not[2], stats_.hiz_why_not[3], stats_.hiz_windows_all,
+        stats_.hiz_small_windows, stats_.hiz_small_draws, hiz_learn_period_, stats_.hiz_verified,
+        stats_.hiz_violations, stats_.hiz_missed_hidden, stats_.hiz_missed_empty);
+  }
+  if (!hiz_zero_pairs_.empty()) {
+    std::vector<std::array<uint64_t, 3>> ranked;
+    uint64_t total = 0;
+    for (const auto& [key, entry] : hiz_zero_pairs_) {
+      ranked.push_back(entry);
+      total += entry[0];
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a[0] > b[0]; });
+    std::string line = fmt::format("Renut: Plume Hi-Z draws with no samples that the test could not call hidden ({}):", total);
+    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 8); ++i) {
+      line += fmt::format(" [vs {:016X} ps {:016X} x{}]", ranked[i][1], ranked[i][2], ranked[i][0]);
+    }
+    REXLOG_INFO("{}", line);
+    hiz_zero_pairs_.clear();
   }
   if (bc_supported_ && bc_mode_) {
     REXLOG_INFO("Renut: Plume BC textures: {} of the {} 2D uploads were blocks, not decoded pixels",
@@ -10181,6 +11421,29 @@ void PlumeCommandProcessor::Report() {
                   std::get<2>(key), std::get<3>(key) ? " memexport" : "", count);
     }
     drops_.clear();
+  }
+  // One line a report in <files>/plume-hiz.txt whatever the log level is, for
+  // A/B runs that cannot read the log.
+  if (!miss_dump_directory_.empty()) {
+    const std::string path = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/plume-hiz.txt";
+    if (FILE* out = std::fopen(path.c_str(), "a")) {
+      std::fprintf(out,
+                   "mode=%u swaps=%llu draws=%llu drawn=%llu dropped=%llu color_seen=%llu color_boxed=%llu "
+                   "color_frustum=%llu depth_seen=%llu depth_boxed=%llu depth_frustum=%llu windows_tested=%llu "
+                   "tested=%llu held=%llu answered=%llu hidden=%llu predicated=%llu test_failed=%llu cp_cpu_ms=%llu "
+                   "cull_ms=%llu pipeline_binds=%llu\n",
+                   hiz_mode_, (unsigned long long)swaps_, (unsigned long long)stats_.draws,
+                   (unsigned long long)stats_.drawn, (unsigned long long)stats_.hiz_culled_total,
+                   (unsigned long long)stats_.hiz_seen[1], (unsigned long long)stats_.hiz_eligible[1],
+                   (unsigned long long)stats_.hiz_frustum[1], (unsigned long long)stats_.hiz_seen[0],
+                   (unsigned long long)stats_.hiz_eligible[0], (unsigned long long)stats_.hiz_frustum[0],
+                   (unsigned long long)stats_.hiz_windows_tested, (unsigned long long)stats_.hiz_records,
+                   (unsigned long long)stats_.hiz_held, (unsigned long long)stats_.hiz_answered,
+                   (unsigned long long)stats_.hiz_occluded, (unsigned long long)stats_.hiz_predicated_draws,
+                   (unsigned long long)stats_.hiz_test_failed, (unsigned long long)(stats_.cp_cpu_us / 1000),
+                   (unsigned long long)(stats_.hiz_cull_ns / 1000000), (unsigned long long)stats_.pipeline_binds);
+      std::fclose(out);
+    }
   }
   reported_guest_swaps_ = renut_guest_swap_count();
   stats_ = {};

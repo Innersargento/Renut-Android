@@ -1,0 +1,37 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// Hi-Z, first level: the largest depth of every 8x8 block of the depth image
+// (copied out as D32_SFLOAT, width texels to a row). The farthest value is the
+// one an object has to be behind to be hidden.
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Floats { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Out { float v[]; };
+
+layout(push_constant) uniform Push {
+    Floats depth;
+    Out dst;
+    uint width;
+    uint height;
+    uint bw;
+    uint bh;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.bw * p.bh) return;
+    uint bx = i % p.bw, by = i / p.bw;
+    float m = 0.0;
+    for (uint y = 0u; y < 8u; ++y) {
+        uint py = by * 8u + y;
+        if (py >= p.height) break;
+        for (uint x = 0u; x < 8u; ++x) {
+            uint px = bx * 8u + x;
+            if (px >= p.width) break;
+            m = max(m, p.depth.v[py * p.width + px]);
+        }
+    }
+    p.dst.v[i] = m;
+}

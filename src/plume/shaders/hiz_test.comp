@@ -1,0 +1,48 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// Hi-Z test: for each record (a screen rectangle in target pixels and the
+// nearest depth of the object's box), 1 if any part of the object can still be
+// in front of what the depth image holds there, 0 if it is wholly behind.
+// The answer feeds conditional rendering; it is conservative in every way
+// (coarse tiles, a hair of slack on the depth).
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Records { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Floats { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Words { uint v[]; };
+
+layout(push_constant) uniform Push {
+    Records records;
+    Words predicate;
+    Floats pyramid;
+    uint count;
+    uint levels;
+    uint offsets[6];
+    uint widths[6];
+    uint heights[6];
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+    vec4 rect = p.records.v[2u * i];
+    float z = p.records.v[2u * i + 1u].x;
+    float size = max(rect.z - rect.x, rect.w - rect.y);
+    uint level = 0u;
+    while (level + 1u < p.levels && float(8u << level) < size) ++level;
+    float tile = float(8u << level);
+    int w = int(p.widths[level]), h = int(p.heights[level]);
+    int x0 = clamp(int(floor(rect.x / tile)), 0, w - 1), x1 = clamp(int(floor(rect.z / tile)), 0, w - 1);
+    int y0 = clamp(int(floor(rect.y / tile)), 0, h - 1), y1 = clamp(int(floor(rect.w / tile)), 0, h - 1);
+    float m = 0.0;
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            m = max(m, p.pyramid.v[p.offsets[level] + uint(y * w + x)]);
+        }
+    }
+    p.predicate.v[i] = z <= m + 2e-5 ? 1u : 0u;
+    // The farthest depth found, for the verification run's statistics.
+    p.predicate.v[i + 16384u] = floatBitsToUint(m);
+}

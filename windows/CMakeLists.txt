@@ -137,7 +137,7 @@ add_executable(renut_plume_exe
     "${RENUT_SRC}/guest/kernel_overrides.cpp" "${RENUT_SRC}/guest/host_support.cpp"
     "${RENUT_SRC}/d3d/d3d_layer.cpp" "${RENUT_SRC}/d3d/native_d3d.cpp"
     "${RENUT_SRC}/d3d/plume_d3d.cpp"
-    "${RENUT_SRC}/plume/plume_renderer.cpp" "${RENUT_SRC}/plume/plume_gpu.cpp"
+    "${RENUT_SRC}/plume/plume_renderer.cpp" "${RENUT_SRC}/plume/plume_gpu.cpp" "${RENUT_SRC}/plume/hiz_model.cpp"
     "${RENUT_SRC}/plume/plume_textures.cpp" "${RENUT_SRC}/plume/shader_cache_blob.S"
     "${RENUT_SHADERS}/shader_cache.cpp"
     "${RENUT_SRC}/vendor/smolv/smolv.cpp"

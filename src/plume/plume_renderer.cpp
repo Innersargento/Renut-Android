@@ -168,6 +168,7 @@ struct VulkanLayerState {
   PFN_vkWaitForFences wait_for_fences = nullptr;
   bool installed = false;
   bool cache_control = false;               // VK_EXT_pipeline_creation_cache_control is on
+  bool conditional = false;                 // VK_EXT_conditional_rendering is on (Hi-Z)
   std::atomic<bool> buffer_address{false};  // buffers get the device address usage
   std::atomic<bool> device_lost{false};
 };
@@ -835,19 +836,24 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, cons
                                       info->ppEnabledExtensionNames + info->enabledExtensionCount);
   VkPhysicalDevicePipelineCreationCacheControlFeatures control{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES};
+  VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
   uint32_t count = 0;
   vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
   std::vector<VkExtensionProperties> available(count);
   vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, available.data());
   const auto named = [](const char* a, const char* b) { return std::strcmp(a, b) == 0; };
-  const bool present = std::any_of(available.begin(), available.end(), [&](const VkExtensionProperties& e) {
-    return named(e.extensionName, VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
-  });
-  const bool requested = std::any_of(extensions.begin(), extensions.end(), [&](const char* e) {
-    return named(e, VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
-  });
-  bool control_wanted = false;
-  if (present && !requested) {
+  const auto has = [&](const char* name) {
+    return std::any_of(available.begin(), available.end(),
+                       [&](const VkExtensionProperties& e) { return named(e.extensionName, name); });
+  };
+  const auto requested = [&](const char* name) {
+    return std::any_of(extensions.begin(), extensions.end(), [&](const char* e) { return named(e, name); });
+  };
+  void* chain = const_cast<void*>(info->pNext);
+  bool control_wanted = false, conditional_wanted = false;
+  if (has(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME) &&
+      !requested(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME)) {
     VkPhysicalDevicePipelineCreationCacheControlFeatures supported{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES};
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -855,16 +861,36 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, cons
     vkGetPhysicalDeviceFeatures2(physical, &features);
     if (supported.pipelineCreationCacheControl) {
       control.pipelineCreationCacheControl = VK_TRUE;
-      control.pNext = const_cast<void*>(info->pNext);
-      edited.pNext = &control;
+      control.pNext = chain;
+      chain = &control;
       extensions.push_back(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
-      edited.enabledExtensionCount = uint32_t(extensions.size());
-      edited.ppEnabledExtensionNames = extensions.data();
       control_wanted = true;
     }
   }
+  // Conditional rendering: the Hi-Z test's answer decides, on the GPU, whether
+  // a draw runs.
+  if (has(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) && !requested(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT supported{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &supported;
+    vkGetPhysicalDeviceFeatures2(physical, &features);
+    if (supported.conditionalRendering) {
+      conditional.conditionalRendering = VK_TRUE;
+      conditional.pNext = chain;
+      chain = &conditional;
+      extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+      conditional_wanted = true;
+    }
+  }
+  if (control_wanted || conditional_wanted) {
+    edited.pNext = chain;
+    edited.enabledExtensionCount = uint32_t(extensions.size());
+    edited.ppEnabledExtensionNames = extensions.data();
+  }
   const VkResult result = layer.create_device(physical, &edited, allocator, device);
   layer.cache_control = result == VK_SUCCESS && control_wanted;
+  layer.conditional = result == VK_SUCCESS && conditional_wanted;
   return result;
 }
 
@@ -948,6 +974,7 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateBuffer(VkDevice device, const VkBuffer
   }
   VkBufferCreateInfo edited = *info;
   edited.usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+  if (layer.conditional) edited.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
   if (layer.buffer_address.load(std::memory_order_relaxed)) {
     edited.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   }
@@ -1005,5 +1032,7 @@ void VulkanLayerDeviceCreated(bool buffer_device_address) {
 }
 
 bool PlumeDeviceLost() { return layer.device_lost.load(); }
+
+bool PlumeConditionalRenderingSupported() { return layer.conditional; }
 
 }  // namespace renut

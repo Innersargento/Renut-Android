@@ -61,6 +61,9 @@ void PlumePipelineCacheCounts(uint64_t* found, uint64_t* compiled);
 // Whether a queue submission or a fence wait has answered VK_ERROR_DEVICE_LOST: the
 // GPU faulted, and every later call says the same.
 bool PlumeDeviceLost();
+// Whether the device was made with VK_EXT_conditional_rendering (storage buffers
+// then also carry the conditional rendering usage). Known once the renderer has started.
+bool PlumeConditionalRenderingSupported();
 
 class PlumeRenderer {
  public:
