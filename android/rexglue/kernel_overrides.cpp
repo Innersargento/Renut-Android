@@ -106,6 +106,24 @@ RENUT_PASS_THROUGH(XAudioUnregisterRenderDriverClient)
 RENUT_PASS_THROUGH(XAudioSubmitRenderDriverFrame)
 RENUT_PASS_THROUGH(XAudioGetVoiceCategoryVolumeChangeMask)
 RENUT_PASS_THROUGH(XamShowKeyboardUI)  // Android's is in text_input_bridge.cpp
+RENUT_PASS_THROUGH(XamUserGetXUID)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserGetSigninState)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserGetSigninInfo)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserGetName)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserGetGamerTag)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserReadProfileSettings)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserReadProfileSettingsEx)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserWriteProfileSettings)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserCheckPrivilege)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserContentRestrictionGetFlags)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserContentRestrictionGetRating)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserGetMembershipTier)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserAreUsersFriends)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamShowSigninUI)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamInputGetState)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamInputGetKeystroke)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamInputGetKeystrokeEx)  // Android's are in xam_users.cpp
+RENUT_PASS_THROUGH(XamUserGetDeviceContext)  // Android's are in xam_users.cpp
 #undef RENUT_PASS_THROUGH
 #endif
 

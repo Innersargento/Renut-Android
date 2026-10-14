@@ -179,7 +179,7 @@ set_source_files_properties(shader_cache_blob.S PROPERTIES
     COMPILE_OPTIONS "-DRENUT_SHADER_BLOB=\"${RENUT_SHADERS}/shader_spirv.smolv\""
     OBJECT_DEPENDS "${RENUT_SHADERS}/shader_spirv.smolv")
 add_library(renut_runtime SHARED runtime_jni.cpp achievements_bridge.cpp text_input_bridge.cpp adpf.cpp plume_graphics.cpp game_fixes.cpp cheats.cpp
-    kernel_overrides.cpp host_support.cpp renut_audio.cpp
+    kernel_overrides.cpp host_support.cpp renut_audio.cpp xam_users.cpp
     d3d_layer.cpp native_d3d.cpp native_probe.cpp native_engine.cpp plume_d3d.cpp plume_renderer.cpp plume_gpu.cpp plume_textures.cpp shader_cache_blob.S
     "${RENUT_SHADERS}/shader_cache.cpp" thirdparty/smolv/smolv.cpp $<TARGET_OBJECTS:renut_guest>)
 target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
