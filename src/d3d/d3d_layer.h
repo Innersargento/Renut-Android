@@ -1,8 +1,8 @@
 #pragma once
 // Interception layer for the game's Direct3D (Xbox 360 XDK) entry points.
 //
-// Every function listed in d3d_functions.inc is overridden (the recompiled
-// definitions are weak). With renut_renderer = "xenos" each override counts the
+// Every function listed in d3d_functions.inc is overridden by a REX_HOOK_RAW
+// written out in d3d_hooks.inc (the recompiled definitions are weak). With renut_renderer = "xenos" each override counts the
 // call and forwards to the original, which emits PM4 for RexGlue's emulated
 // Xenos. With "plume" a registered handler may take the call instead, so the
 // native Plume renderer draws it and the emulated GPU only keeps the control

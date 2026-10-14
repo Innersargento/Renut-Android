@@ -35,8 +35,9 @@ src/
 
 | Arquivo | O que faz |
 |---|---|
-| `d3d_functions.inc` | Lista (X-macro) das entradas do Direct3D do XDK que o jogo chama |
-| `d3d_layer.{h,cpp}` | Sobrescreve cada uma: conta, encaminha ao original ou entrega a um handler |
+| `d3d_functions.inc` | Lista (X-macro) das entradas do Direct3D do XDK que o jogo chama; dá o enum `Function` |
+| `d3d_hooks.inc` | Um `REX_HOOK_RAW` por função, agrupado em *Taken* (o front end nativo assume), *Observed* (o original roda, o reNut lê ou ajusta) e *Forwarded* (só contada) |
+| `d3d_layer.{h,cpp}` | `Enter`/`Leave` comuns: conta, encaminha ao original ou entrega a um handler |
 | `plume_d3d.cpp` | Handlers do modo Plume |
 | `native_d3d.{h,cpp}` | Front end D3D nativo: listas e sincronização sem PM4/EDRAM |
 | `native_engine.{h,cpp}` | Pega os draws do mundo onde o motor os emite e os marca com um id para o renderizador reconhecer |

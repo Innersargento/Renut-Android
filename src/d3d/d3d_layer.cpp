@@ -262,15 +262,37 @@ void SetShaderDumpDirectory(std::string directory) {
 
 }  // namespace renut::d3d
 
-// Strong overrides of the weak recompiled definitions.
-#define X(symbol, name)                                                          \
-  extern "C" void __imp__##symbol(PPCContext& __restrict, uint8_t*);             \
-  REX_HOOK_RAW(symbol) {                                                           \
-    const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;                             \
-    if (!renut::d3d::Enter(renut::d3d::k##name, ctx, base)) {                    \
-      __imp__##symbol(ctx, base);                                                \
-    }                                                                            \
-    renut::d3d::Leave(renut::d3d::k##name, r3, r4, ctx, base);                   \
+// The hooks themselves are in d3d_hooks.inc, one REX_HOOK_RAW per function. They
+// are strong definitions of the recompiled functions' weak symbols; the
+// generated body stays reachable as __imp__<symbol>.
+namespace renut::d3d {
+namespace {
+
+using Original = void (*)(PPCContext& __restrict, uint8_t*);
+
+// One intercepted call: Enter may take it (a handler or the native front end),
+// otherwise the generated body runs, and Leave sees the arguments it was given.
+// Forced inline so that the fence-polling D3D_CBlocker_Check, called tens of
+// millions of times a second, costs what the macro it replaced did.
+[[gnu::always_inline]] inline void Run(Function function, Original original, PPCContext& ctx,
+                                       uint8_t* base) {
+  const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;
+  if (!Enter(function, ctx, base)) {
+    original(ctx, base);
   }
-#include "d3d_functions.inc"
-#undef X
+  Leave(function, r3, r4, ctx, base);
+}
+
+// The three names tell a reader what reNut does with the function (see the
+// header of d3d_hooks.inc). They share Run on purpose: the decision is made by
+// native_d3d::OnEnter and Leave, and these only say where each function stands.
+[[gnu::always_inline]] inline void Taken(Function f, Original o, PPCContext& c, uint8_t* b) { Run(f, o, c, b); }
+[[gnu::always_inline]] inline void Observed(Function f, Original o, PPCContext& c, uint8_t* b) { Run(f, o, c, b); }
+[[gnu::always_inline]] inline void Forwarded(Function f, Original o, PPCContext& c, uint8_t* b) { Run(f, o, c, b); }
+
+}  // namespace
+}  // namespace renut::d3d
+
+using namespace renut::d3d;
+
+#include "d3d_hooks.inc"

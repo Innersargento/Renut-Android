@@ -1,6 +1,7 @@
 // Generated from the Banjo-Kazooie: Nuts & Bolts symbol map of
 // etonedemid/reNut_linuxfixes (config/renut_funcs2.toml): D3D entry points
 // that exist as standalone recompiled functions. X(recompiled symbol, name).
+// The hooks themselves are written out in d3d_hooks.inc; a function must be in both.
 // The last five are named in config/renut_funcs.toml, so the generator emits
 // them under those names instead of sub_<address>.
 X(sub_82655DA0, D3DArrayTexture_GetArraySize)
