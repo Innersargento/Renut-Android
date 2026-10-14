@@ -24,8 +24,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     private Button cancel;
     private volatile Thread worker;
     private long lastProgress;
-    private String report="Nenhum teste gráfico executado.";
-    private long reportReadAt;
+    private String report="";
     private final ArrayList<Button> actions=new ArrayList<>();
     private final Map<String,Runnable> uiActions=new LinkedHashMap<>();
 
@@ -119,13 +118,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         graphics.addView(text("Depuração do Turnip. \"perf\" registra no logcat por que cada render pass foi para GMEM ou sysmem; \"sysmem\" e \"gmem\" forçam um dos modos. Só para medição. Não tem efeito no driver do sistema.",13,muted));
         ir3Debug=text("",16,ink); graphics.addView(ir3Debug);
         graphics.addView(text("Opções do compilador de shaders do Turnip. \"nopreamble\" é o mais rápido, mas faz placas penduradas piscarem entre dois tons; \"noearlypreamble\", \"nouboopt\" e \"nodescprefetch\" servem para medir. Cada combinação tem seu próprio cache de shaders. Não tem efeito no driver do sistema.",13,muted));
-        button(graphics,"Testar Plume no aparelho",()->{
-            Intent intent=new Intent(this,ProbeActivity.class);
-            intent.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
-            intent.putExtra("driverLib",getPreferences(0).getString("driverLib",""));
-            startActivity(intent);
-        });
-        graphics.addView(text("O teste mostra uma animação simples e mede CPU/GPU. Os resultados não indicam o desempenho do Banjo.",13,muted));
         LinearLayout diagnostics=card(body,"03   ATIVIDADE");
         status=text("Pronto para começar.",14,ink); diagnostics.addView(status);
         progress=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal); progress.setVisibility(View.GONE); diagnostics.addView(progress);
@@ -368,8 +360,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         tuDebug.setText("TU_DEBUG: "+(debug.isEmpty()?"desativado":debug));
         String ir3=getPreferences(0).getString("ir3Debug","");
         ir3Debug.setText("IR3_SHADER_DEBUG: "+(ir3.isEmpty()?"desativado":ir3));
-        File diagnostic=new File(getFilesDir(),"probe-report.txt");
-        try{if(diagnostic.lastModified()>reportReadAt){report=new String(Files.readAllBytes(diagnostic.toPath()),java.nio.charset.StandardCharsets.UTF_8);reportReadAt=diagnostic.lastModified();if(worker==null)status.setText(report);}}catch(IOException ignored){}
         File runtimeReport=new File(getFilesDir(),"runtime-report.txt");
         try{if(runtimeReport.isFile()&&worker==null)status.setText(new String(Files.readAllBytes(runtimeReport.toPath()),java.nio.charset.StandardCharsets.UTF_8));}catch(IOException ignored){}
     }

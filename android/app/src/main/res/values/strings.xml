@@ -238,12 +238,7 @@
     <string name="ctrl_rumble">Vibração</string>
     <string name="ctrl_rumble_note">Cada controle vibra com o jogador dele. Se o controle não tem motor de vibração, ou você joga só na tela, o celular vibra no lugar.</string>
     <string name="ctrl_rumble_test">Testar vibração</string>
-    <string name="probe_eyebrow">TESTE GRÁFICO</string>
-    <string name="probe_subtitle">Apresentação Vulkan no aparelho</string>
-    <string name="probe_running">Testando apresentação Plume…\nA animação dura alguns segundos.</string>
-    <string name="probe_save_failed">\nNão foi possível salvar o diagnóstico.</string>
     <string name="result_panel">Resultado</string>
-    <string name="probe_back">Voltar à biblioteca</string>
     <string name="runtime_eyebrow">TESTE DO RUNTIME</string>
     <string name="runtime_subtitle">Validação experimental</string>
     <string name="runtime_graphics_status">RexGlue + Plume\nImagem de teste na memória do runtime. Ainda não representa cenas do jogo.</string>

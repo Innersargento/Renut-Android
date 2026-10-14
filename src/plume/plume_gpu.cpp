@@ -186,9 +186,6 @@ using namespace rex::graphics;
 #include "shaders/depth_stencil_pack.comp.inc"
 #include "shaders/patch_expand.comp.inc"
 #include "shaders/patch_levels.comp.inc"
-#include "shaders/debug_point.frag.inc"
-#include "shaders/debug_trivial.frag.inc"
-#include "shaders/debug_trivial.vert.inc"
 #include "shaders/rect_list.geom.inc"
 
 // The push constants: the guest's three block addresses (24 bytes). The range is
@@ -2058,13 +2055,6 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unique_ptr<RenderTextureView> white_cube_view_;
   std::unique_ptr<RenderShader> rect_list_gs_;
   std::unique_ptr<RenderShader> point_list_gs_;
-  std::unique_ptr<RenderShader> debug_point_fs_;  // plume-debug-shader mode 8
-  // Debug: <files>/plume-trivial holds 1 to swap every draw's shaders for
-  // debug_trivial.{vert,frag} (nothing is rasterised), 2 only its pixel
-  // shader. What the GPU still spends is what a draw costs apart from the
-  // guest's shaders - the split the per-draw cost has been missing.
-  std::unique_ptr<RenderShader> debug_trivial_vs_, debug_trivial_fs_;
-  uint32_t trivial_mode_ = 0;
 
   // Keyed by guest base. Never overlapping: a new range swallows the ones it touches.
   std::map<uint32_t, ExportRange> exports_;
@@ -3241,12 +3231,6 @@ bool PlumeCommandProcessor::SetupContext() {
                                         RenderShaderFormat::SPIRV);
   point_list_gs_ = device_->createShader(k_point_list_geom, sizeof(k_point_list_geom), "main",
                                          RenderShaderFormat::SPIRV);
-  debug_point_fs_ = device_->createShader(k_debug_point_frag, sizeof(k_debug_point_frag), "main",
-                                          RenderShaderFormat::SPIRV);
-  debug_trivial_vs_ = device_->createShader(k_debug_trivial_vert, sizeof(k_debug_trivial_vert), "main",
-                                            RenderShaderFormat::SPIRV);
-  debug_trivial_fs_ = device_->createShader(k_debug_trivial_frag, sizeof(k_debug_trivial_frag), "main",
-                                            RenderShaderFormat::SPIRV);
 
   upload_used_ = 0;
   uint64_t white = Allocate(4 * 6, 256);
@@ -7686,8 +7670,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     key_bytes.Put(c.value);
   }
-  // Mode 8 swaps a point list's pixel shader for the sprite-coordinate view.
-  const bool debug_point = debug_draw && (debug_mode_ & 8) && point_list && color_count;
   // Geometry-shader and patch draws keep their own: their stages expect the
   // guest's outputs.
   const bool plain_draw = !rect_list && !point_list && !patch_list;
@@ -7700,11 +7682,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   const bool depth_strip = depth_module != nullptr;
   key_bytes.Put(uint8_t(fetch_spec | (depth_strip << 1)));
-  // Debug (plume-trivial bit 4): a trivial vertex shader for depth-only draws
-  // alone, to price what those draws cost without their vertex work.
-  const bool trivial_vs = ((trivial_mode_ & 1) || ((trivial_mode_ & 4) && !ps)) && plain_draw;
-  const bool trivial_fs = ps && (trivial_vs || ((trivial_mode_ & 2) && plain_draw));
-  key_bytes.Put(uint8_t(debug_point | (trivial_vs << 1) | (trivial_fs << 2)));
   for (const auto& e : input_elements) {
     key_bytes.Put(e.location);
     key_bytes.Put(e.format);
@@ -7749,15 +7726,11 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   if (!pipeline) {
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = layout_.get();
-    desc.vertexShader = trivial_vs     ? debug_trivial_vs_.get()
-                        : depth_strip  ? depth_module
-                        : fetch_spec  ? vertex_compiled->fetch_spec_module.get()
-                                      : vertex_compiled->module.get();
+    desc.vertexShader = depth_strip ? depth_module
+                        : fetch_spec ? vertex_compiled->fetch_spec_module.get()
+                                     : vertex_compiled->module.get();
     desc.geometryShader = rect_list ? rect_list_gs_.get() : point_list ? point_list_gs_.get() : nullptr;
-    desc.pixelShader = debug_point   ? debug_point_fs_.get()
-                       : trivial_fs  ? debug_trivial_fs_.get()
-                       : ps          ? ps->compiled->module.get()
-                                     : nullptr;
+    desc.pixelShader = ps ? ps->compiled->module.get() : nullptr;
     desc.primitiveTopology = topology;
     desc.cullMode = cull;
     desc.frontFace = front_face;
@@ -7786,8 +7759,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.specConstantsCount = uint32_t(spec_constants.size());
     // The pipeline built ahead from the recipe file (StartRecipes), if this
     // start had it; a pipeline not in the file yet is written to it.
-    if (recipes_ && !debug_point && !trivial_vs && !trivial_fs &&
-        !pending_pipelines_.count(key) &&
+    if (recipes_ && !pending_pipelines_.count(key) &&
         !failed_pipelines_.count(key)) {
       Recipe recipe;
       recipe.vs = (patch_list ? vs->domain_entry : vs->entry)->hash;
@@ -8228,7 +8200,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // order.
   bool defer = false;
   uint64_t window_signature = 0;
-  if (defer_mode_ && !sync_draws_ && !trace_ && !skip_mask_ && !bind_skip_ && !trivial_mode_ && !debug_draw && !patch_list &&
+  if (defer_mode_ && !sync_draws_ && !trace_ && !skip_mask_ && !bind_skip_ && !debug_draw && !patch_list &&
       !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && depth_write) {
     const xenos::CompareFunction zf = depth_control.zfunc;
     const bool strict = zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual ||
@@ -10012,13 +9984,6 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
     if (pixel_center != pixel_center_debug_) REXLOG_INFO("Renut: Plume pixel centre mode {}", pixel_center);
     pixel_center_debug_ = pixel_center;
-    unsigned int trivial = 0;
-    if (FILE* file = std::fopen((root + "/plume-trivial").c_str(), "r")) {
-      if (std::fscanf(file, "%u", &trivial) != 1) trivial = 0;
-      std::fclose(file);
-    }
-    if (trivial != trivial_mode_) REXLOG_INFO("Renut: Plume trivial shader mode {}", trivial);
-    trivial_mode_ = trivial;
     if (debug_shader != debug_shader_) REXLOG_INFO("Renut: Plume debugging shader {:016X}", debug_shader);
     debug_shader_ = debug_shader;
   }

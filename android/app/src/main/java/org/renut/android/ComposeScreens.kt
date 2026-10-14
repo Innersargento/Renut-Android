@@ -121,9 +121,6 @@ object ComposeScreens {
     @JvmStatic fun showController(activity: ControllerSettingsActivity) {
         activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { ControllerScreen(activity) } } })
     }
-    @JvmStatic fun showProbe(activity: ProbeActivity) {
-        activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { ProbeScreen(activity) } } })
-    }
     @JvmStatic fun showRuntime(activity: RuntimeActivity) {
         activity.setContentView(ComposeView(activity).apply { setContent { RenutTheme { RuntimeScreen(activity) } } })
     }
@@ -1225,18 +1222,6 @@ private val SidebarWidth = 360.dp
             Text(name, Modifier.fillMaxWidth().clickable { activity.uiSelect(index); chooseDevice = false; tick++ }.padding(12.dp))
         } } },
         confirmButton = { TextButton(onClick = { chooseDevice = false }) { Text(stringResource(R.string.common_close)) } })
-}
-
-@Composable private fun ProbeScreen(activity: ProbeActivity) {
-    var tick by remember { mutableIntStateOf(0) }
-    LaunchedEffect(Unit) { while (true) { delay(500); tick++ } }
-    @Suppress("UNUSED_VARIABLE") val refresh = tick
-    Column(Modifier.fillMaxSize().background(Background).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Header(stringResource(R.string.probe_eyebrow), "Plume", stringResource(R.string.probe_subtitle))
-        Panel(stringResource(R.string.result_panel)) { Text(activity.uiStatus(), color = Text, fontSize = 13.sp) }
-        AndroidView(factory = { SurfaceView(activity).also(activity::attachComposeSurface) }, modifier = Modifier.fillMaxWidth().weight(1f))
-        ActionButton(stringResource(R.string.probe_back), true) { activity.finish() }
-    }
 }
 
 @Composable private fun RuntimeScreen(activity: RuntimeActivity) {

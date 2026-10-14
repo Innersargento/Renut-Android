@@ -381,16 +381,7 @@ add("ctrl_rumble_note", "Cada controle vibra com o jogador dele. Se o controle n
 add("ctrl_rumble_test", "Testar vibração", "Test vibration", "测试震动", "Probar vibración")
 
 # ---- diagnostic screens ---------------------------------------------------------------------------
-add("probe_eyebrow", "TESTE GRÁFICO", "GRAPHICS TEST", "图形测试", "PRUEBA GRÁFICA")
-add("probe_subtitle", "Apresentação Vulkan no aparelho", "Vulkan presentation on the device", "设备上的 Vulkan 呈现",
-    "Presentación Vulkan en el dispositivo")
-add("probe_running", "Testando apresentação Plume…\nA animação dura alguns segundos.",
-    "Testing Plume presentation…\nThe animation lasts a few seconds.", "正在测试 Plume 呈现…\n动画将持续几秒钟。",
-    "Probando la presentación de Plume…\nLa animación dura unos segundos.")
-add("probe_save_failed", "\nNão foi possível salvar o diagnóstico.", "\nThe diagnostic could not be saved.",
-    "\n无法保存诊断信息。", "\nNo se pudo guardar el diagnóstico.")
 add("result_panel", "Resultado", "Result", "结果", "Resultado")
-add("probe_back", "Voltar à biblioteca", "Back to the library", "返回游戏库", "Volver a la biblioteca")
 add("runtime_eyebrow", "TESTE DO RUNTIME", "RUNTIME TEST", "运行时测试", "PRUEBA DEL RUNTIME")
 add("runtime_subtitle", "Validação experimental", "Experimental validation", "实验性验证", "Validación experimental")
 add("runtime_graphics_status", "RexGlue + Plume\nImagem de teste na memória do runtime. Ainda não representa cenas do jogo.",

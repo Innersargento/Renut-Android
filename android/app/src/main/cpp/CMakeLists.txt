@@ -19,8 +19,5 @@ target_include_directories(renut_plume PUBLIC "${PLUME_ROOT}"
 # session's loader and falls back to dlopen. The file itself is not edited.
 target_compile_definitions(renut_plume PRIVATE NDEBUG dlopen=renut_vulkan_dlopen)
 add_subdirectory("${RENUT_ROOT}/external/libadrenotools" adrenotools)
-add_library(renut_probe SHARED probe.cpp)
-target_link_libraries(renut_probe PRIVATE renut_plume adrenotools android log dl)
-target_link_options(renut_probe PRIVATE "-Wl,-z,max-page-size=16384")
 
 add_subdirectory("${RENUT_ROOT}/android/native" native)

@@ -21,7 +21,6 @@
         <!-- The screen layout editor; landscape, as the layout it edits is. -->
         <activity android:name=".LayoutEditorActivity" android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode" />
-        <activity android:name=".ProbeActivity" android:process=":gpu" android:exported="false" />
         <activity android:name=".RuntimeActivity" android:process=":runtime" android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
         <!-- In the game's process: keeps it alive while the app is in the background. -->

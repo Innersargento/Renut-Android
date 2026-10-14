@@ -238,12 +238,7 @@
     <string name="ctrl_rumble">Vibration</string>
     <string name="ctrl_rumble_note">Each controller rumbles for its own player. If a controller has no rumble motor, or you play on the touch screen alone, the phone vibrates instead.</string>
     <string name="ctrl_rumble_test">Test vibration</string>
-    <string name="probe_eyebrow">GRAPHICS TEST</string>
-    <string name="probe_subtitle">Vulkan presentation on the device</string>
-    <string name="probe_running">Testing Plume presentation…\nThe animation lasts a few seconds.</string>
-    <string name="probe_save_failed">\nThe diagnostic could not be saved.</string>
     <string name="result_panel">Result</string>
-    <string name="probe_back">Back to the library</string>
     <string name="runtime_eyebrow">RUNTIME TEST</string>
     <string name="runtime_subtitle">Experimental validation</string>
     <string name="runtime_graphics_status">RexGlue + Plume\nTest image in the runtime\'s memory. It does not represent game scenes yet.</string>
