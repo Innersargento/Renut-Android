@@ -4,7 +4,7 @@ leaves the app itself to Android Studio / Gradle.
 
     python tools/prepare.py doctor                 what is missing on this machine
     python tools/prepare.py all --game <iso|dir|default.xex>
-    python tools/prepare.py deps                   SDK, Plume, adrenotools, shader tool (pinned revisions + patches)
+    python tools/prepare.py deps                   submodules (RexGlue, Plume), adrenotools, shader tool (pinned revisions)
     python tools/prepare.py game --game <...>      checks the executable and installs assets/default.xex
     python tools/prepare.py codegen                recompiles the executable to C++ (generated/android)
     python tools/prepare.py shaders [--dumps DIR]  recompiles the shaders to SPIR-V (generated/shaders)
@@ -43,15 +43,10 @@ XEX_SHA256 = "d57b15b73490ca8334fb2fc7a53e0b21936a187731fa4f891273f4feaf38d3bc"
 XEX_PACKAGE = "org.renut.android"
 
 # name -> (url, pinned commit, submodule paths or None for "all, recursively", patch to apply)
+# RexGlue and Plume are not here: they are git submodules of this repository
+# (thirdparty/rexglue-sdk, thirdparty/plume), used as released and never patched.
 DEPENDENCIES = {
-    "rexglue-android": ("https://github.com/rexglue/rexglue-sdk.git", "f5337cdc947ff6d4c4196737e2c807a48f2a1fc2",
-                        ["thirdparty/" + n for n in ("libmspack", "tomlplusplus", "simde", "xxHash", "spdlog", "fmt", "utfcpp", "cli11",
-                                                     "o1heap", "sdl3", "imgui", "FFmpeg", "glslang", "vulkan-headers",
-                                                     "vulkan-memory-allocator", "spirv-tools", "spirv-headers")],
-                        "android/rexglue/android-platform.patch"),
     "libucontext": ("https://github.com/kaniini/libucontext.git", "49e671dd52ff6791295d8161ad3b6da7dc5f6f9d", [], None),
-    "plume": ("https://github.com/renderbag/plume.git", "d890ac899e505fb30040e037a4037cdeca68f033", None,
-              "android/plume-formats.patch"),
     "libadrenotools": ("https://github.com/bylaws/libadrenotools.git", "8fae8ce254dfc1344527e05301e43f37dea2df80", None, None),
 }
 
@@ -382,6 +377,8 @@ def ensure_host_sdk():
 def stage_deps(args):
     step("Dependências (revisões fixas e patches do projeto)")
     EXT.mkdir(exist_ok=True)
+    say("   RexGlue e Plume: submódulos de thirdparty/ (sem patches)")
+    git("-C", str(ROOT), "submodule", "update", "--init", "--recursive")
     for name in DEPENDENCIES:
         ensure_dependency(name)
     ensure_host_sdk()
@@ -619,9 +616,9 @@ def build_internal(image, folder, extra_ucode):
 
 def decompress_xctd(source, destination):
     """Bundle/4f holds XCTD files (the console's file compression); a small C decoder over libmspack unpacks them."""
-    mspack = EXT / "rexglue-android" / "thirdparty" / "libmspack" / "libmspack" / "mspack"
+    mspack = ROOT / "thirdparty" / "rexglue-sdk" / "thirdparty" / "libmspack" / "libmspack" / "mspack"
     if not (mspack / "lzxd.c").is_file():
-        fail("libmspack ausente em external/. Rode o passo 'deps'.")
+        fail("libmspack ausente em thirdparty/. Rode o passo 'deps'.")
     destination.mkdir(parents=True, exist_ok=True)
     script = to_linux_path(TOOLS / "shaders" / "decompress_xctd.sh")
     env = "MSPACK_DIR=%s XCTD_BIN=%s" % (shlex.quote(to_linux_path(mspack)),

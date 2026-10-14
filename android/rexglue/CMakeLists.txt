@@ -4,7 +4,11 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 get_filename_component(RENUT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(REXGLUE_ROOT "${RENUT_ROOT}/external/rexglue-android")
+# The SDK is the git submodule thirdparty/rexglue-sdk (tag v0.10.0) exactly as
+# released: nothing under thirdparty/ is edited, patched or copied. What Android
+# needs on top of it is in this directory (shims/, kernel_overrides.*, the
+# audio output) or arrives as compile options below.
+set(REXGLUE_ROOT "${RENUT_ROOT}/thirdparty/rexglue-sdk")
 set(PROJECT_SOURCE_DIR "${REXGLUE_ROOT}")
 set(REXGLUE_USE_D3D12 OFF)
 set(REXGLUE_USE_VULKAN ON)
@@ -16,8 +20,15 @@ add_compile_options(-fno-strict-aliasing -ffp-model=strict -fno-char8_t)
 # assembleDebug leaves CMAKE_BUILD_TYPE=Debug, so clang defaulted to -O0 for
 # every target except rexgpu-xenos: the kernel, runtime and shader compiler all
 # ran unoptimized even though REXGLUE_BUILD_CONFIG says "Release". Optimize the
-# whole tree; asserts stay enabled (no NDEBUG) so behaviour is unchanged.
+# whole tree. NDEBUG is how the SDK is released: its asserts are checks of
+# the console's own invariants that the title legitimately breaks (a graphics
+# interrupt finding a spinlock its processor already holds, a stray audio
+# handle...), and the previous build kept them quiet by patching them out.
 add_compile_options(-O2)
+add_compile_definitions(NDEBUG)
+# libc++ in the NDK lacks clock_time_conversion/clock_cast, which the SDK's chrono.h
+# builds on (shims/android_chrono.h).
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/shims/android_chrono.h>")
 include("${REXGLUE_ROOT}/cmake/rex_pch.cmake")
 set(REXGLUE_DERIVED_MAJOR 0)
 set(REXGLUE_DERIVED_MINOR 10)
@@ -76,6 +87,16 @@ set_property(TARGET rexcore PROPERTY LINK_LIBRARIES "${CORE_LIBRARIES}")
 get_target_property(CORE_INTERFACE rexcore INTERFACE_LINK_LIBRARIES)
 list(REMOVE_ITEM CORE_INTERFACE pthread rt "$<LINK_ONLY:pthread>" "$<LINK_ONLY:rt>")
 set_property(TARGET rexcore PROPERTY INTERFACE_LINK_LIBRARIES "${CORE_INTERFACE}")
+# Bionic has no ucontext; the SDK's fiber code reaches libucontext through names
+# defined ahead of it, not through an edit.
+set_source_files_properties("${REXGLUE_ROOT}/src/core/fiber_posix.cpp"
+    TARGET_DIRECTORY rexcore PROPERTIES
+    COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/shims/android_ucontext.h")
+# The same for what the core files assume of glibc (shims/android_core.h).
+set_source_files_properties("${REXGLUE_ROOT}/src/core/memory_posix.cpp"
+    "${REXGLUE_ROOT}/src/core/threading_posix.cpp"
+    TARGET_DIRECTORY rexcore PROPERTIES
+    COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/shims/android_core.h")
 add_subdirectory("${REXGLUE_ROOT}/src/filesystem" filesystem)
 add_subdirectory("${REXGLUE_ROOT}/src/system" system)
 target_link_libraries(rexruntime PRIVATE rexcore rexfilesystem log android)
@@ -100,6 +121,11 @@ file(READ "${REXGLUE_ROOT}/src/ui/CMakeLists.txt" UI_CMAKE)
 string(FIND "${UI_CMAKE}" "# Platform-specific dependencies" UI_END)
 string(SUBSTRING "${UI_CMAKE}" 0 ${UI_END} UI_CMAKE)
 string(REPLACE "surface_gnulinux.cpp" "" UI_CMAKE "${UI_CMAKE}")
+# The window is GameWindow (android_game_window.h), a rex::ui::Window over the
+# Android surface (and GameContext its app context); the SDK's SDL window includes
+# Xlib unconditionally.
+string(REGEX REPLACE "[ ]+window_sdl[.]cpp" "" UI_CMAKE "${UI_CMAKE}")
+string(REGEX REPLACE "[ ]+windowed_app_context_sdl[.]cpp" "" UI_CMAKE "${UI_CMAKE}")
 string(REPLACE "add_library(rexui OBJECT \${REXUI_SOURCES})"
     "list(TRANSFORM REXUI_SOURCES PREPEND \"${REXGLUE_ROOT}/src/ui/\")\nadd_library(rexui OBJECT \${REXUI_SOURCES})" UI_CMAKE "${UI_CMAKE}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ui.cmake" "${UI_CMAKE}")
@@ -121,6 +147,10 @@ include("${RENUT_ROOT}/generated/android/sources.cmake")
 add_library(renut_guest OBJECT ${GENERATED_SOURCES})
 target_include_directories(renut_guest PRIVATE "${RENUT_ROOT}/generated/android")
 target_link_libraries(renut_guest PRIVATE rexruntime)
+# The kernel exports reNut takes over (kernel_overrides.cpp): the game's calls to
+# them are renamed at compile time, the SDK is not touched.
+include("${CMAKE_CURRENT_SOURCE_DIR}/kernel_overrides.cmake")
+renut_kernel_overrides(renut_guest)
 # The recompiled game is the hot path: a profile of the boot stall put ~90% of
 # CPU inside two guest functions, so this target's level matters most.
 target_compile_options(renut_guest PRIVATE -O2 -g0 -Wno-unused-variable -Wno-unused-label)
@@ -149,12 +179,13 @@ set_source_files_properties(shader_cache_blob.S PROPERTIES
     COMPILE_OPTIONS "-DRENUT_SHADER_BLOB=\"${RENUT_SHADERS}/shader_spirv.smolv\""
     OBJECT_DEPENDS "${RENUT_SHADERS}/shader_spirv.smolv")
 add_library(renut_runtime SHARED runtime_jni.cpp achievements_bridge.cpp text_input_bridge.cpp adpf.cpp plume_graphics.cpp game_fixes.cpp cheats.cpp
+    kernel_overrides.cpp host_support.cpp renut_audio.cpp
     d3d_layer.cpp native_d3d.cpp native_probe.cpp native_engine.cpp plume_d3d.cpp plume_renderer.cpp plume_gpu.cpp plume_textures.cpp shader_cache_blob.S
     "${RENUT_SHADERS}/shader_cache.cpp" thirdparty/smolv/smolv.cpp $<TARGET_OBJECTS:renut_guest>)
 target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
     "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/smolv")
 target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume adrenotools
-    xxHash::xxhash android log dl)
+    xxHash::xxhash android log dl aaudio)
 # Every call between recompiled guest functions, and to the __savegprlr/
 # __restgprlr helpers that each prologue and epilogue calls, went through a PLT
 # stub: they are weak, default-visibility functions of a shared library, so the

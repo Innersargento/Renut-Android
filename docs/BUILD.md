@@ -99,7 +99,7 @@ e pula o que já está pronto):
 
 | Etapa | O que faz | Tempo aproximado |
 | --- | --- | --- |
-| `deps` | clona RexGlue, Plume e libadrenotools nas revisões fixas, aplica os patches do projeto, baixa o gerador de código, compila o conversor de shaders | 10–25 min (download de ~1,3 GB + compilação) |
+| `deps` | inicializa os submódulos (RexGlue e Plume, sem patches), clona libadrenotools e libucontext nas revisões fixas, baixa o gerador de código, compila o conversor de shaders | 10–25 min (download de ~1,3 GB + compilação) |
 | `game` | extrai o ISO e confere o `default.xex` | 2–5 min |
 | `codegen` | recompila o executável do Xbox 360 para C++ (`generated/android`) | segundos |
 | `shaders` | extrai e descomprime os shaders do jogo e converte tudo para SPIR-V (`generated/shaders`) | ~20 min (a conversão usa em grande parte um único núcleo) |
@@ -262,9 +262,11 @@ conversor de shaders é compilado (padrão `~/.cache/renut-xenosrecomp`).
 
 ## 6. Como funciona (resumo)
 
-- **Dependências fixas:** `deps` clona cada projeto no *commit* exato que o
-  reNut usa e aplica os patches do repositório (`android/rexglue/android-platform.patch`,
-  `android/plume-formats.patch`); nada é compilado com versão "mais nova".
+- **Dependências fixas:** o RexGlue (tag `v0.10.0`) e o Plume são submódulos em
+  `thirdparty/`, usados como foram publicados — o reNut não os altera nem aplica
+  patches (veja `docs/DEPENDENCIAS.md`). `deps` inicializa os submódulos e clona
+  o resto (libadrenotools, libucontext) no *commit* exato; nada é compilado com
+  versão "mais nova".
 - **Código do jogo:** o gerador do RexGlue traduz o PowerPC do `default.xex`
   para C++ (`generated/android`), que o NDK compila para ARM64.
 - **Shaders:** a imagem do executável (`xex.bin`) é extraída do próprio

@@ -956,7 +956,20 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateBuffer(VkDevice device, const VkBuffer
 
 VKAPI_ATTR VkResult VKAPI_CALL LayerQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits,
                                                 VkFence fence) {
-  const VkResult result = layer.queue_submit(queue, count, submits, fence);
+  // Plume makes every submit wait for its semaphores at COLOR_ATTACHMENT_OUTPUT.
+  // The native present uploads through TRANSFER before it touches the colour
+  // output, and a wait that late does not protect those writes: wait for
+  // everything.
+  thread_local std::vector<VkSubmitInfo> edited;
+  thread_local std::vector<VkPipelineStageFlags> stages;
+  edited.assign(submits, submits + count);
+  uint32_t most = 0;
+  for (const VkSubmitInfo& submit : edited) most = std::max(most, submit.waitSemaphoreCount);
+  stages.assign(most, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+  for (VkSubmitInfo& submit : edited) {
+    if (submit.waitSemaphoreCount) submit.pWaitDstStageMask = stages.data();
+  }
+  const VkResult result = layer.queue_submit(queue, count, edited.data(), fence);
   if (result == VK_ERROR_DEVICE_LOST) layer.device_lost.store(true);
   return result;
 }

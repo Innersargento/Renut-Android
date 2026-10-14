@@ -15,7 +15,7 @@ OUT=$2
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-MSPACK=${MSPACK_DIR:-$ROOT/external/rexglue-android/thirdparty/libmspack/libmspack/mspack}
+MSPACK=${MSPACK_DIR:-$ROOT/thirdparty/rexglue-sdk/thirdparty/libmspack/libmspack/mspack}
 BIN=${XCTD_BIN:-$ROOT/out/prepare/xctd_decompress}
 CC_BIN=${CC:-$(command -v clang || command -v cc || command -v gcc)}
 

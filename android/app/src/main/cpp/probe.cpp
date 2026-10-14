@@ -43,24 +43,10 @@ double percentile(std::vector<double> samples, double p) {
 }
 }
 
-VkResult renutInitializeVulkanLoader() {
-    if (!driverEntry) return VK_ERROR_INITIALIZATION_FAILED;
-    volkInitializeCustom(driverEntry);
-    return vkCreateInstance ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
-}
-
-// The other seams in the generated copy of plume_vulkan.cpp. The probe draws a
-// handful of pipelines once, so it has nothing worth caching; the runtime's own
-// definitions (android/rexglue/plume_renderer.cpp) are the ones that keep them.
-VkResult renutCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
-                                      const VkGraphicsPipelineCreateInfo* infos,
-                                      const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
-    return vkCreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
-}
-VkResult renutCreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
-                                     const VkComputePipelineCreateInfo* infos,
-                                     const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
-    return vkCreateComputePipelines(device, cache, count, infos, allocator, pipelines);
+// Plume's translation unit calls this where volk would open "libvulkan.so"
+// (see the build file): the probe answers with the driver it loaded.
+extern "C" void* renut_vulkan_dlopen(const char* name, int flags) {
+    return driverLibrary ? driverLibrary : dlopen(name, flags);
 }
 
 extern "C" JNIEXPORT void JNICALL

@@ -5,6 +5,10 @@
 // released.
 #include <cstdint>
 
+namespace rex::system {
+class KernelState;
+}
+
 namespace renut {
 
 // The player's pause. While set, every guest thread parks at its next kernel
@@ -17,5 +21,15 @@ bool IsTitlePaused();
 // Parks the calling guest thread while the title is paused. Host threads and
 // threads of the SDK are never parked.
 void WaitIfTitlePaused();
+
+// X_KTHREAD::kernel_time (offset 0x58), the thread's kernel time in
+// milliseconds, is read by guest code straight out of memory and nothing in the
+// SDK writes it. Banjo-Kazooie: Nuts & Bolts drives its allocator's reclaim
+// watchdog off it and, with the field stuck at zero, spins at 100% CPU for
+// ever. This host thread keeps it moving, as the guest clock, on every guest
+// thread. Start it once the title's threads can exist; stop it before the
+// kernel state goes away.
+void StartKernelTime(rex::system::KernelState* kernel);
+void StopKernelTime();
 
 }  // namespace renut

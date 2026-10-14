@@ -62,11 +62,13 @@ git submodule update --init --recursive
 - **Windows (PC): feito.** `windows/` compila e roda contra os dois submódulos
   intactos: logo da Rare, abertura e tela-título (renderização conferida por
   captura da própria janela), ~2.100 quadros em 65 s sem queda.
-- **Android: ainda no caminho antigo.** O APK ainda compila contra
-  `external/` (pastas preparadas por `tools/prepare.py`) com
-  `android/rexglue/android-platform.patch` e `android/plume-formats.patch`. A
-  tabela abaixo diz o que cada parte do patch do SDK vira. Nada disso será
-  aplicado quando o Android passar para os submódulos.
+- **Android: compila e roda contra os dois submódulos intactos** (13/10/2026).
+  `android/rexglue/CMakeLists.txt` aponta para `thirdparty/rexglue-sdk` e o
+  Plume é compilado de `thirdparty/plume`; `external/` só guarda o que não é
+  SDK nem Plume (libadrenotools, libucontext). O que o Android precisa a mais
+  vem de `android/rexglue/shims/` (cabeçalhos incluídos à força em arquivos do
+  SDK), de `kernel_overrides.*` e do áudio próprio (`renut_audio.cpp`). Chega à
+  tela-título; o que ainda falta está na tabela abaixo.
 
 ## O patch antigo do SDK, parte por parte
 
@@ -77,17 +79,17 @@ git submodule update --init --recursive
 | `GetResolveInfoFromRect` | **Feito**: o SDK recebe um arquivo de registradores que descreve o retângulo (`ResolveInfoForRect`) |
 | `PresentFrontBuffer` e o gancho em `VdSwap` | **Feito**: `renut_imp_VdSwap` |
 | Contadores e logs de diagnóstico (trabalho da GPU, pools, `WaitDiag`, traço de eventos de áudio, falha de MMIO, estatísticas do CP) | **Descartados**; o que serve vira medição do próprio reNut |
-| Pausa do jogador (`XThread::SetTitlePaused`) | **Feito** em `host_support.cpp`; falta ligar nas esperas do kernel por override (Android) |
-| Texto do teclado do jogo (`SetTextInputHandler`) | A fazer: override de `XamShowKeyboardUI` (Android) |
-| Vários jogadores (`XamUser*`, `XamInput*`) | A fazer: overrides (Android) |
-| `KeInitializeEvent` reaproveitando o objeto, `XamAlloc` com flags, handles de áudio inválidos, assert do spinlock | A fazer: overrides (Android) |
-| `X_KTHREAD::kernel_time` avançando (vigia do alocador do jogo) | A fazer: thread do host (Android) |
-| Fibras com libucontext, `chrono.h` no NDK | A fazer: cabeçalho incluído à força no arquivo (Android) |
+| Pausa do jogador (`XThread::SetTitlePaused`) | **Feito**: `host_support.cpp` + overrides das esperas, atrasos e `NtYieldExecution` |
+| Texto do teclado do jogo (`SetTextInputHandler`) | **Feito**: override de `XamShowKeyboardUI` em `text_input_bridge.cpp` |
+| Vários jogadores (`XamUser*`, `XamInput*`) | A fazer: overrides (Android); o jogador 1 (toque) funciona |
+| `KeInitializeEvent` reaproveitando o objeto, `XamAlloc` com flags, handles de áudio inválidos, assert do spinlock | **Feito**: override de `KeInitializeEvent`; handles de áudio nos overrides do XAudio; os asserts do SDK ficam fora (`NDEBUG`, como o SDK é distribuído) |
+| `X_KTHREAD::kernel_time` avançando (vigia do alocador do jogo) | **Feito**: thread do host (`StartKernelTime`) |
+| Fibras com libucontext, `chrono.h` no NDK | **Feito**: `shims/android_ucontext.h`, `shims/android_chrono.h`, `shims/android_core.h` |
 | Espera em vários objetos sem busca ativa, `sigqueue` por thread no Android | **Sem substituto de fora**: PR no RexGlue |
-| Ciclo de vida do cliente de áudio, prioridade das threads de áudio | Parte por override; resto, PR no RexGlue |
+| Ciclo de vida do cliente de áudio, prioridade das threads de áudio | **Feito** no áudio próprio: o cliente só some depois que o callback do jogo termina; as threads de áudio e do XMA sobem de prioridade |
 | Pacotes XMA sem quadro inicial | **Sem substituto de fora**: PR no RexGlue |
 | `QueryProtect` por falta de página em Linux/Android | **Sem substituto de fora**: PR no RexGlue |
-| Dobra estéreo do áudio no Android (SDL/AAudio) | A fazer: backend de áudio próprio do reNut (o SDK aceita um) |
+| Dobra estéreo do áudio no Android (SDL/AAudio) | **Feito**: `renut_audio.cpp` (AAudio, estéreo, NEON); ver abaixo |
 | Espera do `WAIT_REG_MEM` em 500 µs | A fazer: tratado no laço próprio, se a medição pedir |
 
 ## O patch antigo do Plume, parte por parte
@@ -103,3 +105,30 @@ git submodule update --init --recursive
 | `textureCompressionBC` nas capacidades | **Feito**: consultado ao driver |
 | Rastreio de memória, mapeamento persistente, sem compressão | **Descartados** (eram ferramentas de investigação) |
 | Carregador Vulkan do app Android (driver embutido) | A fazer (Android): a abertura do `libvulkan` do Plume é redirecionada na compilação do arquivo, sem editá-lo |
+
+## Áudio do Android (`android/rexglue/renut_audio.cpp`)
+
+O backend SDL do SDK e o laço de trabalho do `AudioSystem` do SDK não são
+usados no Android. O reNut registra o seu próprio `AudioSystem` em
+`RuntimeConfig::audio_factory` e as quatro exportações `XAudio*` que lidam com
+clientes de renderização passam por `kernel_overrides.cpp`:
+
+- **Uma saída AAudio por cliente**: `LOW_LATENCY`, compartilhada, `float` estéreo,
+  48 kHz, buffer de dois bursts (4 ms no aparelho de teste) que só cresce quando
+  o aparelho informa um underrun.
+- **O callback do aparelho só copia**: a dobra 5.1 → estéreo (NEON, mesma conta
+  do `conversion.h` do SDK) roda na thread que entrega o quadro, em um anel SPSC
+  de 64 quadros sem trava; o callback devolve créditos, não toma lock nem aloca.
+- **Thread de trabalho própria**: dorme em um único futex que cada crédito
+  devolvido acorda, em vez de esperar em todos os semáforos de uma vez (a espera
+  em vários objetos do SDK em POSIX/Android gira e queima um núcleo). Sobe a
+  thread do jogo e a do decodificador XMA para nice -10.
+- **Ciclo de vida**: `XAudioUnregisterRenderDriverClient` só volta depois que o
+  callback do jogo em execução terminou (o Banjo depende disso para encerrar a
+  thread de renderização); handles que não são nossos são ignorados; fluxo
+  desconectado (fone, troca de rota) é reaberto pela thread de trabalho.
+- **Pausa**: o `Pause()`/`Resume()` do `AudioSystem` do SDK continuam valendo;
+  as saídas AAudio entram em pausa de verdade.
+- **Diagnóstico**: abertura, underruns e erros vão para o logcat (tag
+  `renut-audio`), mesmo com o log do runtime desligado; quadros de silêncio por
+  5 s saem na mesma tag e em `renut_audio_silent_frames()`.

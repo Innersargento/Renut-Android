@@ -27,11 +27,12 @@
 #include <rex/chrono/clock.h>
 #include <rex/ui/presenter.h>
 #include <rex/audio/audio_system.h>
-#include <rex/audio/sdl/sdl_audio_system.h>
+#include "renut_audio.h"
 #include <rex/system/xthread.h>
 #include <rex/input/input_system.h>
 #include "renut_android_init.h"
 #include "adpf.h"
+#include "host_support.h"
 using rex::X_STATUS;
 extern const rex::PPCImageInfo PPCImageConfig;
 void renutSetContentActivity(JNIEnv*, jobject);
@@ -77,7 +78,7 @@ static std::atomic<bool> render_stopped{false};
 static std::mutex game_window_mutex;
 static renut::GameWindow* live_game_window = nullptr;
 // The player's pause reaches everything the game runs. Guest threads park at their
-// next kernel wait (rex XThread::SetTitlePaused), the renderer parks at its next
+// next kernel wait (renut::SetTitlePaused), the renderer parks at its next
 // present, the guest clock stops crawling, and the audio mixer and the XMA decoder
 // stop. The audio part can wait on a worker that is inside a title callback, so
 // it runs on its own thread and never on the UI thread; `pause_wanted` is what the
@@ -95,7 +96,7 @@ static void ApplyAudioPause() {
 // Releases every pause before the game stops, so no thread is left parked.
 static void ReleasePause() {
   pause_wanted = false;
-  rex::system::XThread::SetTitlePaused(false);
+  renut::SetTitlePaused(false);
   if(auto* plume=renut::PlumeRenderer::Get())plume->SetPaused(false);
 }
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeStop(JNIEnv*,jclass) {
@@ -143,7 +144,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nat
   if(!plume)return JNI_FALSE;
   pause_wanted=paused;
   renut::adpf::SetActive(!paused);
-  rex::system::XThread::SetTitlePaused(paused);
+  renut::SetTitlePaused(paused);
   plume->SetPaused(paused);
   renut::d3d::SetBackground(paused);
   rex::chrono::Clock::set_guest_time_scalar(paused?0.02:1.0);
@@ -388,7 +389,8 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
           : "plume-pipelines-" + std::to_string(std::hash<std::string>{}(plume_env)) + ".bin")).string());
       config.graphics.reset(renut::CreatePlumeGraphicsSystem());
       if(!config.graphics)throw std::runtime_error("Backend gráfico indisponível.");
-      config.audio_factory=REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+      // reNut's own AAudio output (renut_audio.cpp), not the SDK's SDL backend.
+      config.audio_factory=[](rex::runtime::FunctionDispatcher* dispatcher){return renut::audio::Create(dispatcher);};
       config.input_factory=[](bool tool_mode){
         auto input=rex::input::CreateDefaultInputSystem(tool_mode);
         input->AddDriver(std::make_unique<renut::TouchInput>());
@@ -422,6 +424,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     status = runtime.LoadXexImage("game:\\default.xex");
     if (status != X_STATUS_SUCCESS) throw std::runtime_error(fmt::format("Carregamento XEX falhou: {:08X}", status));
     note("XEX carregado na memória do runtime.");
+    renut::StartKernelTime(runtime.kernel_state());
     renut::AchievementsStart(env,activity,runtime,root);
     renut::TextInputStart(env,activity);
     // Actual recompiled leaf: copies the byte at r3+61 to r4 and returns zero.
@@ -464,6 +467,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     renut::adpf::Stop();
     renut::AchievementsStop(runtime);
     ReleasePause();
+    renut::StopKernelTime();
     {
       std::lock_guard<std::mutex> lock(audio_mutex);
       g_audio=nullptr;

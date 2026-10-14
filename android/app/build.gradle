@@ -26,7 +26,7 @@ android {
     }
     kotlinOptions { jvmTarget = '17' }
     buildFeatures { compose true }
-    sourceSets.main.java.srcDir '../../external/rexglue-android/thirdparty/sdl3/android-project/app/src/main/java'
+    sourceSets.main.java.srcDir '../../thirdparty/rexglue-sdk/thirdparty/sdl3/android-project/app/src/main/java'
     packaging { jniLibs { useLegacyPackaging true } }
     buildTypes { release { minifyEnabled false } }
 }

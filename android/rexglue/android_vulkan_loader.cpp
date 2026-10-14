@@ -39,3 +39,13 @@ void* renutXenosVulkanSymbol(const char* name) {
   std::lock_guard lock(loader_mutex);
   return loader?dlsym(loader,name):nullptr;
 }
+// What volk's dlopen("libvulkan.so") becomes inside Plume's translation unit
+// (see the build file): the loader the session opened, with its driver, when
+// there is one.
+extern "C" void* renut_vulkan_dlopen(const char* name, int flags) {
+  {
+    std::lock_guard lock(loader_mutex);
+    if (loader) return loader;
+  }
+  return dlopen(name, flags);
+}
