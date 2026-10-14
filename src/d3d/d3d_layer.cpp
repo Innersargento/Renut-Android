@@ -1,6 +1,5 @@
 #include "d3d_layer.h"
 #include "native_d3d.h"
-#include "native_probe.h"
 #include "guest/guest_address.h"
 
 #include <algorithm>
@@ -183,7 +182,6 @@ void SingleTile(PPCContext& ctx, uint8_t* base) {
 
 // Called for every intercepted function. Returns true if a handler took it.
 inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
-  renut::native_probe::D3DEnter(function, ctx, base);
   if (function == kD3DDevice_BeginTiling) SingleTile(ctx, base);
   if (int32_t every = ReportEvery()) {
     counts[function].fetch_add(1, std::memory_order_relaxed);

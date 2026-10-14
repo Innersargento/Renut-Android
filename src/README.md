@@ -40,9 +40,6 @@ src/
 | `d3d_layer.{h,cpp}` | `Enter`/`Leave` comuns: conta, encaminha ao original ou entrega a um handler |
 | `plume_d3d.cpp` | Handlers do modo Plume |
 | `native_d3d.{h,cpp}` | Front end D3D nativo: listas e sincronização sem PM4/EDRAM |
-| `native_engine.{h,cpp}` | Pega os draws do mundo onde o motor os emite e os marca com um id para o renderizador reconhecer |
-| `native_probe.{h,cpp}` | Sonda de reconhecimento: conta as funções do motor lidas no PowerPC |
-| `native_{vs,ps,lit}_table.inc` | Tabelas geradas por `tools/native/` |
 
 ## plume/
 

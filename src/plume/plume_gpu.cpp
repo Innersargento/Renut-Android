@@ -1,7 +1,6 @@
 #include "plume_gpu.h"
 #include "d3d/d3d_layer.h"
 #include "d3d/native_d3d.h"
-#include "d3d/native_engine.h"
 
 #include "plume_renderer.h"
 
@@ -82,7 +81,6 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 #include <filesystem>
 #include <string>
 
-void renutReportShadowEngineProfile();
 // Frames of silence the audio output played for want of one from the title
 // (the SDL driver in rexglue).
 extern "C" uint64_t renut_audio_silent_frames();
@@ -115,15 +113,6 @@ REXCVAR_DEFINE_INT32(renut_plume_depth_strip, 1, "reNut/Plume",
                      "Draw depth-only draws (no fragment shader: the shadow maps) with a vertex shader "
                      "that has lost its interpolant outputs, which nothing reads: 0 off, 1 on")
     .range(0, 1);
-REXCVAR_DEFINE_BOOL(renut_plume_native, false, "reNut/Plume",
-                    "Native renderer v0: depth-only draws of rigid meshes use the renderer's own vertex "
-                    "shader with the transform in push constants instead of the recompiled guest one");
-REXCVAR_DEFINE_BOOL(renut_plume_native_view, false, "reNut/Plume",
-                    "Native renderer v1 (test): draw the engine's world draws of rigid meshes entirely with "
-                    "the renderer's own shaders - one texture and a simple light, no guest material");
-REXCVAR_DEFINE_BOOL(renut_plume_native_lit, false, "reNut/Plume",
-                    "Native renderer v1: the lit world material's guest pixel shaders replaced by "
-                    "native_lit.frag, a hand-written port (files/plume-native-lit overrides it live)");
 REXCVAR_DEFINE_INT32(renut_plume_rel_constants, 2, "reNut/Plume",
                      "How a vertex shader's relative constant reads (a0, aL: skinning matrices) are served: "
                      "0 by the file's four blocks, 1 by the whole file as one block, 2 by that block "
@@ -181,9 +170,6 @@ REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
 extern std::atomic<int> g_renut_scene_split_mode;
 REXCVAR_DECLARE(bool, renut_scene_msaa);
 
-// The native renderer mode, for the reconnaissance report (native_probe.cpp).
-std::atomic<uint32_t> g_renut_native_mode{1};
-
 namespace renut {
 namespace {
 
@@ -203,83 +189,11 @@ using namespace rex::graphics;
 #include "shaders/debug_point.frag.inc"
 #include "shaders/debug_trivial.frag.inc"
 #include "shaders/debug_trivial.vert.inc"
-#include "shaders/native_rigid.vert.inc"
-#include "shaders/native_view.frag.inc"
-#include "shaders/native_view.vert.inc"
-#include "shaders/native_surface.frag.inc"
-#include "shaders/native_lit.frag.inc"
 #include "shaders/rect_list.geom.inc"
 
-// Native renderer v0. The guest vertex shaders whose position is a rigid
-// transform of the input position by four float constants
-// (native_vs_table.inc, from tools/native/scan_native_vs.py): a depth-only draw
-// of one of them is drawn with native_rigid.vert, which reads that transform
-// from the push constants instead of the guest's constant blocks. v1's native
-// view also draws their colour draws, with what else the table says they read.
-struct NativeRigid {
-  uint8_t location, swizzle;
-  uint8_t rows[4];
-  uint8_t texcoord, texcoord_swizzle, normal, normal_swizzle;
-  uint8_t texcoord_output;  // interpolant it writes texcoord0 to as fetched, 255 none
-};
-const std::unordered_map<uint64_t, NativeRigid>& NativeRigidShaders() {
-  static const std::unordered_map<uint64_t, NativeRigid> table = {
-#define X(hash, location, swizzle, k0, k1, k2, k3, tc, tc_swizzle, n, n_swizzle, tc_out) \
-  {hash, {location, swizzle, {k0, k1, k2, k3}, tc, tc_swizzle, n, n_swizzle, tc_out}},
-#include "d3d/native_vs_table.inc"
-#undef X
-  };
-  return table;
-}
-// The surface texture of each guest pixel shader (native_ps_table.inc, from
-// tools/native/scan_native_ps.py): the slot, and the interpolant its
-// coordinates come in. The native view samples it when the vertex shader
-// writes the raw texture coordinate to that same interpolant.
-struct NativeSurface {
-  uint8_t slot, interpolant;
-};
-const std::unordered_map<uint64_t, NativeSurface>& NativeSurfaceTextures() {
-  static const std::unordered_map<uint64_t, NativeSurface> table = {
-#define X(hash, slot, interpolant) {hash, {slot, interpolant}},
-#include "d3d/native_ps_table.inc"
-#undef X
-  };
-  return table;
-}
-// The guest pixel shaders native_lit.frag implements (native_lit_table.inc,
-// from tools/native/lit_table.py) and the registers of their material.
-struct NativeLit {
-  uint8_t power, specular, alpha, bias;
-};
-const std::unordered_map<uint64_t, NativeLit>& NativeLitShaders() {
-  static const std::unordered_map<uint64_t, NativeLit> table = {
-#define X(hash, power, specular, alpha, bias) {hash, {power, specular, alpha, bias}},
-#include "d3d/native_lit_table.inc"
-#undef X
-  };
-  return table;
-}
-constexpr uint32_t kNativeLitSpecBase = 110;
-
-// A D3D vertex or index buffer object's address (word 6, read in the
-// recompiled D3DDevice_SetStreamSource): in the 0xE0000000 view of physical
-// memory, which sits 4 KB above the physical address.
-uint32_t EngineBufferAddress(uint32_t word) {
-  return (word & 0x1FFFFFFCu) + (word >= 0xE0000000u ? 0x1000u : 0u);
-}
-// The push constants: the guest's three block addresses, then (native draws)
-// at kNativePushOffset the four rows and g_ViewportScaleOffset, and for the
-// native view the alpha reference, flags, texture and sampler indices at 112.
+// The push constants: the guest's three block addresses (24 bytes). The range is
+// declared wider than that.
 constexpr uint32_t kPushBytes = 128;
-constexpr uint32_t kNativePushOffset = 32;
-constexpr uint32_t kNativeSwizzleSpec = 100;
-constexpr uint32_t kNativeTexcoordSwizzleSpec = 101;
-constexpr uint32_t kNativeNormalSwizzleSpec = 102;
-
-// The native mode the cvars ask for (files/plume-native overrides it live).
-int NativeModeFromCvars() {
-  return REXCVAR_GET(renut_plume_native) ? (REXCVAR_GET(renut_plume_native_view) ? 2 : 1) : 0;
-}
 
 // Where microcode without a recompiled shader is saved (SetPlumeMissDumpDirectory).
 std::string g_miss_dump_directory;
@@ -1452,7 +1366,6 @@ struct Stats {
   // ones whose surface was used again and got the contents copied back, and
   // the ones a full clear made unnecessary.
   uint64_t depth_aliased = 0, depth_restored = 0, depth_dropped = 0, depth_abandoned = 0;
-  uint64_t native_draws = 0;   // drawn by the native renderer (plume-native)
   uint64_t twin_skipped = 0;   // MSAA off: per-band copies of a draw already drawn
   // New pipelines by how they were made: found in the driver's cache at the
   // draw, found by a worker, or compiled (and of those, how many waited for a
@@ -2151,7 +2064,6 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // shader. What the GPU still spends is what a draw costs apart from the
   // guest's shaders - the split the per-draw cost has been missing.
   std::unique_ptr<RenderShader> debug_trivial_vs_, debug_trivial_fs_;
-  std::unique_ptr<RenderShader> native_rigid_vs_;  // native renderer v0 (NativeRigidShaders)
   uint32_t trivial_mode_ = 0;
 
   // Keyed by guest base. Never overlapping: a new range swallows the ones it touches.
@@ -2360,20 +2272,6 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     float blend_factor[4] = {};
     uint32_t stencil_ref = 0, stencil_mask = 0, stencil_write_mask = 0;
     uint64_t push[3] = {};
-    // Native renderer v0: the draw's vertex shader is native_rigid.vert, which
-    // reads these (four rows, viewport scale/offset, half-pixel offset) at
-    // kNativePushOffset and no constant block.
-    bool native = false;
-    // Native surfaces (plume-native 3): the guest vertex shader with
-    // native_surface.frag, which reads native_push[20..23] at offset 112; the
-    // guest's push constants and constant blocks are bound as usual.
-    bool native_surface = false;
-    float native_push[24] = {};
-    // A native rigid depth draw (native_rigid.vert into a shadow map) and the
-    // mesh it draws - target, viewport, buffers, index range - so that
-    // FlushDeferred can draw several of the same mesh as one instanced draw.
-    bool rigid_depth = false;
-    uint64_t mesh_key = 0;
     uint32_t instances = 1;
     uint32_t constant_offsets[kConstantBindings] = {};
     RenderViewport viewport;
@@ -2478,34 +2376,6 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // fragment shader with the vertex shader's output-less form. Part of the
   // pipeline key.
   uint32_t depth_strip_mode_ = 1;
-  // files/plume-native (or the cvars): 1 draws the depth-only draws of the
-  // shaders in NativeRigidShaders with native_rigid.vert; 2 also draws the
-  // engine's world draws of those shaders with native_view.vert/.frag (the
-  // native view). Part of the pipeline key.
-  uint32_t native_mode_ = 1;
-  uint32_t engine_samples_ = 0;
-  // files/plume-shadow-texels (float): a native rigid shadow caster whose
-  // bounding sphere covers fewer texels of its shadow map than this is not
-  // drawn; 0 keeps them all.
-  float shadow_texels_ = 1.5f;
-  // files/plume-shadow-instancing (0/1): draws of the same mesh into the same
-  // shadow map, waiting in one deferred window, are drawn as one instanced draw.
-  uint32_t shadow_instancing_ = 1;
-  // Each frame slot's instance rows (four float4 per instance), written by
-  // FlushDeferred and read by native_rigid.vert through rowsAddress.
-  static constexpr uint32_t kInstanceRowsBytes = 1u << 20;
-  std::unique_ptr<RenderBuffer> instance_rows_[kPlumeFramesInFlight];
-  uint8_t* instance_rows_data_[kPlumeFramesInFlight] = {};
-  uint64_t instance_rows_address_[kPlumeFramesInFlight] = {};
-  uint32_t instance_rows_used_ = 0;  // engine draw lines given to the report (native_engine.cpp)
-  std::unique_ptr<RenderShader> native_view_vs_[4];  // [has texcoord | has normal << 1]
-  std::unique_ptr<RenderShader> native_view_fs_;
-  std::unique_ptr<RenderShader> native_surface_fs_[4];  // by the interpolant the texture coordinates come in
-  // files/plume-native-lit (0/1, or the cvar): the guest pixel shaders in
-  // NativeLitShaders are replaced by native_lit.frag, the hand-written lit
-  // world material.
-  uint32_t native_lit_mode_ = 0;
-  std::unique_ptr<RenderShader> native_lit_fs_;
   // files/plume-patchlevel: percent of the guest's tessellation level the water
   // grid uses (100 = as the game sets it).
   uint32_t patch_level_percent_ = 100;
@@ -3349,9 +3219,6 @@ bool PlumeCommandProcessor::SetupContext() {
   defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
   fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
   depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
-  native_mode_ = uint32_t(NativeModeFromCvars());
-  g_renut_native_mode.store(native_mode_, std::memory_order_relaxed);
-  native_lit_mode_ = REXCVAR_GET(renut_plume_native_lit) ? 1 : 0;
   rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
   no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
   no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
@@ -3380,35 +3247,6 @@ bool PlumeCommandProcessor::SetupContext() {
                                             RenderShaderFormat::SPIRV);
   debug_trivial_fs_ = device_->createShader(k_debug_trivial_frag, sizeof(k_debug_trivial_frag), "main",
                                             RenderShaderFormat::SPIRV);
-  native_rigid_vs_ = device_->createShader(k_native_rigid_vert, sizeof(k_native_rigid_vert), "main",
-                                           RenderShaderFormat::SPIRV);
-  native_view_vs_[0] = device_->createShader(k_native_view_vert_t0_n0, sizeof(k_native_view_vert_t0_n0), "main",
-                                             RenderShaderFormat::SPIRV);
-  native_view_vs_[1] = device_->createShader(k_native_view_vert_t1_n0, sizeof(k_native_view_vert_t1_n0), "main",
-                                             RenderShaderFormat::SPIRV);
-  native_view_vs_[2] = device_->createShader(k_native_view_vert_t0_n1, sizeof(k_native_view_vert_t0_n1), "main",
-                                             RenderShaderFormat::SPIRV);
-  native_view_vs_[3] = device_->createShader(k_native_view_vert_t1_n1, sizeof(k_native_view_vert_t1_n1), "main",
-                                             RenderShaderFormat::SPIRV);
-  native_view_fs_ = device_->createShader(k_native_view_frag, sizeof(k_native_view_frag), "main",
-                                          RenderShaderFormat::SPIRV);
-  native_surface_fs_[0] = device_->createShader(k_native_surface_frag_i0, sizeof(k_native_surface_frag_i0), "main",
-                                                RenderShaderFormat::SPIRV);
-  native_surface_fs_[1] = device_->createShader(k_native_surface_frag_i1, sizeof(k_native_surface_frag_i1), "main",
-                                                RenderShaderFormat::SPIRV);
-  native_surface_fs_[2] = device_->createShader(k_native_surface_frag_i2, sizeof(k_native_surface_frag_i2), "main",
-                                                RenderShaderFormat::SPIRV);
-  native_surface_fs_[3] = device_->createShader(k_native_surface_frag_i3, sizeof(k_native_surface_frag_i3), "main",
-                                                RenderShaderFormat::SPIRV);
-  native_lit_fs_ = device_->createShader(k_native_lit_frag, sizeof(k_native_lit_frag), "main",
-                                         RenderShaderFormat::SPIRV);
-  for (uint32_t i = 0; i < kPlumeFramesInFlight; ++i) {
-    instance_rows_[i] = device_->createBuffer(RenderBufferDesc::UploadBuffer(
-        kInstanceRowsBytes, RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::STORAGE));
-    if (!instance_rows_[i]) continue;
-    instance_rows_data_[i] = static_cast<uint8_t*>(instance_rows_[i]->map());
-    instance_rows_address_[i] = static_cast<VulkanBuffer*>(instance_rows_[i].get())->getDeviceAddress();
-  }
 
   upload_used_ = 0;
   uint64_t white = Allocate(4 * 6, 256);
@@ -4596,7 +4434,6 @@ void PlumeCommandProcessor::BeginFrame() {
   ApplyWritebacks(slot_);
   list_ = lists_[slot_].get();
   slice_base_ = slice_origin_ + uint64_t(slot_) * upload_slice_size_;
-  instance_rows_used_ = 0;
   for (uint32_t index : retired_descriptor_slots_[slot_]) {
     set_2d_->setTexture(index, white_2d_.get(), RenderTextureLayout::SHADER_READ);
     written_2d_[index] = {white_2d_.get(), nullptr};
@@ -7806,136 +7643,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   if (rel_active) spec_constants.emplace_back(RENUT_SPEC_REL_CONSTANTS, rel_variant);
-  // Native renderer v0: a depth-only draw (no colour target, so no pass whose
-  // depth a later colour draw has to match exactly) of a rigid shader, with no
-  // user clip plane and no memory export, is drawn with native_rigid.vert.
-  const NativeRigid* native_rigid = nullptr;
-  if (native_mode_ && native_rigid_vs_ && !ps && !color_count && !ucp_mask && !rect_list && !point_list &&
-      !patch_list && !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
-    const auto& table = NativeRigidShaders();
-    const auto found = table.find(vs->entry->hash);
-    if (found != table.end() && found->second.location == 0 &&
-        std::any_of(input_elements.begin(), input_elements.end(),
-                    [](const RenderInputElement& e) { return e.location == 0; })) {
-      native_rigid = &found->second;
-      spec_constants.emplace_back(kNativeSwizzleSpec, native_rigid->swizzle);
-    }
-  }
-  // Native renderer v1: the engine draw this PM4 draw came from, by the tag
-  // native_engine.cpp put in vertex booleans 104..127 - checked against what
-  // the PM4 says: the index count, and which words of the engine's vertex and
-  // index buffer objects hold the stream-0 and index addresses.
-  const uint32_t engine_tag =
-      regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_096_127] >> renut::native_engine::kTagShift;
-  renut::native_engine::Draw engine_draw;
-  bool engine_found = false, engine_count_ok = false;
-  int engine_vb_word = -1, engine_ib_word = -1;
-  if (engine_tag) {
-    engine_found = renut::native_engine::Lookup(engine_tag, engine_draw);
-    if (engine_found) {
-      engine_count_ok = engine_draw.index_count && index_count % engine_draw.index_count == 0;
-      const uint32_t pm4_vb = regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 95 * 2] & 0x1FFFFFFCu;
-      const uint32_t pm4_ib =
-          index_buffer_info && index_buffer_info->guest_base ? index_buffer_info->guest_base & 0x1FFFFFFFu : 0;
-      if (pm4_vb && EngineBufferAddress(engine_draw.vb_words[6]) == pm4_vb) engine_vb_word = 6;
-      if (pm4_ib && EngineBufferAddress(engine_draw.ib_words[6]) == (pm4_ib & ~3u)) engine_ib_word = 6;
-      if (engine_samples_ < 24 && swaps_ > 600) {
-        ++engine_samples_;
-        std::string line = fmt::format(
-            "   tag {:06X} pass {} vs {:016X} ps {:016X} count {} (engine {}) pm4 vb {:08X} ib {:08X} | vb obj {:08X} "
-            "stride {} ib obj {:08X} | vb words",
-            engine_tag, engine_draw.pass, vs->entry->hash, ps ? ps->entry->hash : 0, index_count,
-            engine_draw.index_count, pm4_vb, pm4_ib, engine_draw.vertex_buffer, engine_draw.stride,
-            engine_draw.index_buffer);
-        for (uint32_t w : engine_draw.vb_words) line += fmt::format(" {:08X}", w);
-        line += " | ib words";
-        for (uint32_t w : engine_draw.ib_words) line += fmt::format(" {:08X}", w);
-        renut::native_engine::AddSample(line + "\n");
-      }
-    }
-  } else {
-    renut::native_engine::NoteUntagged();
-  }
-  // The native view (plume-native 2): a validated engine world draw of a rigid
-  // shader, into one colour target, drawn with native_view.vert/.frag.
-  const NativeRigid* native_view = nullptr;
-  uint32_t native_view_variant = 0;
-  if (native_mode_ == 2 && engine_found && engine_count_ok && engine_ib_word == 6 && ps && color_count == 1 &&
-      !ucp_mask && !rect_list &&
-      !point_list && !patch_list && !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && native_view_fs_) {
-    const auto& table = NativeRigidShaders();
-    const auto found = table.find(vs->entry->hash);
-    auto has = [&](uint32_t location) {
-      return std::any_of(input_elements.begin(), input_elements.end(),
-                         [&](const RenderInputElement& e) { return e.location == location; });
-    };
-    if (found != table.end() && found->second.location == 0 && has(0)) {
-      native_view_variant = (found->second.texcoord && has(8) ? 1u : 0u) | (found->second.normal && has(5) ? 2u : 0u);
-      if (native_view_vs_[native_view_variant]) {
-        native_view = &found->second;
-        spec_constants.emplace_back(kNativeSwizzleSpec, native_view->swizzle);
-        spec_constants.emplace_back(kNativeTexcoordSwizzleSpec, native_view->texcoord_swizzle);
-        spec_constants.emplace_back(kNativeNormalSwizzleSpec, native_view->normal_swizzle);
-      }
-    }
-  }
-  // Native surfaces (plume-native 3): every validated engine world draw into
-  // one colour target keeps its guest vertex shader - any family - and gets
-  // native_surface.frag for its material, reading the surface texture's
-  // coordinates from the interpolant the guest pixel shader reads them from.
-  int native_surface = -1;
-  const NativeSurface* surface_texture = nullptr;
-  if (native_mode_ == 3 && engine_found && engine_count_ok && engine_ib_word == 6 && ps && color_count == 1 &&
-      !rect_list && !point_list && !patch_list) {
-    const auto& surfaces = NativeSurfaceTextures();
-    const auto found = surfaces.find(ps->entry->hash);
-    if (found != surfaces.end() && found->second.interpolant < 4) surface_texture = &found->second;
-    native_surface = surface_texture ? surface_texture->interpolant : 0;
-    if (!native_surface_fs_[native_surface]) native_surface = -1;
-  }
-  // The native lit material: an exact port of the guest pixel shader, so it
-  // stands in wherever that shader is used, engine draw or not.
-  const NativeLit* native_lit = nullptr;
-  if (native_lit_mode_ && native_lit_fs_ && ps && !native_view && native_surface < 0 && !rect_list && !point_list) {
-    const auto& table = NativeLitShaders();
-    const auto found = table.find(ps->entry->hash);
-    if (found != table.end()) {
-      native_lit = &found->second;
-      spec_constants.emplace_back(kNativeLitSpecBase + 0, native_lit->power);
-      spec_constants.emplace_back(kNativeLitSpecBase + 1, native_lit->specular);
-      spec_constants.emplace_back(kNativeLitSpecBase + 2, native_lit->alpha);
-      spec_constants.emplace_back(kNativeLitSpecBase + 3, native_lit->bias);
-      renut::native_engine::NoteNativeLit();
-    }
-  }
-  if (engine_tag) {
-    renut::native_engine::NoteDraw(engine_found, engine_count_ok, engine_vb_word, engine_ib_word,
-                                   native_view != nullptr || native_surface >= 0);
-    if (engine_found && engine_ib_word == 6 && ps && color_count) {
-      renut::native_engine::NoteShaders(vs->entry->hash, ps->entry->hash);
-    }
-  }
-  // A shadow caster too small for its map (plume-shadow-texels). Its rows are
-  // world x light view-projection; c120..c122 hold the world matrix
-  // (sub_823A8CC0), whose scale turns the engine's world-space bounding radius
-  // into the mesh's. The diameter in clip units times half the viewport is the
-  // diameter in texels. Only the native rigid depth draws into a target that is
-  // not the screen's, the way plume-shadowmin picks its casters.
-  if (shadow_texels_ > 0.f && native_rigid && engine_found && engine_draw.has_sphere && pitch != 1280 &&
-      depth_control.z_write_enable && !depth_control.stencil_enable) {
-    const float* row = reinterpret_cast<const float*>(
-        &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + native_rigid->rows[0] * 4]);
-    const float* world = reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 120 * 4]);
-    const float row_length = std::sqrt(row[0] * row[0] + row[1] * row[1] + row[2] * row[2]);
-    const float scale = std::sqrt(world[0] * world[0] + world[1] * world[1] + world[2] * world[2]);
-    if (scale > 1e-4f && scale < 1e4f && std::isfinite(row_length)) {
-      const float texels = engine_draw.sphere[3] * row_length / scale * std::fabs(viewport.width);
-      if (texels < shadow_texels_) {
-        renut::native_engine::NoteShadowCull();
-        return true;
-      }
-    }
-  }
   // The pipeline key: the fields laid end to end and hashed once. Hashing
   // each field on its own was a few dozen XXH3 calls a draw.
   KeyBytes key_bytes;
@@ -7992,10 +7699,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     depth_module = fetch_spec ? vertex_compiled->depth_fetch_spec_module.get() : vertex_compiled->depth_module.get();
   }
   const bool depth_strip = depth_module != nullptr;
-  key_bytes.Put(uint8_t(fetch_spec | (depth_strip << 1) | ((native_rigid != nullptr) << 2) |
-                        ((native_view != nullptr) << 3) | (native_view_variant << 4)));
-  key_bytes.Put(uint8_t(native_surface + 1));
-  key_bytes.Put(uint8_t(native_lit != nullptr));
+  key_bytes.Put(uint8_t(fetch_spec | (depth_strip << 1)));
   // Debug (plume-trivial bit 4): a trivial vertex shader for depth-only draws
   // alone, to price what those draws cost without their vertex work.
   const bool trivial_vs = ((trivial_mode_ & 1) || ((trivial_mode_ & 4) && !ps)) && plain_draw;
@@ -8046,17 +7750,12 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = layout_.get();
     desc.vertexShader = trivial_vs     ? debug_trivial_vs_.get()
-                        : native_rigid ? native_rigid_vs_.get()
-                        : native_view  ? native_view_vs_[native_view_variant].get()
                         : depth_strip  ? depth_module
                         : fetch_spec  ? vertex_compiled->fetch_spec_module.get()
                                       : vertex_compiled->module.get();
     desc.geometryShader = rect_list ? rect_list_gs_.get() : point_list ? point_list_gs_.get() : nullptr;
     desc.pixelShader = debug_point   ? debug_point_fs_.get()
                        : trivial_fs  ? debug_trivial_fs_.get()
-                       : native_view ? native_view_fs_.get()
-                       : native_surface >= 0 ? native_surface_fs_[native_surface].get()
-                       : native_lit ? native_lit_fs_.get()
                        : ps          ? ps->compiled->module.get()
                                      : nullptr;
     desc.primitiveTopology = topology;
@@ -8087,7 +7786,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     desc.specConstantsCount = uint32_t(spec_constants.size());
     // The pipeline built ahead from the recipe file (StartRecipes), if this
     // start had it; a pipeline not in the file yet is written to it.
-    if (recipes_ && !debug_point && !trivial_vs && !trivial_fs && !native_rigid && !native_view && native_surface < 0 && !native_lit &&
+    if (recipes_ && !debug_point && !trivial_vs && !trivial_fs &&
         !pending_pipelines_.count(key) &&
         !failed_pipelines_.count(key)) {
       Recipe recipe;
@@ -8381,51 +8080,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   pk.push[0] = Address(constant_offsets_[0][0]);
   pk.push[1] = Address(skip_ps_constants ? unused_ps_offset : constant_offsets_[1][0]);
   pk.push[2] = Address(shared_offset_);
-  if (const NativeRigid* native = native_rigid ? native_rigid : native_view) {
-    pk.native = true;
-    pk.rigid_depth = native_rigid != nullptr;
-    for (uint32_t row = 0; row < 4; ++row) {
-      std::memcpy(pk.native_push + row * 4,
-                  &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + native->rows[row] * 4], 16);
-    }
-    std::memcpy(pk.native_push + 16, scale_offset, sizeof(scale_offset));
-    if (native_view) {
-      // The pixel shader's surface texture, through the descriptor and
-      // sampler this draw already resolved for it - when the vertex shader
-      // hands it the raw coordinates it samples it with. A blended draw keeps
-      // its alpha; an opaque one writes 0, the game's "no bloom".
-      uint32_t flags = blends[0].blendEnabled ? 2u : 0u, texture = 0, sampler = 0;
-      const auto& surfaces = NativeSurfaceTextures();
-      const auto surface = surfaces.find(ps->entry->hash);
-      if (surface != surfaces.end() && native_view->texcoord_output == surface->second.interpolant &&
-          texture_descriptor[surface->second.slot]) {
-        flags |= 1u;
-        texture = texture_descriptor[surface->second.slot];
-        sampler = sampler_descriptor[surface->second.slot];
-      }
-      const float reference = alpha_test ? alpha_ref : 0.f;
-      std::memcpy(pk.native_push + 20, &reference, 4);
-      std::memcpy(pk.native_push + 21, &flags, 4);
-      std::memcpy(pk.native_push + 22, &texture, 4);
-      std::memcpy(pk.native_push + 23, &sampler, 4);
-    }
-    ++stats_.native_draws;
-  }
-  if (native_surface >= 0) {
-    pk.native_surface = true;
-    uint32_t flags = blends[0].blendEnabled ? 2u : 0u, texture = 0, sampler = 0;
-    if (surface_texture && texture_descriptor[surface_texture->slot]) {
-      flags |= 1u;
-      texture = texture_descriptor[surface_texture->slot];
-      sampler = sampler_descriptor[surface_texture->slot];
-    }
-    const float reference = alpha_test ? alpha_ref : 0.f;
-    std::memcpy(pk.native_push + 20, &reference, 4);
-    std::memcpy(pk.native_push + 21, &flags, 4);
-    std::memcpy(pk.native_push + 22, &texture, 4);
-    std::memcpy(pk.native_push + 23, &sampler, 4);
-    ++stats_.native_draws;
-  }
   for (uint32_t stage = 0; stage < 2; ++stage) {
     for (uint32_t chunk = 0; chunk < kConstantChunks; ++chunk) {
       pk.constant_offsets[stage * kConstantChunks + chunk] =
@@ -8612,24 +8266,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     if (!deferred_.empty() && deferred_signature_ != window_signature) FlushDeferred();
     deferred_signature_ = window_signature;
     pk.first_slot = uint32_t(deferred_slots_.size());
-    if (pk.rigid_depth && pk.kind == DrawPacket::Kind::kIndexed) {
-      uint64_t key = uint64_t(uintptr_t(pk.index_buffer));
-      HashCombine(key, uint32_t(pk.index_format));
-      HashCombine(key, pk.count);
-      HashCombine(key, pk.first);
-      HashCombine(key, pk.base_vertex);
-      HashCombine(key, uint64_t(uintptr_t(pk.framebuffer)));
-      HashCombine(key, XXH3_64bits(&pk.viewport, sizeof(pk.viewport)));
-      HashCombine(key, XXH3_64bits(&pk.scissor, sizeof(pk.scissor)));
-      HashCombine(key, pk.stencil_ref);
-      for (const DeferredSlot& slot : draw_slots_) {
-        HashCombine(key, slot.slot.index);
-        HashCombine(key, slot.slot.stride);
-        HashCombine(key, uint64_t(uintptr_t(slot.view.buffer.ref)));
-        HashCombine(key, slot.view.buffer.offset);
-      }
-      pk.mesh_key = key ? key : 1;
-    }
     deferred_slots_.insert(deferred_slots_.end(), draw_slots_.begin(), draw_slots_.end());
     deferred_.push_back(pk);
     ++stats_.deferred_draws;
@@ -8670,17 +8306,12 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
       vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, pk.stencil_write_mask);
     }
   }
-  // A native draw reads nothing but its own push constants: the guest's
-  // addresses and constant blocks stay as the last guest draw left them.
-  if (pk.native) {
-    L()->setGraphicsPushConstants(0, pk.native_push, kNativePushOffset, sizeof(pk.native_push));
-  } else if (std::memcmp(pk.push, pushed_constants_, sizeof(pk.push)) != 0 &&
+  if (std::memcmp(pk.push, pushed_constants_, sizeof(pk.push)) != 0 &&
              !((bind_skip_ & 2) && pushed_constants_[0] != UINT64_MAX)) {
     L()->setGraphicsPushConstants(0, pk.push, 0, sizeof(pk.push));
     std::memcpy(pushed_constants_, pk.push, sizeof(pk.push));
   }
-  if (pk.native_surface) L()->setGraphicsPushConstants(0, pk.native_push + 20, 112, 16);
-  if (!pk.native && std::memcmp(pk.constant_offsets, bound_constant_offsets_, sizeof(pk.constant_offsets)) != 0 &&
+  if (std::memcmp(pk.constant_offsets, bound_constant_offsets_, sizeof(pk.constant_offsets)) != 0 &&
       !((bind_skip_ & 1) && bound_constant_offsets_[0] != UINT32_MAX)) {
     vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(L())->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             static_cast<VulkanPipelineLayout*>(layout_.get())->vk, 4, 1, &constants_set_,
@@ -8982,51 +8613,9 @@ void PlumeCommandProcessor::FlushDeferred() {
   ++stats_.defer_windows;
   stats_.defer_binds_before += before;
   stats_.defer_binds_after += after;
-  // Native rigid depth draws are order-independent (depth only, strict test):
-  // within a pipeline, draws of the same mesh go next to each other and a run
-  // of them becomes one instanced draw, its rows in the frame slot's buffer.
-  const bool instancing = shadow_instancing_ && instance_rows_data_[slot_];
-  if (instancing) {
-    for (size_t a = 0; a < n;) {
-      size_t b = a + 1;
-      while (b < n && flushing_[defer_order_[b]].pipeline == flushing_[defer_order_[a]].pipeline) ++b;
-      if (flushing_[defer_order_[a]].rigid_depth && b - a > 1) {
-        std::stable_sort(defer_order_.begin() + a, defer_order_.begin() + b, [&](uint32_t x, uint32_t y) {
-          return flushing_[x].mesh_key < flushing_[y].mesh_key;
-        });
-      }
-      a = b;
-    }
-  }
-  constexpr uint32_t kRowsBytes = 64;
-  for (size_t i = 0; i < n;) {
+  for (size_t i = 0; i < n; ++i) {
     const DrawPacket& pk = flushing_[defer_order_[i]];
-    size_t j = i + 1;
-    if (instancing && pk.rigid_depth && pk.mesh_key) {
-      while (j < n && j - i < 512 && flushing_[defer_order_[j]].mesh_key == pk.mesh_key &&
-             flushing_[defer_order_[j]].pipeline == pk.pipeline) {
-        ++j;
-      }
-    }
-    const uint32_t count = uint32_t(j - i);
-    if (count > 1 && instance_rows_used_ + count * kRowsBytes <= kInstanceRowsBytes) {
-      uint8_t* rows = instance_rows_data_[slot_] + instance_rows_used_;
-      for (uint32_t k = 0; k < count; ++k) {
-        std::memcpy(rows + k * kRowsBytes, flushing_[defer_order_[i + k]].native_push, kRowsBytes);
-      }
-      DrawPacket batch = pk;
-      batch.instances = count;
-      const uint64_t address = instance_rows_address_[slot_] + instance_rows_used_;
-      const uint32_t words[2] = {uint32_t(address), uint32_t(address >> 32)};
-      std::memcpy(batch.native_push + 20, words, sizeof(words));
-      instance_rows_used_ += count * kRowsBytes;
-      EmitDraw(batch, flushing_slots_.data() + pk.first_slot, pk.slot_count);
-      renut::native_engine::NoteShadowBatch(count);
-      i = j;
-      continue;
-    }
     EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
-    ++i;
   }
   flushing_.clear();
   flushing_slots_.clear();
@@ -10120,54 +9709,6 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       depth_strip_mode_ = uint32_t(depth_strip);
     }
     {
-      int native = NativeModeFromCvars();
-      if (FILE* file = std::fopen((root + "/plume-native").c_str(), "r")) {
-        int value = native;
-        if (std::fscanf(file, "%d", &value) == 1) native = std::clamp(value, 0, 3);
-        std::fclose(file);
-      }
-      if (uint32_t(native) != native_mode_) {
-        REXLOG_INFO("Renut: Plume native renderer mode {} (0 off, 1 rigid depth draws, 2 also the native view, "
-                    "3 rigid depth draws and native surfaces)",
-                    native);
-      }
-      native_mode_ = uint32_t(native);
-      g_renut_native_mode.store(native_mode_, std::memory_order_relaxed);
-    }
-    {
-      float texels = 1.5f;
-      if (FILE* file = std::fopen((root + "/plume-shadow-texels").c_str(), "r")) {
-        if (std::fscanf(file, "%f", &texels) != 1) texels = 1.5f;
-        std::fclose(file);
-      }
-      if (texels != shadow_texels_) REXLOG_INFO("Renut: Plume shadow casters under {} texels dropped", texels);
-      shadow_texels_ = texels;
-      int instancing = 1;
-      if (FILE* file = std::fopen((root + "/plume-shadow-instancing").c_str(), "r")) {
-        if (std::fscanf(file, "%d", &instancing) != 1) instancing = 1;
-        std::fclose(file);
-      }
-      if (uint32_t(instancing != 0) != shadow_instancing_) {
-        REXLOG_INFO("Renut: Plume shadow caster instancing {}", instancing ? "on" : "off");
-      }
-      shadow_instancing_ = instancing != 0;
-      const int lit_default = REXCVAR_GET(renut_plume_native_lit) ? 1 : 0;
-      int lit = lit_default;
-      if (FILE* file = std::fopen((root + "/plume-native-lit").c_str(), "r")) {
-        if (std::fscanf(file, "%d", &lit) != 1) lit = lit_default;
-        std::fclose(file);
-      }
-      if (uint32_t(lit != 0) != native_lit_mode_) {
-        REXLOG_INFO("Renut: Plume native lit material {}", lit ? "on" : "off");
-      }
-      native_lit_mode_ = lit != 0;
-      // The report's frame rate is split by this: the native mode, +4 with the
-      // texel cull on, +8 with the instancing on.
-      g_renut_native_mode.store(native_mode_ | (shadow_texels_ > 0.f ? 4u : 0u) | (shadow_instancing_ ? 8u : 0u) |
-                                    (native_lit_mode_ ? 16u : 0u),
-                                std::memory_order_relaxed);
-    }
-    {
       int adaptive = std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1);
       if (FILE* file = std::fopen((root + "/plume-adaptive").c_str(), "r")) {
         int value = adaptive;
@@ -10565,7 +10106,6 @@ void PlumeCommandProcessor::ReportMemory() {
 }
 
 void PlumeCommandProcessor::Report() {
-  renutReportShadowEngineProfile();
   REXLOG_INFO(
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
       "no_target={} resolves={} clears={} passes={} barriers={} pipeline_binds={} vertices={} gs_draws={} patch_draws={} patch_vertices={} adaptive={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
@@ -10597,9 +10137,6 @@ void PlumeCommandProcessor::Report() {
     REXLOG_INFO("Renut: Plume deferred draws (mode {}): {} draws in {} windows, pipeline changes {} -> {}",
                 defer_mode_, stats_.deferred_draws, stats_.defer_windows, stats_.defer_binds_before,
                 stats_.defer_binds_after);
-  }
-  if (stats_.native_draws) {
-    REXLOG_INFO("Renut: Plume native renderer: {} rigid depth draws", stats_.native_draws);
   }
   if (bc_supported_ && bc_mode_) {
     REXLOG_INFO("Renut: Plume BC textures: {} of the {} 2D uploads were blocks, not decoded pixels",

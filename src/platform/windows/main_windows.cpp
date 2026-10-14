@@ -34,7 +34,6 @@
 
 #include "d3d/d3d_layer.h"
 #include "d3d/native_d3d.h"
-#include "d3d/native_probe.h"
 #include "plume/plume_gpu.h"
 #include "plume/plume_renderer.h"
 
@@ -242,7 +241,6 @@ int main(int argc, char** argv) {
 
     renut::d3d::SetShaderDumpDirectory((data_dir / "shader-dump").string());
     renut::d3d::SetRuntimeFilesDirectory(data_dir.string());
-    renut::native_probe::SetFilesDirectory(data_dir.string());
     renut::native_d3d::SetFilesDirectory(data_dir.string());
     renut::ArmPlumeMemoryTrace(data_dir.string());
 

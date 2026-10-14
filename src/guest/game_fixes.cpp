@@ -1,8 +1,6 @@
 // Game-specific overrides of recompiled functions. The generated definitions
 // are weak symbols, so a strong definition here replaces them at link time.
 
-#include "d3d/native_engine.h"
-#include "d3d/native_probe.h"
 #include "guest_address.h"
 #include <atomic>
 #include <cstdint>
@@ -20,23 +18,10 @@ REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut",
                     "Keep the game's MSAA scene surfaces, which the Xbox 360 renders in two "
                     "or four bands (predicated tiling) with every draw sent once per band. "
                     "Off: one pass, no MSAA - the host never resolved the samples anyway");
-REXCVAR_DEFINE_BOOL(renut_shadow_engine_profile, false, "reNut",
-                    "Count shadow casters submitted by the game's dynamic and cached shadow passes");
 REXCVAR_DEFINE_BOOL(renut_plume_uncap_fps, false, "reNut/Plume",
                     "Use the game's immediate presentation interval instead of its 30 FPS setting");
 
 namespace {
-
-enum class ShadowPass : uint8_t { None, Dynamic, Cached };
-thread_local ShadowPass shadow_pass = ShadowPass::None;
-std::atomic<uint64_t> shadow_dynamic_passes{0}, shadow_cached_passes{0};
-std::atomic<uint64_t> shadow_dynamic_casters{0}, shadow_cached_casters{0};
-
-struct ShadowPassScope {
-  explicit ShadowPassScope(ShadowPass next) : previous(shadow_pass) { shadow_pass = next; }
-  ~ShadowPassScope() { shadow_pass = previous; }
-  ShadowPass previous;
-};
 
 // The game's MSAA mode (0 none, 1 2x, 2 4x), read by the scene surface setup
 // (sub_823ED2A8) and the tile count (sub_8222A990).
@@ -131,62 +116,6 @@ REX_HOOK_RAW(sub_822BC0D8) {
   __imp__sub_822BC0D8(ctx, base);
 }
 
-// These are the two shadow-map jobs identified in config/renut_hooks.toml. The
-// game still submits every caster normally. This seam lets the native backend
-// measure each category before it takes ownership of any draw.
-extern "C" void __imp__sub_823B3598(PPCContext& __restrict, uint8_t*);
-REX_HOOK_RAW(sub_823B3598) {
-  renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B3598, ctx, base);
-  if (!REXCVAR_GET(renut_shadow_engine_profile)) {
-    __imp__sub_823B3598(ctx, base);
-    return;
-  }
-  ShadowPassScope scope(ShadowPass::Dynamic);
-  shadow_dynamic_passes.fetch_add(1, std::memory_order_relaxed);
-  __imp__sub_823B3598(ctx, base);
-}
-
-extern "C" void __imp__sub_823B3CE0(PPCContext& __restrict, uint8_t*);
-REX_HOOK_RAW(sub_823B3CE0) {
-  renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B3CE0, ctx, base);
-  if (!REXCVAR_GET(renut_shadow_engine_profile)) {
-    __imp__sub_823B3CE0(ctx, base);
-    return;
-  }
-  ShadowPassScope scope(ShadowPass::Cached);
-  shadow_cached_passes.fetch_add(1, std::memory_order_relaxed);
-  __imp__sub_823B3CE0(ctx, base);
-}
-
-// sub_823B0698 is the caster draw called by both shadow-map jobs. The tag is
-// thread-local because game jobs can run concurrently. No guest state is
-// changed, and an unclassified invocation is left alone.
-extern "C" void __imp__sub_823B0698(PPCContext& __restrict, uint8_t*);
-REX_HOOK_RAW(sub_823B0698) {
-  renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B0698, ctx, base);
-  if (shadow_pass == ShadowPass::Dynamic) {
-    shadow_dynamic_casters.fetch_add(1, std::memory_order_relaxed);
-  } else if (shadow_pass == ShadowPass::Cached) {
-    shadow_cached_casters.fetch_add(1, std::memory_order_relaxed);
-  }
-  // Its draws carry the object's bounding sphere to the Plume renderer, which
-  // drops shadow casters too small to show in the map (native_engine.h).
-  renut::native_engine::SetObject(ctx.r4.u32, base);
-  __imp__sub_823B0698(ctx, base);
-  renut::native_engine::SetObject(0, base);
-}
-
-void renutReportShadowEngineProfile() {
-  if (!REXCVAR_GET(renut_shadow_engine_profile)) return;
-  const auto dynamic_passes = shadow_dynamic_passes.exchange(0, std::memory_order_relaxed);
-  const auto cached_passes = shadow_cached_passes.exchange(0, std::memory_order_relaxed);
-  const auto dynamic_casters = shadow_dynamic_casters.exchange(0, std::memory_order_relaxed);
-  const auto cached_casters = shadow_cached_casters.exchange(0, std::memory_order_relaxed);
-  REXLOG_INFO("Renut: shadow engine over 300 swaps: dynamic {} passes / {} casters, "
-              "cached {} passes / {} casters", dynamic_passes, dynamic_casters,
-              cached_passes, cached_casters);
-}
-
 // Scene render targets @ 0x823ED2A8, rebuilt on every device reset. With MSAA
 // the 1280x720 colour and depth surfaces outgrow the 10 MB of EDRAM, so the
 // game splits the frame into 2 (2x) or 4 (4x) bands of 384 rows and replays the
@@ -231,7 +160,6 @@ extern "C" void __imp__sub_823B18C8(PPCContext& __restrict, uint8_t*);
 // (wrong: with one tile the game predicates almost everything to mask 3).
 std::atomic<int> g_renut_scene_split_mode{2};
 REX_HOOK_RAW(sub_823B18C8) {
-  renut::native_probe::EngineEnter(renut::native_probe::kEngine_sub_823B18C8, ctx, base);
   const int mode = g_renut_scene_split_mode.load(std::memory_order_relaxed);
   if (!REXCVAR_GET(renut_scene_msaa) && (mode == 0 || mode == 2 || mode == 5)) {
     const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(renut::GuestPtr(base, ctx.r3.u32 + 40)));
