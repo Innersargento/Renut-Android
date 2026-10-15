@@ -1,8 +1,24 @@
 setjmp_address = 0x82BB5EF0
 longjmp_address = 0x82BB59B0
 
-
-
+# Codegen flags UnleashedRecomp ships. Three are on: skip_lr, skip_msr and cr_as_local (a bisection on the PC build,
+# 16/10, counting the window title's frame number: all three together run, 169 FPS at the title). The rest hang the
+# game at its 3D title - two job threads (sub_823DFE68, made in gameMain) park in debugHookCall because
+# sub_82240400(thread id) returns non-zero:
+#   ctr_as_local + xer_as_local + reserved_as_local  hang as a group (not bisected inside it)
+#   non_argument_as_local                            hangs alone
+#   non_volatile_as_local                            needs share_registers on 2,133 functions
+#     (config/renut_share_registers.toml, not included) and the save/restore helpers put back in them
+#     (tools/fix_shared_helpers.py); with both the game still loops on failed heap allocations.
+# Delete generated/android/*.cpp before regenerating: the generator skips files it finds unchanged.
+skip_lr = true
+skip_msr = true
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = true
+non_argument_as_local = false
+non_volatile_as_local = false
 
 [functions]
 0x82B100E8 = {}
