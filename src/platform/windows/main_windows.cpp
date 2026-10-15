@@ -34,6 +34,7 @@
 
 #include "d3d/d3d_layer.h"
 #include "d3d/native_d3d.h"
+#include "plume/frame_pacing.h"
 #include "plume/plume_gpu.h"
 #include "plume/plume_renderer.h"
 
@@ -213,6 +214,7 @@ int main(int argc, char** argv) {
 
   try {
     if (!config_file.empty()) rex::cvar::LoadConfig(config_file);
+    renut::pacing::ApplyConfiguredTarget();
     const auto log_level = spdlog::level::from_str(rex::cvar::GetFlagByName("log_level"));
     rex::InitLogging((data_dir / "rexglue-runtime.log").string().c_str(), log_level);
     Note("Renderizador: Plume (Windows, Vulkan)");

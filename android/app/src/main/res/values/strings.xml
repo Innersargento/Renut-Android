@@ -95,8 +95,11 @@
     <string name="settings_import_note">O jogo atual só é substituído depois que o novo for validado.</string>
     <string name="settings_display">Display</string>
     <string name="settings_fps">Contador de FPS</string>
-    <string name="settings_uncap">Destravar FPS</string>
-    <string name="settings_uncap_note">Usa o modo de apresentação imediato e a maior frequência da tela na próxima partida. Pode alterar o ritmo de partes do jogo.</string>
+    <string name="settings_fps_target">Taxa de quadros</string>
+    <string name="settings_fps_value">%1$d FPS</string>
+    <string name="settings_fps_original">%1$d FPS (original)</string>
+    <string name="settings_fps_unlimited">Ilimitado</string>
+    <string name="settings_fps_target_note">30 é o ritmo original do jogo. Acima disso o jogo apresenta sem esperar o vblank e é mantido na taxa escolhida; no fim da barra não há limite, nem o da frequência da tela. Muda na hora, e pode alterar o ritmo de partes do jogo.</string>
     <string name="settings_controls">Controles</string>
     <string name="settings_show_controls">Mostrar controles na tela</string>
     <string name="settings_external">Controles externos e jogadores</string>

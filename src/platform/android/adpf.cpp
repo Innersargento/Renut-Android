@@ -22,11 +22,11 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include "plume/frame_pacing.h"
+
 REXCVAR_DEFINE_BOOL(renut_adpf, true, "reNut/Performance",
                     "Report each frame's work to Android's performance hint session (ADPF) so the system "
                     "holds the CPU at the lowest clocks that keep the game's pace");
-
-REXCVAR_DECLARE(bool, renut_plume_uncap_fps);
 
 // The kernel's swap path calls this when set (command_processor.cpp).
 extern "C" void (*renut_frame_hook)();
@@ -262,9 +262,23 @@ void Maintain() {
 
 }  // namespace
 
+namespace {
+// The time a frame has at that rate. Unlimited has no deadline; the work is judged
+// against the 120 Hz of the fastest panels, so the governor still aims for speed.
+int64_t FramePeriodNs(int fps) { return int64_t(1e9 / double(fps > 0 ? fps : 120)); }
+}  // namespace
+
+void SetTargetFps(int fps) {
+  const int64_t period = FramePeriodNs(fps);
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_target_ns = period;
+  if (g_session && g_api.update_target) g_api.update_target(g_session, period);
+}
+
 void Start() {
   if (g_started.exchange(true)) return;
-  const double target_fps = REXCVAR_GET(renut_plume_uncap_fps) ? 60.0 : 30.0;
+  const int target = renut::pacing::Target();
+  const double target_fps = target > 0 ? double(target) : 120.0;
   if (!REXCVAR_GET(renut_adpf)) {
     REXLOG_INFO("Renut: ADPF off (renut_adpf = false)");
     g_started = false;

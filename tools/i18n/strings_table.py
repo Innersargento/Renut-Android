@@ -159,11 +159,14 @@ add("settings_import_note", "O jogo atual só é substituído depois que o novo 
     "只有在新游戏通过验证后，才会替换当前游戏。", "El juego actual solo se reemplaza después de validar el nuevo.")
 add("settings_display", "Display", "Display", "显示", "Pantalla")
 add("settings_fps", "Contador de FPS", "FPS counter", "FPS 计数器", "Contador de FPS")
-add("settings_uncap", "Destravar FPS", "Unlock FPS", "解除帧率限制", "Desbloquear FPS")
-add("settings_uncap_note", "Usa o modo de apresentação imediato e a maior frequência da tela na próxima partida. Pode alterar o ritmo de partes do jogo.",
-    "Uses immediate presentation and the screen's highest refresh rate in the next session. It can change the pacing of parts of the game.",
-    "下一局将使用即时呈现模式和屏幕的最高刷新率。这可能会改变游戏部分内容的节奏。",
-    "Usa la presentación inmediata y la mayor frecuencia de la pantalla en la próxima partida. Puede alterar el ritmo de partes del juego.")
+add("settings_fps_target", "Taxa de quadros", "Frame rate", "帧率", "Tasa de fotogramas")
+add("settings_fps_value", "%1$d FPS", "%1$d FPS", "%1$d FPS", "%1$d FPS")
+add("settings_fps_original", "%1$d FPS (original)", "%1$d FPS (original)", "%1$d FPS（原版）", "%1$d FPS (original)")
+add("settings_fps_unlimited", "Ilimitado", "Unlimited", "不限制", "Sin límite")
+add("settings_fps_target_note", "30 é o ritmo original do jogo. Acima disso o jogo apresenta sem esperar o vblank e é mantido na taxa escolhida; no fim da barra não há limite, nem o da frequência da tela. Muda na hora, e pode alterar o ritmo de partes do jogo.",
+    "30 is the game's original pace. Above it the game presents without waiting for the vblank and is held to the chosen rate; the end of the bar has no limit at all, not even the screen's refresh rate. It changes at once, and can change the pacing of parts of the game.",
+    "30 为游戏原版节奏。高于 30 时，游戏不再等待垂直消隐并保持在所选帧率；滑块末端完全不限制，也不受屏幕刷新率约束。更改立即生效，可能会改变游戏部分内容的节奏。",
+    "30 es el ritmo original del juego. Por encima, el juego presenta sin esperar al vblank y se mantiene en la tasa elegida; el final de la barra no tiene límite, ni siquiera el de la frecuencia de la pantalla. Cambia al instante y puede alterar el ritmo de partes del juego.")
 add("settings_controls", "Controles", "Controls", "控制", "Controles")
 add("settings_show_controls", "Mostrar controles na tela", "Show on-screen controls", "显示屏幕控制按键",
     "Mostrar controles en pantalla")

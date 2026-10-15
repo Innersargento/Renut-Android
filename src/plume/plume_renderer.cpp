@@ -1,5 +1,6 @@
 #include "plume_renderer.h"
 
+#include "frame_pacing.h"
 #include "plume_vulkan.h"
 
 #include <algorithm>
@@ -594,6 +595,43 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
   // In the background the loop stops here, holding the finished frame.
   s.WaitWhilePaused();
   std::lock_guard swap_lock(s.swap_mutex);
+  if (s.swap) {
+    // How the swapchain presents follows the frame-rate target, live. On the
+    // display's vertical sync (FIFO) every present waits for a refresh, so the
+    // refresh rate (120 Hz on the fast panels) was a ceiling no matter what the
+    // game or the pacer asked for. Above the sync ceiling, or unlimited, it
+    // queues nothing: Mailbox replaces a waiting frame with the newer one, and
+    // Immediate shows it at once where the driver has that and not Mailbox.
+    auto* chain = static_cast<VulkanSwapChain*>(s.swap.get());
+    VkPresentModeKHR want = VK_PRESENT_MODE_FIFO_KHR;
+    if (!(pacing::PresentVsync() && REXCVAR_GET(renut_plume_vsync))) {
+      if (chain->mailboxPresentModeSupported) {
+        want = VK_PRESENT_MODE_MAILBOX_KHR;
+      } else if (chain->immediatePresentModeSupported) {
+        want = VK_PRESENT_MODE_IMMEDIATE_KHR;
+      }
+    }
+    static VkPresentModeKHR refused = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    if (chain->createdPresentMode != want && want != refused) {
+      // The images in flight go before the swapchain is replaced under them.
+      WaitForAllSlots();
+      chain->requiredPresentMode = want;
+      if (chain->resize()) {
+        while (s.release.size() < s.swap->getTextureCount()) {
+          s.release.push_back(s.device->createCommandSemaphore());
+        }
+        REXLOG_INFO("Renut: Plume presents {} (target {} FPS)",
+                    want == VK_PRESENT_MODE_FIFO_KHR      ? "on the vertical sync"
+                    : want == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox"
+                                                          : "immediate",
+                    pacing::Target());
+      } else {
+        chain->requiredPresentMode = chain->createdPresentMode;
+        refused = want;
+        REXLOG_WARN("Renut: Plume could not change the present mode; keeping the current one");
+      }
+    }
+  }
   auto& slot = s.slots[slot_index % kPlumeFramesInFlight];
   // The caller waits before it reuses a slot, so this one is free by now.
   WaitForSlot(slot_index);

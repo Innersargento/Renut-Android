@@ -95,8 +95,11 @@
     <string name="settings_import_note">只有在新游戏通过验证后，才会替换当前游戏。</string>
     <string name="settings_display">显示</string>
     <string name="settings_fps">FPS 计数器</string>
-    <string name="settings_uncap">解除帧率限制</string>
-    <string name="settings_uncap_note">下一局将使用即时呈现模式和屏幕的最高刷新率。这可能会改变游戏部分内容的节奏。</string>
+    <string name="settings_fps_target">帧率</string>
+    <string name="settings_fps_value">%1$d FPS</string>
+    <string name="settings_fps_original">%1$d FPS（原版）</string>
+    <string name="settings_fps_unlimited">不限制</string>
+    <string name="settings_fps_target_note">30 为游戏原版节奏。高于 30 时，游戏不再等待垂直消隐并保持在所选帧率；滑块末端完全不限制，也不受屏幕刷新率约束。更改立即生效，可能会改变游戏部分内容的节奏。</string>
     <string name="settings_controls">控制</string>
     <string name="settings_show_controls">显示屏幕控制按键</string>
     <string name="settings_external">外接手柄与玩家</string>

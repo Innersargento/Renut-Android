@@ -27,8 +27,43 @@ final class RuntimeOptions {
     /** 0 full, 1 three quarters, 2 half: the resolution the scene is drawn at (plume_gpu.cpp). */
     static final String INTERNAL_RESOLUTION = "renut_plume_internal_resolution";
 
+    /**
+     * The frame rate the game is held to (frame_pacing.h): 30 is its own, 31-240 a rate of the
+     * player's choosing, 0 unlimited.
+     */
+    static final String FPS_TARGET = "renut_fps_target";
+    /** The switch the slider replaced; still read from an older renut.toml. */
+    private static final String LEGACY_UNCAP_FPS = "renut_plume_uncap_fps";
+    static final int FPS_ORIGINAL = 30, FPS_MIN = 30, FPS_MAX = 240, FPS_STEP = 5, FPS_UNLIMITED = 0;
+    /** The slider's positions: 30, 35 ... 240, then "unlimited" at the end (so 0..SLIDER_UNLIMITED). */
+    static final int SLIDER_UNLIMITED = (FPS_MAX - FPS_MIN) / FPS_STEP + 1;
+
+    /** The frame rate at a slider position. */
+    static int fpsFromSlider(int position) {
+        if (position >= SLIDER_UNLIMITED) return FPS_UNLIMITED;
+        return FPS_MIN + Math.max(0, position) * FPS_STEP;
+    }
+
+    /** The slider position of a frame rate (the nearest step; 0 is the end of the bar). */
+    static int sliderFromFps(int fps) {
+        if (fps <= 0) return SLIDER_UNLIMITED;
+        return Math.min(SLIDER_UNLIMITED - 1, Math.max(0, Math.round((fps - FPS_MIN) / (float) FPS_STEP)));
+    }
+
+    /** The saved frame-rate target; an old "unlock FPS" switch that was on reads as unlimited. */
+    static int fpsTarget(Context context) {
+        String value = get(context, FPS_TARGET, "");
+        if (!value.isEmpty()) {
+            try {
+                int fps = Integer.parseInt(value);
+                return fps <= 0 ? FPS_UNLIMITED : Math.min(FPS_MAX, Math.max(FPS_MIN, fps));
+            } catch (NumberFormatException ignored) { }
+        }
+        return "true".equals(get(context, LEGACY_UNCAP_FPS, "false")) ? FPS_UNLIMITED : FPS_ORIGINAL;
+    }
+
     private static final Set<String> BOOLEANS = new java.util.HashSet<>(java.util.Arrays.asList(
-        "renut_plume_async_pipelines", "renut_plume_uncap_fps", "renut_plume_no_shadows", "renut_plume_no_bloom",
+        "renut_plume_async_pipelines", LEGACY_UNCAP_FPS, "renut_plume_no_shadows", "renut_plume_no_bloom",
         "renut_adpf", CHEATS));
     static {
         BOOLEANS.addAll(java.util.Arrays.asList(CHEAT_FLAGS));
@@ -57,7 +92,14 @@ final class RuntimeOptions {
 
     static void set(Context context, String key, String value) throws IOException {
         boolean text = key.equals("log_level") || key.equals(CHEAT_SKIN);
-        if (!(BOOLEANS.contains(key) && (value.equals("true") || value.equals("false"))
+        boolean fps = false;
+        if (key.equals(FPS_TARGET)) {
+            try {
+                int parsed = Integer.parseInt(value);
+                fps = parsed == FPS_UNLIMITED || parsed >= FPS_MIN && parsed <= FPS_MAX;
+            } catch (NumberFormatException ignored) { }
+        }
+        if (!(fps || BOOLEANS.contains(key) && (value.equals("true") || value.equals("false"))
             || key.equals("log_level") && LEVELS.contains(value)
             || (key.equals(TEXTURE_QUALITY) || key.equals(SHADOW_QUALITY) || key.equals(INTERNAL_RESOLUTION))
                 && (value.equals("0") || value.equals("1") || value.equals("2"))
@@ -82,6 +124,10 @@ final class RuntimeOptions {
         try { Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING); }
         catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
             Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        }
+        // The slider has the last word: an old switch left on would turn 30 into unlimited.
+        if (key.equals(FPS_TARGET) && !"false".equals(get(context, LEGACY_UNCAP_FPS, "false"))) {
+            set(context, LEGACY_UNCAP_FPS, "false");
         }
     }
 

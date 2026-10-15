@@ -20,6 +20,8 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private TextPrompt textPrompt;
     private boolean controlsVisible;
     private float gameRefreshRate=60f;
+    // The frame rate the game is held to (RuntimeOptions.FPS_TARGET): 30 its own, 0 unlimited.
+    private int fpsTarget=RuntimeOptions.FPS_ORIGINAL;
     // One per local player: the gamepad that plays as player one (together with the touch screen)
     // and the one that plays as player two. Null while no gamepad is assigned to that player.
     private final ExternalController.Player[] controllers = new ExternalController.Player[ExternalController.PLAYERS];
@@ -51,6 +53,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native void nativeExternalTrigger(int player,int trigger,float value);
     private static native void nativeSetPlayerAttached(int player,boolean attached);
     private static native long nativeRumble();
+    private static native void nativeSetFpsTarget(int fps);
     private static native long nativeFrameCount();
     private static native long nativePrecompileProgress();
     private static native void nativeTextInputResult(String text,boolean cancelled);
@@ -104,16 +107,9 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         super.onCreate(state);
         Transitions.fadeOpen(this);
         launch=getIntent().getBooleanExtra("launch",false);
-        if(launch && "true".equals(RuntimeOptions.get(this,"renut_plume_uncap_fps","false"))){
-            Display display=getDisplay();
-            if(display!=null){
-                Display.Mode current=display.getMode();
-                for(Display.Mode mode:display.getSupportedModes()){
-                    if(mode.getPhysicalWidth()==current.getPhysicalWidth() &&
-                       mode.getPhysicalHeight()==current.getPhysicalHeight())
-                        gameRefreshRate=Math.max(gameRefreshRate,mode.getRefreshRate());
-                }
-            }
+        if(launch){
+            fpsTarget=RuntimeOptions.fpsTarget(this);
+            gameRefreshRate=refreshRateFor(fpsTarget);
         }
         if(launch)setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         graphics=launch||getIntent().getBooleanExtra("graphics",false);
@@ -324,6 +320,48 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     public void uiOpenLayoutEditor(){
         if(!launch)return;
         startActivity(new Intent(this,LayoutEditorActivity.class));
+    }
+    /**
+     * The display mode the screen should run at for a frame rate. Up to 60 the default rate keeps an
+     * even cadence (30 is every second refresh); above it (or unlimited) the panel's fastest mode
+     * of the current resolution, so that its refresh rate is not what holds the game back.
+     */
+    private float refreshRateFor(int fps){
+        float rate=60f;
+        if(fps!=0&&fps<=60)return rate;
+        Display display=getDisplay();
+        if(display==null)return rate;
+        Display.Mode current=display.getMode();
+        for(Display.Mode mode:display.getSupportedModes()){
+            if(mode.getPhysicalWidth()==current.getPhysicalWidth() &&
+               mode.getPhysicalHeight()==current.getPhysicalHeight())
+                rate=Math.max(rate,mode.getRefreshRate());
+        }
+        return rate;
+    }
+    public int uiFpsTarget(){return fpsTarget;}
+    /**
+     * Live while the slider moves: the game takes the new rate at its next frame, and the screen
+     * is asked for the refresh rate that goes with it. Nothing is saved (uiSaveFpsTarget does that
+     * when the finger lifts).
+     */
+    public void uiSetFpsTarget(int fps){
+        fpsTarget=fps;
+        if(loaded)nativeSetFpsTarget(fps);
+        float rate=refreshRateFor(fps);
+        if(rate==gameRefreshRate)return;
+        gameRefreshRate=rate;
+        if(!launch)return;
+        WindowManager.LayoutParams params=getWindow().getAttributes();
+        params.preferredRefreshRate=rate;
+        getWindow().setAttributes(params);
+        if(android.os.Build.VERSION.SDK_INT>=30&&surface!=null&&surface.getHolder().getSurface().isValid()){
+            try{surface.getHolder().getSurface().setFrameRate(rate,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(Exception ignored){}
+        }
+    }
+    public void uiSaveFpsTarget(int fps){
+        try{RuntimeOptions.set(this,RuntimeOptions.FPS_TARGET,Integer.toString(fps));}
+        catch(java.io.IOException e){Toast.makeText(this,Language.s(R.string.toml_save_failed,e.getMessage()),Toast.LENGTH_SHORT).show();}
     }
     public boolean uiFpsVisible(){return fpsWanted;}
     public void uiSetFpsVisible(boolean visible){

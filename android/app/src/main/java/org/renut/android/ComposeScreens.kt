@@ -669,7 +669,6 @@ private val SKIN_LABELS = listOf(
     val turnip = remember(driver) { activity.uiDriverIsTurnip() }
     val logLevel = activity.uiRuntimeOption("log_level", "info")
     val shaderAsync = activity.uiRuntimeOption("renut_plume_async_pipelines", "true") == "true"
-    val uncapFps = activity.uiRuntimeOption("renut_plume_uncap_fps", "false") == "true"
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
     val sustained = activity.uiRuntimeOption("renut_adpf", "true") == "true"
@@ -712,10 +711,10 @@ private val SKIN_LABELS = listOf(
             Panel(stringResource(R.string.settings_display)) {
                 ToggleRow(stringResource(R.string.settings_fps), fpsEnabled, !busy) { activity.uiSetFps(it) }
                 ToggleRow(stringResource(R.string.settings_temp), tempEnabled, !busy) { activity.uiSetTemp(it) }
-                ToggleRow(stringResource(R.string.settings_uncap), uncapFps, !busy) {
-                    activity.uiSetRuntimeOption("renut_plume_uncap_fps", it.toString())
+                FpsTargetSlider(RuntimeOptions.fpsTarget(activity), !busy, onLive = {}) {
+                    activity.uiSetRuntimeOption(RuntimeOptions.FPS_TARGET, it.toString())
                 }
-                Text(stringResource(R.string.settings_uncap_note), color = Muted, fontSize = 12.sp)
+                Text(stringResource(R.string.settings_fps_target_note), color = Muted, fontSize = 12.sp)
             }
         }
         item {
@@ -836,6 +835,34 @@ private val SKIN_LABELS = listOf(
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(label, color = Text, modifier = Modifier.weight(1f))
         Switch(checked = checked, enabled = enabled, onCheckedChange = onCheckedChange)
+    }
+}
+
+@Composable private fun fpsLabel(fps: Int): String = when (fps) {
+    RuntimeOptions.FPS_UNLIMITED -> stringResource(R.string.settings_fps_unlimited)
+    RuntimeOptions.FPS_ORIGINAL -> stringResource(R.string.settings_fps_original, fps)
+    else -> stringResource(R.string.settings_fps_value, fps)
+}
+
+/**
+ * The frame-rate bar: 30 (the game's own) up to 240 in steps of 5, and "unlimited" at its end.
+ * [onLive] runs on every step while the thumb moves; [onCommit] once, when it lets go.
+ */
+@Composable private fun FpsTargetSlider(initial: Int, enabled: Boolean, onLive: (Int) -> Unit, onCommit: (Int) -> Unit) {
+    var position by remember { mutableFloatStateOf(RuntimeOptions.sliderFromFps(initial).toFloat()) }
+    val fps = RuntimeOptions.fpsFromSlider(Math.round(position))
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(stringResource(R.string.settings_fps_target), color = Text, modifier = Modifier.weight(1f))
+            Text(fpsLabel(fps), color = Accent, fontWeight = FontWeight.Bold)
+        }
+        Slider(
+            value = position,
+            onValueChange = { position = it; onLive(RuntimeOptions.fpsFromSlider(Math.round(it))) },
+            enabled = enabled,
+            valueRange = 0f..RuntimeOptions.SLIDER_UNLIMITED.toFloat(),
+            steps = RuntimeOptions.SLIDER_UNLIMITED - 1,
+            onValueChangeFinished = { onCommit(RuntimeOptions.fpsFromSlider(Math.round(position))) })
     }
 }
 
@@ -1006,6 +1033,7 @@ private val SidebarWidth = 360.dp
             fpsVisible = it
             activity.uiSetFpsVisible(it)
         }
+        SidebarFpsTarget(activity)
         SidebarToggle(Icons.Default.Thermostat, stringResource(R.string.settings_temp), tempVisible) {
             tempVisible = it
             activity.uiSetTempVisible(it)
@@ -1165,6 +1193,29 @@ private val SidebarWidth = 360.dp
             if (subtitle != null) Text(subtitle, color = Muted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         if (chevron) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = Muted)
+    }
+}
+
+/** The frame-rate bar in the sidebar: the game follows it as it moves, and the choice is kept when it lets go. */
+@Composable private fun SidebarFpsTarget(activity: RuntimeActivity) {
+    var position by remember { mutableFloatStateOf(RuntimeOptions.sliderFromFps(activity.uiFpsTarget()).toFloat()) }
+    val fps = RuntimeOptions.fpsFromSlider(Math.round(position))
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF26282B))
+            .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 2.dp)
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Speed, null, tint = Text, modifier = Modifier.size(24.dp))
+            Text(stringResource(R.string.settings_fps_target), Modifier.weight(1f), color = Text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+            Text(fpsLabel(fps), color = Accent, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        }
+        Slider(
+            value = position,
+            onValueChange = { position = it; activity.uiSetFpsTarget(RuntimeOptions.fpsFromSlider(Math.round(it))) },
+            modifier = Modifier.fillMaxWidth().height(32.dp),
+            valueRange = 0f..RuntimeOptions.SLIDER_UNLIMITED.toFloat(),
+            steps = RuntimeOptions.SLIDER_UNLIMITED - 1,
+            onValueChangeFinished = { activity.uiSaveFpsTarget(RuntimeOptions.fpsFromSlider(Math.round(position))) })
     }
 }
 

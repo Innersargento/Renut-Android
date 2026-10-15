@@ -12,14 +12,29 @@
 #include <rex/ppc/func.h>
 #include <rex/hook.h>
 
+#include "plume/frame_pacing.h"
 #include "plume/plume_gpu.h"
 
 REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut",
                     "Keep the game's MSAA scene surfaces, which the Xbox 360 renders in two "
                     "or four bands (predicated tiling) with every draw sent once per band. "
                     "Off: one pass, no MSAA - the host never resolved the samples anyway");
+REXCVAR_DEFINE_INT32(renut_fps_target, 30, "reNut/Plume",
+                     "Frame rate the game is held to: 30 is its own (vblank paced), 31-240 presents "
+                     "immediately and paces to that rate, 0 is unlimited. Changes live from the sidebar "
+                     "(plume/frame_pacing.h)")
+    .range(0, 240);
+// The old switch, still read so that a renut.toml written before the slider keeps its meaning.
 REXCVAR_DEFINE_BOOL(renut_plume_uncap_fps, false, "reNut/Plume",
-                    "Use the game's immediate presentation interval instead of its 30 FPS setting");
+                    "Deprecated: renut_fps_target = 0 (unlimited) replaces it");
+
+namespace renut::pacing {
+void ApplyConfiguredTarget() {
+  int fps = REXCVAR_GET(renut_fps_target);
+  if (fps == kOriginalFps && REXCVAR_GET(renut_plume_uncap_fps)) fps = kUnlimited;
+  SetTarget(fps);
+}
+}  // namespace renut::pacing
 
 namespace {
 
@@ -42,16 +57,23 @@ void ForceSceneSinglePass(uint8_t* base) {
 
 }  // namespace
 
-// The game selects a presentation interval through this routine. Index 0 is
-// its immediate mode; preserve the original routine's device bookkeeping.
+// The game selects a presentation interval through this routine. Index 0 is its
+// immediate mode; preserve the original routine's device bookkeeping. Anything
+// but the game's own 30 FPS asks for the immediate one here, as before the
+// frame-rate slider; a target that changes later is also applied per frame at the
+// swap's synchronization point (native_d3d.cpp SynchronizeToPresentationInterval).
+// What the game ends up with is noted, so that the command thread paces the frames
+// itself whenever the vblank does not (frame_pacing.h VblankPaces).
 extern "C" void __imp__rex_setParamInterval(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(rex_setParamInterval) {
-  if (REXCVAR_GET(renut_plume_uncap_fps) && ctx.r3.u32 != 0) {
+  if (renut::pacing::ImmediatePresentation() && ctx.r3.u32 != 0) {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
-      REXLOG_INFO("Renut: presentation interval {} -> immediate (FPS unlocked)", ctx.r3.u32);
+      REXLOG_INFO("Renut: presentation interval {} -> immediate (frame-rate target {})", ctx.r3.u32,
+                  renut::pacing::Target());
     ctx.r3.u32 = 0;
   }
+  renut::pacing::NoteGameInterval(ctx.r3.u32);
   __imp__rex_setParamInterval(ctx, base);
 }
 

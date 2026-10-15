@@ -27,6 +27,7 @@
 #include "guest/guest_address.h"
 
 #include "d3d_layer.h"
+#include "plume/frame_pacing.h"
 
 #include <algorithm>
 #include <array>
@@ -1799,8 +1800,15 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
 // that, queues the swap callback (InsertCallback, recorded by its own hook)
 // and has the GPU wait until the vertical-blank handler clears it again:
 // the command processor stalls there, and so does the game behind its
-// fences, at the presentation interval it chose (30 FPS unless unlocked).
+// fences, at the presentation interval it chose (30 FPS).
+//
+// The frame-rate target (plume/frame_pacing.h) is applied here, per frame, so it
+// changes while playing: anything but the game's own 30 FPS asks for immediate
+// presentation, without the interval the game stored being touched, and the
+// command thread paces the frames instead (plume_gpu.cpp IssueSwap). Back at 30
+// the very next swap waits for the vblank again.
 bool SynchronizeToPresentationInterval(PPCContext& ctx, uint8_t* base) {
+  if (renut::pacing::ImmediatePresentation()) ctx.r4.u32 = 1;
   const uint32_t dev = ctx.r3.u32, immediate = ctx.r4.u32;
   std::unique_lock lock(g_front.mutex);
   if (!g_front.sync_recording) return false;

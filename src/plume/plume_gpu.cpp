@@ -2,7 +2,9 @@
 #include "d3d/d3d_layer.h"
 #include "d3d/native_d3d.h"
 
+#include "frame_pacing.h"
 #include "plume_renderer.h"
+#include <rex/chrono/clock.h>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -70,6 +72,7 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
+#include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/cvar.h>
 #include <rex/memory.h>
@@ -182,6 +185,7 @@ REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
 // (<files>/plume-keep-split: 0 clear, 1 leave, 2 whole-screen projection).
 extern std::atomic<int> g_renut_scene_split_mode;
 REXCVAR_DECLARE(bool, renut_scene_msaa);
+REXCVAR_DECLARE(bool, vsync);  // the SDK's: off ticks the guest's vblank every millisecond
 
 namespace renut {
 namespace {
@@ -11115,6 +11119,14 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         std::chrono::duration_cast<std::chrono::microseconds>(submit_end - frame_start_).count());
   }
   frame_start_ = submit_end;
+  // The frame is on its way: hold the command thread, and with it the game
+  // behind its fences, to the rate the player chose. While the vblank holds the
+  // game (its own 30 FPS and an interval that waits for it) that is its job, and
+  // unlimited has nothing to wait for; both make this a no-op.
+  {
+    static pacing::Pacer pacer;
+    pacer.Wait(pacing::VblankPaces() ? 0 : pacing::Target());
+  }
   if (snap_dump && renderer) {
     renderer->WaitForAllSlots();
     const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
@@ -12046,7 +12058,75 @@ class PlumeGraphicsSystem final : public gfx::GraphicsSystem {
  public:
   std::string name() const override { return "Plume"; }
 
+  // The SDK starts its vblank worker here; this replaces it with the clock below
+  // once the base has set the rest up (its Shutdown joins whatever thread is held
+  // in vsync_worker_thread_, so that stays the owner).
+  rex::X_STATUS SetupGuestGpu(rex::runtime::FunctionDispatcher* dispatcher,
+                              rex::system::KernelState* kernel) override {
+    using rex::X_STATUS;
+    const X_STATUS status = gfx::GraphicsSystem::SetupGuestGpu(dispatcher, kernel);
+    if (status != X_STATUS_SUCCESS) return status;
+    vsync_worker_running_ = false;
+    if (vsync_worker_thread_) {
+      vsync_worker_thread_->Wait(0, 0, 0, nullptr);
+      vsync_worker_thread_.reset();
+    }
+    vsync_worker_running_ = true;
+    vsync_worker_thread_ = rex::system::object_ref<rex::system::XHostThread>(
+        new rex::system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() { return VblankClock(); }));
+    vsync_worker_thread_->set_name("GPU VSync");
+    vsync_worker_thread_->Create();
+    return status;
+  }
+
  protected:
+  // The guest's vertical blank: one MarkVblank per refresh of the video mode the
+  // game set (60 Hz), which is what its presentation interval counts and so what
+  // holds it at 30 FPS.
+  //
+  // The SDK's worker polled every millisecond and, when it found itself late,
+  // marked every vblank it owed in a row: a wake-up that overslept (common on a
+  // phone's timer slack and under load) came out as two vblanks back to back and
+  // then a gap, which the game showed as alternating short and long frames. This
+  // one sleeps to an absolute deadline, spins the last stretch, marks exactly one
+  // vblank per deadline, and when it fell more than two periods behind (the
+  // process was descheduled, the interrupt ran long) it forgets the debt rather
+  // than paying it as a burst. The deadlines are in the guest's clock: while the
+  // game is paused its time crawls, and so do the vblanks.
+  int VblankClock() {
+    using pacing::Clock;
+    rex::system::X_VIDEO_MODE mode;
+    rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
+    const double hz = std::max(1.0, double(float(mode.refresh_rate)));
+    auto next = Clock::now();
+    bool first = true;
+    while (vsync_worker_running_) {
+      // Host time per vblank: a guest period stretched by the guest clock's scale.
+      const double scale = std::max(0.001, rex::chrono::Clock::guest_time_scalar());
+      const double seconds = REXCVAR_GET(vsync) ? 1.0 / hz : 0.001;
+      const auto period = std::chrono::nanoseconds(int64_t(seconds / scale * 1e9));
+      if (first) {
+        next += period;
+        first = false;
+      }
+      // Waits in slices so that a long period (paused) still notices the stop.
+      for (;;) {
+        if (!vsync_worker_running_) return 0;
+        const auto now = Clock::now();
+        if (now >= next) break;
+        const auto remaining = next - now;
+        if (remaining > pacing::kSpinTail * 2) {
+          std::this_thread::sleep_for(
+              std::min<Clock::duration>(remaining - pacing::kSpinTail, std::chrono::milliseconds(4)));
+        } else {
+          std::this_thread::yield();
+        }
+      }
+      MarkVblank();
+      next = pacing::NextTick(next, Clock::now(), period);
+    }
+    return 0;
+  }
   // Presentation belongs to PlumeRenderer; there is no RexGlue provider.
   void CreateProvider(bool) override {}
   std::unique_ptr<gfx::CommandProcessor> CreateCommandProcessor() override {

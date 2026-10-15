@@ -59,9 +59,12 @@ renut_plume.exe --game "<pasta com default.xex e Bundle>" [--data <pasta>] [--co
 
 ## Configuração, save e contador
 
-- `renut.toml` na pasta de dados é lido na abertura. FPS liberado:
-  `renut_plume_uncap_fps = true` (o jogo usa o intervalo de apresentação
-  imediato) e `renut_plume_vsync = false` (o Plume apresenta sem esperar o vsync).
+- `renut.toml` na pasta de dados é lido na abertura. Taxa de quadros:
+  `renut_fps_target = 30` é o ritmo original do jogo (preso ao vblank); de 31 a
+  240 o jogo apresenta sem esperar o vblank e é mantido nessa taxa; `0` não tem
+  limite. Acima de 60 (ou `0`) o Plume deixa de apresentar no vsync (Mailbox ou
+  Immediate); `renut_plume_vsync = false` faz isso em qualquer taxa.
+  `renut_plume_uncap_fps = true` ainda é lido e vale `renut_fps_target = 0`.
 - O save é o do reNut desktop: copie o conteúdo de `Documents\renut` para
   `<pasta de dados>\runtime-user` (perfil `B13E...`, conquistas em `achievements`).
 - O título da janela mostra os FPS e o número do quadro (quadros que o jogo

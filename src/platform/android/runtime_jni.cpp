@@ -23,6 +23,7 @@
 #include "d3d/d3d_layer.h"
 #include "plume/plume_renderer.h"
 #include "plume/plume_gpu.h"
+#include "plume/frame_pacing.h"
 #include <rex/chrono/clock.h>
 #include <rex/ui/presenter.h>
 #include <rex/audio/audio_system.h>
@@ -179,6 +180,13 @@ extern "C" JNIEXPORT jlong JNICALL Java_org_renut_android_RuntimeActivity_native
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeSetPlayerAttached(JNIEnv*,jclass,jint player,jboolean attached) {
   renut::SetPlayerAttached(player,attached);
 }
+// The frame rate the player picked in the sidebar (30..240, 0 unlimited), taken up at
+// the game's next frame: the swap stops or starts waiting for the vblank, the command
+// thread's pacer and the swapchain's present mode follow (plume/frame_pacing.h).
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeSetFpsTarget(JNIEnv*,jclass,jint fps) {
+  renut::pacing::SetTarget(fps);
+  renut::adpf::SetTargetFps(renut::pacing::Target());
+}
 extern "C" uint64_t renut_guest_swap_count();
 extern "C" JNIEXPORT jlong JNICALL Java_org_renut_android_RuntimeActivity_nativeFrameCount(JNIEnv*,jclass) {
   return jlong(renut_guest_swap_count());
@@ -299,6 +307,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     // logging so that log_level applies from the first line.
     bool has_config = std::filesystem::is_regular_file(root / "renut.toml");
     if (has_config) rex::cvar::LoadConfig(root / "renut.toml");
+    renut::pacing::ApplyConfiguredTarget();
     auto log_level = spdlog::level::from_str(rex::cvar::GetFlagByName("log_level"));
     rex::InitLogging(log_path.c_str(), log_level);
     if (has_config) note("Configuração: renut.toml aplicado.");
