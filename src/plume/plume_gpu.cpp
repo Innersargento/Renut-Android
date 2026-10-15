@@ -1453,6 +1453,21 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     bool* written = &constants_written_[0][0];
     for (uint32_t block = lo >> kShift; block <= hi >> kShift; ++block) written[block] = true;
   }
+  // A write of `count` registers from `values`: the registers that already hold
+  // these bytes are left alone, and only the blocks a different one lands in are
+  // marked. The guest sets the same view/projection/lighting constants before
+  // draw after draw, and a marked block costs a compare of the whole 1 KB (and
+  // an upload when it differs) at the next draw that reads it.
+  void StoreConstants(uint32_t first, const uint32_t* values, uint32_t count) {
+    uint32_t* dst = &register_file_->values[first];
+    uint32_t lo = 0;
+    while (lo < count && dst[lo] == values[lo]) ++lo;
+    if (lo == count) return;
+    uint32_t hi = count;
+    while (dst[hi - 1] == values[hi - 1]) --hi;
+    std::memcpy(dst + lo, values + lo, size_t(hi - lo) * sizeof(uint32_t));
+    MarkConstantsWritten(first + lo, hi - lo);
+  }
 
   static constexpr uint32_t kConstantChunks = 4;
   static constexpr uint32_t kConstantChunkSize = 1024;
@@ -1924,6 +1939,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     bool base_map = false;
   };
   const FetchLayout* LayoutOf(const xenos::xe_gpu_texture_fetch_t& fetch);
+  const FetchLayout* LayoutOfByContents(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
@@ -2285,6 +2301,12 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::map<std::pair<uint64_t, uint64_t>, PairTotal> pair_totals_;
   uint32_t pairprof_mode_ = 0, pairprof_frames_left_ = 0;
   bool pair_capture_ = false;
+  // Whether each recorded draw leaves its entry in recent_draws_, for the report
+  // of a lost device. A hash lookup, ~200 bytes of stream addresses and a few
+  // buffer-address calls a draw: on by default only where the GPU is a Mali,
+  // which has lost its device on a draw's data; files/plume-trail overrides.
+  bool trail_ = false;
+  bool trail_device_default_ = false;
   uint32_t pair_used_ = 0, pair_frames_ = 0;
   uint64_t pair_span_ns_ = 0, pair_gap_ns_ = 0, pair_frame_ns_ = 0;
   void PairStamp();
@@ -2799,11 +2821,13 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // where the content check below runs once.
   Resolved* FindResolved(uint32_t address) {
     if (resolved_lookup_frame_ != swaps_) {
-      resolved_lookup_.clear();
       resolved_lookup_frame_ = swaps_;
+      ++resolved_lookup_serial_;
     }
-    auto known = resolved_lookup_.find(address);
-    if (known != resolved_lookup_.end()) return known->second;
+    // Direct-mapped by address, valid for this frame and this serial: a map
+    // that was emptied every frame was two hash lookups a sampled slot.
+    ResolvedLookup& cached = resolved_lookup_[(address >> 12) & (kResolvedLookupSize - 1)];
+    if (cached.serial == resolved_lookup_serial_ && cached.address == address) return cached.value;
     Resolved* latest = nullptr;
     for (auto& [key, r] : resolved_) {
       if (uint32_t(key) == address && r.texture && (!latest || r.written > latest->written)) latest = &r;
@@ -2829,17 +2853,59 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
       }
     }
     if (latest) latest->sampled = true;
-    resolved_lookup_.emplace(address, latest);
+    cached = {address, resolved_lookup_serial_, latest};
     if (resolve_log_ && latest) LogResolveLine(fmt::format("f={} sampled {:08X}", swaps_, address));
     return latest;
   }
-  void InvalidateResolvedLookups() { resolved_lookup_.clear(); }
-  std::unordered_map<uint32_t, Resolved*> resolved_lookup_;
+  void InvalidateResolvedLookups() { ++resolved_lookup_serial_; }
+  struct ResolvedLookup {
+    uint32_t address = 0;
+    uint64_t serial = 0;
+    Resolved* value = nullptr;
+  };
+  static constexpr uint32_t kResolvedLookupSize = 1024;
+  std::array<ResolvedLookup, kResolvedLookupSize> resolved_lookup_{};
+  uint64_t resolved_lookup_serial_ = 1;
   uint64_t resolved_lookup_frame_ = UINT64_MAX;
   uint64_t resolve_serial_ = 0;
   uint64_t target_serial_ = 0;
   std::unordered_map<uint64_t, GuestTexture> guest_textures_;
   LookupMemo<GuestTexture, 12> texture_memo_;
+  // Object identity (files/plume-objkeys): what the six words of a texture
+  // fetch constant - the D3D texture's header as the guest bound it - resolved
+  // to, kept per fetch slot. The game binds the same few textures to the same
+  // slots draw after draw, and hashing the six words and walking two maps to
+  // learn that was a visible slice of the command thread. Valid while
+  // object_epoch_ is what it was: bumped wherever a layout, a texture or a
+  // framebuffer these point at can go away.
+  struct SlotObject {
+    uint32_t words[6] = {};
+    uint64_t epoch = 0;
+    const FetchLayout* layout = nullptr;
+    GuestTexture* texture = nullptr;
+  };
+  std::array<SlotObject, 32> slot_objects_{};
+  int fetch_slot_ = -1;  // the slot IssueDraw is resolving, for LayoutOf and GetGuestTexture
+  uint64_t object_epoch_ = 1;
+  bool objkeys_ = true;
+  // The last framebuffer asked for and the images it was made from.
+  struct LastFramebuffer {
+    const RenderTexture* images[5] = {};
+    uint32_t color_count = UINT32_MAX;
+    uint64_t epoch = 0;
+    RenderFramebuffer* framebuffer = nullptr;
+  } last_framebuffer_;
+  // Streams by what their fetch constant says, across slots and draws: the
+  // per-slot memo only helps a slot whose buffer does not change between
+  // draws, and a mesh drawn in the colour pass and in each shadow cascade
+  // comes back to different slots' memos. An entry is trusted for the frame it
+  // was made in, so the kept stream's age is still refreshed once a frame.
+  struct PooledStream {
+    StreamMemo memo;
+    uint64_t frame = UINT64_MAX;
+  };
+  static constexpr uint32_t kStreamPoolSize = 2048;
+  std::vector<PooledStream> stream_pool_ = std::vector<PooledStream>(kStreamPoolSize);
   std::unordered_set<uint32_t> unsupported_formats_;
   uint32_t next_descriptor_ = 1;
   std::unordered_map<uint64_t, GuestTexture> guest_cubes_;
@@ -3357,6 +3423,9 @@ bool PlumeCommandProcessor::SetupContext() {
     VkPhysicalDeviceFeatures features{};
     vkGetPhysicalDeviceFeatures(static_cast<VulkanDevice*>(device_)->physicalDevice, &features);
     bc_supported_ = features.textureCompressionBC == VK_TRUE;
+    // ARM's vendor id.
+    trail_device_default_ = static_cast<VulkanDevice*>(device_)->physicalDeviceProperties.vendorID == 0x13B5;
+    trail_ = trail_device_default_;
   }
   bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
   REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
@@ -3632,6 +3701,7 @@ void PlumeCommandProcessor::ShutdownContext() {
   standins_.clear();
   pipeline_memo_.Clear();
   framebuffers_.clear();
+  ++object_epoch_;
   targets_.clear();
   resolved_.clear();
   InvalidateResolvedLookups();
@@ -4676,6 +4746,7 @@ void PlumeCommandProcessor::EvictIdleTextures() {
   }
   // Once, not per erased entry: the memo is 64 KB.
   texture_memo_.Clear();
+  ++object_epoch_;
   const uint64_t limit_3d = idle_for(free_3d < 16);
   for (auto* map : {&guest_stacks_, &guest_volumes_}) {
     for (auto it = map->begin(); it != map->end();) {
@@ -5028,6 +5099,7 @@ void PlumeCommandProcessor::RetireFramebuffers() {
   for (auto& [key, framebuffer] : framebuffers_)
     retired_framebuffer_slots_[slot_].push_back(std::move(framebuffer));
   framebuffers_.clear();
+  ++object_epoch_;
   bound_framebuffer_ = nullptr;
 }
 
@@ -5192,6 +5264,16 @@ RenderFramebuffer* PlumeCommandProcessor::GetFramebuffer(const std::array<Target
   // What SetFramebuffer labels the next pass with.
   color_count_of_pass_ = color_count;
   depth_of_pass_ = depth != nullptr;
+  // The same attachments as the draw before: the same framebuffer, without
+  // hashing them or asking the map.
+  const RenderTexture* images[5] = {};
+  for (uint32_t i = 0; i < color_count; ++i) images[i] = colors[i]->texture.get();
+  images[4] = depth ? depth->texture.get() : nullptr;
+  if (objkeys_ && last_framebuffer_.framebuffer && last_framebuffer_.epoch == object_epoch_ &&
+      last_framebuffer_.color_count == color_count &&
+      std::memcmp(last_framebuffer_.images, images, sizeof(images)) == 0) {
+    return last_framebuffer_.framebuffer;
+  }
   uint64_t key = 0;
   for (uint32_t i = 0; i < color_count; ++i) HashCombine(key, colors[i]->texture.get());
   HashCombine(key, depth ? depth->texture.get() : nullptr);
@@ -5203,6 +5285,10 @@ RenderFramebuffer* PlumeCommandProcessor::GetFramebuffer(const std::array<Target
     framebuffer = device_->createFramebuffer(
         RenderFramebufferDesc(attachments, color_count, depth ? depth->texture.get() : nullptr));
   }
+  std::memcpy(last_framebuffer_.images, images, sizeof(images));
+  last_framebuffer_.color_count = color_count;
+  last_framebuffer_.epoch = object_epoch_;
+  last_framebuffer_.framebuffer = framebuffer.get();
   return framebuffer.get();
 }
 
@@ -5384,15 +5470,40 @@ uint64_t ContentHash(const uint8_t* data, uint32_t span) {
 // draw path asked for it once per texture slot of every draw: the busiest frame
 // of Showdown Town ran this arithmetic 169 thousand times, a quarter of the
 // command processor's time, for a few hundred distinct textures.
+// The layout a fetch constant describes. Asked for the same constant at the
+// same slot draw after draw: the slot remembers the six words and what they
+// came to, and only a different constant (or a bumped object_epoch_) goes on to
+// hash them.
 const PlumeCommandProcessor::FetchLayout* PlumeCommandProcessor::LayoutOf(
     const xenos::xe_gpu_texture_fetch_t& fetch) {
-  uint64_t fetch_key = 0;
-  HashCombine(fetch_key, fetch.dword_0);
-  HashCombine(fetch_key, fetch.dword_1);
-  HashCombine(fetch_key, fetch.dword_2);
-  HashCombine(fetch_key, fetch.dword_3);
-  HashCombine(fetch_key, fetch.dword_4);
-  HashCombine(fetch_key, fetch.dword_5);
+  static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
+  if (!objkeys_ || fetch_slot_ < 0) return LayoutOfByContents(fetch);
+  SlotObject& object = slot_objects_[uint32_t(fetch_slot_) & 31];
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(&fetch);
+  if (object.epoch == object_epoch_ && std::memcmp(object.words, words, sizeof(object.words)) == 0) {
+    return object.layout;
+  }
+  const FetchLayout* layout = LayoutOfByContents(fetch);
+  std::memcpy(object.words, words, sizeof(object.words));
+  object.epoch = object_epoch_;
+  object.layout = layout;
+  object.texture = nullptr;
+  return layout;
+}
+
+const PlumeCommandProcessor::FetchLayout* PlumeCommandProcessor::LayoutOfByContents(
+    const xenos::xe_gpu_texture_fetch_t& fetch) {
+  // The memo key: six words mixed by multiply and fold. Six XXH3 calls for one
+  // small input each were a visible slice of the command thread (this runs for
+  // every texture slot of every draw whose constant differs from the slot's
+  // last). It is kept in memory only (layout_memo_, fetch_layouts_), never
+  // written anywhere, so it need not match HashCombine.
+  uint64_t fetch_key = 0x9E3779B97F4A7C15ull;
+  for (const uint32_t word : {fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+                              fetch.dword_5}) {
+    fetch_key = (fetch_key ^ word) * 0xFF51AFD7ED558CCDull;
+    fetch_key ^= fetch_key >> 32;
+  }
   if (const FetchLayout* known = layout_memo_.Find(fetch_key)) return known->usable ? known : nullptr;
   auto found = fetch_layouts_.find(fetch_key);
   if (found != fetch_layouts_.end()) {
@@ -5467,10 +5578,20 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
     skip = std::max(skip, reduced);
   }
   const uint32_t host_levels = levels - skip;
-  GuestTexture* texture_node = texture_memo_.Find(key);
+  // The slot's own record of the texture its constant resolved to last draw
+  // (see SlotObject), checked against the layout it was made for.
+  SlotObject* slot_object = objkeys_ && fetch_slot_ >= 0 ? &slot_objects_[uint32_t(fetch_slot_) & 31] : nullptr;
+  if (slot_object && (slot_object->epoch != object_epoch_ || slot_object->layout != fetch_layout)) {
+    slot_object = nullptr;
+  }
+  GuestTexture* texture_node = slot_object ? slot_object->texture : nullptr;
   if (!texture_node) {
-    texture_node = &guest_textures_[key];
-    texture_memo_.Put(key, texture_node);
+    texture_node = texture_memo_.Find(key);
+    if (!texture_node) {
+      texture_node = &guest_textures_[key];
+      texture_memo_.Put(key, texture_node);
+    }
+    if (slot_object) slot_object->texture = texture_node;
   }
   GuestTexture& texture = *texture_node;
   if (texture.failed) return 0;
@@ -5993,8 +6114,10 @@ uint32_t PlumeCommandProcessor::GetGuestCubeTexture(const xenos::xe_gpu_texture_
 
 void PlumeCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    register_file_->values[index] = value;
-    MarkConstantsWritten(index, 1);
+    if (register_file_->values[index] != value) {
+      register_file_->values[index] = value;
+      MarkConstantsWritten(index, 1);
+    }
     return;
   }
   CommandProcessor::WriteRegister(index, value);
@@ -6195,8 +6318,7 @@ void PlumeCommandProcessor::NativeSwapOut() {
 void PlumeCommandProcessor::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) {
   if (first >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       uint64_t(first) + count <= uint64_t(XE_GPU_REG_SHADER_CONSTANT_LOOP_31) + 1) {
-    std::memcpy(&register_file_->values[first], values, size_t(count) * sizeof(uint32_t));
-    MarkConstantsWritten(first, count);
+    StoreConstants(first, values, count);
     return;
   }
   for (uint32_t i = 0; i < count; ++i) WriteRegister(first + i, values[i]);
@@ -6923,7 +7045,9 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         texture_descriptor[slot] = depth_view ? SwizzledResolved(r, false, swizzle, stencil_first) : r.descriptor;
       }
     } else if (fetch.dimension == xenos::DataDimension::k2DOrStacked) {
+      fetch_slot_ = int(slot);
       texture_descriptor[slot] = GetGuestTexture(fetch);
+      fetch_slot_ = -1;
       if (fetch.stacked) stack_descriptor[slot] = GetGuestStackedTexture(fetch);
     } else if (fetch.dimension == xenos::DataDimension::kCube) {
       cube_descriptor[slot] = GetGuestCubeTexture(fetch);
@@ -7182,6 +7306,23 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       offset = memo.offset;
       bound = memo.bound;
       ++stats_.stream_memo_hits;
+    } else if (PooledStream* pooled = objkeys_ && !validate_windows_ && !sync_draws_ && !trace_
+                                          ? &stream_pool_[((uint64_t(constant_words[0]) * 0x9E3779B97F4A7C15ull) ^
+                                                           (uint64_t(constant_words[1]) * 0xC2B2AE3D27D4EB4Full) ^
+                                                           native_stream.base ^ signature) %
+                                                          kStreamPoolSize]
+                                          : nullptr;
+               pooled && pooled->frame == swaps_ && pooled->memo.buffer && pooled->memo.epoch == stream_epoch_ &&
+               pooled->memo.generation == upload_generation_ && pooled->memo.words[0] == constant_words[0] &&
+               pooled->memo.words[1] == constant_words[1] && pooled->memo.native_base == native_stream.base &&
+               pooled->memo.native_size == native_stream.size && pooled->memo.repack_signature == signature &&
+               pooled->memo.export_epoch == export_epoch_) {
+      // Another slot, or an earlier pass, resolved this same stream this frame.
+      memo = pooled->memo;
+      buffer = memo.buffer;
+      offset = memo.offset;
+      bound = memo.bound;
+      ++stats_.stream_memo_hits;
     } else {
       bool repacked = false;
       if (repackable && !ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
@@ -7206,6 +7347,14 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         memo.buffer = bound ? buffer : nullptr;
         memo.offset = offset;
         memo.bound = bound;
+        if (objkeys_ && memo.buffer && !validate_windows_ && !sync_draws_ && !trace_) {
+          PooledStream& pooled = stream_pool_[((uint64_t(constant_words[0]) * 0x9E3779B97F4A7C15ull) ^
+                                               (uint64_t(constant_words[1]) * 0xC2B2AE3D27D4EB4Full) ^
+                                               native_stream.base ^ signature) %
+                                              kStreamPoolSize];
+          pooled.memo = memo;
+          pooled.frame = swaps_;
+        }
       }
     }
     if (bound) {
@@ -8419,13 +8568,17 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   pk.interface_key = interface_key;
   pk.vs_hash = vs->entry->hash ^ (uint64_t(rel_constants_mode_ >= 10 ? rel_variant : 0) << 60);
   pk.ps_hash = ps ? ps->entry->hash : 0;
-  pk.s0_addr = streams[0];
-  pk.s0_size = slot_sizes[0];
-  pk.s10_addr = streams[10];
-  pk.s10_size = slot_sizes[10];
-  for (uint32_t i = 0; i < RENUT_VERTEX_STREAM_COUNT; ++i) {
-    pk.stream_addr[i] = streams[i];
-    pk.stream_size[i] = slot_sizes[i];
+  if (trail_) {
+    pk.s0_addr = streams[0];
+    pk.s0_size = slot_sizes[0];
+    pk.s10_addr = streams[10];
+    pk.s10_size = slot_sizes[10];
+  }
+  if (trail_) {
+    for (uint32_t i = 0; i < RENUT_VERTEX_STREAM_COUNT; ++i) {
+      pk.stream_addr[i] = streams[i];
+      pk.stream_size[i] = slot_sizes[i];
+    }
   }
   if (blend_constants) {
     pk.blend_constants = true;
@@ -8792,7 +8945,7 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
   if (pair_stamped) PairStamp();
   ++stats_.drawn;
   if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
-  {
+  if (trail_) {
     // Only one draw in eight asks (a hash lookup a draw was over 1% of this
     // thread): the report of a lost device calls a pair new from its first
     // frame, and an unknown one is simply not called new.
@@ -11003,6 +11156,32 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       defer_mode_ = uint32_t(defer);
     }
     {
+      bool trail = trail_device_default_;
+      if (FILE* file = std::fopen((root + "/plume-trail").c_str(), "r")) {
+        int value = trail;
+        if (std::fscanf(file, "%d", &value) == 1) trail = value != 0;
+        std::fclose(file);
+      }
+      if (trail != trail_) REXLOG_INFO("Renut: Plume draw trail {}", trail ? "on" : "off");
+      trail_ = trail;
+    }
+    {
+      // Resolve textures, framebuffers and streams by what the guest bound
+      // rather than by hashing it again at every draw. 0 puts the old path back.
+      bool objkeys = true;
+      if (FILE* file = std::fopen((root + "/plume-objkeys").c_str(), "r")) {
+        int value = 1;
+        if (std::fscanf(file, "%d", &value) == 1) objkeys = value != 0;
+        std::fclose(file);
+      }
+      if (objkeys != objkeys_) {
+        REXLOG_INFO("Renut: Plume object keys {}", objkeys ? "on" : "off");
+        ++object_epoch_;
+        ++stream_epoch_;
+      }
+      objkeys_ = objkeys;
+    }
+    {
       int hiz = std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 4);
       if (FILE* file = std::fopen((root + "/plume-hiz").c_str(), "r")) {
         int value = hiz;
@@ -11053,6 +11232,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         for (auto& [key, texture] : guest_textures_) RetireGuestTexture(texture);
         guest_textures_.clear();
         texture_memo_.Clear();
+        ++object_epoch_;
       }
     }
     {
@@ -11176,6 +11356,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       // Two of its bits change how a level's layout is worked out.
       fetch_layouts_.clear();
       layout_memo_.Clear();
+      ++object_epoch_;
     }
     skip_mask_ = mask;
     const bool sync_draws = access((root + "/plume-syncdraws").c_str(), F_OK) == 0;
