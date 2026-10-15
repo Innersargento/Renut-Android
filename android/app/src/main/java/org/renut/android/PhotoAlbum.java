@@ -109,8 +109,54 @@ final class PhotoAlbum {
         return photos;
     }
 
+    /**
+     * The packages that hold a photo, as "xuid/titleid/kind/package" relative to runtime-user. They
+     * are pictures, not saved games, so the save list and the save export leave them out.
+     */
+    static java.util.Set<String> photoPackages(File runtimeUser) {
+        java.util.HashSet<String> keys = new java.util.HashSet<>();
+        File parent = runtimeUser.getParentFile();
+        if (parent == null) return keys;
+        for (Photo photo : load(parent)) {
+            File pack = photo.file.getParentFile();
+            File kind = pack == null ? null : pack.getParentFile();
+            File title = kind == null ? null : kind.getParentFile();
+            File user = title == null ? null : title.getParentFile();
+            if (user == null) continue;
+            keys.add(user.getName() + "/" + title.getName() + "/" + kind.getName() + "/" + pack.getName());
+        }
+        return keys;
+    }
+
+    /** Writes every photo to a zip as PNG, newest first. Returns how many were written. */
+    static int exportZip(File filesDir, OutputStream output) throws IOException {
+        List<Photo> photos = load(filesDir);
+        if (photos.isEmpty()) return 0;
+        int written = 0;
+        try (java.util.zip.ZipOutputStream zip = new java.util.zip.ZipOutputStream(output)) {
+            java.text.SimpleDateFormat stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US);
+            for (int i = 0; i < photos.size(); i++) {
+                Photo photo = photos.get(i);
+                Bitmap bitmap = decode(photo, 0);
+                if (bitmap == null) continue;
+                zip.putNextEntry(new java.util.zip.ZipEntry(
+                    "reNut-" + stamp.format(new java.util.Date(photo.takenAt)) + "-" + (i + 1) + ".png"));
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, new java.io.FilterOutputStream(zip) {
+                    @Override public void write(byte[] b, int off, int len) throws IOException { out.write(b, off, len); }
+                    @Override public void close() {}
+                });
+                zip.closeEntry();
+                bitmap.recycle();
+                written++;
+            }
+        }
+        return written;
+    }
+
     private static Photo scan(File file, String name) {
-        if (!file.isFile() || file.length() < 2048 || file.length() > MAX_FILE) return null;
+        // The package's own preview of the picture, not a photo of its own.
+        if (file.getName().equals("__thumbnail.png")) return null;
+        if (!file.isFile()|| file.length() < 2048 || file.length() > MAX_FILE) return null;
         byte[] data;
         try {
             data = readAll(file);

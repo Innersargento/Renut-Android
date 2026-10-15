@@ -55,6 +55,10 @@
     <string name="photos_save">Guardar en la galería</string>
     <string name="photos_saved">Foto guardada en Imágenes/reNut.</string>
     <string name="photos_save_failed">No se pudo guardar la foto.</string>
+    <string name="photos_export">Exportar todas las fotos (.zip)</string>
+    <string name="photos_exported">Fotos exportadas.</string>
+    <string name="photos_export_none">No hay fotos para exportar.</string>
+    <string name="play_saves_card">Partidas guardadas</string>
     <string name="play_panel_open">Al abrir la aplicación</string>
     <string name="play_autostart">Iniciar directamente el juego</string>
     <string name="play_autostart_note">El juego arranca sin pasar por esta pantalla. Para volver aquí, sal del juego desde su menú.</string>

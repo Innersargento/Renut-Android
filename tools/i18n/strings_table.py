@@ -93,7 +93,12 @@ add("photos_saved", "Foto salva em Imagens/reNut.", "Photo saved to Pictures/reN
     "照片已保存到 Pictures/reNut。", "Foto guardada en Imágenes/reNut.")
 add("photos_save_failed", "Não foi possível salvar a foto.", "The photo could not be saved.",
     "无法保存照片。", "No se pudo guardar la foto.")
-add("play_panel_open", "Ao abrir o app", "When opening the app", "打开应用时", "Al abrir la aplicación")
+add("photos_export", "Exportar todas as fotos (.zip)", "Export all photos (.zip)", "导出全部照片 (.zip)", "Exportar todas las fotos (.zip)")
+add("photos_exported", "Fotos exportadas.", "Photos exported.", "照片已导出。", "Fotos exportadas.")
+add("photos_export_none", "Não há fotos para exportar.", "There are no photos to export.",
+    "没有可导出的照片。", "No hay fotos para exportar.")
+add("play_saves_card", "Saves", "Saves", "存档", "Partidas guardadas")
+add("play_panel_open","Ao abrir o app", "When opening the app", "打开应用时", "Al abrir la aplicación")
 add("play_autostart", "Iniciar direto no jogo", "Start straight into the game", "直接进入游戏", "Iniciar directamente el juego")
 add("play_autostart_note", "O jogo começa sem passar por esta tela. Para voltar aqui, saia do jogo pelo menu.",
     "The game starts without going through this screen. To come back here, leave the game from its menu.",

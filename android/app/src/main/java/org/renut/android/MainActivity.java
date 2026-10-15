@@ -16,7 +16,7 @@ import java.util.*;
 import java.util.zip.*;
 
 public final class MainActivity extends androidx.activity.ComponentActivity {
-    private static final int DRIVER=12, EXPORT=13, SAVE_IMPORT=14, SAVE_EXPORT=15;
+    private static final int DRIVER=12, EXPORT=13, SAVE_IMPORT=14, SAVE_EXPORT=15, PHOTO_EXPORT=16;
     private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
     private TextView status, library, driver, fpsCounter, oneUiFix, tuDebug, ir3Debug, savesSummary;
     private LinearLayout savesList;
@@ -322,6 +322,12 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         try { RuntimeOptions.set(this,key,value); }
         catch(IOException e){toast(Language.s(R.string.toml_save_failed,e.getMessage()));}
     }
+    /** Asks where to put a zip with every photo of the game; the write happens in onActivityResult. */
+    public void uiExportPhotos(){
+        if(worker!=null)return;
+        Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("application/zip").addCategory(Intent.CATEGORY_OPENABLE);
+        i.putExtra(Intent.EXTRA_TITLE,"renut-fotos.zip");startActivityForResult(i,PHOTO_EXPORT);
+    }
     public java.util.List<String> uiSaves()throws IOException{return SaveArchive.list(new File(getFilesDir(),"runtime-user"));}
     private void pick(int code){startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE),code);}
     private void refreshSaves(){
@@ -376,6 +382,23 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
                     .setNegativeButton(Language.s(R.string.common_cancel),null)
                     .setPositiveButton(Language.s(R.string.saves_import_action),(dialog,which)->transferSaves(uri,true)).show();
             }else transferSaves(uri,false);
+            return;
+        }
+        if(request==PHOTO_EXPORT){
+            if(worker!=null)return;
+            for(Button b:actions)b.setEnabled(false);
+            worker=new Thread(()->{
+                try{
+                    int count;
+                    try(OutputStream out=getContentResolver().openOutputStream(uri)){
+                        if(out==null)throw new IOException(Language.s(R.string.unavailable_dest));
+                        count=PhotoAlbum.exportZip(getFilesDir(),out);
+                    }
+                    if(count==0)try{getContentResolver().delete(uri,null,null);}catch(Exception ignored){}
+                    runOnUiThread(()->Toast.makeText(this,Language.s(count>0?R.string.photos_exported:R.string.photos_export_none),Toast.LENGTH_LONG).show());
+                }catch(Exception e){runOnUiThread(()->new AlertDialog.Builder(this).setTitle(Language.s(R.string.saves_failed_title)).setMessage(e.getMessage()).setPositiveButton(Language.s(R.string.common_ok),null).show());}
+                finally{runOnUiThread(()->{worker=null;for(Button b:actions)b.setEnabled(true);});}
+            },"renut-photos");worker.start();
             return;
         }
         if(request==EXPORT){

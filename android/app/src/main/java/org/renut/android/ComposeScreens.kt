@@ -7,7 +7,10 @@ import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ContentTransform
@@ -217,7 +220,6 @@ private class NavEntry(val icon: ImageVector, val label: Int)
 
 private val NAV_ENTRIES = listOf(
     NavEntry(Icons.Default.PlayArrow, R.string.nav_play),
-    NavEntry(Icons.Default.Folder, R.string.nav_saves),
     NavEntry(Icons.Default.EmojiEvents, R.string.nav_achievements),
     NavEntry(Icons.Default.Settings, R.string.nav_settings))
 
@@ -255,8 +257,10 @@ private val NAV_ENTRIES = listOf(
     var page by rememberSaveable { mutableIntStateOf(0) }
     // The photo album opens over the Play page and closes when another page is chosen.
     var photosOpen by rememberSaveable { mutableStateOf(false) }
+    // Likewise the saves, reached from a card on the Play page.
+    var savesOpen by rememberSaveable { mutableStateOf(false) }
     var tick by remember { mutableIntStateOf(0) }
-    BackHandler(photosOpen) { photosOpen = false }
+    BackHandler(photosOpen || savesOpen) { photosOpen = false; savesOpen = false }
     LaunchedEffect(Unit) { while (true) { delay(700); tick++ } }
 
     @Composable fun Pages(modifier: Modifier) {
@@ -264,14 +268,17 @@ private val NAV_ENTRIES = listOf(
             PhotosScreen(activity, modifier, tick) { photosOpen = false }
             return
         }
+        if (savesOpen) {
+            SaveScreen(activity, modifier, tick) { savesOpen = false }
+            return
+        }
         AnimatedContent(
             targetState = page, label = "launcher-page", modifier = modifier,
             transitionSpec = { pageTransition(targetState > initialState) }
         ) { shown ->
             when (shown) {
-                0 -> PlayScreen(activity, Modifier, tick, { page = 2 }) { photosOpen = true }
-                1 -> SaveScreen(activity, Modifier, tick)
-                2 -> AchievementsScreen(activity, Modifier, tick)
+                0 -> PlayScreen(activity, Modifier, tick, { page = 1 }, { photosOpen = true }) { savesOpen = true }
+                1 -> AchievementsScreen(activity, Modifier, tick)
                 else -> SettingsScreen(activity, Modifier, tick)
             }
         }
@@ -284,7 +291,7 @@ private val NAV_ENTRIES = listOf(
     if (landscape) {
         // Wide and short: the icons stand in a column on the left, the page takes the rest.
         Row(Modifier.fillMaxSize().background(Background)) {
-            LauncherRail(page) { photosOpen = false; page = it }
+            LauncherRail(page) { photosOpen = false; savesOpen = false; page = it }
             // A page does not need the whole width of a landscape screen.
             // Scaffold keeps the page clear of the bars in portrait; here it is done by hand.
             Box(
@@ -301,7 +308,7 @@ private val NAV_ENTRIES = listOf(
             bottomBar = {
                 NavigationBar(containerColor = Surface) {
                     NAV_ENTRIES.forEachIndexed { index, entry ->
-                        NavigationBarItem(selected = page == index, onClick = { photosOpen = false; page = index },
+                        NavigationBarItem(selected = page == index, onClick = { photosOpen = false; savesOpen = false; page = index },
                             icon = { Icon(entry.icon, null) }, label = { Text(stringResource(entry.label)) })
                     }
                 }
@@ -311,12 +318,18 @@ private val NAV_ENTRIES = listOf(
     }
 }
 
-@Composable private fun SaveScreen(activity: MainActivity, modifier: Modifier, tick: Int) {
+/** The saved games: what the game keeps on this device, with export and import as a zip. */
+@Composable private fun SaveScreen(activity: MainActivity, modifier: Modifier, tick: Int, onBack: () -> Unit) {
     @Suppress("UNUSED_VARIABLE") val update = tick
-    val saves = rememberUpdatedState(runCatching { activity.uiSaves() }.getOrDefault(emptyList()))
+    val stamp = PhotoAlbum.stamp(activity.filesDir)
+    // Listing looks inside the packages (to tell photos from saves), so it runs off the main thread.
+    val saves by produceState(emptyList<String>(), stamp) {
+        value = withContext(Dispatchers.IO) { runCatching { activity.uiSaves() }.getOrDefault(emptyList()) }
+    }
     // The Headers and each package's __thumbnail.png are the game's own bookkeeping, not saves of their own.
-    val visibleSaves = saves.value.filterNot { it.contains("/Headers/") || it.endsWith("/__thumbnail.png") }.ifEmpty { saves.value }
+    val visibleSaves = saves.filterNot { it.contains("/Headers/") || it.endsWith("/__thumbnail.png") }.ifEmpty { saves }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item { BackLink(onBack) }
         item { Header(stringResource(R.string.saves_eyebrow), stringResource(R.string.saves_title), stringResource(R.string.saves_subtitle)) }
         item {
             Panel(stringResource(R.string.saves_panel_library)) {
@@ -341,7 +354,33 @@ private val NAV_ENTRIES = listOf(
     }
 }
 
-@Composable private fun PlayScreen(activity: MainActivity, modifier: Modifier, tick: Int, openAchievements: () -> Unit, openPhotos: () -> Unit) {
+@Composable private fun BackLink(onBack: () -> Unit) {
+    Row(
+        Modifier.clip(RoundedCornerShape(12.dp)).clickable { onBack() }.padding(end = 12.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Accent)
+        Spacer(Modifier.width(6.dp))
+        Text(stringResource(R.string.common_back), color = Accent, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** The entry to the saves, on the Play page. */
+@Composable private fun SavesCard(open: () -> Unit) {
+    Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(20.dp),
+        modifier = Modifier.fillMaxWidth().clickable { open() }) {
+        Row(Modifier.padding(18.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Folder, null, tint = Accent, modifier = Modifier.size(32.dp))
+            Column(Modifier.weight(1f)) {
+                Text(stringResource(R.string.play_saves_card), color = Text, fontWeight = FontWeight.SemiBold)
+                Text(stringResource(R.string.saves_subtitle), color = Muted, fontSize = 13.sp)
+            }
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = Muted)
+        }
+    }
+}
+
+@Composable private fun PlayScreen(activity: MainActivity, modifier: Modifier, tick: Int, openAchievements: () -> Unit, openPhotos: () -> Unit, openSaves: () -> Unit) {
     @Suppress("UNUSED_VARIABLE") val update = tick
     val state = activity.uiGameState()
     val busy = activity.uiBusy()
@@ -414,6 +453,7 @@ private val NAV_ENTRIES = listOf(
             }
         }
         item { PhotosCard(activity, openPhotos) }
+        item { SavesCard(openSaves) }
         item { CheatsPanel(activity, !busy) }
         item {
             Panel(stringResource(R.string.play_panel_open)) {
@@ -461,15 +501,10 @@ private val NAV_ENTRIES = listOf(
     ) {
         item(span = { GridItemSpan(maxLineSpan) }) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(
-                    Modifier.clip(RoundedCornerShape(12.dp)).clickable { onBack() }.padding(end = 12.dp, top = 4.dp, bottom = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Accent)
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.common_back), color = Accent, fontWeight = FontWeight.SemiBold)
-                }
+                BackLink(onBack)
                 Header(stringResource(R.string.photos_eyebrow), stringResource(R.string.photos_title), stringResource(R.string.photos_subtitle))
+                if (photos.isNotEmpty())
+                    ActionButton(stringResource(R.string.photos_export), !activity.uiBusy(), outlined = true) { activity.uiExportPhotos() }
             }
         }
         if (photos.isEmpty() && loaded.value) {
@@ -726,10 +761,15 @@ private val SKIN_LABELS = listOf(
         }
         item {
             Panel(stringResource(R.string.settings_advanced)) {
-                SingleChoiceSelector(stringResource(R.string.settings_driver), driver, activity.uiDriverChoices(), !busy) { activity.uiSelectDriver(it) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    SingleChoiceSelector(stringResource(R.string.settings_driver), driver, activity.uiDriverChoices(), !busy, Modifier.weight(1f)) { activity.uiSelectDriver(it) }
+                    // Only a driver the user imported can be removed; the bundled and system ones stay.
+                    if (activity.uiDriverStored()) IconButton(onClick = { confirmDeleteDriver = true }, enabled = !busy) {
+                        Icon(Icons.Default.Delete, stringResource(R.string.settings_driver_delete), tint = if (busy) Muted else Accent)
+                    }
+                }
                 ActionButton(stringResource(R.string.settings_driver_import), !busy, outlined = true) { activity.uiAction("Importar driver Adreno (.zip)") }
                 if (busy) Text(activity.uiStatus(), color = Muted, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
-                if (activity.uiDriverStored()) ActionButton(stringResource(R.string.settings_driver_delete), !busy, outlined = true) { confirmDeleteDriver = true }
                 if (turnip) {
                     ToggleRow("One UI fix", oneUiEnabled, !busy) { activity.uiSetOneUi(it) }
                     MultiModeSelector("TU_DEBUG", tuMode, listOf("perf", "sysmem", "gmem")) { activity.uiSetTuMode(it) }
@@ -866,12 +906,31 @@ private val SKIN_LABELS = listOf(
     }
 }
 
+/** A dropdown's closed face: small label over the current value, with a caret, in a recessed field. */
+@Composable private fun DropdownField(label: String, value: String, enabled: Boolean, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color(0xFF111214))
+            .border(1.dp, Color(0xFF3A3D42), RoundedCornerShape(10.dp))
+            .alpha(if (enabled) 1f else 0.5f)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(label, color = Muted, fontSize = 12.sp)
+            Text(value, color = Text, fontSize = 15.sp)
+        }
+        Icon(Icons.Default.ArrowDropDown, null, tint = Muted, modifier = Modifier.size(28.dp))
+    }
+}
+
 @Composable private fun MultiModeSelector(label: String, selected: String, choices: List<String>, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     var local by remember { mutableStateOf(selected) }
     Box {
-        OutlinedButton(onClick = { local = selected; expanded = true }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
-            Text("$label: ${(if (expanded) local else selected).ifEmpty { stringResource(R.string.common_disabled) }.replace(",", ", ")}")
+        DropdownField(label, (if (expanded) local else selected).ifEmpty { stringResource(R.string.common_disabled) }.replace(",", ", "), true) {
+            local = selected; expanded = true
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             DropdownMenuItem(text = { Text(stringResource(R.string.common_disabled)) }, leadingIcon = {
@@ -892,12 +951,10 @@ private val SKIN_LABELS = listOf(
     }
 }
 
-@Composable private fun SingleChoiceSelector(label: String, selected: String, choices: List<String>, enabled: Boolean = true, onSelect: (String) -> Unit) {
+@Composable private fun SingleChoiceSelector(label: String, selected: String, choices: List<String>, enabled: Boolean = true, modifier: Modifier = Modifier, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    Box {
-        OutlinedButton(onClick = { expanded = true }, enabled = enabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
-            Text("$label: $selected")
-        }
+    Box(modifier) {
+        DropdownField(label, selected, enabled) { expanded = true }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             choices.forEach { choice ->
                 DropdownMenuItem(text = { Text(choice) }, onClick = { expanded = false; onSelect(choice) })

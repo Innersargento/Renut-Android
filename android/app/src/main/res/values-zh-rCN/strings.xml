@@ -55,6 +55,10 @@
     <string name="photos_save">保存到相册</string>
     <string name="photos_saved">照片已保存到 Pictures/reNut。</string>
     <string name="photos_save_failed">无法保存照片。</string>
+    <string name="photos_export">导出全部照片 (.zip)</string>
+    <string name="photos_exported">照片已导出。</string>
+    <string name="photos_export_none">没有可导出的照片。</string>
+    <string name="play_saves_card">存档</string>
     <string name="play_panel_open">打开应用时</string>
     <string name="play_autostart">直接进入游戏</string>
     <string name="play_autostart_note">游戏将跳过此界面直接开始。要回到这里，请通过游戏菜单退出游戏。</string>

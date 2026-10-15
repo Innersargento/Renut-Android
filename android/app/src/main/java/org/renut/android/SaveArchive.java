@@ -13,7 +13,12 @@ final class SaveArchive {
 
     static List<String> list(File root)throws IOException {
         ArrayList<String> names=new ArrayList<>();
-        if(root.isDirectory())collect(root,root,names);
+        if(root.isDirectory()){
+            collect(root,root,names);
+            // Photo Mode pictures live in the same kind of package but are the album's, not saves.
+            Set<String> photos=PhotoAlbum.photoPackages(root);
+            if(!photos.isEmpty())names.removeIf(n->isPhotoPath(n,photos));
+        }
         Collections.sort(names);
         return names;
     }
@@ -31,6 +36,13 @@ final class SaveArchive {
                 }
             }
         }
+    }
+    private static boolean isPhotoPath(String name,Set<String> photos){
+        String[] p=name.split("/",-1);
+        if(p.length>=4&&photos.contains(p[0]+"/"+p[1]+"/"+p[2]+"/"+p[3]))return true;
+        if(p.length==5&&p[2].equals("Headers")&&p[4].endsWith(".header"))
+            return photos.contains(p[0]+"/"+p[1]+"/"+p[3]+"/"+p[4].substring(0,p[4].length()-7));
+        return false;
     }
     private static boolean hex8(String s){return s.matches("[0-9A-Fa-f]{8}");}
     private static boolean isSavePath(String name){
