@@ -110,6 +110,14 @@ REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
 REXCVAR_DEFINE_INT32(renut_plume_hiz, 2, "reNut/Plume",
                      "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
                      "lies wholly outside the view frustum or the scissor (exact; files/plume-hiz overrides)");
+REXCVAR_DEFINE_BOOL(renut_plume_shader_cache, true, "reNut/Plume",
+                    "Remember across frames which shader lives at a guest address and length, trusting it "
+                    "until the guest writes there (write-watched), instead of hashing the microcode of "
+                    "every shader a frame uses again (files/plume-shadercache overrides)");
+REXCVAR_DEFINE_BOOL(renut_plume_key_reuse, true, "reNut/Plume",
+                    "Key a draw's pipeline by one hash of its vertex shader's fetch table, kept on the "
+                    "shader, instead of laying every specialization constant of the table into the key "
+                    "each draw (files/plume-keyreuse overrides)");
 REXCVAR_DEFINE_INT32(renut_plume_fetch_spec, 1, "reNut/Plume",
                      "Give each vertex shader's live vertex fetch table to the driver as specialization "
                      "constants, so that the format switches of its fetch sites fold away: 0 off, 1 on")
@@ -450,6 +458,9 @@ class HostShader : public gfx::Shader {
   CompiledShader* domain_compiled = nullptr;
   std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> domain_live_fetches;
   bool domain_decoded = false;
+  // One hash of each fetch table (vertex form, domain form), made the first
+  // time a draw keys a pipeline by it (0: not made yet).
+  uint64_t fetch_spec_hash[2] = {0, 0};
   // Hi-Z: the model entry last found for this shader and the (masked) booleans
   // it was found under, so a draw does not hash and look them up again.
   void* hiz_entry = nullptr;
@@ -1940,6 +1951,8 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   };
   const FetchLayout* LayoutOf(const xenos::xe_gpu_texture_fetch_t& fetch);
   const FetchLayout* LayoutOfByContents(const xenos::xe_gpu_texture_fetch_t& fetch);
+  gfx::Shader* LoadShaderByContents(xenos::ShaderType shader_type, const uint32_t* host_address,
+                                    uint32_t dword_count);
   uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
@@ -1956,6 +1969,24 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   std::unique_ptr<ShaderStore> store_;
   std::unordered_map<uint64_t, std::unique_ptr<HostShader>> shaders_;
   // LoadShader's answers this frame, by microcode address: {dwords, shader}.
+  // Across frames (renut_plume_shader_cache): the shader found at a guest
+  // address and length stays that shader until the guest writes under it. The
+  // pages are write-watched like a kept stream's, and an entry written over
+  // three times is treated as dynamic (the ring a patched shader is copied
+  // into) and goes back to hashing, unwatched.
+  struct ShaderWatch {
+    HostShader* shader = nullptr;
+    uint32_t base = 0, bytes = 0;
+    bool valid = false;
+    uint32_t drops = 0;
+    uint64_t dropped_frame = 0;
+  };
+  std::unordered_map<uint64_t, ShaderWatch> shader_watch_;
+  std::unordered_multimap<uint32_t, uint64_t> shader_block_index_;
+  LookupMemo<ShaderWatch, 12> shader_watch_memo_;
+  bool shader_cache_ = true;
+  bool key_reuse_ = true;
+  uint64_t shader_cache_hits_ = 0, shader_cache_drops_ = 0;
   std::unordered_map<const uint32_t*, std::pair<uint32_t, HostShader*>> shader_lookup_;
   // In front of shader_lookup_, by address and length; cleared with it.
   LookupMemo<HostShader, 12> shader_memo_;
@@ -3431,6 +3462,8 @@ bool PlumeCommandProcessor::SetupContext() {
   REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
               bc_mode_ ? "on" : "off");
   texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
+  shader_cache_ = REXCVAR_GET(renut_plume_shader_cache);
+  key_reuse_ = REXCVAR_GET(renut_plume_key_reuse);
   REXLOG_INFO("Renut: Plume texture quality: {}",
               texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
   shadow_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
@@ -3721,6 +3754,9 @@ void PlumeCommandProcessor::ShutdownContext() {
   for (auto& list : writebacks_) list.clear();
   shader_lookup_.clear();
   shader_memo_.Clear();
+  shader_watch_memo_.Clear();
+  shader_watch_.clear();
+  shader_block_index_.clear();
   shaders_.clear();
   if (timestamp_pool_ != VK_NULL_HANDLE) {
     vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_, nullptr);
@@ -3948,10 +3984,19 @@ void PlumeCommandProcessor::DrainWatchHits() {
     auto drop_kept = [&](KeptStream& kept) {
       if (kept.valid && touches(kept.base, kept.base + kept.size)) DropKept(kept);
     };
+    auto drop_shader = [&](ShaderWatch& entry) {
+      if (entry.valid && touches(entry.base, entry.base + entry.bytes)) {
+        entry.valid = false;
+        ++entry.drops;
+        entry.dropped_frame = swaps_;
+        ++shader_cache_drops_;
+      }
+    };
     if (last - first > 1024) {
       // A huge range: every one is looked at.
       for (auto& [key, texture] : guest_textures_) drop_texture(texture);
       for (auto& [key, kept] : kept_streams_) drop_kept(kept);
+      for (auto& [key, entry] : shader_watch_) drop_shader(entry);
       continue;
     }
     for (uint32_t block = first; block <= last; ++block) {
@@ -3965,6 +4010,17 @@ void PlumeCommandProcessor::DrainWatchHits() {
         auto found = kept_streams_.find(it->second);
         if (found != kept_streams_.end()) drop_kept(found->second);
       }
+      auto shaders = shader_block_index_.equal_range(block);
+      for (auto it = shaders.first; it != shaders.second; ++it) {
+        auto found = shader_watch_.find(it->second);
+        if (found != shader_watch_.end()) drop_shader(found->second);
+      }
+    }
+  }
+  if (shader_block_index_.size() > 200000) {
+    shader_block_index_.clear();
+    for (auto& [key, entry] : shader_watch_) {
+      if (entry.valid) IndexBlocks(shader_block_index_, entry.base, entry.bytes, key);
     }
   }
   // Entries of what is gone pile up: rebuilt from what is live.
@@ -6136,8 +6192,58 @@ void PlumeCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
 }
 
-gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t,
+gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                                const uint32_t* host_address, uint32_t dword_count) {
+  // Across frames: an address and length are the shader last found there while
+  // the guest has not written under them (see ShaderWatch). Looked up first,
+  // so a shader the game binds every frame is never hashed again.
+  ShaderWatch* watch = nullptr;
+  uint64_t watch_key = 0;
+  if (shader_cache_ && guest_address && dword_count && dword_count <= (64u << 10)) {
+    DrainWatchHits();
+    watch_key = (uint64_t(guest_address) << 32) | dword_count;
+    watch = shader_watch_memo_.Find(watch_key);
+    if (!watch) {
+      auto found = shader_watch_.find(watch_key);
+      if (found != shader_watch_.end()) {
+        watch = &found->second;
+        shader_watch_memo_.Put(watch_key, watch);
+      }
+    }
+    if (watch && watch->valid) {
+      ++shader_cache_hits_;
+      return watch->shader;
+    }
+  }
+  // Watch first, hash second: a write that lands during the hash is a hit,
+  // drained at the next lookup, and drops the entry made below.
+  bool watched = false;
+  if (watch_key) {
+    if (!watch) {
+      watch = &shader_watch_[watch_key];
+      shader_watch_memo_.Put(watch_key, watch);
+    }
+    const uint32_t bytes = dword_count * 4;
+    const bool dynamic = watch->drops >= 3 && swaps_ - watch->dropped_frame < 900;
+    if (!dynamic && memory_->GetPhysicalHeap()->QueryRangeAccess(guest_address, guest_address + bytes - 1) ==
+                        rex::memory::PageAccess::kReadWrite) {
+      memory_->EnablePhysicalMemoryAccessCallbacks(guest_address, bytes, true, false);
+      watched = true;
+    }
+  }
+  gfx::Shader* result = LoadShaderByContents(shader_type, host_address, dword_count);
+  if (watched && result) {
+    watch->shader = static_cast<HostShader*>(result);
+    watch->base = guest_address;
+    watch->bytes = dword_count * 4;
+    watch->valid = true;
+    IndexBlocks(shader_block_index_, guest_address, dword_count * 4, watch_key);
+  }
+  return result;
+}
+
+gfx::Shader* PlumeCommandProcessor::LoadShaderByContents(xenos::ShaderType shader_type,
+                                                         const uint32_t* host_address, uint32_t dword_count) {
   // The guest binds the same few hundred shaders thousands of times a frame,
   // and hashing the whole microcode each time was a steady few percent of
   // this thread. Within a frame an address and length stand for the shader
@@ -8163,10 +8269,33 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   // draw that uses this shader and adds no pipelines of its own.
   CompiledShader* vertex_compiled = patch_list ? vs->domain_compiled : vs->compiled;
   const bool fetch_spec = fetch_spec_mode_ && vertex_compiled && vertex_compiled->fetch_spec_module;
+  // The table is the same on every draw of the shader. With key reuse the key
+  // takes one hash of it (made once, kept on the shader) and the constants
+  // themselves are laid into spec_constants only when a pipeline has to be
+  // made - at the position they had, so the driver's cache sees the same list.
+  const auto& fetch_table = patch_list ? vs->domain_live_fetches : vs->live_fetches;
+  uint64_t fetch_table_hash = 0;
   if (fetch_spec) {
-    for (const auto& [slot, entry] : patch_list ? vs->domain_live_fetches : vs->live_fetches) {
-      for (uint32_t word = 0; word < 4; ++word) {
-        if (entry[word]) spec_constants.emplace_back(kFetchSpecBase + slot * 4 + word, entry[word]);
+    if (key_reuse_) {
+      uint64_t& cached = vs->fetch_spec_hash[patch_list ? 1 : 0];
+      if (!cached) {
+        uint64_t h = 0x9E3779B97F4A7C15ull;
+        for (const auto& [slot, entry] : fetch_table) {
+          for (uint32_t word = 0; word < 4; ++word) {
+            if (entry[word]) {
+              const uint32_t pair[2] = {kFetchSpecBase + slot * 4 + word, entry[word]};
+              h = XXH3_64bits_withSeed(pair, sizeof(pair), h);
+            }
+          }
+        }
+        cached = h | 1;  // never 0: that is "not made"
+      }
+      fetch_table_hash = cached;
+    } else {
+      for (const auto& [slot, entry] : fetch_table) {
+        for (uint32_t word = 0; word < 4; ++word) {
+          if (entry[word]) spec_constants.emplace_back(kFetchSpecBase + slot * 4 + word, entry[word]);
+        }
       }
     }
   }
@@ -8214,6 +8343,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
     key_bytes.Put(c.value);
   }
+  if (fetch_table_hash) key_bytes.Put(fetch_table_hash);
   // Geometry-shader and patch draws keep their own: their stages expect the
   // guest's outputs.
   const bool plain_draw = !rect_list && !point_list && !patch_list;
@@ -8268,6 +8398,18 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   auto& pipeline = *pipeline_node;
   RenderPipeline* standin = nullptr;
   if (!pipeline) {
+    if (fetch_table_hash) {
+      // The table the key stood for, ahead of the relative-constants entry where
+      // the list had it.
+      auto at = spec_constants.end() - (rel_active ? 1 : 0);
+      std::vector<RenderSpecConstant> table;
+      for (const auto& [slot, entry] : fetch_table) {
+        for (uint32_t word = 0; word < 4; ++word) {
+          if (entry[word]) table.emplace_back(kFetchSpecBase + slot * 4 + word, entry[word]);
+        }
+      }
+      spec_constants.insert(at, table.begin(), table.end());
+    }
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = layout_.get();
     desc.vertexShader = depth_strip ? depth_module
@@ -11182,6 +11324,35 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       objkeys_ = objkeys;
     }
     {
+      // files/plume-shadercache and files/plume-keyreuse: 0 puts the old path
+      // back, 1 forces it on; absent leaves the cvar's choice.
+      auto read_switch = [&](const char* name, bool fallback) {
+        bool value = fallback;
+        if (FILE* file = std::fopen((root + "/" + name).c_str(), "r")) {
+          int v = fallback;
+          if (std::fscanf(file, "%d", &v) == 1) value = v != 0;
+          std::fclose(file);
+        }
+        return value;
+      };
+      const bool shader_cache = read_switch("plume-shadercache", REXCVAR_GET(renut_plume_shader_cache));
+      if (shader_cache != shader_cache_) {
+        REXLOG_INFO("Renut: Plume shader cache {}", shader_cache ? "on" : "off");
+        shader_watch_.clear();
+        shader_watch_memo_.Clear();
+        shader_block_index_.clear();
+      }
+      shader_cache_ = shader_cache;
+      const bool key_reuse = read_switch("plume-keyreuse", REXCVAR_GET(renut_plume_key_reuse));
+      if (key_reuse != key_reuse_) {
+        REXLOG_INFO("Renut: Plume pipeline key reuse {}", key_reuse ? "on" : "off");
+        // Keys made the other way name different pipelines: the memos go, the
+        // pipelines are found again (or made) under the new keys.
+        pipeline_memo_.Clear();
+      }
+      key_reuse_ = key_reuse;
+    }
+    {
       int hiz = std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 4);
       if (FILE* file = std::fopen((root + "/plume-hiz").c_str(), "r")) {
         int value = hiz;
@@ -11675,6 +11846,8 @@ void PlumeCommandProcessor::Report() {
       stats_.constant_bytes >> 20, stats_.kept_hits, stats_.kept_bytes_made >> 20, stats_.kept_drops,
       stats_.kept_unwatchable, kept_bytes_ >> 20, kept_streams_.size(), stats_.band_skipped,
       stats_.band_moved, stats_.band_widened);
+  REXLOG_INFO("Renut: Plume shader cache ({}): {} hits, {} entries, {} dropped by writes", shader_cache_ ? "on" : "off",
+              shader_cache_hits_, shader_watch_.size(), shader_cache_drops_);
   if (stats_.defer_windows) {
     REXLOG_INFO("Renut: Plume windows closed by: elsewhere {} ({} draws), state change {} ({}), full {} ({}), "
                 "immediate draw {} ({}), the draw's own needs {} ({})",
