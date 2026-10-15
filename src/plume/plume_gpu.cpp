@@ -1408,7 +1408,7 @@ struct Stats {
   // model and a box, the ones that could not be dropped for lack of either,
   // and the ones whose box lay wholly outside the frustum or the scissor.
   uint64_t hiz_seen[2] = {}, hiz_eligible[2] = {}, hiz_no_model[2] = {}, hiz_no_box[2] = {};
-  uint64_t hiz_frustum[2] = {}, hiz_scissor[2] = {};
+  uint64_t hiz_frustum[2] = {}, hiz_scissor[2] = {}, hiz_skipped[2] = {};
   uint64_t hiz_boxes_made = 0, hiz_box_us = 0, hiz_box_hits = 0, hiz_models = 0, hiz_models_valid = 0,
            hiz_model_rejected = 0, hiz_model_us = 0;
   uint64_t hiz_culled_total = 0;
@@ -1418,7 +1418,7 @@ struct Stats {
   uint64_t hiz_boxed_draws = 0, hiz_why_not[4] = {}, hiz_small_windows = 0, hiz_small_draws = 0, hiz_windows_all = 0;
   uint64_t hiz_cull_ns = 0;
   uint64_t stream_memo_hits = 0;
-  uint64_t hiz_stage_ns[3] = {};  // model lookup, box lookup, constants evaluation (sampled, scaled)
+  uint64_t hiz_stage_ns[4] = {};  // model lookup, box lookup, constants evaluation, plane/scissor tests (sampled, scaled)
   // Draws with no model by why (renut::hiz::Why), depth-only [0] and colour [1].
   uint64_t hiz_why_model[2][12] = {};
   uint64_t hiz_verified = 0, hiz_violations = 0, hiz_missed_hidden = 0, hiz_missed_empty = 0;
@@ -2519,6 +2519,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // files/plume-hiz: 0 off, 1 counts what could be dropped, 2 drops the draws
   // whose box lies wholly outside the frustum or the scissor (exact).
   uint32_t hiz_mode_ = 0;
+  // files/plume-hizskip: 0 tests every draw, 1 (default) samples the meshes that are
+  // almost never culled.
+  bool hiz_skip_ = true;
   struct HizModelEntry {
     std::shared_ptr<renut::hiz::Model> model;
     bool validated = false;
@@ -2534,6 +2537,15 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     uint64_t checksum = 0;
     uint64_t checked_frame = 0;
   };
+  // How often draws of a mesh (all of its instances together) were found outside
+  // the frustum, decayed: a mesh that is almost never culled is only sampled
+  // (HizCullDraw), because its tests cost more than they save. Direct-mapped by a
+  // key of the model, the fetch range and the index range; a collision restarts it.
+  struct HizCold {
+    uint64_t key = 0;
+    uint32_t seen = 0, culled = 0, phase = 0;
+  };
+  std::array<HizCold, 4096> hiz_cold_{};
   std::unordered_map<uint64_t, HizBox> hiz_boxes_;
   // 64 KB blocks of guest memory -> keys of the boxes made from them, so a write
   // finds its boxes without walking all of them (entries of boxes already gone
@@ -9701,6 +9713,40 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
     return false;
   }
   const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+  // A mesh whose draws are almost never found outside (under 1 in 16, over the
+  // last 64-128 draws of it, every instance together) costs more in tests than
+  // the few culls save: break-even is about one cull in ten. Only every 8th draw
+  // of it is tested; a cull found there counts for 8, so the estimate stays
+  // unbiased and a mesh that starts to leave the view is tested again within a
+  // few draws. Skipping a test is always safe: the draw is just made. The mesh
+  // is named by a cheap key (model, fetch range, index range), so a skipped draw
+  // never reaches the box lookup either.
+  HizCold* cold_slot = nullptr;
+  bool sampled_cold = false;
+  if (hiz_skip_ && hiz_mode_ == 2) {
+    const uint64_t index_word = index_info && index_info->guest_base
+                                    ? (uint64_t(index_info->guest_base) << 32) | index_count
+                                    : uint64_t(index_count);
+    uint64_t k = (uint64_t(reinterpret_cast<uintptr_t>(entry)) ^ 0x9E3779B97F4A7C15ull) * 0xFF51AFD7ED558CCDull;
+    k = (k ^ ((uint64_t(fetch.address) << 32) | fetch.size)) * 0xC4CEB9FE1A85EC53ull;
+    k = (k ^ index_word ^ (uint64_t(uint32_t(base_vertex)) << 40)) * 0xFF51AFD7ED558CCDull;
+    k ^= k >> 29;
+    cold_slot = &hiz_cold_[k & (hiz_cold_.size() - 1)];
+    if (cold_slot->key != k) *cold_slot = HizCold{k, 0, 0, 0};
+    if (cold_slot->seen >= 128) {
+      cold_slot->seen >>= 1;
+      cold_slot->culled >>= 1;
+    }
+    const bool cold = cold_slot->seen >= 32 && cold_slot->culled * 16 < cold_slot->seen;
+    ++cold_slot->seen;
+    if (cold) {
+      if ((++cold_slot->phase & 7) != 0) {
+        ++stats_.hiz_skipped[kind];
+        return false;
+      }
+      sampled_cold = true;
+    }
+  }
   const auto stage_b = hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   const HizBox* box = HizBoxFor(model, fetch, index_info, index_count, base_vertex);
   if (hiz_stage_timing_) {
@@ -9722,7 +9768,6 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
     }
     entry->validated = true;
   }
-
   // The constants as the shader sees them, and the model's affine map.
   const float* constants = reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
   float affine[4][5];
@@ -9732,6 +9777,19 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
     stats_.hiz_stage_ns[2] += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                 std::chrono::steady_clock::now() - stage_c).count());
   }
+  struct StageGuard {
+    uint64_t* out;
+    std::chrono::steady_clock::time_point begin;
+    bool on;
+    ~StageGuard() {
+      if (on) {
+        *out += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - begin).count());
+      }
+    }
+  } plane_stage{&stats_.hiz_stage_ns[3],
+                hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point(),
+                hiz_stage_timing_};
   // The box in clip space is a parallelepiped: centre C and, along the element's
   // components, the columns A[.][1 + j] * half_j. A plane's value over it ranges
   // over centre +- sum |coefficient along j| * half_j, so "all of it outside" is
@@ -9781,6 +9839,7 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
       wholly_outside(0, -1, 0, 1) ||
       (clip.dx_clip_space_def && (wholly_outside(0, 0, 1, 0) || wholly_outside(0, 0, -1, 1)))) {
     ++stats_.hiz_frustum[kind];
+    if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
     return hiz_mode_ >= 2;
   }
   // Wholly in front of the eye: the scissor and the screen rectangle make sense.
@@ -9816,6 +9875,7 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
   if (all_positive(-xs, 0, left - 1.0f - bx) || all_positive(xs, 0, -(right + 1.0f - bx)) ||
       all_positive(0, -ys, top - 1.0f - by) || all_positive(0, ys, -(bottom + 1.0f - by))) {
     ++stats_.hiz_scissor[kind];
+    if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
     return hiz_mode_ >= 2;
   }
   if (hiz_mode_ >= 3 && clip.dx_clip_space_def) {
@@ -11375,6 +11435,13 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         REXLOG_INFO("Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor, 3 + occlusion, 4 + occlusion of depth-only draws)", hiz);
       }
       hiz_mode_ = uint32_t(hiz);
+      bool skip = true;
+      if (FILE* file = std::fopen((root + "/plume-hizskip").c_str(), "r")) {
+        int value = 1;
+        if (std::fscanf(file, "%d", &value) == 1) skip = value != 0;
+        std::fclose(file);
+      }
+      hiz_skip_ = skip;
     }
     {
       int fetch_spec = std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1);
@@ -12029,7 +12096,7 @@ void PlumeCommandProcessor::Report() {
                    "mode=%u swaps=%llu draws=%llu drawn=%llu dropped=%llu color_seen=%llu color_boxed=%llu "
                    "color_frustum=%llu depth_seen=%llu depth_boxed=%llu depth_frustum=%llu windows_tested=%llu "
                    "tested=%llu held=%llu answered=%llu hidden=%llu predicated=%llu test_failed=%llu cp_cpu_ms=%llu "
-                   "cull_ms=%llu model_ms=%llu box_ms=%llu eval_ms=%llu memo_hits=%llu pipeline_binds=%llu nm_color=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu nm_depth=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                   "cull_ms=%llu model_ms=%llu box_ms=%llu eval_ms=%llu memo_hits=%llu pipeline_binds=%llu nm_color=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu nm_depth=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu skipped=%llu,%llu skip=%d tests_ms=%llu\n",
                    hiz_mode_, (unsigned long long)swaps_, (unsigned long long)stats_.draws,
                    (unsigned long long)stats_.drawn, (unsigned long long)stats_.hiz_culled_total,
                    (unsigned long long)stats_.hiz_seen[1], (unsigned long long)stats_.hiz_eligible[1],
@@ -12042,7 +12109,9 @@ void PlumeCommandProcessor::Report() {
                    (unsigned long long)(stats_.hiz_cull_ns / 1000000), (unsigned long long)(stats_.hiz_stage_ns[0] / 1000000),
                    (unsigned long long)(stats_.hiz_stage_ns[1] / 1000000), (unsigned long long)(stats_.hiz_stage_ns[2] / 1000000),
                    (unsigned long long)stats_.stream_memo_hits, (unsigned long long)stats_.pipeline_binds,
-                   (unsigned long long)stats_.hiz_why_model[1][1], (unsigned long long)stats_.hiz_why_model[1][2], (unsigned long long)stats_.hiz_why_model[1][3], (unsigned long long)stats_.hiz_why_model[1][4], (unsigned long long)stats_.hiz_why_model[1][5], (unsigned long long)stats_.hiz_why_model[1][6], (unsigned long long)stats_.hiz_why_model[1][7], (unsigned long long)stats_.hiz_why_model[1][8], (unsigned long long)stats_.hiz_why_model[1][9], (unsigned long long)stats_.hiz_why_model[1][10], (unsigned long long)stats_.hiz_why_model[0][1], (unsigned long long)stats_.hiz_why_model[0][2], (unsigned long long)stats_.hiz_why_model[0][3], (unsigned long long)stats_.hiz_why_model[0][4], (unsigned long long)stats_.hiz_why_model[0][5], (unsigned long long)stats_.hiz_why_model[0][6], (unsigned long long)stats_.hiz_why_model[0][7], (unsigned long long)stats_.hiz_why_model[0][8], (unsigned long long)stats_.hiz_why_model[0][9], (unsigned long long)stats_.hiz_why_model[0][10]);
+                   (unsigned long long)stats_.hiz_why_model[1][1], (unsigned long long)stats_.hiz_why_model[1][2], (unsigned long long)stats_.hiz_why_model[1][3], (unsigned long long)stats_.hiz_why_model[1][4], (unsigned long long)stats_.hiz_why_model[1][5], (unsigned long long)stats_.hiz_why_model[1][6], (unsigned long long)stats_.hiz_why_model[1][7], (unsigned long long)stats_.hiz_why_model[1][8], (unsigned long long)stats_.hiz_why_model[1][9], (unsigned long long)stats_.hiz_why_model[1][10], (unsigned long long)stats_.hiz_why_model[0][1], (unsigned long long)stats_.hiz_why_model[0][2], (unsigned long long)stats_.hiz_why_model[0][3], (unsigned long long)stats_.hiz_why_model[0][4], (unsigned long long)stats_.hiz_why_model[0][5], (unsigned long long)stats_.hiz_why_model[0][6], (unsigned long long)stats_.hiz_why_model[0][7], (unsigned long long)stats_.hiz_why_model[0][8], (unsigned long long)stats_.hiz_why_model[0][9], (unsigned long long)stats_.hiz_why_model[0][10],
+                   (unsigned long long)stats_.hiz_skipped[1], (unsigned long long)stats_.hiz_skipped[0], hiz_skip_ ? 1 : 0,
+                   (unsigned long long)(stats_.hiz_stage_ns[3] / 1000000));
       std::fclose(out);
     }
   }
