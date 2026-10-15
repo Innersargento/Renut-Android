@@ -454,6 +454,11 @@ class HostShader : public gfx::Shader {
   // it was found under, so a draw does not hash and look them up again.
   void* hiz_entry = nullptr;
   uint32_t hiz_bools[8] = {};
+  // Format-17 elements to repack (offset, stride) by stream, found once the
+  // shader is compiled; signature mixes them for the stream memo.
+  std::array<std::vector<std::pair<uint32_t, uint32_t>>, 17> repack;
+  std::array<uint64_t, 17> repack_signature{};
+  bool repack_decoded = false;
 };
 
 class ShaderStore {
@@ -1397,6 +1402,7 @@ struct Stats {
   uint64_t flush_windows[8] = {}, flush_draws[8] = {};
   uint64_t hiz_boxed_draws = 0, hiz_why_not[4] = {}, hiz_small_windows = 0, hiz_small_draws = 0, hiz_windows_all = 0;
   uint64_t hiz_cull_ns = 0;
+  uint64_t stream_memo_hits = 0;
   uint64_t hiz_stage_ns[3] = {};  // model lookup, box lookup, constants evaluation (sampled, scaled)
   // Draws with no model by why (renut::hiz::Why), depth-only [0] and colour [1].
   uint64_t hiz_why_model[2][12] = {};
@@ -1785,6 +1791,22 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
     }
   }
   void DropKept(KeptStream& kept);
+  // Bumped whenever a kept stream's buffer can have gone: what a draw found for
+  // a vertex stream last time is good while this, the ring generation and the
+  // stream's fetch constant are the same (see the stream loop of IssueDraw).
+  uint64_t stream_epoch_ = 1;
+  // Bumped whenever the set of export ranges changes (what overlaps what).
+  uint64_t export_epoch_ = 1;
+  struct StreamMemo {
+    uint32_t words[2] = {};
+    uint64_t native_base = 0, native_size = 0;
+    uint64_t repack_signature = 0;
+    uint64_t epoch = 0, generation = 0, export_epoch = 0;
+    RenderBuffer* buffer = nullptr;
+    uint64_t offset = 0;
+    bool bound = false;
+  };
+  std::array<StreamMemo, 17> stream_memo_{};
   // A format-17 stream (see RepackFormat17) kept already repacked, like a kept
   // stream; falls back to UploadRepacked when it cannot be kept.
   bool RepackedStream(uint32_t address, uint32_t size, xenos::Endian endian,
@@ -3617,13 +3639,15 @@ void PlumeCommandProcessor::ShutdownContext() {
   targets_.clear();
   resolved_.clear();
   InvalidateResolvedLookups();
+  ++export_epoch_;
   exports_.clear();
   patch_grids_.clear();
   if (watch_handle_) {
     memory_->UnregisterPhysicalMemoryInvalidationCallback(watch_handle_);
     watch_handle_ = nullptr;
   }
-  kept_streams_.clear();
+  ++stream_epoch_;
+    kept_streams_.clear();
   kept_memo_.Clear();
   kept_bytes_ = 0;
   for (auto& retired : retired_buffers_) retired.clear();
@@ -3825,6 +3849,7 @@ std::pair<uint32_t, uint32_t> PlumeCommandProcessor::WatchHitThunk(void* context
 // A kept stream the guest wrote over: the buffer goes once the frames in flight
 // are done with it, and it counts as dropped (see GuestStream).
 void PlumeCommandProcessor::DropKept(KeptStream& kept) {
+  ++stream_epoch_;
   // Earlier draws of this frame, and the frame before, may still read it.
   retired_buffers_[slot_].push_back(std::move(kept.buffer));
   kept_bytes_ -= kept.size;
@@ -4121,6 +4146,7 @@ PlumeCommandProcessor::ExportRange* PlumeCommandProcessor::GetExport(uint32_t ba
       L()->copyBufferRegion(RenderBufferReference(fresh.buffer.get(), old.base - lo),
                               RenderBufferReference(old.buffer.get(), 0), old.size);
       retired_buffers_[slot_].push_back(std::move(old.buffer));
+      ++export_epoch_;
       exports_.erase(key);
     }
   }
@@ -4134,6 +4160,7 @@ PlumeCommandProcessor::ExportRange* PlumeCommandProcessor::GetExport(uint32_t ba
     REXLOG_INFO("Renut: Plume export range {:08X}+{:X} endian {} (asked {:08X}+{:X}, merged {})", lo,
                 fresh.size, uint32_t(endian), base, size, merged.size());
   }
+  ++export_epoch_;
   return &exports_.emplace(lo, std::move(fresh)).first->second;
 }
 
@@ -4691,7 +4718,7 @@ void PlumeCommandProcessor::EvictIdleTextures() {
       retired_buffers_[slot_].push_back(std::move(it->second.buffer));
       kept_bytes_ -= it->second.size;
     }
-    it = kept_streams_.erase(it);
+    it = (++stream_epoch_, kept_streams_.erase(it));
     kept_erased = true;
   }
   if (kept_erased) kept_memo_.Clear();
@@ -7123,29 +7150,68 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     // A stream with format 17 vectors the input assembler hands to the shader
     // (see RepackFormat17) is copied for this draw with those moved into the
     // layout the shader decodes.
-    bool repacked = false;
-    if (!patch_list && stream != RENUT_DIRECT_FETCH_STREAM && vs->compiled) {
-      std::pair<uint32_t, uint32_t> repack[8];
-      uint32_t repack_count = 0;
+    if (!vs->repack_decoded && vs->compiled) {
+      vs->repack_decoded = true;
       for (const LiveElement& e : vs->elements) {
-        if (e.format != 17 || e.slot != stream || !e.stride || repack_count == 8) continue;
+        if (e.format != 17 || e.slot >= 17 || !e.stride || vs->repack[e.slot].size() == 8) continue;
         for (const auto& [location, integer] : vs->compiled->inputs) {
           if (location == e.location && !integer) {
-            repack[repack_count++] = {e.offset, e.stride};
+            vs->repack[e.slot].emplace_back(e.offset, e.stride);
+            vs->repack_signature[e.slot] =
+                (vs->repack_signature[e.slot] ^ ((uint64_t(e.offset) << 32) | e.stride)) * 0x100000001B3ull + 1;
             break;
           }
         }
       }
-      if (repack_count && !ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
+    }
+    const bool repackable = !patch_list && stream != RENUT_DIRECT_FETCH_STREAM && vs->compiled &&
+                            !vs->repack[stream].empty();
+    // What the last draw found for this stream is good again when its fetch
+    // constant, the native stream window and the repack are the same and no
+    // kept buffer went away, the ring has not wrapped, and no export range
+    // overlaps (exports change under draws).
+    const BufferRange native_stream =
+        native_swapped_ && stream < native_streams_.size() ? native_streams_[stream] : BufferRange{};
+    StreamMemo& memo = stream_memo_[stream];
+    const uint32_t* constant_words = reinterpret_cast<const uint32_t*>(&fetch);
+    const uint64_t signature = repackable ? vs->repack_signature[stream] : 0;
+    bool bound = false;
+    if (memo.buffer && memo.epoch == stream_epoch_ && memo.generation == upload_generation_ &&
+        memo.words[0] == constant_words[0] && memo.words[1] == constant_words[1] &&
+        memo.native_base == native_stream.base &&
+        memo.native_size == native_stream.size && memo.repack_signature == signature &&
+        memo.export_epoch == export_epoch_ && !validate_windows_ &&
+        !sync_draws_ && !trace_) {
+      buffer = memo.buffer;
+      offset = memo.offset;
+      bound = memo.bound;
+      ++stats_.stream_memo_hits;
+    } else {
+      bool repacked = false;
+      if (repackable && !ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
         buffer = upload_.get();
-        repacked = RepackedStream(fetch.address << 2, fetch.size << 2, fetch.endian, repack, repack_count, buffer,
-                                  offset);
-        if (repacked) Trace("  stream{} repacked: {} format 17 element(s)", stream, repack_count);
+        repacked = RepackedStream(fetch.address << 2, fetch.size << 2, fetch.endian, vs->repack[stream].data(),
+                                  uint32_t(vs->repack[stream].size()), buffer, offset);
+        if (repacked) Trace("  stream{} repacked: {} format 17 element(s)", stream, vs->repack[stream].size());
+      }
+      stream_object_ = native_stream;
+      bound = repacked || BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset);
+      stream_object_ = {};
+      if (!exports_.empty() && ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
+        memo.buffer = nullptr;  // an exported stream is not remembered
+      } else {
+        std::memcpy(memo.words, constant_words, sizeof(memo.words));
+        memo.native_base = native_stream.base;
+        memo.native_size = native_stream.size;
+        memo.repack_signature = signature;
+        memo.epoch = stream_epoch_;
+        memo.export_epoch = export_epoch_;
+        memo.generation = upload_generation_;
+        memo.buffer = bound ? buffer : nullptr;
+        memo.offset = offset;
+        memo.bound = bound;
       }
     }
-    stream_object_ = native_swapped_ && stream < native_streams_.size() ? native_streams_[stream] : BufferRange{};
-    const bool bound = repacked || BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset);
-    stream_object_ = {};
     if (bound) {
       streams[stream] = buffer == upload_.get() ? Address(offset) : buffer->getDeviceAddress() + offset;
       slot_offsets[stream] = offset;
@@ -11161,7 +11227,8 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         for (auto& [key, kept] : kept_streams_) {
           if (kept.buffer) retired_buffers_[slot_].push_back(std::move(kept.buffer));
         }
-        kept_streams_.clear();
+        ++stream_epoch_;
+    kept_streams_.clear();
   kept_memo_.Clear();
         kept_bytes_ = 0;
       }
@@ -11355,6 +11422,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   for (auto it = exports_.begin(); it != exports_.end();) {
     if (it->second.exported_frame + 30 < swaps_) {
       retired_buffers_[slot_].push_back(std::move(it->second.buffer));
+      ++export_epoch_;
       it = exports_.erase(it);
     } else {
       ++it;
@@ -11625,7 +11693,7 @@ void PlumeCommandProcessor::Report() {
                    "mode=%u swaps=%llu draws=%llu drawn=%llu dropped=%llu color_seen=%llu color_boxed=%llu "
                    "color_frustum=%llu depth_seen=%llu depth_boxed=%llu depth_frustum=%llu windows_tested=%llu "
                    "tested=%llu held=%llu answered=%llu hidden=%llu predicated=%llu test_failed=%llu cp_cpu_ms=%llu "
-                   "cull_ms=%llu model_ms=%llu box_ms=%llu eval_ms=%llu pipeline_binds=%llu nm_color=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu nm_depth=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                   "cull_ms=%llu model_ms=%llu box_ms=%llu eval_ms=%llu memo_hits=%llu pipeline_binds=%llu nm_color=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu nm_depth=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
                    hiz_mode_, (unsigned long long)swaps_, (unsigned long long)stats_.draws,
                    (unsigned long long)stats_.drawn, (unsigned long long)stats_.hiz_culled_total,
                    (unsigned long long)stats_.hiz_seen[1], (unsigned long long)stats_.hiz_eligible[1],
@@ -11637,7 +11705,7 @@ void PlumeCommandProcessor::Report() {
                    (unsigned long long)stats_.hiz_test_failed, (unsigned long long)(stats_.cp_cpu_us / 1000),
                    (unsigned long long)(stats_.hiz_cull_ns / 1000000), (unsigned long long)(stats_.hiz_stage_ns[0] / 1000000),
                    (unsigned long long)(stats_.hiz_stage_ns[1] / 1000000), (unsigned long long)(stats_.hiz_stage_ns[2] / 1000000),
-                   (unsigned long long)stats_.pipeline_binds,
+                   (unsigned long long)stats_.stream_memo_hits, (unsigned long long)stats_.pipeline_binds,
                    (unsigned long long)stats_.hiz_why_model[1][1], (unsigned long long)stats_.hiz_why_model[1][2], (unsigned long long)stats_.hiz_why_model[1][3], (unsigned long long)stats_.hiz_why_model[1][4], (unsigned long long)stats_.hiz_why_model[1][5], (unsigned long long)stats_.hiz_why_model[1][6], (unsigned long long)stats_.hiz_why_model[1][7], (unsigned long long)stats_.hiz_why_model[1][8], (unsigned long long)stats_.hiz_why_model[1][9], (unsigned long long)stats_.hiz_why_model[1][10], (unsigned long long)stats_.hiz_why_model[0][1], (unsigned long long)stats_.hiz_why_model[0][2], (unsigned long long)stats_.hiz_why_model[0][3], (unsigned long long)stats_.hiz_why_model[0][4], (unsigned long long)stats_.hiz_why_model[0][5], (unsigned long long)stats_.hiz_why_model[0][6], (unsigned long long)stats_.hiz_why_model[0][7], (unsigned long long)stats_.hiz_why_model[0][8], (unsigned long long)stats_.hiz_why_model[0][9], (unsigned long long)stats_.hiz_why_model[0][10]);
       std::fclose(out);
     }
