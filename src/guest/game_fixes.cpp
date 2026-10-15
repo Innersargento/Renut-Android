@@ -74,6 +74,28 @@ REX_HOOK_RAW(sub_8223FD48) {
   __imp__sub_8223FD48(ctx, base);
 }
 
+// Photo Mode's capture routine @ 0x82535F20 (r3 the destination texture). It
+// resolves the screen into a scratch texture, waits for the copy, and converts
+// that texture's memory into the photo's with the CPU (XGCopySurface); the game
+// then encodes its JPEG from those texels. Resolves stay on the GPU here, so
+// without help the picture is black. While the routine runs, the resolve it
+// issues is the one the CPU is about to read: native_d3d marks that record
+// (renut_in_photo_capture) and Plume copies that one resolve and no other. A
+// routine that is never called, or a resolve outside it, copies nothing - the
+// cost while playing is zero.
+namespace {
+thread_local bool in_photo_capture = false;
+}
+
+extern "C" bool renut_in_photo_capture() { return in_photo_capture; }
+
+extern "C" void __imp__sub_82535F20(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_82535F20) {
+  in_photo_capture = true;
+  __imp__sub_82535F20(ctx, base);
+  in_photo_capture = false;
+}
+
 // Scene changes, held until the new scene's pipelines exist - as
 // UnleashedRecomp holds its loading screen - so it is never drawn without
 // them (plume_gpu.cpp: PlumeSceneRequested). The app shows the progress over

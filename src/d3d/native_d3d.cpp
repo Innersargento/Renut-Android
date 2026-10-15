@@ -69,6 +69,9 @@ REX_FUNC(sub_821E5218);  // D3D_PatchVertexShaderToMatchVertexDeclaration
 REX_FUNC(sub_82210AB0);  // KickOff: more ring space
 void __imp__sub_822052C8(PPCContext& __restrict, uint8_t*);  // InsertCallback, the original
 void __imp__sub_8228A748(PPCContext& __restrict, uint8_t*);  // SynchronizeToPresentationInterval
+// True while this guest thread is inside Photo Mode's capture routine
+// (guest/game_fixes.cpp): the resolve it issues is marked for the CPU read.
+bool renut_in_photo_capture();
 }
 
 namespace renut::native_d3d {
@@ -1461,7 +1464,8 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     // surface registers RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005).
     for (uint32_t r = 0x2318; r <= 0x2323; ++r) list.words.push_back(U32(base, dev + kRegs2300 + (r - 0x2300) * 4));
     for (uint32_t r = 0; r < 6; ++r) list.words.push_back(U32(base, dev + kRegs2000 + r * 4));
-    list.words.push_back(source);
+    // Bit 8: the capture Photo Mode's routine is making (see NativeResolve).
+    list.words.push_back(source | (renut_in_photo_capture() ? 0x100u : 0u));
     // The destination object: the level, slice or face the copy goes to, as
     // Direct3D's own lookup found it (3D slices interleave and stay by address).
     const bool to_object = dimension != 2;

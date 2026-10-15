@@ -1659,20 +1659,16 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // Resolves come as records (NativeResolve); the ring's copy draws do nothing.
   bool IssueCopy() override { return true; }
   bool ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces);
-  // A colour resolve whose pixels the CPU reads straight from guest memory (the game's
-  // Photo Mode encodes its picture from them): the GPU copy is run and waited for, then
-  // written into the resolve's tiled destination. See ReadbackResolve.
+  // The picture Photo Mode takes: the game's capture routine (sub_82535F20, hooked in
+  // guest/game_fixes.cpp) names the resolve it is about to read with the CPU, and only
+  // that one is run, waited for and written into its tiled destination. Everything
+  // else the scene resolves stays on the GPU.
   void ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info, uint32_t base_address, uint32_t dest_x,
                        uint32_t dest_y, uint32_t w, uint32_t h, uint32_t pitch, uint32_t bpp, uint32_t scale = 4);
   // Debug: appends a line to <files>/plume-resolve.log while <files>/plume-resolve-log exists.
   void LogResolveLine(const std::string& line);
-  // <files>/plume-readback: absent or "auto" = full-screen colour copies into a texture no draw
-  // fetches (Photo Mode's picture); "off"; "big" = every full-screen copy into a texture; "mid" =
-  // anything of 256x128 or more; a hex address = copies into that address.
-  int readback_mode_ = 1;
-  uint32_t readback_address_ = 0;
-  uint32_t readback_done_ = 0;
-  std::unordered_map<uint32_t, uint64_t> readback_last_;
+  uint32_t photo_captures_ = 0;
+  bool capture_this_resolve_ = false;
   bool resolve_log_ = false;
   void NativeResolve(const uint32_t* record);
   // The surfaces bound when the lists last sent the target registers
@@ -10077,7 +10073,11 @@ void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
   // The source is the surface bound in the slot the resolve names; its
   // register is RB_COLOR_INFO, _DEPTH_INFO or RB_COLOR1..3_INFO.
   static constexpr uint32_t kRegisterOfSlot[5] = {1, 3, 4, 5, 2};
-  const uint32_t slot = std::min(w[23], 4u);
+  // Bit 8 of the source word: Photo Mode's capture routine issued this resolve
+  // (native_d3d.cpp), the one copied to the CPU. Not tied to an address: the
+  // scratch texture it resolves into is built on the spot.
+  capture_this_resolve_ = (w[23] & 0x100) != 0;
+  const uint32_t slot = std::min(w[23] & 0xFFu, 4u);
   ResolveSurfaces surfaces;
   surfaces.source = NativeTarget(slot, w[17 + kRegisterOfSlot[slot]]);
   surfaces.depth = SurfaceTarget(4);
@@ -10093,6 +10093,7 @@ void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
   surfaces.object_pitch = w[29];
   ++(surfaces.object_base ? object_resolves_ : address_resolves_count_);
   ExecuteResolve(info, surfaces);
+  capture_this_resolve_ = false;
 }
 
 bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces) {
@@ -10241,25 +10242,15 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
             uint32_t(info.copy_dest_info.copy_dest_endian), uint32_t(info.copy_dest_info.copy_dest_swap),
             uint32_t(dest.format)));
       }
-      if (readback_mode_ && !copying_depth && w && h) {
-        // The size it has in guest pixels, whatever resolution it was drawn at.
-        const uint32_t guest_w = uint32_t(uint64_t(w) * 4 / source->scale);
-        const uint32_t guest_h = uint32_t(uint64_t(h) * 4 / source->scale);
-        const bool big = to_object && guest_w >= 1000 && guest_h >= 500;
-        // Auto: a full-screen copy into a texture that no draw has fetched. Everything the scene
-        // resolves for post-processing is fetched the same frame; Photo Mode's picture never is.
-        if ((readback_mode_ == 1 && big && !dest.sampled) || (readback_mode_ == 2 && big) ||
-            (readback_mode_ == 3 && guest_w >= 256 && guest_h >= 128) ||
-            (readback_mode_ == 4 && base_address == readback_address_)) {
-          // The forced modes at most once every 90 frames per address, so a scene resolve into the same
-          // texture every frame does not stall it; auto only has to keep one that is never fetched
-          // (and so would be read back every frame) from doing that.
-          auto last = readback_last_.find(base_address);
-          if (last == readback_last_.end() || swaps_ - last->second >= (readback_mode_ == 1 ? 8u : 90u)) {
-            readback_last_[base_address] = swaps_;
-              ReadbackResolve(dest, info, base_address, dest_x, dest_y, w, h, dest.guest_pitch, dest_bpp,
-                              source->scale);
-          }
+      // Only the resolve Photo Mode's capture routine issued (capture_this_resolve_): one copy
+      // to the CPU per photo, and none while playing.
+      if (capture_this_resolve_) {
+        ++photo_captures_;
+        REXLOG_INFO("Renut: Plume photo capture {}: {}x{} at ({},{}) -> {:08X} {} pitch {} bpp {} format {} depth {}",
+                    photo_captures_, w, h, dest_x, dest_y, base_address, to_object ? "object" : "address",
+                    dest.guest_pitch, dest_bpp, uint32_t(dest.format), copying_depth);
+        if (!copying_depth && w && h && base_address) {
+          ReadbackResolve(dest, info, base_address, dest_x, dest_y, w, h, dest.guest_pitch, dest_bpp, source->scale);
         }
       }
     }
@@ -10395,10 +10386,8 @@ void PlumeCommandProcessor::ReadbackResolve(Resolved& dest, const draw_util::Res
   // Without this the next lookup would take the changed bytes for another texture
   // streamed into the same memory and drop the resolve.
   dest.guest_hash = ContentHash(memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
-  if (readback_done_++ < 12) {
-    REXLOG_INFO("Renut: Plume resolve {}x{} read back into {:08X} (pitch {}, endian {}, swap {}, {} texels)", w, h,
-                base_address, pitch, endian_value, swap_rb ? 1 : 0, written);
-  }
+  REXLOG_INFO("Renut: Plume photo capture {} ({}x{} into {:08X}, pitch {}, endian {}, swap {}, {} texels)",
+              photo_captures_, w, h, base_address, pitch, endian_value, swap_rb ? 1 : 0, written);
 }
 
 bool PlumeCommandProcessor::CreatePackPipeline() {
@@ -11260,26 +11249,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       REXLOG_INFO("Renut: Plume snapshot of the first resolve shader {:016X} samples", snap_shader);
     }
     snap_shader_ = snap_shader;
-    {
-      int mode = 1;
-      unsigned address = 0;
-      if (FILE* file = std::fopen((root + "/plume-readback").c_str(), "r")) {
-        char word[16] = {};
-        if (std::fscanf(file, "%15s", word) == 1) {
-          if (!std::strcmp(word, "off")) mode = 0;
-          else if (!std::strcmp(word, "big")) mode = 2;
-          else if (!std::strcmp(word, "mid")) mode = 3;
-          else if (std::strcmp(word, "auto") && std::sscanf(word, "%x", &address) == 1) mode = 4;
-        }
-        std::fclose(file);
-      }
-      if (mode != readback_mode_ || address != readback_address_) {
-        REXLOG_INFO("Renut: Plume resolve readback mode {} address {:08X}", mode, address);
-      }
-      readback_mode_ = mode;
-      readback_address_ = address;
-      resolve_log_ = access((root + "/plume-resolve-log").c_str(), F_OK) == 0;
-    }
+    resolve_log_ = access((root + "/plume-resolve-log").c_str(), F_OK) == 0;
     {
       std::vector<ConstOverride> overrides;
       if (FILE* file = std::fopen((root + "/plume-const").c_str(), "r")) {
