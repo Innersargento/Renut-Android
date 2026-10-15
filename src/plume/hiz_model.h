@@ -36,6 +36,22 @@ struct FetchDesc {
   uint32_t used_mask = 0;
 };
 
+// Why a model could not be made, by where the unknown came from.
+enum class Why : uint8_t {
+  kNone = 0,     // a model exists
+  kControl,      // relative destinations, step limits, other unsupported flow
+  kLoop,         // a loop (aL): skinning over the bones, mostly
+  kPredicate,    // predication whose condition the executor cannot know
+  kNoFetch,      // no fetched element can be a position
+  kInstanced,    // constants addressed by a0 computed from the vertex index only
+  kSkinned,      // constants addressed by a0 computed from another fetched element
+  kRelative,     // constants addressed by a0/aL of some other origin
+  kOtherFetch,   // the position depends on a second fetched element
+  kVertexIndex,  // the position depends on the vertex index (not through a0)
+  kNonlinear,    // a non-affine operation (comparisons, floor, products of positions)
+  kCount
+};
+
 struct Model {
   struct Node {
     uint8_t op = 0;
@@ -43,6 +59,7 @@ struct Model {
     float imm = 0.f;
   };
   bool valid = false;
+  Why why = Why::kControl;
   FetchDesc fetch;
   std::vector<Node> nodes;
   // coeff[o][j]: node of clip component o (x, y, z, w) for j = 0 the bias, 1..4

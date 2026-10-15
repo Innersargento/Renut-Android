@@ -1397,6 +1397,9 @@ struct Stats {
   uint64_t flush_windows[8] = {}, flush_draws[8] = {};
   uint64_t hiz_boxed_draws = 0, hiz_why_not[4] = {}, hiz_small_windows = 0, hiz_small_draws = 0, hiz_windows_all = 0;
   uint64_t hiz_cull_ns = 0;
+  uint64_t hiz_stage_ns[3] = {};  // model lookup, box lookup, constants evaluation (sampled, scaled)
+  // Draws with no model by why (renut::hiz::Why), depth-only [0] and colour [1].
+  uint64_t hiz_why_model[2][12] = {};
   uint64_t hiz_verified = 0, hiz_violations = 0, hiz_missed_hidden = 0, hiz_missed_empty = 0;
   uint64_t hiz_windows_tested = 0, hiz_records = 0, hiz_held = 0, hiz_test_failed = 0, hiz_answered = 0,
            hiz_occluded = 0, hiz_held_skipped = 0, hiz_held_visible = 0, hiz_predicated_draws = 0;
@@ -1769,6 +1772,24 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint32_t validate_logged_ = 0;
   uint64_t kept_drop_events_ = 0, validate_ranges_ = 0, validate_stale_ = 0;
   std::unordered_map<uint64_t, KeptStream> kept_streams_;
+  // What the write watch has to look at when the guest writes: the kept streams
+  // and the watched textures by 64 KB block of guest memory, so a write finds
+  // its few instead of every one (entries of what is gone are skipped, and the
+  // index is rebuilt when it has grown far past what lives).
+  std::unordered_multimap<uint32_t, uint64_t> kept_block_index_, texture_block_index_;
+  static void IndexBlocks(std::unordered_multimap<uint32_t, uint64_t>& index, uint32_t base, uint32_t size,
+                          uint64_t key) {
+    if (!size) return;
+    for (uint32_t block = base >> 16; block <= uint32_t((uint64_t(base) + size - 1) >> 16); ++block) {
+      index.emplace(block, key);
+    }
+  }
+  void DropKept(KeptStream& kept);
+  // A format-17 stream (see RepackFormat17) kept already repacked, like a kept
+  // stream; falls back to UploadRepacked when it cannot be kept.
+  bool RepackedStream(uint32_t address, uint32_t size, xenos::Endian endian,
+                      const std::pair<uint32_t, uint32_t>* elements, uint32_t element_count,
+                      RenderBuffer*& buffer, uint64_t& offset);
   LookupMemo<KeptStream, 13> kept_memo_;
   uint64_t kept_bytes_ = 0;
   // Host memory profile (see InitializeContext). A phone with 3 GB of RAM
@@ -2446,6 +2467,16 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void HizIndexBox(uint64_t key, const HizBox& box);
   void HizDropBoxes(uint32_t start, uint32_t length);
   HizBox hiz_scratch_box_;
+  // A direct-mapped front for hiz_boxes_: the same mesh and index range come
+  // back draw after draw and frame after frame. Entries die with a generation
+  // bump whenever a box is erased.
+  struct HizFront {
+    uint64_t key = 0;
+    const HizBox* box = nullptr;
+    uint32_t generation = 0;
+  };
+  std::array<HizFront, 8192> hiz_front_{};
+  uint32_t hiz_box_generation_ = 1;
   std::unordered_map<uint64_t, uint64_t> hiz_clip_states_;
   HizModelEntry* HizModelFor(HostShader& vs);
   const HizBox* HizBoxFor(const renut::hiz::Model& model, const xenos::xe_gpu_vertex_fetch_t& fetch,
@@ -2465,6 +2496,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   } hiz_test_;
   uint64_t hiz_last_box_key_ = 0;
   uint32_t hiz_timer_phase_ = 0;
+  bool hiz_stage_timing_ = false;
+  std::unordered_map<uint64_t, uint64_t> hiz_nomodel_draws_;
+  std::unordered_map<uint64_t, uint32_t> hiz_nomodel_why_;
   // ---- Hi-Z occlusion (see HizFlushWindow) ----
   bool hiz_cond_ = false;  // the device has conditional rendering
   static constexpr uint32_t kHizMaxRecords = 16384;
@@ -3788,6 +3822,19 @@ std::pair<uint32_t, uint32_t> PlumeCommandProcessor::WatchHitThunk(void* context
   return {start, length};
 }
 
+// A kept stream the guest wrote over: the buffer goes once the frames in flight
+// are done with it, and it counts as dropped (see GuestStream).
+void PlumeCommandProcessor::DropKept(KeptStream& kept) {
+  // Earlier draws of this frame, and the frame before, may still read it.
+  retired_buffers_[slot_].push_back(std::move(kept.buffer));
+  kept_bytes_ -= kept.size;
+  kept.valid = false;
+  ++kept.drops;
+  kept.dropped_frame = swaps_;
+  ++stats_.kept_drops;
+  ++kept_drop_events_;
+}
+
 void PlumeCommandProcessor::DrainWatchHits() {
   const uint32_t serial = watch_serial_.load(std::memory_order_acquire);
   if (serial == watch_seen_) return;
@@ -3797,29 +3844,54 @@ void PlumeCommandProcessor::DrainWatchHits() {
     std::lock_guard<std::mutex> lock(watch_mutex_);
     hits.swap(watch_hits_);
   }
-  for (auto& [key, texture] : guest_textures_) {
-    if (!texture.watched) continue;
-    for (const auto& [start, length] : hits) {
-      if ((texture.watch_begin[0] < start + length && start < texture.watch_end[0]) ||
-          (texture.watch_begin[1] < start + length && start < texture.watch_end[1])) {
+  for (const auto& [start, length] : hits) {
+    if (!length) continue;
+    const uint32_t first = start >> 16, last = uint32_t((uint64_t(start) + length - 1) >> 16);
+    auto touches = [&](uint32_t base, uint32_t end) { return base < start + uint64_t(length) && start < end; };
+    auto drop_texture = [&](GuestTexture& texture) {
+      if (texture.watched && (touches(texture.watch_begin[0], texture.watch_end[0]) ||
+                              touches(texture.watch_begin[1], texture.watch_end[1]))) {
         texture.watched = false;
-        break;
+      }
+    };
+    auto drop_kept = [&](KeptStream& kept) {
+      if (kept.valid && touches(kept.base, kept.base + kept.size)) DropKept(kept);
+    };
+    if (last - first > 1024) {
+      // A huge range: every one is looked at.
+      for (auto& [key, texture] : guest_textures_) drop_texture(texture);
+      for (auto& [key, kept] : kept_streams_) drop_kept(kept);
+      continue;
+    }
+    for (uint32_t block = first; block <= last; ++block) {
+      auto textures = texture_block_index_.equal_range(block);
+      for (auto it = textures.first; it != textures.second; ++it) {
+        auto found = guest_textures_.find(it->second);
+        if (found != guest_textures_.end()) drop_texture(found->second);
+      }
+      auto kepts = kept_block_index_.equal_range(block);
+      for (auto it = kepts.first; it != kepts.second; ++it) {
+        auto found = kept_streams_.find(it->second);
+        if (found != kept_streams_.end()) drop_kept(found->second);
       }
     }
   }
-  for (auto& [key, kept] : kept_streams_) {
-    if (!kept.valid) continue;
-    for (const auto& [start, length] : hits) {
-      if (kept.base < start + length && start < kept.base + kept.size) {
-        // Earlier draws of this frame, and the frame before, may still read it.
-        retired_buffers_[slot_].push_back(std::move(kept.buffer));
-        kept_bytes_ -= kept.size;
-        kept.valid = false;
-        ++kept.drops;
-        kept.dropped_frame = swaps_;
-        ++stats_.kept_drops;
-        ++kept_drop_events_;
-        break;
+  // Entries of what is gone pile up: rebuilt from what is live.
+  if (kept_block_index_.size() > 400000) {
+    kept_block_index_.clear();
+    for (auto& [key, kept] : kept_streams_) {
+      if (kept.valid) IndexBlocks(kept_block_index_, kept.base, kept.size, key);
+    }
+  }
+  if (texture_block_index_.size() > 400000) {
+    texture_block_index_.clear();
+    for (auto& [key, texture] : guest_textures_) {
+      if (!texture.watched) continue;
+      for (uint32_t which = 0; which < 2; ++which) {
+        if (texture.watch_end[which] > texture.watch_begin[which]) {
+          IndexBlocks(texture_block_index_, texture.watch_begin[which],
+                      texture.watch_end[which] - texture.watch_begin[which], key);
+        }
       }
     }
   }
@@ -3827,6 +3899,66 @@ void PlumeCommandProcessor::DrainWatchHits() {
   if (!hiz_boxes_.empty()) {
     for (const auto& [start, length] : hits) HizDropBoxes(start, length);
   }
+}
+
+bool PlumeCommandProcessor::RepackedStream(uint32_t address, uint32_t size, xenos::Endian endian,
+                                           const std::pair<uint32_t, uint32_t>* elements, uint32_t element_count,
+                                           RenderBuffer*& buffer, uint64_t& offset) {
+  buffer = upload_.get();
+  if (!keep_streams_ || !address || !size || size > (4u << 20)) {
+    return UploadRepacked(address, size, endian, elements, element_count, offset);
+  }
+  DrainWatchHits();
+  uint64_t key = 0xC2B2AE3D27D4EB4Full ^ (uint64_t(address) << 20) ^ (uint64_t(size) << 3) ^ uint64_t(endian);
+  for (uint32_t i = 0; i < element_count; ++i) {
+    key = (key ^ ((uint64_t(elements[i].first) << 32) | elements[i].second)) * 0x100000001B3ull;
+  }
+  KeptStream& kept = kept_streams_[key];
+  kept.last_used = swaps_;
+  if (kept.valid && kept.base == address && kept.size == size) {
+    buffer = kept.buffer.get();
+    offset = 0;
+    ++stats_.kept_hits;
+    return true;
+  }
+  const bool dynamic = kept.drops >= 3 && swaps_ - kept.dropped_frame < 900;
+  if (dynamic || kept_bytes_ + size > kept_budget_ ||
+      memory_->GetPhysicalHeap()->QueryRangeAccess(address, address + size - 1) !=
+          rex::memory::PageAccess::kReadWrite) {
+    return UploadRepacked(address, size, endian, elements, element_count, offset);
+  }
+  auto made = device_->createBuffer(RenderBufferDesc::UploadBuffer(
+      size, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::DEVICE_ADDRESSABLE |
+                RenderBufferFlag::STORAGE));
+  if (!made) return UploadRepacked(address, size, endian, elements, element_count, offset);
+  // Watch first, copy second: a write that lands during the copy still drops it.
+  memory_->EnablePhysicalMemoryAccessCallbacks(address, size, true, false);
+  auto* data = static_cast<uint8_t*>(made->map());
+  CopySwapped(data, memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
+  for (uint32_t i = 0; i < element_count; ++i) {
+    const uint32_t stride = elements[i].second;
+    if (!stride) continue;
+    for (uint64_t at = elements[i].first; at + 4 <= size; at += stride) {
+      uint32_t word;
+      std::memcpy(&word, data + at, 4);
+      word = RepackFormat17(word);
+      std::memcpy(data + at, &word, 4);
+    }
+  }
+  made->unmap();
+  kept.buffer = std::move(made);
+  kept.base = address;
+  kept.size = size;
+  kept.endian = uint32_t(endian);
+  kept.made_frame = swaps_;
+  kept.valid = true;
+  IndexBlocks(kept_block_index_, address, size, key);
+  kept_bytes_ += size;
+  stats_.kept_bytes_made += size;
+  stats_.stream_bytes += size;
+  buffer = kept.buffer.get();
+  offset = 0;
+  return true;
 }
 
 bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::Endian endian,
@@ -3909,6 +4041,7 @@ bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::
   kept.endian = uint32_t(endian);
   kept.made_frame = swaps_;
   kept.valid = true;
+  IndexBlocks(kept_block_index_, window_base, window_size, key);
   kept_bytes_ += window_size;
   stats_.kept_bytes_made += window_size;
   buffer = kept.buffer.get();
@@ -5356,6 +5489,8 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
       memory_->EnablePhysicalMemoryAccessCallbacks(texture.watch_begin[which],
                                                    texture.watch_end[which] - texture.watch_begin[which],
                                                    true, false);
+      IndexBlocks(texture_block_index_, texture.watch_begin[which],
+                  texture.watch_end[which] - texture.watch_begin[which], key);
     }
     texture.watched = true;
   }
@@ -6611,6 +6746,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
                                                           (!ps || ps->entry->hash != debug_shader_)))) {
     // One call in 16 is timed (the clock reads are a cost of their own).
     const bool timed = (++hiz_timer_phase_ & 15) == 0;
+    hiz_stage_timing_ = timed;
     std::chrono::steady_clock::time_point cull_start;
     if (timed) cull_start = std::chrono::steady_clock::now();
     const bool dropped = HizCullDraw(*vs, prim_type, index_count, index_buffer_info, color_pass);
@@ -7002,7 +7138,8 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       }
       if (repack_count && !ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
         buffer = upload_.get();
-        repacked = UploadRepacked(fetch.address << 2, fetch.size << 2, fetch.endian, repack, repack_count, offset);
+        repacked = RepackedStream(fetch.address << 2, fetch.size << 2, fetch.endian, repack, repack_count, buffer,
+                                  offset);
         if (repacked) Trace("  stream{} repacked: {} format 17 element(s)", stream, repack_count);
       }
     }
@@ -8594,8 +8731,13 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
   ++stats_.drawn;
   if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
   {
-    const uint64_t first_frame =
-        pair_first_frame_.try_emplace(pk.vs_hash * 1099511628211ull ^ pk.ps_hash, swaps_).first->second;
+    // Only one draw in eight asks (a hash lookup a draw was over 1% of this
+    // thread): the report of a lost device calls a pair new from its first
+    // frame, and an unknown one is simply not called new.
+    uint64_t first_frame = 0;
+    if ((stats_.drawn & 7) == 0) {
+      first_frame = pair_first_frame_.try_emplace(pk.vs_hash * 1099511628211ull ^ pk.ps_hash, swaps_).first->second;
+    }
     const uint64_t at = recent_draw_count_.load(std::memory_order_relaxed);
     RecentDraw& recent = recent_draws_[at % kRecentDraws];
     recent = {swaps_, pk.vs_hash, pk.ps_hash, uint64_t(uintptr_t(pk.pipeline)),
@@ -8886,6 +9028,7 @@ void PlumeCommandProcessor::HizIndexBox(uint64_t key, const HizBox& box) {
 // The guest wrote [start, start + length): the boxes made from any of it go.
 void PlumeCommandProcessor::HizDropBoxes(uint32_t start, uint32_t length) {
   if (!length) return;
+  ++hiz_box_generation_;
   const uint32_t first = start >> 16, last = uint32_t((uint64_t(start) + length - 1) >> 16);
   if (last - first > 4096) {
     // A huge range: cheaper to look at every box.
@@ -9015,8 +9158,20 @@ const PlumeCommandProcessor::HizBox* PlumeCommandProcessor::HizBoxFor(
   parts[n++] = indexed ? ((uint64_t(uint32_t(index_info->format)) << 8) | uint64_t(uint32_t(index_info->endianness)))
                        : 0xFFFF;
   parts[n++] = uint64_t(uint32_t(base_vertex));
-  const uint64_t key = XXH3_64bits(parts, n * sizeof(uint64_t));
+  // A multiply-and-rotate mix of the six words: the key only has to tell two
+  // meshes apart, and this ran for every draw.
+  uint64_t key = 0x9E3779B97F4A7C15ull;
+  for (uint32_t i = 0; i < n; ++i) {
+    key = (key ^ parts[i]) * 0xFF51AFD7ED558CCDull;
+    key ^= key >> 32;
+  }
   hiz_last_box_key_ = key;
+  HizFront& front = hiz_front_[key & (hiz_front_.size() - 1)];
+  if (front.key == key && front.generation == hiz_box_generation_ && front.box &&
+      swaps_ - front.box->checked_frame < 30) {
+    ++stats_.hiz_box_hits;
+    return front.box->valid ? front.box : nullptr;
+  }
 
   const uint8_t* memory = memory_->TranslatePhysical<const uint8_t*>(0);
   auto checksum_of = [&](const HizBox& box) {
@@ -9038,14 +9193,17 @@ const PlumeCommandProcessor::HizBox* PlumeCommandProcessor::HizBoxFor(
     // its bytes is a second line, looked at every 30 frames rather than at every draw.
     if (swaps_ - box.checked_frame < 30) {
       ++stats_.hiz_box_hits;
+      front = {key, &box, hiz_box_generation_};
       return box.valid ? &box : nullptr;
     }
     if (checksum_of(box) == box.checksum) {
       box.checked_frame = swaps_;
       ++stats_.hiz_box_hits;
+      front = {key, &box, hiz_box_generation_};
       return box.valid ? &box : nullptr;
     }
     hiz_boxes_.erase(found);
+    ++hiz_box_generation_;
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -9072,6 +9230,7 @@ const PlumeCommandProcessor::HizBox* PlumeCommandProcessor::HizBoxFor(
     box.checked_frame = swaps_;
     const HizBox* stored = &hiz_boxes_.emplace(key, box).first->second;
     HizIndexBox(key, box);
+    front = {key, stored, hiz_box_generation_};
     return valid ? stored : nullptr;
   };
   if (!box.vertex_size || uint64_t(box.vertex_base) + box.vertex_size > 0x20000000ull ||
@@ -9161,9 +9320,17 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
   }
   if (regs.Get<reg::SQ_VS_CONST>(XE_GPU_REG_SQ_VS_CONST).base != 0) return ++stats_.hiz_why[4], false;
 
+  const auto stage_a = hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   HizModelEntry* entry = HizModelFor(vs);
+  if (hiz_stage_timing_) {
+    stats_.hiz_stage_ns[0] += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - stage_a).count());
+  }
   if (!entry->model || !entry->model->valid) {
     ++stats_.hiz_no_model[kind];
+    ++stats_.hiz_why_model[kind][entry->model ? uint32_t(entry->model->why) % 12 : 0];
+    ++hiz_nomodel_draws_[(vs.entry ? vs.entry->hash : 0) ^ (entry->model ? uint64_t(entry->model->why) & 15 : 0)];
+    hiz_nomodel_why_[vs.entry ? vs.entry->hash : 0] = entry->model ? uint32_t(entry->model->why) : 0;
     return false;
   }
   renut::hiz::Model& model = *entry->model;
@@ -9173,7 +9340,12 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
     return false;
   }
   const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+  const auto stage_b = hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   const HizBox* box = HizBoxFor(model, fetch, index_info, index_count, base_vertex);
+  if (hiz_stage_timing_) {
+    stats_.hiz_stage_ns[1] += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - stage_b).count());
+  }
   if (!box) {
     ++stats_.hiz_no_box[kind];
     return false;
@@ -9193,7 +9365,12 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
   // The constants as the shader sees them, and the model's affine map.
   const float* constants = reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
   float affine[4][5];
+  const auto stage_c = hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   renut::hiz::Evaluate(model, constants, 0, affine);
+  if (hiz_stage_timing_) {
+    stats_.hiz_stage_ns[2] += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - stage_c).count());
+  }
   // The box in clip space is a parallelepiped: centre C and, along the element's
   // components, the columns A[.][1 + j] * half_j. A plane's value over it ranges
   // over centre +- sum |coefficient along j| * half_j, so "all of it outside" is
@@ -11302,6 +11479,23 @@ void PlumeCommandProcessor::Report() {
         stats_.hiz_model_us / 1000, stats_.hiz_boxes_made, stats_.hiz_box_us / 1000, stats_.hiz_box_hits,
         stats_.hiz_why[0], stats_.hiz_why[1], stats_.hiz_why[2], stats_.hiz_why[3], stats_.hiz_why[4]);
   }
+  if (hiz_mode_ && !hiz_nomodel_draws_.empty()) {
+    std::vector<std::pair<uint64_t, uint64_t>> ranked;
+    for (const auto& [key, count] : hiz_nomodel_draws_) ranked.emplace_back(count, key);
+    std::sort(ranked.rbegin(), ranked.rend());
+    std::string line = "Renut: Plume Hi-Z shaders without a model (vs hash/why/draws):";
+    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); ++i) {
+      uint64_t hash = ranked[i].second;
+      uint32_t why = 0;
+      for (uint32_t w = 0; w < 16; ++w) {
+        auto it = hiz_nomodel_why_.find(hash ^ w);
+        if (it != hiz_nomodel_why_.end() && it->second == w) { why = w; hash ^= w; break; }
+      }
+      line += fmt::format(" [{:016X}/{}/{}]", hash, why, ranked[i].first);
+    }
+    REXLOG_INFO("{}", line);
+    hiz_nomodel_draws_.clear();
+  }
   if (hiz_mode_ && !hiz_clip_states_.empty()) {
     std::vector<std::pair<uint64_t, uint64_t>> ranked;
     for (const auto& [state, count] : hiz_clip_states_) ranked.emplace_back(count, state);
@@ -11431,7 +11625,7 @@ void PlumeCommandProcessor::Report() {
                    "mode=%u swaps=%llu draws=%llu drawn=%llu dropped=%llu color_seen=%llu color_boxed=%llu "
                    "color_frustum=%llu depth_seen=%llu depth_boxed=%llu depth_frustum=%llu windows_tested=%llu "
                    "tested=%llu held=%llu answered=%llu hidden=%llu predicated=%llu test_failed=%llu cp_cpu_ms=%llu "
-                   "cull_ms=%llu pipeline_binds=%llu\n",
+                   "cull_ms=%llu model_ms=%llu box_ms=%llu eval_ms=%llu pipeline_binds=%llu nm_color=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu nm_depth=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
                    hiz_mode_, (unsigned long long)swaps_, (unsigned long long)stats_.draws,
                    (unsigned long long)stats_.drawn, (unsigned long long)stats_.hiz_culled_total,
                    (unsigned long long)stats_.hiz_seen[1], (unsigned long long)stats_.hiz_eligible[1],
@@ -11441,7 +11635,10 @@ void PlumeCommandProcessor::Report() {
                    (unsigned long long)stats_.hiz_held, (unsigned long long)stats_.hiz_answered,
                    (unsigned long long)stats_.hiz_occluded, (unsigned long long)stats_.hiz_predicated_draws,
                    (unsigned long long)stats_.hiz_test_failed, (unsigned long long)(stats_.cp_cpu_us / 1000),
-                   (unsigned long long)(stats_.hiz_cull_ns / 1000000), (unsigned long long)stats_.pipeline_binds);
+                   (unsigned long long)(stats_.hiz_cull_ns / 1000000), (unsigned long long)(stats_.hiz_stage_ns[0] / 1000000),
+                   (unsigned long long)(stats_.hiz_stage_ns[1] / 1000000), (unsigned long long)(stats_.hiz_stage_ns[2] / 1000000),
+                   (unsigned long long)stats_.pipeline_binds,
+                   (unsigned long long)stats_.hiz_why_model[1][1], (unsigned long long)stats_.hiz_why_model[1][2], (unsigned long long)stats_.hiz_why_model[1][3], (unsigned long long)stats_.hiz_why_model[1][4], (unsigned long long)stats_.hiz_why_model[1][5], (unsigned long long)stats_.hiz_why_model[1][6], (unsigned long long)stats_.hiz_why_model[1][7], (unsigned long long)stats_.hiz_why_model[1][8], (unsigned long long)stats_.hiz_why_model[1][9], (unsigned long long)stats_.hiz_why_model[1][10], (unsigned long long)stats_.hiz_why_model[0][1], (unsigned long long)stats_.hiz_why_model[0][2], (unsigned long long)stats_.hiz_why_model[0][3], (unsigned long long)stats_.hiz_why_model[0][4], (unsigned long long)stats_.hiz_why_model[0][5], (unsigned long long)stats_.hiz_why_model[0][6], (unsigned long long)stats_.hiz_why_model[0][7], (unsigned long long)stats_.hiz_why_model[0][8], (unsigned long long)stats_.hiz_why_model[0][9], (unsigned long long)stats_.hiz_why_model[0][10]);
       std::fclose(out);
     }
   }

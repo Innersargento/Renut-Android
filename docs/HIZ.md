@@ -96,3 +96,38 @@ Por quadro (média de 4 janelas de 300 quadros alternadas 0/2/3):
   clock estava mais alto desta vez (500-550 MHz contra ~350), então os números
   absolutos não são comparáveis entre as duas medições, só os pares dentro de cada
   uma.
+
+## Por que um draw não tem modelo (PC, cena do título, por 300 quadros, cor)
+
+`files/plume-hiz.txt` agora traz `nm_color=` e `nm_depth=` (10 causas, na ordem
+da enum `renut::hiz::Why` a partir de 1: controle, laço, predicado, sem fetch,
+instanciado, skinned, relativo, outro elemento, índice de vértice, não linear) e
+o log lista os shaders sem modelo mais frequentes.
+
+* **Predicado** (~70-136 mil de ~320-375 mil draws de cor; 3-30 mil de ~80-100 mil de
+  profundidade): os shaders skinned. O predicado vem do peso do osso
+  (`p0 = r0.y != 0`) e as matrizes de osso vêm do stream 10 por índice de
+  vértice, então a posição não é afim em constantes. Exigiria análise por
+  intervalos e leitura da paleta; o custo por draw (alguns µs) passa do que um
+  corte poupa (~5 µs), então não foi feito.
+* **Instanciado** (a0 calculado do vertex id, constantes c133+): 21-32 mil de cor.
+  Esses shaders também fazem balanço com `sin()`, ou seja, não são afins.
+* **Não linear**: era 12-38 mil; quase tudo era `max(a, a)` escalar (o mov do
+  montador) que o executor não reconhecia. Corrigido: 0 agora, e os draws de cor
+  com caixa subiram de ~190 mil para ~210-229 mil por janela.
+
+## Perfil da thread de comandos (simpleperf, Showdown, câmera parada, 20/10)
+
+Thread "GPU Commands", ~100% de um núcleo, ~4,4-4,7 µs por draw. Próprio (self) e
+inclusive, % da thread:
+
+* `IssueDraw` 12% próprio, 83% inclusive; `EmitDraw` + `FlushDeferred` 32%.
+* Dentro do driver (Turnip): `setPipeline` 8%, `drawIndexedInstanced` 5,4%,
+  `setIndexBuffer` 2,7%, `ioctl` 8%, e a maior parte do `memmove` (11%) é cópia
+  de estado dentro dessas chamadas.
+* `GuestStream` 4,2% + `BindStream` 1,3%; `GetGuestTexture` 3,7%; `HizBoxFor`
+  3,9%; `HizCullDraw` inclusive 8,7-9,8%.
+* Antes das otimizações deste dia: `DrainWatchHits` 3,6% (percorria todas as
+  texturas e streams a cada escrita) e `UploadRepacked` 4,2% (copiava o stream
+  de formato 17 a cada draw) e o hash de par de shader 1,3%: os três saíram do
+  topo. Custo por draw na thread: 4,66 -> 4,38 µs (-6%).

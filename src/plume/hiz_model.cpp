@@ -23,8 +23,13 @@ constexpr uint32_t kMaxControlSteps = 3000;
 // A scalar that is either unknown (taint) or the affine form
 //   k[0] + k[1] * fx + k[2] * fy + k[3] * fz + k[4] * fw
 // of the candidate element's components, each k a node over the constants.
+// `src` says where an unknown came from: kVid the vertex index, kFetch another
+// fetched element, kRel a constant addressed by a0/aL (the address register's
+// own origin in the bits above 4), kNonlin anything else.
+enum Src : uint8_t { kVid = 1, kFetch = 2, kRel = 4, kNonlin = 8 };
 struct Val {
   bool taint = false;
+  uint8_t src = 0;
   uint16_t k[5] = {};
 };
 
@@ -112,8 +117,9 @@ class Executor {
     for (auto& r : temps_)
       for (auto& v : r) v = Val{};
     // r0.x holds the vertex index.
-    temps_[0][0].taint = true;
-    for (auto& p : position_) p = Val{}, p.taint = true;
+    temps_[0][0] = Taint(kVid);
+    a0_src_ = 0;
+    for (auto& p : position_) p = Taint(kNonlin);
     position_written_ = 0;
     last_full_ = {};
     have_full_ = false;
@@ -123,6 +129,7 @@ class Executor {
   }
 
   Builder builder;
+  Why failure() const { return fail_why_; }
   std::vector<FetchInstance> fetches;  // filled by the collecting run
   Val position_[4];
   uint32_t position_written_ = 0;
@@ -133,17 +140,21 @@ class Executor {
   const uint32_t* bools_;
   int target_ = -1;
   bool fail_ = false;
+  Why fail_why_ = Why::kControl;
   uint32_t fetch_count_ = 0;
   bool pred_known_ = true, pred_value_ = false;
   Val prev_;
+  // What the address register was last set from (Src bits).
+  uint8_t a0_src_ = 0;
   Val temps_[128][4];
   ucode::VertexFetchInstruction last_full_;
   bool have_full_ = false;
   uint32_t steps_ = 0;
 
-  static Val Taint() {
+  static Val Taint(uint8_t src = kNonlin) {
     Val v;
     v.taint = true;
+    v.src = src;
     return v;
   }
   bool Independent(const Val& v) const { return !v.k[1] && !v.k[2] && !v.k[3] && !v.k[4]; }
@@ -153,7 +164,7 @@ class Executor {
     return v;
   }
   Val VAdd(const Val& a, const Val& b) {
-    if (a.taint || b.taint) return Taint();
+    if (a.taint || b.taint) return Taint(uint8_t(a.src | b.src));
     Val r;
     for (int i = 0; i < 5; ++i) r.k[i] = builder.Add(a.k[i], b.k[i]);
     return r;
@@ -166,13 +177,13 @@ class Executor {
   }
   Val VAbs(const Val& a) {
     if (a.taint) return a;
-    if (!Independent(a)) return Taint();
+    if (!Independent(a)) return Taint(kNonlin);
     Val r;
     r.k[0] = builder.Abs(a.k[0]);
     return r;
   }
   Val VMul(const Val& a, const Val& b) {
-    if (a.taint || b.taint) return Taint();
+    if (a.taint || b.taint) return Taint(uint8_t(a.src | b.src));
     Val r;
     if (Independent(b)) {
       for (int i = 0; i < 5; ++i) r.k[i] = builder.Mul(a.k[i], b.k[0]);
@@ -182,7 +193,7 @@ class Executor {
       for (int i = 0; i < 5; ++i) r.k[i] = builder.Mul(b.k[i], a.k[0]);
       return r;
     }
-    return Taint();
+    return Taint(kNonlin);
   }
   static bool Same(const Val& a, const Val& b) {
     if (a.taint || b.taint) return false;
@@ -200,12 +211,12 @@ class Executor {
       const uint32_t index = ucode::AluInstruction::src_temp_reg(reg);
       absolute = ucode::AluInstruction::is_src_temp_value_absolute(reg);
       if (ucode::AluInstruction::is_src_temp_relative(reg) || index >= 128) {
-        for (auto& v : base) v = Taint();
+        for (auto& v : base) v = Taint(kRel);
       } else {
         for (int c = 0; c < 4; ++c) base[c] = temps_[index][c];
       }
     } else if (alu.src_const_is_addressed(i)) {
-      for (auto& v : base) v = Taint();
+      for (auto& v : base) v = Taint(uint8_t(kRel | (a0_src_ << 4)));
     } else {
       for (int c = 0; c < 4; ++c) base[c] = ConstVal(builder.Const((reg & 0xFF) * 4 + c));
     }
@@ -221,32 +232,29 @@ class Executor {
     if (alu.is_predicated()) {
       if (!pred_known_) {
         fail_ = true;
+        fail_why_ = Why::kPredicate;
         return;
       }
       if (alu.predicate_condition() != pred_value_) return;
     }
     // Vector operation.
-    Val vr[4] = {Taint(), Taint(), Taint(), Taint()};
+    Val vr[4] = {Taint(kNonlin), Taint(kNonlin), Taint(kNonlin), Taint(kNonlin)};
     const ucode::AluVectorOpcode vop = alu.vector_opcode();
     Val a[4], b[4], c[4];
-    switch (vop) {
-      case ucode::AluVectorOpcode::kAdd:
-      case ucode::AluVectorOpcode::kMul:
-      case ucode::AluVectorOpcode::kMax:
-      case ucode::AluVectorOpcode::kMin:
-      case ucode::AluVectorOpcode::kDp4:
-      case ucode::AluVectorOpcode::kDp3:
-        Source(alu, 1, a);
-        Source(alu, 2, b);
-        break;
-      case ucode::AluVectorOpcode::kMad:
-      case ucode::AluVectorOpcode::kDp2Add:
-        Source(alu, 1, a);
-        Source(alu, 2, b);
-        Source(alu, 3, c);
-        break;
-      default: break;
+    {
+      // Operands the opcode reads.
+      const ucode::AluVectorOpcodeInfo& info = ucode::GetAluVectorOpcodeInfo(vop);
+      Val* operands[3] = {a, b, c};
+      for (uint32_t o = 0; o < 3; ++o) {
+        if (info.operand_components_used[o]) Source(alu, o + 1, operands[o]);
+      }
     }
+    // What an unknown result comes from: everything the opcode read.
+    auto from_operands = [&]() {
+      uint8_t from = kNonlin;
+      for (int j = 0; j < 4; ++j) from |= uint8_t(a[j].src | b[j].src | c[j].src);
+      return from;
+    };
     switch (vop) {
       case ucode::AluVectorOpcode::kAdd:
         for (int i = 0; i < 4; ++i) vr[i] = VAdd(a[i], b[i]);
@@ -260,7 +268,9 @@ class Executor {
       case ucode::AluVectorOpcode::kMax:
       case ucode::AluVectorOpcode::kMin:
         // The assembler's mov is max(a, a).
-        for (int i = 0; i < 4; ++i) vr[i] = Same(a[i], b[i]) ? a[i] : Taint();
+        for (int i = 0; i < 4; ++i) {
+          vr[i] = Same(a[i], b[i]) ? a[i] : Taint(uint8_t(a[i].src | b[i].src | kNonlin));
+        }
         break;
       case ucode::AluVectorOpcode::kDp4:
       case ucode::AluVectorOpcode::kDp3: {
@@ -281,18 +291,26 @@ class Executor {
       case ucode::AluVectorOpcode::kSetpGtPush:
       case ucode::AluVectorOpcode::kSetpGePush:
         pred_known_ = false;
+        for (auto& v : vr) v = Taint(from_operands());
         break;
-      default: break;
+      case ucode::AluVectorOpcode::kMaxA:
+        // The address register is set from component w.
+        a0_src_ = uint8_t(a[3].src & ~kNonlin);
+        for (auto& v : vr) v = Taint(from_operands());
+        break;
+      default:
+        for (auto& v : vr) v = Taint(from_operands());
+        break;
     }
     if (alu.vector_clamp()) {
-      for (auto& v : vr) v = Taint();
+      for (auto& v : vr) v = Taint(uint8_t(v.src | kNonlin));
     }
 
     // Scalar operation (sees the registers as they were before this
     // instruction's vector write).
     const ucode::AluScalarOpcode sop = alu.scalar_opcode();
     const ucode::AluScalarOpcodeInfo& info = ucode::GetAluScalarOpcodeInfo(sop);
-    Val so[2] = {Taint(), Taint()};
+    Val so[2] = {Taint(kNonlin), Taint(kNonlin)};
     if (info.operand_count == 1) {
       const uint32_t reg = alu.src_reg(3);
       const uint32_t swizzle = alu.src_swizzle(3);
@@ -302,12 +320,12 @@ class Executor {
         const uint32_t index = ucode::AluInstruction::src_temp_reg(reg);
         absolute = ucode::AluInstruction::is_src_temp_value_absolute(reg);
         if (ucode::AluInstruction::is_src_temp_relative(reg) || index >= 128) {
-          for (auto& v : base) v = Taint();
+          for (auto& v : base) v = Taint(kRel);
         } else {
           for (int k = 0; k < 4; ++k) base[k] = temps_[index][k];
         }
       } else if (alu.src_const_is_addressed(3)) {
-        for (auto& v : base) v = Taint();
+        for (auto& v : base) v = Taint(uint8_t(kRel | (a0_src_ << 4)));
       } else {
         for (int k = 0; k < 4; ++k) base[k] = ConstVal(builder.Const((reg & 0xFF) * 4 + k));
       }
@@ -322,13 +340,14 @@ class Executor {
       const uint32_t swizzle = alu.src_swizzle(3);
       Val k;
       if (alu.src_const_is_addressed(3)) {
-        k = Taint();
+        k = Taint(uint8_t(kRel | (a0_src_ << 4)));
       } else {
         k = ConstVal(builder.Const((alu.src_reg(3) & 0xFF) * 4 +
                                    ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, 3)));
       }
       const uint32_t temp = alu.scalar_const_reg_op_src_temp_reg();
-      Val r = temp < 128 ? temps_[temp][ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, 0)] : Taint();
+      Val r = temp < 128 ? temps_[temp][ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, 0)]
+                         : Taint(kNonlin);
       if (alu.src_negate(3)) {
         k = VNeg(k);
         r = VNeg(r);
@@ -350,6 +369,16 @@ class Executor {
       case ucode::AluScalarOpcode::kSubsc1: prev_ = VAdd(so[0], VNeg(so[1])); break;
       case ucode::AluScalarOpcode::kSubsPrev: prev_ = VAdd(so[0], VNeg(prev_)); break;
       case ucode::AluScalarOpcode::kRetainPrev: break;
+      case ucode::AluScalarOpcode::kMaxs:
+      case ucode::AluScalarOpcode::kMins:
+        // max(a, a) is the assembler's scalar mov.
+        prev_ = Same(so[0], so[1]) ? so[0] : Taint(uint8_t(so[0].src | so[1].src | kNonlin));
+        break;
+      case ucode::AluScalarOpcode::kMaxAs:
+      case ucode::AluScalarOpcode::kMaxAsf:
+        a0_src_ = uint8_t(so[0].src & ~kNonlin);
+        prev_ = Taint(uint8_t(so[0].src | so[1].src | kNonlin));
+        break;
       case ucode::AluScalarOpcode::kSetpEq:
       case ucode::AluScalarOpcode::kSetpNe:
       case ucode::AluScalarOpcode::kSetpGt:
@@ -359,12 +388,12 @@ class Executor {
       case ucode::AluScalarOpcode::kSetpClr:
       case ucode::AluScalarOpcode::kSetpRstr:
         pred_known_ = false;
-        prev_ = Taint();
+        prev_ = Taint(uint8_t(so[0].src | so[1].src | kNonlin));
         break;
-      default: prev_ = Taint(); break;
+      default: prev_ = Taint(uint8_t(so[0].src | so[1].src | kNonlin)); break;
     }
     Val scalar = prev_;
-    if (alu.scalar_clamp()) scalar = Taint();
+    if (alu.scalar_clamp()) scalar = Taint(uint8_t(scalar.src | kNonlin));
 
     const uint32_t vmask = alu.GetVectorOpResultWriteMask();
     const uint32_t smask = alu.GetScalarOpResultWriteMask();
@@ -406,6 +435,7 @@ class Executor {
     if (vf.is_predicated()) {
       if (!pred_known_) {
         fail_ = true;
+        fail_why_ = Why::kPredicate;
         return;
       }
       if (vf.predicate_condition() != pred_value_) return;
@@ -466,7 +496,7 @@ class Executor {
             v.k[1 + c] = builder.Imm(1.f);
             used |= 1u << c;
           } else {
-            v = Taint();
+            v = Taint(kFetch);
           }
           break;
         }
@@ -538,6 +568,7 @@ class Executor {
               const auto cond = *reinterpret_cast<const ucode::ControlFlowCondExecPredInstruction*>(&exec);
               if (!pred_known_) {
                 fail_ = true;
+                fail_why_ = Why::kPredicate;
                 return;
               }
               run = cond.condition() == pred_value_;
@@ -579,6 +610,7 @@ class Executor {
             if (call.is_predicated()) {
               if (!pred_known_) {
                 fail_ = true;
+                fail_why_ = Why::kPredicate;
                 return;
               }
               take = call.condition() == pred_value_;
@@ -606,6 +638,7 @@ class Executor {
             if (jmp.is_predicated()) {
               if (!pred_known_) {
                 fail_ = true;
+                fail_why_ = Why::kPredicate;
                 return;
               }
               take = jmp.condition() == pred_value_;
@@ -616,8 +649,13 @@ class Executor {
           if (take) next = jmp.address();
           break;
         }
+        case ucode::ControlFlowOpcode::kLoopStart:
+        case ucode::ControlFlowOpcode::kLoopEnd:
+          fail_ = true;
+          fail_why_ = Why::kLoop;
+          return;
         default:
-          // Loops and anything else: not followed.
+          // Anything else: not followed.
           fail_ = true;
           return;
       }
@@ -638,7 +676,12 @@ float HalfToFloat(uint16_t h) {
 std::shared_ptr<Model> BuildModel(const uint32_t* ucode_words, size_t dwords, const uint32_t* bools) {
   auto model = std::make_shared<Model>();
   Executor collect(ucode_words, dwords, bools);
-  if (!collect.Run(-1)) return model;
+  if (!collect.Run(-1)) {
+    model->why = collect.failure();
+    return model;
+  }
+  model->why = Why::kNoFetch;
+  uint8_t worst = 0;
   for (size_t candidate = 0; candidate < collect.fetches.size() && candidate < 16; ++candidate) {
     if (!collect.fetches[candidate].usable) continue;
     Executor exec(ucode_words, dwords, bools);
@@ -648,13 +691,16 @@ std::shared_ptr<Model> BuildModel(const uint32_t* ucode_words, size_t dwords, co
     if (exec.position_written_ != 0xF) continue;
     bool ok = true, dependent = false;
     for (int o = 0; o < 4; ++o) {
-      if (exec.position_[o].taint) ok = false;
-      else if (exec.position_[o].k[1] || exec.position_[o].k[2] || exec.position_[o].k[3] || exec.position_[o].k[4]) {
+      if (exec.position_[o].taint) {
+        ok = false;
+        worst |= exec.position_[o].src;
+      } else if (exec.position_[o].k[1] || exec.position_[o].k[2] || exec.position_[o].k[3] || exec.position_[o].k[4]) {
         dependent = true;
       }
     }
     if (!ok || !dependent) continue;
     model->valid = true;
+    model->why = Why::kNone;
     model->fetch = collect.fetches[candidate].desc;
     model->fetch.used_mask = exec.symbolic_used_;
     for (int o = 0; o < 4; ++o)
@@ -664,6 +710,23 @@ std::shared_ptr<Model> BuildModel(const uint32_t* ucode_words, size_t dwords, co
     for (const auto& n : model->nodes) reads += n.op == kConst;
     model->constants_read = reads;
     return model;
+  }
+  // None of the candidates worked: where the unknown in the position came from.
+  bool any_usable = false;
+  for (const auto& f : collect.fetches) any_usable = any_usable || f.usable;
+  if (any_usable) {
+    const uint8_t a0 = uint8_t(worst >> 4);
+    if (worst & kRel) {
+      if (a0 & kFetch) model->why = Why::kSkinned;
+      else if (a0 & kVid) model->why = Why::kInstanced;
+      else model->why = Why::kRelative;
+    } else if (worst & kFetch) {
+      model->why = Why::kOtherFetch;
+    } else if (worst & kVid) {
+      model->why = Why::kVertexIndex;
+    } else {
+      model->why = Why::kNonlinear;
+    }
   }
   return model;
 }
