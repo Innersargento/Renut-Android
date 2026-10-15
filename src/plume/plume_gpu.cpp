@@ -2643,9 +2643,72 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void HizDestroy();
   // The command list, after recording any draws that are waiting.
   RenderCommandList* L() {
+    // The recording thread's own calls get the list as it is.
+    if (OnRecorder()) return list_;
     if (!deferred_.empty()) FlushDeferred(in_issue_draw_ ? 4 : 0);
+    if (rec_posted_.load(std::memory_order_relaxed) != rec_completed_.load(std::memory_order_relaxed) || rec_pending_) {
+      SyncRecorder();
+    }
     return list_;
   }
+
+  // ---- Recording thread (files/plume-recthread) ----
+  // The draws of a frame are decoded on this thread (IssueDraw makes a packet
+  // out of the guest's state) and recorded on another: EmitDraw's Vulkan calls,
+  // most of which are the driver copying its state, were about a third of this
+  // thread. Packets go to the recorder in batches, in the order they would have
+  // been recorded. Everything else that records, or that reads what recording
+  // writes (the bound state, the pass marks), goes through L() or SyncRecorder(),
+  // which waits for the recorder to be done: from this thread's point of view
+  // the list is still recorded in order and by one thread at a time.
+  struct RecJob {
+    std::vector<DrawPacket> packets;
+    std::vector<DeferredSlot> slots;
+  };
+  static constexpr size_t kRecBatch = 48;
+  bool rec_enabled_ = true;
+  std::mutex rec_mutex_;
+  std::condition_variable rec_cv_, rec_done_cv_;
+  std::deque<RecJob*> rec_queue_;
+  std::atomic<uint32_t> rec_queued_{0};
+  std::vector<RecJob*> rec_free_;
+  std::vector<std::unique_ptr<RecJob>> rec_owned_;
+  RecJob* rec_pending_ = nullptr;  // being filled by this thread
+  std::atomic<uint64_t> rec_posted_{0}, rec_completed_{0};
+  bool rec_stop_ = false;
+  std::thread::id rec_thread_id_;
+  // What EmitDraw counts: written by the recorder, folded into stats_ at the
+  // report (after a sync).
+  struct RecStats {
+    uint64_t drawn = 0, pipeline_binds = 0, predicated = 0, passes = 0;
+  } rec_stats_;
+  // The pass attachments of the draw being recorded, on the recorder's side
+  // (color_count_of_pass_ is this thread's, read by IssueDraw).
+  uint32_t emit_colors_ = 0;
+  bool emit_depth_ = false;
+  struct RecWorker {
+    std::thread thread;
+    std::mutex* mutex = nullptr;
+    std::condition_variable* cv = nullptr;
+    bool* stop = nullptr;
+    ~RecWorker() {
+      if (!thread.joinable()) return;
+      {
+        std::lock_guard<std::mutex> lock(*mutex);
+        *stop = true;
+      }
+      cv->notify_all();
+      thread.join();
+    }
+  } rec_worker_;
+  bool OnRecorder() const { return std::this_thread::get_id() == rec_thread_id_; }
+  bool RecActive() const {
+    return rec_enabled_ && hiz_mode_ < 3 && !pair_capture_ && !sync_draws_ && sync_every_ <= 1 && !trace_;
+  }
+  void RecQueue(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count);
+  void RecPost();
+  void SyncRecorder();
+  void RecThreadMain();
 
   std::unordered_map<uint64_t, Target> targets_;
   std::unordered_map<uint64_t, std::unique_ptr<RenderFramebuffer>> framebuffers_;
@@ -3735,6 +3798,7 @@ void PlumeCommandProcessor::WalkSegment(uint32_t cpu_ptr, uint32_t count, uint32
 }
 
 void PlumeCommandProcessor::ShutdownContext() {
+  SyncRecorder();
   native_d3d::SetWake({});
   device_watch_stop_ = true;
   if (device_watch_.thread.joinable()) device_watch_.thread.join();
@@ -4575,6 +4639,7 @@ const PlumeCommandProcessor::PatchGrid* PlumeCommandProcessor::GetPatchGrid(bool
 }
 
 void PlumeCommandProcessor::WriteTimestamp() {
+  if (!OnRecorder()) SyncRecorder();
   // plume-skip bit 67108864 turns the per-pass timing off. It writes ~138
   // timestamps a frame, mostly at render pass boundaries, and a timestamp there
   // can make a tiler flush - so its own cost has to be measurable.
@@ -4868,6 +4933,7 @@ void PlumeCommandProcessor::EvictIdleTextures() {
 }
 
 void PlumeCommandProcessor::BeginFrame() {
+  SyncRecorder();
   slot_ = (slot_ + 1) % kPlumeFramesInFlight;
   // The slot's command list, ring slice and retired resources are all still in
   // use until the frame that last held it has finished.
@@ -4942,6 +5008,7 @@ void PlumeCommandProcessor::BeginFrame() {
 
 // Resets the per-frame state that lives in the ring slice and opens the list.
 void PlumeCommandProcessor::StartList() {
+  SyncRecorder();
   upload_used_ = slice_base_;
   uploaded_streams_.clear();
   ++upload_generation_;
@@ -5168,6 +5235,7 @@ Target* PlumeCommandProcessor::SurfaceTarget(uint32_t slot) {
 }
 
 void PlumeCommandProcessor::RetireFramebuffers() {
+  SyncRecorder();
   for (auto& [key, framebuffer] : framebuffers_)
     retired_framebuffer_slots_[slot_].push_back(std::move(framebuffer));
   framebuffers_.clear();
@@ -5365,6 +5433,8 @@ RenderFramebuffer* PlumeCommandProcessor::GetFramebuffer(const std::array<Target
 }
 
 void PlumeCommandProcessor::SetFramebuffer(RenderFramebuffer* framebuffer) {
+  const bool recorder = OnRecorder();
+  if (!recorder) SyncRecorder();
   if (!state_bound_) {
     L()->setGraphicsPipelineLayout(layout_.get());
     L()->setGraphicsDescriptorSet(set_2d_.get(), 0);
@@ -5378,12 +5448,12 @@ void PlumeCommandProcessor::SetFramebuffer(RenderFramebuffer* framebuffer) {
     // the first draw, so the mark lands between the two.
     L()->setFramebuffer(framebuffer);
     bound_framebuffer_ = framebuffer;
-    ++stats_.passes;
+    ++rec_stats_.passes;
     PassMark mark;
     mark.width = framebuffer->getWidth();
     mark.height = framebuffer->getHeight();
-    mark.colors = color_count_of_pass_;
-    mark.depth = depth_of_pass_;
+    mark.colors = recorder ? emit_colors_ : color_count_of_pass_;
+    mark.depth = recorder ? emit_depth_ : depth_of_pass_;
     pass_marks_[slot_].push_back(mark);
     WriteTimestamp();
   }
@@ -8976,16 +9046,120 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     return true;
   }
   FlushDeferred(3);
-  EmitDraw(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
+  if (RecActive()) RecQueue(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
+  else EmitDraw(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
   return true;
+}
+
+void PlumeCommandProcessor::RecQueue(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
+  if (!rec_worker_.thread.joinable()) {
+    rec_worker_.mutex = &rec_mutex_;
+    rec_worker_.cv = &rec_cv_;
+    rec_worker_.stop = &rec_stop_;
+    rec_stop_ = false;
+    rec_worker_.thread = std::thread([this] { RecThreadMain(); });
+    rec_thread_id_ = rec_worker_.thread.get_id();
+  }
+  if (!rec_pending_) {
+    {
+      std::lock_guard<std::mutex> lock(rec_mutex_);
+      if (!rec_free_.empty()) {
+        rec_pending_ = rec_free_.back();
+        rec_free_.pop_back();
+      }
+    }
+    if (!rec_pending_) {
+      rec_owned_.push_back(std::make_unique<RecJob>());
+      rec_pending_ = rec_owned_.back().get();
+      rec_pending_->packets.reserve(kRecBatch);
+      rec_pending_->slots.reserve(kRecBatch * 8);
+    }
+    rec_pending_->packets.clear();
+    rec_pending_->slots.clear();
+  }
+  RecJob& job = *rec_pending_;
+  DrawPacket& copy = job.packets.emplace_back(pk);
+  copy.first_slot = uint32_t(job.slots.size());
+  copy.slot_count = slot_count;
+  job.slots.insert(job.slots.end(), slots, slots + slot_count);
+  if (job.packets.size() >= kRecBatch) RecPost();
+}
+
+void PlumeCommandProcessor::RecPost() {
+  if (!rec_pending_) return;
+  if (rec_pending_->packets.empty()) return;
+  {
+    std::lock_guard<std::mutex> lock(rec_mutex_);
+    rec_queue_.push_back(rec_pending_);
+    rec_queued_.fetch_add(1, std::memory_order_release);
+    rec_posted_.fetch_add(1, std::memory_order_release);
+  }
+  rec_pending_ = nullptr;
+  rec_cv_.notify_one();
+}
+
+// Waits until everything handed to the recorder has been recorded.
+void PlumeCommandProcessor::SyncRecorder() {
+  if (OnRecorder()) return;
+  RecPost();
+  const uint64_t target = rec_posted_.load(std::memory_order_acquire);
+  if (rec_completed_.load(std::memory_order_acquire) >= target) return;
+  for (int i = 0; i < 4000; ++i) {
+    if (rec_completed_.load(std::memory_order_acquire) >= target) return;
+  }
+  std::unique_lock<std::mutex> lock(rec_mutex_);
+  rec_done_cv_.wait(lock, [&] { return rec_completed_.load(std::memory_order_acquire) >= target; });
+}
+
+void PlumeCommandProcessor::RecThreadMain() {
+  pthread_setname_np(pthread_self(), "PlumeRecord");
+  for (;;) {
+    RecJob* job = nullptr;
+    // A short spin first: waking a sleeping thread costs more than the gap
+    // between two batches of a busy frame.
+    for (int i = 0; i < 20000 && !job; ++i) {
+      if (rec_queued_.load(std::memory_order_acquire) == 0) continue;
+      std::lock_guard<std::mutex> lock(rec_mutex_);
+      if (!rec_queue_.empty()) {
+        job = rec_queue_.front();
+        rec_queue_.pop_front();
+        rec_queued_.fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+    if (!job) {
+      std::unique_lock<std::mutex> lock(rec_mutex_);
+      rec_cv_.wait(lock, [&] { return rec_stop_ || !rec_queue_.empty(); });
+      if (rec_queue_.empty()) return;  // stopping
+      job = rec_queue_.front();
+      rec_queue_.pop_front();
+      rec_queued_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    for (const DrawPacket& pk : job->packets) {
+      EmitDraw(pk, job->slots.data() + pk.first_slot, pk.slot_count);
+    }
+    {
+      std::lock_guard<std::mutex> lock(rec_mutex_);
+      rec_free_.push_back(job);
+      rec_completed_.fetch_add(1, std::memory_order_release);
+    }
+    rec_done_cv_.notify_all();
+  }
 }
 
 // Records one packet: the pass, the pipeline and every piece of per-draw state
 // that differs from what the list already has bound, then the draw itself.
 void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
+  // Not from the recorder (the Hi-Z windows, the debug modes): nothing may be
+  // in flight while this thread touches the bound state.
+  if (!OnRecorder()) SyncRecorder();
   const bool pair_stamped = pair_capture_ && PairBegin(pk);
-  color_count_of_pass_ = pk.pass_colors;
-  depth_of_pass_ = pk.pass_depth;
+  if (OnRecorder()) {
+    emit_colors_ = pk.pass_colors;
+    emit_depth_ = pk.pass_depth;
+  } else {
+    color_count_of_pass_ = pk.pass_colors;
+    depth_of_pass_ = pk.pass_depth;
+  }
   SetFramebuffer(pk.framebuffer);
   // plume-skip bit 262144 keeps the bound pipeline whenever it can stand in
   // for the draw's own (same attachments and vertex input): the picture is
@@ -8995,7 +9169,7 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
     L()->setPipeline(pk.pipeline);
     bound_pipeline_ = pk.pipeline;
     bound_interface_key_ = pk.interface_key;
-    ++stats_.pipeline_binds;
+    ++rec_stats_.pipeline_binds;
   }
   // Dynamic state of the pipelines that use it (the Vulkan layer makes it so,
   // see plume_renderer.cpp): not part of Plume's interface, so on the command
@@ -9097,18 +9271,18 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
   }
   if (predicated) {
     vkCmdEndConditionalRenderingEXT(predicate_cb);
-    ++stats_.hiz_predicated_draws;
+    ++rec_stats_.predicated;
   }
   if (queried) vkCmdEndQuery(predicate_cb, hiz_query_pool_, pk.hiz_query);
   if (pair_stamped) PairStamp();
-  ++stats_.drawn;
+  ++rec_stats_.drawn;
   if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
   if (trail_) {
     // Only one draw in eight asks (a hash lookup a draw was over 1% of this
     // thread): the report of a lost device calls a pair new from its first
     // frame, and an unknown one is simply not called new.
     uint64_t first_frame = 0;
-    if ((stats_.drawn & 7) == 0) {
+    if ((rec_stats_.drawn & 7) == 0) {
       first_frame = pair_first_frame_.try_emplace(pk.vs_hash * 1099511628211ull ^ pk.ps_hash, swaps_).first->second;
     }
     const uint64_t at = recent_draw_count_.load(std::memory_order_relaxed);
@@ -9350,9 +9524,11 @@ void PlumeCommandProcessor::FlushDeferred(uint32_t reason) {
   stats_.defer_binds_before += before;
   stats_.defer_binds_after += after;
   if (!HizFlushWindow(n)) {
+    const bool async = RecActive();
     for (size_t i = 0; i < n; ++i) {
       const DrawPacket& pk = flushing_[defer_order_[i]];
-      EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
+      if (async) RecQueue(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
+      else EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
     }
   }
   flushing_.clear();
@@ -11380,6 +11556,21 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       trail_ = trail;
     }
     {
+      // files/plume-recthread: 0 records the draws on this thread, as before; 1 (the
+      // default) hands them to the recorder (see RecQueue).
+      bool recorder = true;
+      if (FILE* file = std::fopen((root + "/plume-recthread").c_str(), "r")) {
+        int value = 1;
+        if (std::fscanf(file, "%d", &value) == 1) recorder = value != 0;
+        std::fclose(file);
+      }
+      if (recorder != rec_enabled_) {
+        REXLOG_INFO("Renut: Plume recording thread {}", recorder ? "on" : "off");
+        SyncRecorder();
+      }
+      rec_enabled_ = recorder;
+    }
+    {
       // Resolve textures, framebuffers and streams by what the guest bound
       // rather than by hashing it again at every draw. 0 puts the old path back.
       bool objkeys = true;
@@ -11898,6 +12089,12 @@ void PlumeCommandProcessor::ReportMemory() {
 }
 
 void PlumeCommandProcessor::Report() {
+  SyncRecorder();
+  stats_.drawn += rec_stats_.drawn;
+  stats_.pipeline_binds += rec_stats_.pipeline_binds;
+  stats_.hiz_predicated_draws += rec_stats_.predicated;
+  stats_.passes += rec_stats_.passes;
+  rec_stats_ = {};
   REXLOG_INFO(
       "Renut: Plume frame {}: draws={} drawn={} no_vs={} no_ps={} bad_shader={} skipped_prim={} "
       "no_target={} resolves={} clears={} passes={} barriers={} pipeline_binds={} vertices={} gs_draws={} patch_draws={} patch_vertices={} adaptive={} split(color={} depth={} read={} src={} dst={}) pipelines={} targets={} resolved={} shaders={} "
