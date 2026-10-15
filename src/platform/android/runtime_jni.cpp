@@ -69,8 +69,27 @@ static void ForwardStderrToLogcat() {
   }).detach();
 }
 
+#ifdef RENUT_PGO_GEN
+// The instrumented build (RENUT_PGO=gen): the process is killed rather than exited,
+// so the counters are written out by hand when the game stops or leaves the screen.
+// %m merges every dump of a run into one file.
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int __llvm_profile_write_file(void);
+static void PgoDump() {
+  static std::mutex m;
+  std::lock_guard<std::mutex> lock(m);
+  int r = __llvm_profile_write_file();
+  __android_log_print(ANDROID_LOG_INFO, "renut-pgo", "profile write -> %d", r);
+}
+#else
+static void PgoDump() {}
+#endif
+
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
   ForwardStderrToLogcat();
+#ifdef RENUT_PGO_GEN
+  __llvm_profile_set_filename("/data/data/org.renut.android/files/renut-%m.profraw");
+#endif
   return JNI_VERSION_1_6;
 }
 static std::atomic<bool> render_stopped{false};
@@ -104,6 +123,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeS
   ReleasePause();
   // A game paused in the background is parked in the renderer: wake it to shut down.
   if(auto* plume=renut::PlumeRenderer::Get())plume->ReleaseForShutdown();
+  PgoDump();
 }
 // The app left the screen: its surface is gone. The game keeps its state and
 // stops at its next present, and its clock crawls so that coming back is not a
@@ -111,6 +131,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeS
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeBackground(JNIEnv*,jclass) {
   renut::d3d::SetBackground(true);
   renut::adpf::SetActive(false);
+  PgoDump();
   if(auto* plume=renut::PlumeRenderer::Get())plume->PauseForBackground();
   rex::chrono::Clock::set_guest_time_scalar(0.02);
   {

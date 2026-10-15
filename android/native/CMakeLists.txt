@@ -27,8 +27,32 @@ add_compile_options(-fno-strict-aliasing -ffp-model=strict -fno-char8_t)
 # the console's own invariants that the title legitimately breaks (a graphics
 # interrupt finding a spinlock its processor already holds, a stray audio
 # handle...), and the previous build kept them quiet by patching them out.
-add_compile_options(-O2)
+add_compile_options(-O3)
 add_compile_definitions(NDEBUG)
+# ThinLTO across the whole tree (the guest, the runtime and the SDK libraries are one
+# shared object), parallel and cached so an incremental link only redoes what changed.
+add_compile_options(-flto=thin)
+add_link_options(-flto=thin -Wl,--thinlto-jobs=all
+    "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
+# Profile-guided optimization of the code that matters (the recompiled guest and the
+# runtime), driven by -DRENUT_PGO=gen|use (gradle: -PrenutPgo=gen|use):
+#   gen  instruments those two targets; the profile is written on nativeStop and
+#        nativeBackground (runtime_jni.cpp) to files/renut-%m.profraw.
+#   use  RENUT_PGO_PROFILE is the merged .profdata (tools/pgo.py merge).
+set(RENUT_PGO "" CACHE STRING "PGO mode: gen, use or empty")
+set(RENUT_PGO_PROFILE "" CACHE FILEPATH "merged .profdata for RENUT_PGO=use")
+function(renut_pgo_target target)
+    if(RENUT_PGO STREQUAL "gen")
+        target_compile_options(${target} PRIVATE -fprofile-generate)
+        target_compile_definitions(${target} PRIVATE RENUT_PGO_GEN=1)
+    elseif(RENUT_PGO STREQUAL "use")
+        if(NOT EXISTS "${RENUT_PGO_PROFILE}")
+            message(FATAL_ERROR "RENUT_PGO=use needs RENUT_PGO_PROFILE (merged .profdata): '${RENUT_PGO_PROFILE}'")
+        endif()
+        target_compile_options(${target} PRIVATE "-fprofile-use=${RENUT_PGO_PROFILE}"
+            -Wno-profile-instr-unprofiled -Wno-profile-instr-missing -Wno-backend-plugin)
+    endif()
+endfunction()
 # libc++ in the NDK lacks clock_time_conversion/clock_cast, which the SDK's chrono.h
 # builds on (platform/android/shims/android_chrono.h).
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${RENUT_ANDROID}/shims/android_chrono.h>")
@@ -100,6 +124,12 @@ set_source_files_properties("${REXGLUE_ROOT}/src/core/memory_posix.cpp"
     "${REXGLUE_ROOT}/src/core/threading_posix.cpp"
     TARGET_DIRECTORY rexcore PROPERTIES
     COMPILE_OPTIONS "-include;${RENUT_ANDROID}/shims/android_core.h")
+# QueryProtect is interposed by src/platform/android/query_protect.cpp, which only works
+# while the SDK's own callers reach it through the PLT. ThinLTO imported it into them and
+# bound the calls directly (the movies' MMIO fault path went back to parsing
+# /proc/self/maps per fault: slow video), so its file stays a plain native object.
+set_source_files_properties("${REXGLUE_ROOT}/src/core/memory_posix.cpp"
+    TARGET_DIRECTORY rexcore PROPERTIES COMPILE_OPTIONS "-include;${RENUT_ANDROID}/shims/android_core.h;-fno-lto")
 add_subdirectory("${REXGLUE_ROOT}/src/filesystem" filesystem)
 add_subdirectory("${REXGLUE_ROOT}/src/system" system)
 target_link_libraries(rexruntime PRIVATE rexcore rexfilesystem log android)
@@ -138,7 +168,7 @@ add_subdirectory("${REXGLUE_ROOT}/src/audio" audio)
 add_subdirectory("${REXGLUE_ROOT}/src/kernel" kernel)
 add_subdirectory("${REXGLUE_ROOT}/src/graphics" graphics)
 target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
-target_compile_options(rexgpu-xenos PRIVATE -O2)
+target_compile_options(rexgpu-xenos PRIVATE -O3)
 # The native Plume backend (plume_gpu.cpp) derives from the plugin's
 # GraphicsSystem/CommandProcessor and uses its register decoding helpers, so
 # the plugin exports its symbols instead of only rex_gpu_create.
@@ -156,7 +186,8 @@ include("${RENUT_SRC}/guest/kernel_overrides.cmake")
 renut_kernel_overrides(renut_guest)
 # The recompiled game is the hot path: a profile of the boot stall put ~90% of
 # CPU inside two guest functions, so this target's level matters most.
-target_compile_options(renut_guest PRIVATE -O2 -g0 -Wno-unused-variable -Wno-unused-label)
+target_compile_options(renut_guest PRIVATE -O3 -g0 -Wno-unused-variable -Wno-unused-label)
+renut_pgo_target(renut_guest)
 # The vector tables behind every lvx/stvx byte swap, copied verbatim out of the
 # SDK as read-only data (renut_simd_fast.h explains why). Taken from the header
 # rather than retyped, so an SDK update cannot leave a stale copy behind.
@@ -207,3 +238,7 @@ target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume 
 # their place (the strong overrides in game_fixes.cpp are settled at link time),
 # so bind them locally and the calls become plain branches.
 target_link_options(renut_runtime PRIVATE -Wl,-Bsymbolic-functions)
+renut_pgo_target(renut_runtime)
+if(RENUT_PGO STREQUAL "gen")
+    target_link_options(renut_runtime PRIVATE -fprofile-generate)
+endif()

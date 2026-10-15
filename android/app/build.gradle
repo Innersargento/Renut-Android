@@ -15,7 +15,18 @@ android {
         versionCode 4
         versionName '0.4.0-xenos-experimental'
         ndk { abiFilters 'arm64-v8a' }
-        externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_shared', '-DCMAKE_JOB_POOLS=compile_pool=4', '-DCMAKE_JOB_POOL_COMPILE=compile_pool' } }
+        // -PrenutPgo=gen builds the instrumented APK; -PrenutPgo=use -PrenutPgoProfile=<.profdata>
+        // builds with the merged profile (tools/pgo.py).
+        def pgoArgs = []
+        if (project.hasProperty('renutPgo')) {
+            pgoArgs << "-DRENUT_PGO=${project.property('renutPgo')}".toString()
+            if (project.hasProperty('renutPgoProfile'))
+                pgoArgs << "-DRENUT_PGO_PROFILE=${project.property('renutPgoProfile')}".toString()
+        }
+        externalNativeBuild { cmake {
+            arguments '-DANDROID_STL=c++_shared', '-DCMAKE_JOB_POOLS=compile_pool=4', '-DCMAKE_JOB_POOL_COMPILE=compile_pool'
+            pgoArgs.each { arguments it }
+        } }
     }
     externalNativeBuild {
         cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' }
