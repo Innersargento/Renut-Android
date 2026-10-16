@@ -484,8 +484,10 @@ def stage_game(args):
 
 # ---- stage: codegen ------------------------------------------------------------------------------
 
-UNRESOLVED_BEFORE = 'if (!ctx.cr6.eq) REX_FATAL("Unresolved branch from 0x82C79F68 to 0x82C79EE4");'
-UNRESOLVED_AFTER = "if (!ctx.cr6.eq) goto loc_82C79EE4;"
+# cr_as_local turns ctx.cr6 into a plain local, so the same line is emitted without the "ctx." prefix.
+UNRESOLVED_BEFORES = ('if (!ctx.cr6.eq) REX_FATAL("Unresolved branch from 0x82C79F68 to 0x82C79EE4");',
+                      'if (!cr6.eq) REX_FATAL("Unresolved branch from 0x82C79F68 to 0x82C79EE4");')
+UNRESOLVED_AFTERS = ("if (!ctx.cr6.eq) goto loc_82C79EE4;", "if (!cr6.eq) goto loc_82C79EE4;")
 
 
 def fix_generated(folder):
@@ -494,21 +496,23 @@ def fix_generated(folder):
     texts = {}
     for f in files:
         text = f.read_text(encoding="utf-8", errors="replace")
-        if UNRESOLVED_BEFORE in text or UNRESOLVED_AFTER in text:
+        if any(s in text for s in UNRESOLVED_BEFORES + UNRESOLVED_AFTERS):
             texts[f] = text
-    hits = [f for f, t in texts.items() if UNRESOLVED_BEFORE in t] or list(texts)
+    hits = [f for f, t in texts.items() if any(s in t for s in UNRESOLVED_BEFORES)] or list(texts)
     if len(hits) != 1:
         fail("esperado exatamente um desvio conhecido em generated/android; encontrados %d. Regenere o código." % len(hits))
     path = hits[0]
     text = texts[path]
-    needle = UNRESOLVED_BEFORE if UNRESOLVED_BEFORE in text else UNRESOLVED_AFTER
+    pairs = list(zip(UNRESOLVED_BEFORES, UNRESOLVED_AFTERS))
+    before, after = next(((b, a) for b, a in pairs if b in text), None) or next((b, a) for b, a in pairs if a in text)
+    needle = before if before in text else after
     position = text.index(needle)
     start = text.rfind("DEFINE_REX_FUNC(", 0, position)
     body = text[start:position]
     if not body.startswith("DEFINE_REX_FUNC(sub_82C79EE4)") or "loc_82C79EE4:" not in body:
         fail("o destino do desvio não pertence à função esperada; correção não aplicada.")
-    if needle == UNRESOLVED_BEFORE:
-        path.write_text(text.replace(UNRESOLVED_BEFORE, UNRESOLVED_AFTER), encoding="utf-8", newline="")
+    if needle == before:
+        path.write_text(text.replace(before, after), encoding="utf-8", newline="")
     for f in files:
         if f != path and 'REX_FATAL("Unresolved' in f.read_text(encoding="utf-8", errors="replace"):
             fail("há outros desvios não resolvidos em %s; revise antes de compilar." % f.name)
