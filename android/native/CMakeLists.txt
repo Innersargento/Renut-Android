@@ -166,14 +166,8 @@ include("${CMAKE_CURRENT_BINARY_DIR}/ui.cmake")
 add_subdirectory("${REXGLUE_ROOT}/src/input" input)
 add_subdirectory("${REXGLUE_ROOT}/src/audio" audio)
 add_subdirectory("${REXGLUE_ROOT}/src/kernel" kernel)
-# No Xenos GPU plugin (rexgpu-xenos): the app hosts its own GPU. The renderer takes a handful
-# of decoding helpers from the SDK's sources (windows/xenos-helpers.cmake lists them).
-include("${RENUT_ROOT}/windows/xenos-helpers.cmake")
-renut_xenos_helpers(renut_xenos "${REXGLUE_ROOT}" "" rexruntime)
-target_link_libraries(renut_xenos PRIVATE renderdoc)
-target_compile_definitions(renut_xenos PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
-set_target_properties(renut_xenos PROPERTIES CXX_VISIBILITY_PRESET default
-    VISIBILITY_INLINES_HIDDEN OFF POSITION_INDEPENDENT_CODE ON)
+# No Xenos GPU plugin (rexgpu-xenos): the app hosts its own GPU, and the Xenos decoding it needs is
+# reNut's own (src/plume/gpu/xenos/).
 target_compile_definitions(rexui PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
 
 include("${RENUT_ROOT}/generated/android/sources.cmake")
@@ -218,7 +212,7 @@ set(RENUT_RUNTIME_SOURCES
     d3d/d3d_layer.cpp d3d/plume_d3d.cpp
     d3d/native/lists.cpp d3d/native/flush.cpp d3d/native/draws.cpp d3d/native/commands.cpp d3d/native/sync.cpp d3d/native/entry.cpp d3d/native/report.cpp
     plume/plume_renderer.cpp plume/hiz_model.cpp
-    plume/gpu/context.cpp plume/gpu/draw.cpp plume/gpu/draw_util.cpp plume/gpu/xenos/interpreter.cpp plume/gpu/xenos/register_file.cpp plume/gpu/xenos/registers.cpp plume/gpu/hiz.cpp plume/gpu/host.cpp
+    plume/gpu/context.cpp plume/gpu/draw.cpp plume/gpu/draw_util.cpp plume/gpu/xenos/interpreter.cpp plume/gpu/xenos/register_file.cpp plume/gpu/xenos/registers.cpp plume/gpu/xenos/shader.cpp plume/gpu/xenos/translator.cpp plume/gpu/xenos/translator_disasm.cpp plume/gpu/xenos/ucode.cpp plume/gpu/hiz.cpp plume/gpu/host.cpp
     plume/gpu/native_exec.cpp plume/gpu/options.cpp plume/gpu/patches.cpp plume/gpu/pipeline_cache.cpp
     plume/gpu/profiling.cpp plume/gpu/recorder.cpp plume/gpu/report.cpp plume/gpu/resolve.cpp
     plume/gpu/shaders.cpp plume/gpu/streams.cpp plume/gpu/support.cpp plume/gpu/swap.cpp
@@ -235,7 +229,7 @@ add_library(renut_runtime SHARED ${RENUT_RUNTIME_SOURCES}
 # generated/shaders/shader_cache.cpp includes "shader_cache.h" by bare name.
 target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
     "${RENUT_SRC}" "${RENUT_SRC}/plume")
-target_link_libraries(renut_runtime PRIVATE rexruntime renut_xenos renut_plume adrenotools
+target_link_libraries(renut_runtime PRIVATE rexruntime renut_plume adrenotools
     xxHash::xxhash android log dl aaudio)
 # Every call between recompiled guest functions, and to the __savegprlr/
 # __restgprlr helpers that each prologue and epilogue calls, went through a PLT

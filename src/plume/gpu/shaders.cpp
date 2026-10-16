@@ -30,7 +30,7 @@ void Shaders::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
-gfx::Shader* Shaders::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
+Shader* Shaders::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                                const uint32_t* host_address, uint32_t dword_count) {
   // Across frames: an address and length are the shader last found there while
   // the guest has not written under them (see ShaderWatch). Looked up first,
@@ -69,7 +69,7 @@ gfx::Shader* Shaders::LoadShader(xenos::ShaderType shader_type, uint32_t guest_a
       watched = true;
     }
   }
-  gfx::Shader* result = LoadShaderByContents(shader_type, host_address, dword_count);
+  Shader* result = LoadShaderByContents(shader_type, host_address, dword_count);
   if (watched && result) {
     watch->shader = static_cast<HostShader*>(result);
     watch->base = guest_address;
@@ -80,7 +80,7 @@ gfx::Shader* Shaders::LoadShader(xenos::ShaderType shader_type, uint32_t guest_a
   return result;
 }
 
-gfx::Shader* Shaders::LoadShaderByContents(xenos::ShaderType shader_type,
+Shader* Shaders::LoadShaderByContents(xenos::ShaderType shader_type,
                                                          const uint32_t* host_address, uint32_t dword_count) {
   // The guest binds the same few hundred shaders thousands of times a frame,
   // and hashing the whole microcode each time was a steady few percent of

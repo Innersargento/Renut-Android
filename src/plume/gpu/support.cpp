@@ -53,7 +53,7 @@ uint64_t RecipeProgram(const Recipe& r) {
   return hash;
 }
 
-uint32_t TextureMask(const gfx::Shader& shader) {
+uint32_t TextureMask(const Shader& shader) {
   const uint32_t* u = shader.ucode_dwords();
   const size_t count = shader.ucode_dword_count();
   std::vector<uint8_t> be(count * 4);

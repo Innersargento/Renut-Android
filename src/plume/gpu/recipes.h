@@ -277,7 +277,7 @@ inline PredictQueue g_predict;
 // resolved target, on every draw; a shader samples two or three. The constant a
 // tfetch names sits in the same bits as a vfetch's, and Direct3D does not
 // rewrite it.
-uint32_t TextureMask(const gfx::Shader& shader);
+uint32_t TextureMask(const Shader& shader);
 
 // patched the vfetch instructions for the current vertex declaration; the
 // recompiler recorded which instruction reads each element (fetchAddress).

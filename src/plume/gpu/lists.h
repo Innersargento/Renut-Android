@@ -12,8 +12,8 @@ struct Lists {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
-  gfx::Shader* active_vertex_shader_ = nullptr;
-  gfx::Shader* active_pixel_shader_ = nullptr;
+  Shader* active_vertex_shader_ = nullptr;
+  Shader* active_pixel_shader_ = nullptr;
   // A write of `count` registers from `values`: the registers that already hold
   // these bytes are left alone, and only the blocks a different one lands in are
   // marked. The guest sets the same view/projection/lighting constants before

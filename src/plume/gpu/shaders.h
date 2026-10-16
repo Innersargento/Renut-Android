@@ -11,7 +11,7 @@ struct Shaders {
   GpuBackend& backend;
 
   std::unordered_map<uint32_t, uint32_t> extended_register_values_;
-  gfx::Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
+  Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                           const uint32_t* host_address, uint32_t dword_count);
   // Register writes. The shader constants (ALU, fetch, boolean and loop,
   // 0x4000-0x4927) have no side effects in the base class, and the guest
@@ -22,7 +22,7 @@ struct Shaders {
   // A draw left out for a reason no other counter names: counted by reason
   // and shader for the periodic report, and named in a trace.
   bool Drop(const char* reason, const HostShader* vs, const HostShader* ps);
-  gfx::Shader* LoadShaderByContents(xenos::ShaderType shader_type, const uint32_t* host_address,
+  Shader* LoadShaderByContents(xenos::ShaderType shader_type, const uint32_t* host_address,
                                     uint32_t dword_count);
   std::unordered_map<uint64_t, std::unique_ptr<HostShader>> shaders_;
   LookupMemo<ShaderWatch, 12> shader_watch_memo_;

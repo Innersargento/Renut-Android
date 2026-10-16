@@ -84,7 +84,7 @@ bool Lists::RunNative(uint32_t until) {
       case native_d3d::kOpShader: {
         const auto type = xenos::ShaderType(w[1] & 3);
         const uint32_t address = w[1] & ~3u, dwords = w[2];
-        gfx::Shader* shader = backend.shaders.LoadShader(type, address, backend.memory_->TranslatePhysical<const uint32_t*>(address), dwords);
+        Shader* shader = backend.shaders.LoadShader(type, address, backend.memory_->TranslatePhysical<const uint32_t*>(address), dwords);
         if (type == xenos::ShaderType::kVertex) {
           active_vertex_shader_ = shader;
         } else {

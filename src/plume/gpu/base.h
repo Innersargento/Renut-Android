@@ -69,7 +69,7 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include "xenos/interpreter.h"
-#include <rex/graphics/pipeline/shader/shader.h>
+#include "xenos/shader.h"
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include "xenos/register_file.h"
@@ -132,6 +132,7 @@ namespace gfx = rex::graphics;
 namespace xenos = rex::graphics::xenos;
 // Register indices (XE_GPU_REG_*).
 using namespace rex::graphics;
+using xshader::Shader;  // the Xenos shader analysis (xenos/shader.h)
 
 
 // The push constants: the guest's three block addresses (24 bytes). The range is

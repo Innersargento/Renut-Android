@@ -19,7 +19,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/format/ucode.h>
-#include <rex/graphics/pipeline/shader/shader.h>
+#include "shader.h"
 #include "register_file.h"
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
@@ -30,7 +30,7 @@ namespace interp {
 namespace xenos = rex::graphics::xenos;
 namespace ucode = rex::graphics::ucode;
 namespace memory = rex::memory;
-using rex::graphics::Shader;
+using xshader::Shader;
 
 
 class ShaderInterpreter {

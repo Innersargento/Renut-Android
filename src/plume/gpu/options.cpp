@@ -95,3 +95,6 @@ REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
 // The SDK's `vsync` cvar (rex/graphics/flags.h): the Xenos GPU plugin defined it, and this app
 // has no plugin. Off ticks the guest's vertical blank every millisecond.
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+// Read by the shader analysis (xenos/translator.cpp), which the SDK's GPU plugin used to configure.
+REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");

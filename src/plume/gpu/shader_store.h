@@ -39,7 +39,7 @@ struct LiveElement {
   uint32_t remap = 0;
 };
 
-class HostShader : public gfx::Shader {
+class HostShader : public Shader {
  public:
   HostShader(xenos::ShaderType type, uint64_t hash, const uint32_t* ucode, size_t count)
       : Shader(type, hash, ucode, count) {}

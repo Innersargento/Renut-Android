@@ -32,8 +32,8 @@ class GpuBackend final {
   uint32_t counter() const;
   void increment_counter();
   RegisterFile* registers();
-  gfx::Shader* active_vertex_shader() const;
-  gfx::Shader* active_pixel_shader() const;
+  Shader* active_vertex_shader() const;
+  Shader* active_pixel_shader() const;
   uint32_t ReadRegisterValue(uint32_t index) const;
   rex::memory::Memory* memory_ = nullptr;
   rex::system::KernelState* kernel_state_ = nullptr;
@@ -179,9 +179,9 @@ inline void GpuBackend::increment_counter() { counter_++; }
 
 inline RegisterFile* GpuBackend::registers() { return &registers_; }
 
-inline gfx::Shader* GpuBackend::active_vertex_shader() const { return lists.active_vertex_shader_; }
+inline Shader* GpuBackend::active_vertex_shader() const { return lists.active_vertex_shader_; }
 
-inline gfx::Shader* GpuBackend::active_pixel_shader() const { return lists.active_pixel_shader_; }
+inline Shader* GpuBackend::active_pixel_shader() const { return lists.active_pixel_shader_; }
 
 inline uint32_t GpuBackend::ReadRegisterValue(uint32_t index) const {
     if (index < RegisterFile::kRegisterCount) return registers_.values[index];
