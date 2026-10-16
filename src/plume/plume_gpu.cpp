@@ -812,8 +812,7 @@ struct PrecompileState {
   // load asked for first, the next group in file order, and each scene's groups.
   std::vector<uint8_t> state;
   std::vector<uint32_t> group_size;
-  std::deque<uint32_t> urgent;
-  size_t next = 0;
+  std::deque<uint32_t> urgent, background;
   std::unordered_map<uint32_t, std::vector<uint32_t>> scene_groups;
   // Under mutex: the groups of the scene being loaded that are not built yet,
   // how many recipes it has and has left, when it was asked for and when one
@@ -869,21 +868,23 @@ struct PrecompileState {
     return g;
   }
 
-  // Under mutex. UINT32_MAX when every group is taken.
-  uint32_t TakeGroup() {
-    while (!urgent.empty()) {
-      const uint32_t g = urgent.front();
-      urgent.pop_front();
-      if (state[g] == kPending) {
-        state[g] = kTaken;
-        return g;
-      }
-    }
-    while (next < state.size()) {
-      const uint32_t g = uint32_t(next++);
-      if (state[g] == kPending) {
-        state[g] = kTaken;
-        return g;
+  // Under mutex. What a scene being loaded asks for (urgent) - its recorded
+  // groups and those predicted from the models it loads - and, for the one
+  // thread that works during play (`play`), the programs of models streamed in
+  // meanwhile (background). The rest of the recipe list waits for the scene
+  // that needs it: built all at start, it took the game's CPU for minutes of
+  // the first play. UnleashedRecomp likewise compiles only what the level
+  // being loaded needs. UINT32_MAX when there is nothing to take.
+  uint32_t TakeGroup(bool play) {
+    for (std::deque<uint32_t>* queue : {&urgent, play ? &background : nullptr}) {
+      if (!queue) continue;
+      while (!queue->empty()) {
+        const uint32_t g = queue->front();
+        queue->pop_front();
+        if (state[g] == kPending) {
+          state[g] = kTaken;
+          return g;
+        }
       }
     }
     return UINT32_MAX;
@@ -3367,7 +3368,7 @@ void PlumeCommandProcessor::StartRecipes() {
     p.group_size.clear();
     p.programs.clear();
     p.urgent.clear();
-    p.next = 0;
+    p.background.clear();
     p.busy = 0;
     p.scene_groups.clear();
     p.done = 0;
@@ -3391,7 +3392,8 @@ void PlumeCommandProcessor::StartRecipes() {
   stop_precompile_ = false;
   const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
   const uint32_t count = std::clamp(cores * 2 / 3, 2u, 6u);
-  REXLOG_INFO("Renut: Plume building {} pipelines ({} programs, {} tags over {} scenes) from {} on {} threads",
+  REXLOG_INFO("Renut: Plume knows {} pipelines ({} programs, {} tags over {} scenes) from {}; each scene's are "
+              "built while it loads, on {} threads",
               recipes->size(), p.groups.size(), tags.size(), p.scene_groups.size(), path, count);
   recipes->clear();
   p.predicting = true;
@@ -3410,9 +3412,9 @@ void PlumeCommandProcessor::StartRecipes() {
           std::unique_lock lock(p.mutex);
           for (;;) {
             if (stop_precompile_.load(std::memory_order_relaxed)) return;
-            g = p.TakeGroup();
+            g = p.TakeGroup(t == 0);
             if (g != UINT32_MAX) break;
-            if (p.busy == 0 && p.running) {
+            if (p.busy == 0 && p.running && p.urgent.empty() && p.background.empty()) {
               p.running = false;
               REXLOG_INFO("Renut: Plume built {} of {} pipelines ahead in {} ms", p.done.load() - p.batch_failed,
                           p.total.load(),
@@ -3427,9 +3429,9 @@ void PlumeCommandProcessor::StartRecipes() {
           for (const uint32_t index : p.groups[g]) work.push_back(p.recipes[index]);
           warm = p.warm_only[g];
         }
-        // Behind the game while it plays; at full speed while its loading
-        // screen is up.
-        const int wanted = p.loading.load(std::memory_order_relaxed) ? 0 : 10;
+        // At full speed while a loading screen is up; during play only this
+        // thread works, at the lowest priority.
+        const int wanted = p.loading.load(std::memory_order_relaxed) ? 0 : 19;
         if (wanted != nice) {
           renutSetThreadNice(wanted);
           nice = wanted;
@@ -3645,8 +3647,11 @@ void PlumeCommandProcessor::PredictPipelines() {
     std::vector<std::pair<uint64_t, Recipe>> group;
     group.emplace_back(key, std::move(recipe));
     const uint32_t g = p.AddGroup(std::move(group), true);
-    // While a scene loads its screen waits for these too, and they go first.
-    if (p.loading) {
+    // While a scene loads its screen waits for these too, and they go first;
+    // during play they are left to the one thread that works then.
+    if (!p.loading) {
+      p.background.push_back(g);
+    } else {
       p.urgent.push_front(g);
       p.scene_missing.push_back(g);
       ++p.scene_total;
@@ -12656,7 +12661,16 @@ void PlumeSceneRequested(uint32_t scene, uint32_t asset, uint32_t ref) {
     }
   }
   p.scene_asked = p.scene_moved = std::chrono::steady_clock::now();
-  if (!p.running) p.scene_missing.clear();
+  if (!p.predicting.load(std::memory_order_relaxed)) {
+    p.scene_missing.clear();  // nothing builds them (low-memory mode)
+  } else if (!p.scene_missing.empty()) {
+    if (!p.running) {
+      p.running = true;
+      p.batch_start = p.scene_asked;
+      p.batch_failed = 0;
+    }
+    p.changed.notify_all();
+  }
   // Up until the scene starts whatever is known: the models it loads add
   // their predicted programs to it (PredictPipelines).
   p.loading = p.predicting.load(std::memory_order_relaxed) || !p.scene_missing.empty();
