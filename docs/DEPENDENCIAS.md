@@ -23,12 +23,15 @@ git submodule update --init --recursive
 
 ## Como o reNut usa o SDK sem alterá-lo
 
-1. **O renderizador é nosso, o command processor é o do SDK.**
-   `PlumeCommandProcessor` (plume/gpu/internal.h) deriva de `rex::graphics::CommandProcessor`.
-   A thread do command processor é a que o SDK cria; ela chama `SetupContext()`
-   (virtual) e é ali que roda o laço de trabalho do reNut (`RunWorkerLoop`), que
-   faz o que o do SDK faz e, em volta de cada pacote do anel, o trabalho nativo
-   (listas Direct3D, sincronização). Os pacotes em si são executados pelo SDK.
+1. **A GPU é nossa; o SDK não tem sistema gráfico.** O `Runtime` é montado com
+   `graphics` nulo e sem plugin de GPU (`gpu_plugin` vazio), a fronteira de
+   renderização nativa do SDK. O app hospeda a GPU (`StartPlumeGpu`, depois do
+   `Setup`; `PlumeGpu` em plume/gpu/host.cpp) e o `PlumeCommandProcessor`
+   (plume/gpu/processor.h) roda numa thread própria, sem herdar de nada do SDK.
+   O plugin `rexgpu-xenos` não é compilado nem ligado: só alguns auxiliares de
+   decodificação saem das fontes do SDK, sem alteração, numa biblioteca pequena
+   (`windows/xenos-helpers.cmake`: `RegisterFile`, a análise de microcódigo
+   `Shader`, o interpretador, `draw_util`, as tabelas de ucode).
 2. **Funções do jogo: `REX_HOOK_RAW`.** As 235 funções Direct3D do jogo
    (`d3d_functions.inc`, expandidas em `d3d_layer.cpp`) e as correções de jogo
    (`game_fixes.cpp`) substituem as definições fracas do código recompilado,

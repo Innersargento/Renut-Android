@@ -21,7 +21,7 @@ set(CMAKE_INSTALL_INCLUDEDIR include)
 add_compile_definitions(REX_PLATFORM_LINUX=1 REXGLUE_BUILD_CONFIG="Release")
 add_compile_options(-fno-strict-aliasing -ffp-model=strict -fno-char8_t)
 # assembleDebug leaves CMAKE_BUILD_TYPE=Debug, so clang defaulted to -O0 for
-# every target except rexgpu-xenos: the kernel, runtime and shader compiler all
+# every target except the SDK's GPU plugin: the kernel, runtime and shader compiler all
 # ran unoptimized even though REXGLUE_BUILD_CONFIG says "Release". Optimize the
 # whole tree. NDEBUG is how the SDK is released: its asserts are checks of
 # the console's own invariants that the title legitimately breaks (a graphics
@@ -166,14 +166,14 @@ include("${CMAKE_CURRENT_BINARY_DIR}/ui.cmake")
 add_subdirectory("${REXGLUE_ROOT}/src/input" input)
 add_subdirectory("${REXGLUE_ROOT}/src/audio" audio)
 add_subdirectory("${REXGLUE_ROOT}/src/kernel" kernel)
-add_subdirectory("${REXGLUE_ROOT}/src/graphics" graphics)
-target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
-target_compile_options(rexgpu-xenos PRIVATE -O3)
-# The native Plume backend (plume/gpu) derives from the plugin's
-# GraphicsSystem/CommandProcessor and uses its register decoding helpers, so
-# the plugin exports its symbols instead of only rex_gpu_create.
-set_target_properties(rexgpu-xenos PROPERTIES CXX_VISIBILITY_PRESET default
-    VISIBILITY_INLINES_HIDDEN OFF)
+# No Xenos GPU plugin (rexgpu-xenos): the app hosts its own GPU. The renderer takes a handful
+# of decoding helpers from the SDK's sources (windows/xenos-helpers.cmake lists them).
+include("${RENUT_ROOT}/windows/xenos-helpers.cmake")
+renut_xenos_helpers(renut_xenos "${REXGLUE_ROOT}" "" rexruntime)
+target_link_libraries(renut_xenos PRIVATE renderdoc)
+target_compile_definitions(renut_xenos PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
+set_target_properties(renut_xenos PROPERTIES CXX_VISIBILITY_PRESET default
+    VISIBILITY_INLINES_HIDDEN OFF POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(rexui PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
 
 include("${RENUT_ROOT}/generated/android/sources.cmake")
@@ -235,7 +235,7 @@ add_library(renut_runtime SHARED ${RENUT_RUNTIME_SOURCES}
 # generated/shaders/shader_cache.cpp includes "shader_cache.h" by bare name.
 target_include_directories(renut_runtime PRIVATE "${RENUT_ROOT}/generated/android" "${RENUT_SHADERS}"
     "${RENUT_SRC}" "${RENUT_SRC}/plume")
-target_link_libraries(renut_runtime PRIVATE rexruntime rexgpu-xenos renut_plume adrenotools
+target_link_libraries(renut_runtime PRIVATE rexruntime renut_xenos renut_plume adrenotools
     xxHash::xxhash android log dl aaudio)
 # Every call between recompiled guest functions, and to the __savegprlr/
 # __restgprlr helpers that each prologue and epilogue calls, went through a PLT

@@ -75,7 +75,12 @@ list(FILTER RENUT_UI_SOURCES EXCLUDE REGEX "vulkan_mem_alloc\.cpp$")
 set_property(TARGET rexui PROPERTY SOURCES ${RENUT_UI_SOURCES})
 
 renut_static_copy(renut_rexruntime rexruntime)
-renut_static_copy(renut_rexgpu rexgpu-xenos)
+# The Xenos GPU plugin (rexgpu-xenos, the SDK's emulation) is not part of this build: the
+# app hosts its own GPU. What the renderer still takes from it is a handful of decoding
+# helpers (shader microcode analysis and interpreter, register file, draw state, ucode
+# tables), compiled from the SDK's own sources into this small library.
+include("${CMAKE_CURRENT_SOURCE_DIR}/xenos-helpers.cmake")
+renut_xenos_helpers(renut_xenos "${REXGLUE_ROOT}" rexgpu-xenos renut_rexruntime)
 
 # On Windows, git checks the SDK's symlinks out as small text files, so
 # thirdparty/libmspack/cabextract/mspack/* is not C. The real sources are the
@@ -172,4 +177,4 @@ target_include_directories(renut_plume_exe PRIVATE "${RENUT_ROOT}/generated/andr
     "${RENUT_SRC}" "${RENUT_SRC}/plume")
 target_compile_definitions(renut_plume_exe PRIVATE ${RENUT_COMMON_DEFINITIONS})
 target_compile_options(renut_plume_exe PRIVATE ${RENUT_COMMON_OPTIONS} -ferror-limit=0)
-target_link_libraries(renut_plume_exe PRIVATE renut_rexruntime renut_rexgpu renut_plume xxhash)
+target_link_libraries(renut_plume_exe PRIVATE renut_rexruntime renut_xenos renut_plume xxhash)

@@ -86,7 +86,7 @@ jogo ao descarregar uma cena, e não para o FPS liberado.
 | Ponto | Windows | Onde |
 | --- | --- | --- |
 | Toolchain | clang do NDK + MSYS2, sem MSVC | `toolchain-ndk-clang.cmake` |
-| SDK | `rexruntime`/`rexgpu-xenos` viram bibliotecas estáticas dentro do `.exe` | `CMakeLists.txt` (`renut_static_copy`) |
+| SDK | `rexruntime` vira biblioteca estática dentro do `.exe`; o plugin `rexgpu-xenos` não é usado, só alguns helpers (`windows/xenos-helpers.cmake`) | `CMakeLists.txt` (`renut_static_copy`) |
 | Janela | HWND Win32 passado ao Plume | `platform/windows/main_windows.cpp`, `plume/plume_renderer.*` |
 | Carregador Vulkan | `vulkan-1.dll` | `platform/windows/platform_windows.cpp` |
 | Memória do guest | a vista `0xE0000000` fica 0x1000 acima; `GuestPtr()` aplica o deslocamento nas leituras diretas | `src/guest/guest_address.h` |

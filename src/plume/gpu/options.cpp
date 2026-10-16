@@ -91,3 +91,7 @@ REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
                     "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                     "next start; a scene load waits until they are built. Not in low-memory mode, which only "
                     "records.");
+
+// The SDK's `vsync` cvar (rex/graphics/flags.h): the Xenos GPU plugin defined it, and this app
+// has no plugin. Off ticks the guest's vertical blank every millisecond.
+REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
