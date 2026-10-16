@@ -30,6 +30,7 @@ strrchr = 0x82BB61C0
 strcpy_s = 0x821F4BC0
 lstrlenA = 0x82BCD2F0
 lstrcmpiA = 0x82BCD260
+_stricmp = 0x82BB6220  # case-insensitive compare, 73 call sites
 
 # wide string: a lhz loop returning the count of halfwords (144 call sites)
 wcslen = 0x82BB1798
