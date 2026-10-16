@@ -402,9 +402,6 @@ add("runtime_validating", "Validando o runtime ARM64…\nEste teste ainda não i
 add("runtime_start_failed", "Falha ao iniciar o runtime: %1$s", "Failed to start the runtime: %1$s", "运行时启动失败：%1$s",
     "Error al iniciar el runtime: %1$s")
 add("file_unavailable", "Arquivo indisponível.", "File unavailable.", "文件不可用。", "Archivo no disponible.")
-add("precompile_title", "Preparando shaders", "Preparing shaders", "正在准备着色器", "Preparando shaders")
-add("precompile_detail", "%1$d de %2$d pipelines · %3$d%%", "%1$d of %2$d pipelines · %3$d%%", "%1$d / %2$d 条管线 · %3$d%%",
-    "%1$d de %2$d pipelines · %3$d%%")
 
 # ---- text input box ---------------------------------------------------------------------------------
 add("textbox_default_title", "Digite o texto", "Type the text", "请输入文字", "Escribe el texto")

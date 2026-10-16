@@ -801,10 +801,9 @@ uint64_t SceneTagKey(uint64_t recipe, uint32_t scene) {
   return key;
 }
 
-// The precompilation, shared by its threads, the scene-load hold
-// (PlumeSceneRequested) and the progress note over the game (runtime_jni.cpp).
-// A group is the recipes of one program; a scene's groups are those its
-// pipelines are in.
+// The precompilation, shared by its threads and the loading-screen hold
+// (PlumeSceneRequested / PlumeSceneReady, driven by game_fixes.cpp). A group is
+// the recipes of one program; a scene's groups are those its pipelines are in.
 struct PrecompileState {
   enum : uint8_t { kPending, kTaken, kDone };
   std::mutex mutex;
@@ -816,11 +815,18 @@ struct PrecompileState {
   std::deque<uint32_t> urgent;
   size_t next = 0;
   std::unordered_map<uint32_t, std::vector<uint32_t>> scene_groups;
-  // Recipes built of all, and of the scene a load is waiting for.
+  // Under mutex: the groups of the scene being loaded that are not built yet,
+  // how many recipes it has and has left, when it was asked for and when one
+  // of its groups was last finished.
+  std::vector<uint32_t> scene_missing;
+  uint32_t scene_total = 0, scene_left = 0;
+  std::chrono::steady_clock::time_point scene_asked, scene_moved;
   std::atomic<uint32_t> done{0}, total{0};
-  std::atomic<uint32_t> scene_done{0}, scene_total{0};
   std::atomic<bool> running{false};
-  std::atomic<int> waiting{0};
+  // From a scene request until the game's loading screen lets go: the threads
+  // build at full speed then, behind the game otherwise (UnleashedRecomp
+  // raises its compile threads while loading and lowers them in play).
+  std::atomic<bool> loading{false};
   // The scene the game asked for last (0 before the first: the boot); the
   // pipelines drawn are tagged with it.
   std::atomic<uint32_t> scene{0};
@@ -3321,9 +3327,9 @@ void PlumeCommandProcessor::StartRecipes() {
           g = g_precompile.TakeGroup();
         }
         if (g == UINT32_MAX) break;
-        // Behind the game while it plays; at full speed while a scene load
-        // waits for these.
-        const int wanted = g_precompile.waiting.load(std::memory_order_relaxed) ? 0 : 10;
+        // Behind the game while it plays; at full speed while its loading
+        // screen is up.
+        const int wanted = g_precompile.loading.load(std::memory_order_relaxed) ? 0 : 10;
         if (wanted != nice) {
           renutSetThreadNice(wanted);
           nice = wanted;
@@ -12356,71 +12362,67 @@ void ArmPlumeMemoryTrace(const std::string& root) {
   g_validate_windows = access((root + "/plume-validate").c_str(), F_OK) == 0;
 }
 
-PlumePrecompileProgress GetPlumePrecompileProgress() {
-  const bool waiting = g_precompile.waiting.load(std::memory_order_relaxed) > 0;
-  PlumePrecompileProgress progress;
-  progress.done = waiting ? g_precompile.scene_done.load(std::memory_order_relaxed)
-                          : g_precompile.done.load(std::memory_order_relaxed);
-  progress.total = waiting ? g_precompile.scene_total.load(std::memory_order_relaxed)
-                           : g_precompile.total.load(std::memory_order_relaxed);
-  progress.running = g_precompile.running.load(std::memory_order_relaxed);
-  progress.waiting = waiting;
-  return progress;
-}
-
 void PlumeSceneRequested(uint32_t scene, uint32_t asset, uint32_t ref) {
   PrecompileState& p = g_precompile;
   p.scene.store(scene, std::memory_order_relaxed);
-  const auto start = std::chrono::steady_clock::now();
-  std::unique_lock lock(p.mutex);
+  std::lock_guard lock(p.mutex);
   // The scene's groups that are not built yet go to the front of the queue.
-  std::vector<uint32_t> missing;
-  uint32_t total = 0, done = 0;
-  if (auto groups = p.scene_groups.find(scene); groups != p.scene_groups.end() && p.running) {
+  p.scene_missing.clear();
+  p.scene_total = p.scene_left = 0;
+  const auto groups = p.scene_groups.find(scene);
+  if (groups != p.scene_groups.end()) {
     for (const uint32_t g : groups->second) {
-      total += p.group_size[g];
-      if (p.state[g] == PrecompileState::kDone) {
-        done += p.group_size[g];
-        continue;
-      }
-      missing.push_back(g);
+      p.scene_total += p.group_size[g];
+      if (p.state[g] == PrecompileState::kDone) continue;
+      p.scene_left += p.group_size[g];
+      p.scene_missing.push_back(g);
       if (p.state[g] == PrecompileState::kPending) p.urgent.push_front(g);
     }
   }
-  if (missing.empty()) {
-    REXLOG_INFO("Renut: scene {:08X} (asset {:08X}, ref {:08X}) requested; {} of its pipelines known, none to wait for",
-                scene, asset, ref, total);
-    return;
+  p.scene_asked = p.scene_moved = std::chrono::steady_clock::now();
+  if (!p.running) p.scene_missing.clear();
+  p.loading = !p.scene_missing.empty();
+  if (groups == p.scene_groups.end()) {
+    REXLOG_INFO("Renut: scene {:08X} (asset {:08X}, ref {:08X}) requested; none of its pipelines known yet", scene,
+                asset, ref);
+  } else {
+    REXLOG_INFO("Renut: scene {:08X} (asset {:08X}, ref {:08X}) requested; {} of its {} pipelines left to build", scene,
+                asset, ref, p.scene_missing.empty() ? 0 : p.scene_left, p.scene_total);
   }
-  REXLOG_INFO("Renut: scene {:08X} (asset {:08X}, ref {:08X}) waits for {} of its {} pipelines", scene, asset, ref,
-              total - done, total);
-  p.scene_total = total;
-  p.scene_done = done;
-  p.waiting.fetch_add(1);
+}
+
+bool PlumeSceneReady() {
+  PrecompileState& p = g_precompile;
+  std::lock_guard lock(p.mutex);
+  if (p.scene_missing.empty()) return true;
+  const size_t before = p.scene_missing.size();
+  std::erase_if(p.scene_missing, [&](uint32_t g) {
+    if (p.state[g] != PrecompileState::kDone) return false;
+    p.scene_left -= p.group_size[g];
+    return true;
+  });
+  const auto now = std::chrono::steady_clock::now();
+  if (p.scene_missing.size() != before) p.scene_moved = now;
   // Gives up only if the building stops moving: a stuck driver must not hold
   // the game for ever.
-  auto moved = std::chrono::steady_clock::now();
-  while (!missing.empty() && p.running) {
-    p.changed.wait_for(lock, std::chrono::milliseconds(250));
-    const size_t before = missing.size();
-    std::erase_if(missing, [&](uint32_t g) {
-      if (p.state[g] != PrecompileState::kDone) return false;
-      done += p.group_size[g];
-      return true;
-    });
-    p.scene_done = done;
-    const auto now = std::chrono::steady_clock::now();
-    if (missing.size() != before) {
-      moved = now;
-    } else if (now - moved > std::chrono::seconds(60)) {
-      REXLOG_WARN("Renut: scene {:08X}: its pipelines stopped at {} of {}; it loads without them", scene, done, total);
-      break;
-    }
+  if (!p.scene_missing.empty() && p.running && now - p.scene_moved < std::chrono::seconds(60)) return false;
+  if (!p.scene_missing.empty() && p.running) {
+    REXLOG_WARN("Renut: scene {:08X}: its pipelines stopped with {} of {} left; it opens without them",
+                p.scene.load(std::memory_order_relaxed), p.scene_left, p.scene_total);
   }
-  p.waiting.fetch_sub(1);
-  REXLOG_INFO("Renut: scene {:08X} waited {} ms for {} pipelines", scene,
-              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count(),
-              total);
+  p.scene_missing.clear();
+  return true;
+}
+
+void PlumeSceneOpened(bool held) {
+  PrecompileState& p = g_precompile;
+  std::lock_guard lock(p.mutex);
+  p.loading = false;
+  const auto now = std::chrono::steady_clock::now();
+  REXLOG_INFO("Renut: scene {:08X} opens {} ms after its request{}; {} of its pipelines were known",
+              p.scene.load(std::memory_order_relaxed),
+              std::chrono::duration_cast<std::chrono::milliseconds>(now - p.scene_asked).count(),
+              held ? ", its loading screen held for the pipelines" : "", p.scene_total);
 }
 
 }  // namespace renut

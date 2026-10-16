@@ -252,8 +252,6 @@
     <string name="runtime_validating">正在验证 ARM64 运行时…\n此测试尚不会启动游戏。</string>
     <string name="runtime_start_failed">运行时启动失败：%1$s</string>
     <string name="file_unavailable">文件不可用。</string>
-    <string name="precompile_title">正在准备着色器</string>
-    <string name="precompile_detail">%1$d / %2$d 条管线 · %3$d%%</string>
     <string name="textbox_default_title">请输入文字</string>
     <string name="service_channel">游戏运行中</string>
     <string name="service_text">游戏正在运行。点按即可返回。</string>

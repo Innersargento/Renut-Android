@@ -118,10 +118,12 @@ REX_HOOK_RAW(sub_82535F20) {
   in_photo_capture = false;
 }
 
-// Scene changes, held until the new scene's pipelines exist - as
-// UnleashedRecomp holds its loading screen - so it is never drawn without
-// them (plume_gpu.cpp: PlumeSceneRequested). The app shows the progress over
-// the game meanwhile.
+// Scene changes: the game's own loading screen stays up until the new scene's
+// pipelines exist, as UnleashedRecomp holds its loading screen
+// (CGameModeStage::ExitLoading) until its compiles finish, so a scene is never
+// drawn without them. The request only moves the scene's pipelines to the front
+// of the queue (plume_gpu.cpp: PlumeSceneRequested); the hold is further down,
+// where the loaded scene would start.
 //
 // sub_822BC0D8 replaces the running scene: it saves, pops the scene stack and
 // pushes (appScenePush) the scene whose asset id r3 points at. Every scene
@@ -158,6 +160,73 @@ REX_HOOK_RAW(sub_822BC0D8) {
   if (!scene) scene = 1;
   renut::PlumeSceneRequested(scene, asset, ref);
   __imp__sub_822BC0D8(ctx, base);
+}
+
+// The loading screen stays up until the new scene's pipelines are built. A
+// scene's per-frame update (sub_8229B330, r3 the scene) starts it when the
+// scene is loaded (+16 state 2) and not started yet (+52): it waits there while
+// an intro is pending (the word @ 0x82FAC650 nonzero, the sequence @ 0x82FAC654
+// not finished - the Rare logo at boot), then starts the scene, releases the
+// loading screen it held (sub_822BBE58) and sets +52. Until the scene's
+// pipelines are built, reNut keeps it waiting at that point - the analog of
+// UnleashedRecomp's CheckMadeAll hooks - so the game goes on drawing whatever
+// it shows while loading (the logo, the closed puzzle between worlds), exactly
+// as on a slow disc: with an intro the sequence's state query reports it not
+// finished; without one the update sees the scene as started for that call and
+// returns before starting it. Holding the release instead froze the picture:
+// once the scene starts, the game draws nothing until the opening transition.
+namespace {
+
+constexpr uint32_t kIntro = 0x82FAC650;  // +0 the intro, +4 its sequence
+constexpr uint32_t kSequenceFinished = 4;
+
+thread_local bool in_scene_start = false;
+bool pipeline_hold = false;  // the game's main thread only
+
+void StoreGuestWord(uint8_t* base, uint32_t address, uint32_t value) {
+  value = __builtin_bswap32(value);
+  std::memcpy(renut::GuestPtr(base, address), &value, sizeof(value));
+}
+
+}  // namespace
+
+extern "C" void __imp__sub_8229B330(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_8229B330) {
+  const uint32_t scene = ctx.r3.u32;
+  // The update applies queued state changes first, so a scene seen loading on
+  // entry may reach state 2 and start within this call.
+  if (GuestWord(base, scene + 52) != 0 || renut::PlumeSceneReady()) {
+    const bool starting = GuestWord(base, scene + 52) == 0;
+    __imp__sub_8229B330(ctx, base);
+    if (starting && GuestWord(base, scene + 52)) {
+      renut::PlumeSceneOpened(pipeline_hold);
+      pipeline_hold = false;
+    }
+    return;
+  }
+  if (GuestWord(base, kIntro)) {
+    in_scene_start = true;
+    __imp__sub_8229B330(ctx, base);
+    in_scene_start = false;
+  } else {
+    StoreGuestWord(base, scene + 52, 1);
+    __imp__sub_8229B330(ctx, base);
+    if (GuestWord(base, scene + 52) == 1) StoreGuestWord(base, scene + 52, 0);
+  }
+  if (GuestWord(base, scene + 52)) {  // started all the same
+    renut::PlumeSceneOpened(pipeline_hold);
+    pipeline_hold = false;
+  } else if (GuestWord(base, scene + 16) == 2 && !pipeline_hold) {
+    pipeline_hold = true;
+    REXLOG_INFO("Renut: scene {:08X} loaded; its loading screen held for its pipelines", scene);
+  }
+}
+
+// The intro sequence's state, asked by the scene start above.
+extern "C" void __imp__sub_8238A418(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_8238A418) {
+  __imp__sub_8238A418(ctx, base);
+  if (in_scene_start && ctx.r3.u32 == kSequenceFinished) ctx.r3.u64 = kSequenceFinished - 1;
 }
 
 // Scene render targets @ 0x823ED2A8, rebuilt on every device reset. With MSAA

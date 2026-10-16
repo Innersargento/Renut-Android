@@ -39,18 +39,17 @@ void SetPlumeMissDumpDirectory(const std::string& directory);
 // when the device is lost. Call before PlumeRenderer::Start so the first blocks are seen.
 void ArmPlumeMemoryTrace(const std::string& root);
 
-// The pipelines built ahead at start from <files>/plume-recipes.bin: how many
-// are done of how many (of the waiting scene's while a load waits), whether
-// the building still runs, and whether a scene load is waiting for it.
-struct PlumePrecompileProgress {
-  uint32_t done = 0, total = 0;
-  bool running = false, waiting = false;
-};
-PlumePrecompileProgress GetPlumePrecompileProgress();
-// The game asked for a scene (game_fixes.cpp). The pipelines drawn from now on
-// are tagged with it, and the calling guest thread is blocked until the
-// pipelines tagged with it in earlier runs are built - only those. Returns at
-// once for a scene with none left to build. `asset` and `ref` are for the log.
+// The loading-screen hold, UnleashedRecomp's method with the pipelines built
+// ahead at start from <files>/plume-recipes.bin (game_fixes.cpp drives it).
+// The game asked for a scene: the pipelines drawn from now on are tagged with
+// it, and those tagged with it in earlier runs go to the front of the queue and
+// are built at full speed while its loading screen is up. Never blocks.
+// `asset` and `ref` are for the log.
 void PlumeSceneRequested(uint32_t scene, uint32_t asset, uint32_t ref);
+// Whether the requested scene's pipelines are all built (or the building has
+// stopped moving for a minute): until then the game's loading screen stays.
+bool PlumeSceneReady();
+// The loading screen let go of the scene; `held` if it waited for pipelines.
+void PlumeSceneOpened(bool held);
 
 }  // namespace renut

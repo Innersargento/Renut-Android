@@ -252,8 +252,6 @@
     <string name="runtime_validating">Validando el runtime ARM64…\nEsta prueba aún no inicia el juego.</string>
     <string name="runtime_start_failed">Error al iniciar el runtime: %1$s</string>
     <string name="file_unavailable">Archivo no disponible.</string>
-    <string name="precompile_title">Preparando shaders</string>
-    <string name="precompile_detail">%1$d de %2$d pipelines · %3$d%%</string>
     <string name="textbox_default_title">Escribe el texto</string>
     <string name="service_channel">Juego en ejecución</string>
     <string name="service_text">El juego está abierto. Toca para volver.</string>
