@@ -3209,50 +3209,68 @@ void PlumeCommandProcessor::ReapPipelines() {
 void PlumeCommandProcessor::StartRecipes() {
   recipes_ = REXCVAR_GET(renut_plume_precompile) && !g_miss_dump_directory.empty();
   if (!recipes_) return;
-  const std::string path =
-      g_miss_dump_directory.substr(0, g_miss_dump_directory.rfind('/')) + "/plume-recipes.bin";
-  std::vector<uint8_t> bytes;
-  if (FILE* file = std::fopen(path.c_str(), "rb")) {
-    std::fseek(file, 0, SEEK_END);
-    const long size = std::ftell(file);
-    std::fseek(file, 0, SEEK_SET);
-    if (size > 0) {
-      bytes.resize(size_t(size));
-      if (std::fread(bytes.data(), 1, bytes.size(), file) != bytes.size()) bytes.clear();
+  const std::string files = g_miss_dump_directory.substr(0, g_miss_dump_directory.rfind('/'));
+  const std::string path = files + "/plume-recipes.bin";
+  auto read_file = [](const std::string& name) {
+    std::vector<uint8_t> bytes;
+    if (FILE* file = std::fopen(name.c_str(), "rb")) {
+      std::fseek(file, 0, SEEK_END);
+      const long size = std::ftell(file);
+      std::fseek(file, 0, SEEK_SET);
+      if (size > 0) {
+        bytes.resize(size_t(size));
+        if (std::fread(bytes.data(), 1, bytes.size(), file) != bytes.size()) bytes.clear();
+      }
+      std::fclose(file);
     }
-    std::fclose(file);
-  }
+    return bytes;
+  };
   // Records are a 32-bit size and a recipe's bytes, or a scene tag (the size
   // with kRecipeTagBit). One cut short by the app being killed mid-write ends
   // the list and is cut off the file.
   auto recipes = std::make_shared<std::vector<std::pair<uint64_t, Recipe>>>();
   std::vector<std::pair<uint64_t, uint32_t>> tags;
   RecipeHeader header;
-  const bool valid = bytes.size() >= sizeof(header) && std::memcmp(bytes.data(), &header, sizeof(header)) == 0;
-  size_t good_end = valid ? sizeof(header) : 0;
-  while (valid && bytes.size() - good_end >= sizeof(uint32_t)) {
-    uint32_t size = 0;
-    std::memcpy(&size, bytes.data() + good_end, sizeof(size));
-    const uint8_t* at = bytes.data() + good_end + sizeof(size);
-    const uint32_t length = size & ~kRecipeTagBit;
-    if (size_t(bytes.data() + bytes.size() - at) < length) break;
-    if (size & kRecipeTagBit) {
-      if (length != kRecipeTagSize) break;
-      uint64_t recipe = 0;
-      uint32_t scene = 0;
-      std::memcpy(&recipe, at, sizeof(recipe));
-      std::memcpy(&scene, at + sizeof(recipe), sizeof(scene));
-      if (scene_tags_.insert(SceneTagKey(recipe, scene)).second) tags.emplace_back(recipe, scene);
-    } else {
-      Recipe recipe;
-      RecipeReader reader{at, at + length};
-      const uint64_t key = XXH3_64bits(at, length);
-      if (VisitRecipe(reader, recipe) && recorded_recipes_.insert(key).second) {
-        recipes->emplace_back(key, std::move(recipe));
+  // Returns where the good records end, 0 for a file that is not a list.
+  auto parse = [&](const std::vector<uint8_t>& bytes) -> size_t {
+    if (bytes.size() < sizeof(header) || std::memcmp(bytes.data(), &header, sizeof(header)) != 0) return 0;
+    size_t good_end = sizeof(header);
+    while (bytes.size() - good_end >= sizeof(uint32_t)) {
+      uint32_t size = 0;
+      std::memcpy(&size, bytes.data() + good_end, sizeof(size));
+      const uint8_t* at = bytes.data() + good_end + sizeof(size);
+      const uint32_t length = size & ~kRecipeTagBit;
+      if (size_t(bytes.data() + bytes.size() - at) < length) break;
+      if (size & kRecipeTagBit) {
+        if (length != kRecipeTagSize) break;
+        uint64_t recipe = 0;
+        uint32_t scene = 0;
+        std::memcpy(&recipe, at, sizeof(recipe));
+        std::memcpy(&scene, at + sizeof(recipe), sizeof(scene));
+        if (scene_tags_.insert(SceneTagKey(recipe, scene)).second) tags.emplace_back(recipe, scene);
+      } else {
+        Recipe recipe;
+        RecipeReader reader{at, at + length};
+        const uint64_t key = XXH3_64bits(at, length);
+        if (VisitRecipe(reader, recipe) && recorded_recipes_.insert(key).second) {
+          recipes->emplace_back(key, std::move(recipe));
+        }
       }
+      good_end += sizeof(size) + length;
     }
-    good_end += sizeof(size) + length;
-  }
+    return good_end;
+  };
+  // The list shipped with the app (the app copies it out of the APK) comes
+  // first: it stands in for the pipelines UnleashedRecomp predicts from the
+  // assets a scene loads, so even the first start holds each loading screen
+  // for its scene's pipelines instead of compiling them in play. The player's
+  // own file only adds what the shipped list lacks.
+  const size_t seeded = parse(read_file(files + "/plume-recipes.seed")) ? recipes->size() : 0;
+  const std::vector<uint8_t> bytes = read_file(path);
+  const size_t good_end = parse(bytes);
+  const bool valid = good_end != 0;
+  if (seeded) REXLOG_INFO("Renut: Plume pipeline recipes: {} shipped, {} more recorded here", seeded,
+                          recipes->size() - seeded);
   if (!valid) {
     if ((recipe_file_ = std::fopen(path.c_str(), "wb"))) {
       std::fwrite(&header, sizeof(header), 1, recipe_file_);

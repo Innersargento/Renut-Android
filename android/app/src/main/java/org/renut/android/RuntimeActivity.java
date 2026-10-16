@@ -189,7 +189,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 }else last[0]=-1;  // hidden or not loaded: the first reading after it is not an average
                 fps.postDelayed(this,500);
             }},500);
-            results.setVisibility(View.GONE);results.setBackgroundColor(Color.rgb(12,23,28));
+            results.setVisibility(View.GONE);results.setBackgroundColor(Color.rgb(16,10,6));
             root.addView(results,new FrameLayout.LayoutParams(-1,-1));
             gameMenu=ComposeScreens.createGameMenu(this);
             root.addView(gameMenu.getView(),new FrameLayout.LayoutParams(-1,-1));
@@ -217,7 +217,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         }
         LinearLayout body=new LinearLayout(this);body.setOrientation(LinearLayout.VERTICAL);
         int pad=(int)(20*getResources().getDisplayMetrics().density);
-        body.setPadding(pad,pad*2,pad,pad);body.setBackgroundColor(Color.rgb(12,23,28));
+        body.setPadding(pad,pad*2,pad,pad);body.setBackgroundColor(Color.rgb(16,10,6));
         body.setOnApplyWindowInsetsListener((v,i)->{v.setPadding(pad,pad+i.getSystemWindowInsetTop(),pad,pad+i.getSystemWindowInsetBottom());return i;});
         status.setText(graphics?Language.s(R.string.runtime_graphics_status):Language.s(R.string.runtime_validating));
         body.addView(results,new LinearLayout.LayoutParams(-1,graphics?-2:0,graphics?0:1));
@@ -440,6 +440,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         new Thread(()->{
             String report;
             try {
+                RecipeSeed.sync(this);  // before the renderer reads the recipe lists
                 System.loadLibrary("SDL3");org.libsdl.app.SDL.setupJNI();org.libsdl.app.SDL.initialize();org.libsdl.app.SDL.setContext(this);
                 System.loadLibrary("renut_runtime");loaded=true;
                 runOnUiThread(this::syncSecondPlayer);  // a second pad that was already plugged in
