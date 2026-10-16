@@ -31,7 +31,7 @@ class GpuBackend final {
   void Wake();
   uint32_t counter() const;
   void increment_counter();
-  gfx::RegisterFile* registers();
+  RegisterFile* registers();
   gfx::Shader* active_vertex_shader() const;
   gfx::Shader* active_pixel_shader() const;
   uint32_t ReadRegisterValue(uint32_t index) const;
@@ -40,8 +40,8 @@ class GpuBackend final {
   std::function<void(uint32_t, uint32_t)> dispatch_interrupt_;
   // The GPU's registers: the lists write them, the draws read them, and the CPU sees them
   // through the register window (host.cpp).
-  gfx::RegisterFile registers_;
-  gfx::RegisterFile* register_file_ = nullptr;
+  RegisterFile registers_;
+  RegisterFile* register_file_ = nullptr;
   std::atomic<bool> worker_running_;
   rex::system::object_ref<rex::system::XHostThread> worker_thread_;
   std::function<bool()> service_hardware_;
@@ -177,14 +177,14 @@ inline uint32_t GpuBackend::counter() const { return counter_; }
 
 inline void GpuBackend::increment_counter() { counter_++; }
 
-inline gfx::RegisterFile* GpuBackend::registers() { return &registers_; }
+inline RegisterFile* GpuBackend::registers() { return &registers_; }
 
 inline gfx::Shader* GpuBackend::active_vertex_shader() const { return lists.active_vertex_shader_; }
 
 inline gfx::Shader* GpuBackend::active_pixel_shader() const { return lists.active_pixel_shader_; }
 
 inline uint32_t GpuBackend::ReadRegisterValue(uint32_t index) const {
-    if (index < gfx::RegisterFile::kRegisterCount) return registers_.values[index];
+    if (index < RegisterFile::kRegisterCount) return registers_.values[index];
     auto it = shaders.extended_register_values_.find(index);
     return it != shaders.extended_register_values_.end() ? it->second : 0;
   }

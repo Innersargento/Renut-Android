@@ -67,7 +67,7 @@ HizModelEntry* HiZ::HizModelFor(HostShader& vs) {
     std::memcpy(vs.bool_mask, vs.constant_register_map().bool_bitmap, sizeof(vs.bool_mask));
     vs.bool_mask_decoded = true;
   }
-  const gfx::RegisterFile& regs = *backend.register_file_;
+  const RegisterFile& regs = *backend.register_file_;
   uint32_t bools[8];
   bool same = vs.hiz_entry != nullptr;
   for (uint32_t word = 0; word < 8; ++word) {
@@ -101,8 +101,8 @@ HizModelEntry* HiZ::HizModelFor(HostShader& vs) {
 bool HiZ::HizValidate(HostShader& vs, renut::hiz::Model& model,
                                         const xenos::xe_gpu_vertex_fetch_t& fetch, uint32_t vertex_a,
                                         uint32_t vertex_b) {
-  if (!gfx::ShaderInterpreter::CanInterpretShader(vs)) return false;
-  struct Sink final : gfx::ShaderInterpreter::ExportSink {
+  if (!ShaderInterpreter::CanInterpretShader(vs)) return false;
+  struct Sink final : ShaderInterpreter::ExportSink {
     float position[4] = {};
     uint32_t written = 0;
     void Export(rex::graphics::ucode::ExportRegister reg, const float* value, uint32_t mask) override {
@@ -115,7 +115,7 @@ bool HiZ::HizValidate(HostShader& vs, renut::hiz::Model& model,
       }
     }
   } sink;
-  auto interpreter = std::make_unique<gfx::ShaderInterpreter>(*backend.register_file_, *backend.memory_);
+  auto interpreter = std::make_unique<ShaderInterpreter>(*backend.register_file_, *backend.memory_);
   interpreter->SetShader(vs);
   interpreter->SetExportSink(&sink);
   const float* constants = reinterpret_cast<const float*>(&backend.register_file_->values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
@@ -317,7 +317,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     case xenos::PrimitiveType::kQuadList: break;
     default: return ++backend.stats_.hiz_why[1], false;
   }
-  const gfx::RegisterFile& regs = *backend.register_file_;
+  const RegisterFile& regs = *backend.register_file_;
   if (vs.entry && (vs.entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) return ++backend.stats_.hiz_why[2], false;
   const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
   const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();

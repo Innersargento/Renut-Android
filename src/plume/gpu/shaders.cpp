@@ -11,11 +11,11 @@ void Shaders::WriteRegister(uint32_t index, uint32_t value) {
     }
     return;
   }
-  if (index >= gfx::RegisterFile::kRegisterCount) {
+  if (index >= RegisterFile::kRegisterCount) {
     extended_register_values_.insert_or_assign(index, value);
     return;
   }
-  gfx::RegisterFile& regs = *backend.register_file_;
+  RegisterFile& regs = *backend.register_file_;
   // Volatile: the waits in the lists' sync read these from other threads.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {

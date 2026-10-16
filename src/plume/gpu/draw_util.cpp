@@ -20,7 +20,7 @@
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
-#include <rex/graphics/registers.h>
+#include "xenos/registers.h"
 #include "draw_util.h"
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>

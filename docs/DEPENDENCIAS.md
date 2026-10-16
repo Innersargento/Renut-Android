@@ -28,10 +28,13 @@ git submodule update --init --recursive
    renderização nativa do SDK. O app hospeda a GPU (`StartPlumeGpu`, depois do
    `Setup`; `PlumeGpu` em plume/gpu/host.cpp) e o `GpuBackend`
    (plume/gpu/backend.h) roda numa thread própria, sem herdar de nada do SDK.
-   O plugin `rexgpu-xenos` não é compilado nem ligado: só alguns auxiliares de
-   decodificação saem das fontes do SDK, sem alteração, numa biblioteca pequena
-   (`windows/xenos-helpers.cmake`: `RegisterFile`, a análise de microcódigo
-   `Shader`, o interpretador, `draw_util`, as tabelas de ucode).
+   O plugin `rexgpu-xenos` não é compilado nem ligado. O registrador de GPU
+   (`RegisterFile`, os layouts `reg::*` e a tabela de registradores), o
+   interpretador de microcódigo e o `draw_util` são código do reNut
+   (`src/plume/gpu/xenos/`, `draw_util.*`), copiados do Xenia/SDK com a
+   indicação da origem; do SDK só ficam `xenos.h` e os auxiliares de textura
+   (que o wiki recomenda) e uma biblioteca pequena com a análise de microcódigo
+   `Shader` (`windows/xenos-helpers.cmake`).
 2. **Funções do jogo: `REX_HOOK_RAW`.** As 235 funções Direct3D do jogo
    (`d3d_functions.inc`, expandidas em `d3d_layer.cpp`) e as correções de jogo
    (`game_fixes.cpp`) substituem as definições fracas do código recompilado,

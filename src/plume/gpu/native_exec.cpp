@@ -72,7 +72,7 @@ bool Lists::RunNative(uint32_t until) {
     switch (op) {
       case native_d3d::kOpRegs: {
         const uint32_t count = w[0] >> 8, first = w[1];
-        if (f.pos + 2 + count > words.size() || first + count > gfx::RegisterFile::kRegisterCount) {
+        if (f.pos + 2 + count > words.size() || first + count > RegisterFile::kRegisterCount) {
           ++native_bad_;
           f.pos = words.size();
           break;

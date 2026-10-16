@@ -18,8 +18,8 @@
 #include <vector>
 
 #include <rex/assert.h>
-#include <rex/graphics/register_file.h>
-#include <rex/graphics/registers.h>
+#include "xenos/register_file.h"
+#include "xenos/registers.h"
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 

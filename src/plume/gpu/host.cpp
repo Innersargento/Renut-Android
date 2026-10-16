@@ -170,7 +170,7 @@ class PlumeGpu {
       default:
         break;
     }
-    return backend_ && r < gfx::RegisterFile::kRegisterCount ? backend_->ReadRegisterValue(r) : 0;
+    return backend_ && r < RegisterFile::kRegisterCount ? backend_->ReadRegisterValue(r) : 0;
   }
 
   void WriteRegister(uint32_t addr, uint32_t value) {
@@ -181,7 +181,7 @@ class PlumeGpu {
       return;
     }
     if (r == 0x1844) return;  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
-    if (backend_ && r < gfx::RegisterFile::kRegisterCount) backend_->registers()->values[r] = value;
+    if (backend_ && r < RegisterFile::kRegisterCount) backend_->registers()->values[r] = value;
   }
 
   rex::memory::Memory* memory_ = nullptr;

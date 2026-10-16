@@ -11,7 +11,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     ~InDraw() { flag = false; }
   } in_draw(in_issue_draw_);
   if (g_predict.queued.load(std::memory_order_relaxed)) backend.pipelines.PredictPipelines();
-  const gfx::RegisterFile& regs = *backend.register_file_;
+  const RegisterFile& regs = *backend.register_file_;
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) return true;  // resolves are records
   ++backend.stats_.draws;
@@ -169,10 +169,10 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (!pitch) return backend.shaders.Drop("no pitch", vs, ps);
   const uint32_t height = std::clamp<uint32_t>(regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y, 16, 4096);
   const uint32_t color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
-  static constexpr gfx::Register kColorInfo[4] = {
+  static constexpr Register kColorInfo[4] = {
       XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_COLOR1_INFO, XE_GPU_REG_RB_COLOR2_INFO,
       XE_GPU_REG_RB_COLOR3_INFO};
-  static constexpr gfx::Register kBlendControl[4] = {
+  static constexpr Register kBlendControl[4] = {
       XE_GPU_REG_RB_BLENDCONTROL0, XE_GPU_REG_RB_BLENDCONTROL1, XE_GPU_REG_RB_BLENDCONTROL2,
       XE_GPU_REG_RB_BLENDCONTROL3};
   std::array<Target*, 4> colors{};
