@@ -221,7 +221,8 @@ set(RENUT_RUNTIME_SOURCES
     # Android only
     platform/android/runtime_jni.cpp platform/android/achievements_bridge.cpp
     platform/android/text_input_bridge.cpp platform/android/adpf.cpp platform/android/plume_graphics.cpp
-    platform/android/renut_audio.cpp platform/android/xam_users.cpp platform/android/query_protect.cpp)
+    platform/android/renut_audio.cpp platform/android/xam_users.cpp platform/android/query_protect.cpp
+    platform/android/hardware_concurrency.cpp)
 list(TRANSFORM RENUT_RUNTIME_SOURCES PREPEND "${RENUT_SRC}/")
 add_library(renut_runtime SHARED ${RENUT_RUNTIME_SOURCES}
     "${RENUT_SHADERS}/shader_cache.cpp" $<TARGET_OBJECTS:renut_guest>)
