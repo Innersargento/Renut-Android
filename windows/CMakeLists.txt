@@ -152,6 +152,7 @@ add_executable(renut_plume_exe
     "${RENUT_SRC}/plume/plume_renderer.cpp" "${RENUT_SRC}/plume/hiz_model.cpp"
     "${RENUT_SRC}/plume/gpu/context.cpp"
     "${RENUT_SRC}/plume/gpu/draw.cpp"
+    "${RENUT_SRC}/plume/gpu/draw_util.cpp"
     "${RENUT_SRC}/plume/gpu/hiz.cpp"
     "${RENUT_SRC}/plume/gpu/host.cpp"
     "${RENUT_SRC}/plume/gpu/native_exec.cpp"

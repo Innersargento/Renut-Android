@@ -9,15 +9,15 @@
 #   pipeline/shader/shader.cpp, translator.cpp, translator_disasm.cpp
 #                                Shader and its microcode analysis
 #   pipeline/shader/interpreter.cpp   the ucode interpreter (Hi-Z's vertex position model)
-#   util/draw.cpp                scissor, resolve and depth-control decoding
 #   flags.cpp                    the cvars those read
+#
+# (draw_util, the scissor, resolve and depth-control decoding, is reNut's own: src/plume/gpu/draw_util.cpp.)
 function(renut_xenos_helpers target sdk_root original runtime)
     set(dir "${sdk_root}/src/graphics")
     add_library(${target} STATIC
         "${dir}/flags.cpp" "${dir}/register_file.cpp" "${dir}/registers.cpp" "${dir}/format/ucode.cpp"
         "${dir}/pipeline/shader/shader.cpp" "${dir}/pipeline/shader/translator.cpp"
-        "${dir}/pipeline/shader/translator_disasm.cpp" "${dir}/pipeline/shader/interpreter.cpp"
-        "${dir}/util/draw.cpp")
+        "${dir}/pipeline/shader/translator_disasm.cpp" "${dir}/pipeline/shader/interpreter.cpp")
     if(original AND TARGET ${original})
         foreach(property INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS
                 INTERFACE_INCLUDE_DIRECTORIES INTERFACE_COMPILE_DEFINITIONS)

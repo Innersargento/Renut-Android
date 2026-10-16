@@ -74,7 +74,7 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
-#include <rex/graphics/util/draw.h>
+#include "draw_util.h"
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
@@ -131,7 +131,6 @@ using namespace plume;
 namespace gfx = rex::graphics;
 namespace xenos = rex::graphics::xenos;
 namespace reg = rex::graphics::reg;
-namespace draw_util = rex::graphics::draw_util;
 // Register indices (XE_GPU_REG_*).
 using rex::graphics::Register;
 using namespace rex::graphics;
