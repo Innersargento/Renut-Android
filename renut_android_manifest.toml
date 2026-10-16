@@ -5,4 +5,4 @@ name = "renut_android"
 [entrypoint]
 file_path = "assets/default.xex"
 out_directory_path = "generated/android"
-includes = ["config/renut_funcs.toml", "config/renut_android_hooks.toml"]
+includes = ["config/renut_funcs.toml", "config/renut_android_hooks.toml", "config/renut_crt.toml"]
