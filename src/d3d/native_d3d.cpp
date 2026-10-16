@@ -107,7 +107,7 @@ inline uint32_t Phys(uint32_t a) { return (a & 0x1FFFFFFF) + (((a >> 20) + 0x200
 inline uint32_t Cpu(uint32_t physical) { return physical | 0xA0000000u; }
 
 // Device fields.
-constexpr uint32_t kPredicatedMask = 40, kRingWrite = 48, kRingEnd = 56;
+constexpr uint32_t kPredicatedMask = 40, kRingWrite = 48;
 constexpr uint32_t kFetchShadow = 1152, kVsConstants = 1920, kPsConstants = 6016;
 constexpr uint32_t kBoolLoop = 10112, kClipPlanes = 10272;
 constexpr uint32_t kRegs2000 = 10368, kRegs2100 = 10444, kRegs2180 = 10528, kRegs2200 = 10548;
@@ -348,7 +348,6 @@ void Publish() {
   }
 }
 
-bool SyncWanted();
 
 // ---------------------------------------------------------------------------
 // Scratch guest memory for what Direct3D would put in the ring: vertex data
@@ -1601,8 +1600,6 @@ void Swap(PPCContext& ctx) {
 // Native sync: what the GPU writes back for the CPU, recorded where Direct3D
 // asks for it, so the command processor need not walk the game's segments.
 
-bool SyncWanted() { return GetMode() == Mode::kNative; }
-
 // PM4-less callbacks. What InsertCallback (sub_822052C8) writes is a pure function of its
 // arguments - it stores packets from registers and changes nothing in the device - so the
 // lists can carry its effects instead of its words: the register writes in order and the
@@ -1691,7 +1688,6 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   if (end <= ring || end - ring > 4096) return true;
   lock.lock();
   List& list = Current(dev);
-  const uint32_t words = (end - ring) / 4;
   g_counts.callbacks.fetch_add(1, std::memory_order_relaxed);
   PushEffects(list, CallbackEffects(flags, function, context));
   return true;

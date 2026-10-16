@@ -16,8 +16,6 @@ src/
 ├── platform/
 │   ├── android/  JNI, entrada por toque, áudio AAudio, janela, ADPF, conquistas
 │   └── windows/  main (janela Win32), carregador Vulkan, canário de pilha
-└── renut_engine/, main.cpp, renut_app.h
-              O app desktop original (SDK RexGlue + codegen), fora dos dois builds acima
 ```
 
 ## guest/

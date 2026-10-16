@@ -1595,7 +1595,6 @@ class PlumeCommandProcessor final {
   // ranges are swapped in bulk here, and every write into a stage's float
   // constants marks that stage's block as needing a look (CommitConstants).
   void WriteRegister(uint32_t index, uint32_t value);
-  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   // Marks the constant blocks (kConstantChunks per stage, each bound on its
   // own - see set 4 in shader_common.h) that a write lands in.
   void MarkConstantsWritten(uint32_t first, uint32_t count) {
@@ -1733,8 +1732,6 @@ class PlumeCommandProcessor final {
   bool band_fragpos_ = false;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
-  // Resolves come as records (NativeResolve); the ring's copy draws do nothing.
-  bool IssueCopy() { return true; }
   bool ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces);
   // The picture Photo Mode takes: the game's capture routine (sub_82535F20, hooked in
   // guest/game_fixes.cpp) names the resolve it is about to read with the CPU, and only
@@ -2636,7 +2633,6 @@ class PlumeCommandProcessor final {
   // ---- Hi-Z occlusion (see HizFlushWindow) ----
   bool hiz_cond_ = false;  // the device has conditional rendering
   static constexpr uint32_t kHizMaxRecords = 16384;
-  static constexpr uint32_t kHizMinWindow = 12;
   VkPipeline hiz_pipelines_[3] = {};
   VkShaderModule hiz_modules_[3] = {};
   VkPipelineLayout hiz_layout_ = VK_NULL_HANDLE;
@@ -5500,42 +5496,6 @@ void PlumeCommandProcessor::EvictSurfaceTargets() {
   if (evicted) RetireFramebuffers();
 }
 
-static const char* Pm4OpcodeName(uint32_t op) {
-  switch (op) {
-    case xenos::PM4_NOP: return "NOP";
-    case xenos::PM4_ME_INIT: return "ME_INIT";
-    case xenos::PM4_INDIRECT_BUFFER: return "INDIRECT_BUFFER";
-    case xenos::PM4_INDIRECT_BUFFER_PFD: return "INDIRECT_BUFFER_PFD";
-    case xenos::PM4_WAIT_REG_MEM: return "WAIT_REG_MEM";
-    case xenos::PM4_WAIT_FOR_IDLE: return "WAIT_FOR_IDLE";
-    case xenos::PM4_REG_RMW: return "REG_RMW";
-    case xenos::PM4_MEM_WRITE: return "MEM_WRITE";
-    case xenos::PM4_COND_WRITE: return "COND_WRITE";
-    case xenos::PM4_COND_EXEC: return "COND_EXEC";
-    case xenos::PM4_EVENT_WRITE: return "EVENT_WRITE";
-    case xenos::PM4_EVENT_WRITE_SHD: return "EVENT_WRITE_SHD";
-    case xenos::PM4_EVENT_WRITE_EXT: return "EVENT_WRITE_EXT";
-    case xenos::PM4_EVENT_WRITE_ZPD: return "EVENT_WRITE_ZPD";
-    case xenos::PM4_DRAW_INDX: return "DRAW_INDX";
-    case xenos::PM4_DRAW_INDX_2: return "DRAW_INDX_2";
-    case xenos::PM4_SET_CONSTANT: return "SET_CONSTANT";
-    case xenos::PM4_SET_CONSTANT2: return "SET_CONSTANT2";
-    case xenos::PM4_SET_SHADER_CONSTANTS: return "SET_SHADER_CONSTANTS";
-    case xenos::PM4_LOAD_ALU_CONSTANT: return "LOAD_ALU_CONSTANT";
-    case xenos::PM4_IM_LOAD: return "IM_LOAD";
-    case xenos::PM4_IM_LOAD_IMMEDIATE: return "IM_LOAD_IMMEDIATE";
-    case xenos::PM4_INVALIDATE_STATE: return "INVALIDATE_STATE";
-    case xenos::PM4_INTERRUPT: return "INTERRUPT";
-    case xenos::PM4_XE_SWAP: return "XE_SWAP";
-    case xenos::PM4_VIZ_QUERY: return "VIZ_QUERY";
-    case xenos::PM4_SET_BIN_MASK_LO:
-    case xenos::PM4_SET_BIN_MASK_HI:
-    case xenos::PM4_SET_BIN_SELECT_LO:
-    case xenos::PM4_SET_BIN_SELECT_HI: return "SET_BIN_*";
-    default: return "";
-  }
-}
-
 std::string PlumeCommandProcessor::SurfaceReport() {
   size_t count = 0;
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
@@ -6436,21 +6396,6 @@ void PlumeCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     }
   } else if (index == XE_GPU_REG_COHER_STATUS_HOST) {
     const_cast<volatile uint32_t&>(regs.values[index]) |= UINT32_C(0x80000000);
-  }
-}
-
-void PlumeCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
-                                                  uint32_t num_registers) {
-  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
-      uint64_t(start_index) + num_registers <= uint64_t(XE_GPU_REG_SHADER_CONSTANT_LOOP_31) + 1) {
-    CopySwapped(reinterpret_cast<uint8_t*>(&register_file_->values[start_index]),
-                reinterpret_cast<const uint8_t*>(base), size_t(num_registers) * sizeof(uint32_t),
-                xenos::Endian::k8in32);
-    MarkConstantsWritten(start_index, num_registers);
-    return;
-  }
-  for (uint32_t i = 0; i < num_registers; ++i) {
-    WriteRegister(start_index + i, rex::memory::load_and_swap<uint32_t>(base + i));
   }
 }
 
