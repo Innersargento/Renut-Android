@@ -24,7 +24,7 @@ git submodule update --init --recursive
 ## Como o reNut usa o SDK sem alterá-lo
 
 1. **O renderizador é nosso, o command processor é o do SDK.**
-   `PlumeCommandProcessor` (plume_gpu.cpp) deriva de `rex::graphics::CommandProcessor`.
+   `PlumeCommandProcessor` (plume/gpu/internal.h) deriva de `rex::graphics::CommandProcessor`.
    A thread do command processor é a que o SDK cria; ela chama `SetupContext()`
    (virtual) e é ali que roda o laço de trabalho do reNut (`RunWorkerLoop`), que
    faz o que o do SDK faz e, em volta de cada pacote do anel, o trabalho nativo

@@ -6,7 +6,7 @@
 // shader's vfetch instructions in place - fetch constant, format, stride and
 // offset - so the microcode the GPU is handed differs from the microcode the
 // game registered (and that was recompiled) in exactly those fields. Clearing
-// them gives both the same key. Shared by the runtime (plume_gpu.cpp) and
+// them gives both the same key. Shared by the runtime (plume/gpu) and
 // tools/shaders/ucode_map.cpp so the two cannot drift.
 //
 // The destination swizzle stays in `Key`. It decides which components of the

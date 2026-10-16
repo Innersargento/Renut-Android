@@ -43,11 +43,37 @@ src/
 
 | Arquivo | O que faz |
 |---|---|
-| `plume_gpu.{h,cpp}` | Sistema gráfico: lê o PM4 do jogo e executa cada draw, resolve e swap com Plume e os shaders recompilados offline |
+| `plume_gpu.h` | API pública do sistema gráfico (iniciar, parar, cena e pipelines); a implementação está em `gpu/` |
 | `plume_renderer.{h,cpp}` | Dono da janela/swapchain via Plume; alimentado pela camada D3D; camada Vulkan própria (estado dinâmico, cache de pipelines) |
 | `plume_textures.{h,cpp}` | Decodifica no CPU as texturas do jogo (destile, byte swap, RGBA8) |
 | `spirv_rewrites.h`, `xenos_ucode_key.h`, `shader_cache.h`, `shader_cache_blob.S` | Transformações de SPIR-V, chave do microcódigo, cache de shaders embutido |
 | `shaders/` | Shaders próprios do renderizador (`.vert/.frag/.comp/.geom` e o `.inc` com o SPIR-V; regerados por `tools/shaders/build_host_shaders.sh`) |
+
+### plume/gpu/
+
+O processador de comandos do Plume, dividido por assunto. Tudo em `renut::gpu`; `internal.h` declara os tipos e a classe `PlumeCommandProcessor`, e nada fora de `gpu/` o inclui.
+
+| Arquivo | O que faz |
+|---|---|
+| `internal.h` | Tipos, auxiliares e a classe `PlumeCommandProcessor` |
+| `options.cpp` | Os cvars `renut_plume_*` |
+| `support.cpp` | Funções livres: formatos, blend, entradas de shader, receitas, mapa de microcódigo |
+| `pipeline_cache.cpp` | Threads de pipelines, arquivo de receitas, predição de pipelines |
+| `context.cpp` | Contexto Vulkan (criar e desfazer) e o laço do worker |
+| `streams.cpp` | Anel de upload, streams de vértice mantidos, memexport, blocos de constantes |
+| `profiling.cpp` | Timestamps de GPU e o profiler de pares |
+| `targets.cpp` | Início do quadro, render targets, framebuffers, imagens resolvidas |
+| `textures.cpp` | Texturas do jogo e samplers |
+| `shaders.cpp` | Escrita de registradores, busca de shaders, estatísticas de pipeline |
+| `native_exec.cpp` | Executa as listas nativas que o front end D3D grava |
+| `draw.cpp` | `IssueDraw`: um draw do jogo, do estado dos registradores até o draw gravado |
+| `recorder.cpp` | Thread de gravação, draws adiados, relatório de device perdido |
+| `hiz.cpp` | Culling Hi-Z |
+| `resolve.cpp` | Resolves e cópias de profundidade |
+| `patches.cpp` | Expansão dos patches de tesselação |
+| `swap.cpp` | `IssueSwap`: a apresentação do quadro |
+| `report.cpp` | Relatórios de memória e estatísticas |
+| `host.cpp` | `PlumeGpu` (o hardware de vídeo hospedado) e a API de `plume_gpu.h` |
 
 ## Onde ficam os scripts de build
 

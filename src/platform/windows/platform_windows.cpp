@@ -1,6 +1,6 @@
 // Windows counterparts of the small platform seams the Android build provides
 // in android_vulkan_loader.cpp, plume_graphics.cpp and the thread-priority call
-// in plume_gpu.cpp.
+// in plume/gpu/host.cpp.
 #include <windows.h>
 
 #include <atomic>

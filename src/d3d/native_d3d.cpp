@@ -1704,7 +1704,7 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
 // The frame-rate target (plume/frame_pacing.h) is applied here, per frame, so it
 // changes while playing: anything but the game's own 30 FPS asks for immediate
 // presentation, without the interval the game stored being touched, and the
-// command thread paces the frames instead (plume_gpu.cpp IssueSwap). Back at 30
+// command thread paces the frames instead (plume/gpu/swap.cpp IssueSwap). Back at 30
 // the very next swap waits for the vblank again.
 bool SynchronizeToPresentationInterval(PPCContext& ctx, uint8_t* base) {
   if (renut::pacing::ImmediatePresentation()) ctx.r4.u32 = 1;

@@ -128,7 +128,7 @@ REX_HOOK_RAW(sub_82535F20) {
 // pipelines exist, as UnleashedRecomp holds its loading screen
 // (CGameModeStage::ExitLoading) until its compiles finish, so a scene is never
 // drawn without them. The request only moves the scene's pipelines to the front
-// of the queue (plume_gpu.cpp: PlumeSceneRequested); the hold is further down,
+// of the queue (plume/gpu/host.cpp: PlumeSceneRequested); the hold is further down,
 // where the loaded scene would start.
 //
 // sub_822BC0D8 replaces the running scene: it saves, pops the scene stack and

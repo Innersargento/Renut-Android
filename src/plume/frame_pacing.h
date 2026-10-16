@@ -3,7 +3,7 @@
 //
 // One target, read live by every part that paces or presents:
 //   30        the game's own rate. Its presentation interval holds it to every
-//             second vertical blank, and the vblank clock (plume_gpu.cpp) is what
+//             second vertical blank, and the vblank clock (plume/gpu/host.cpp) is what
 //             makes that steady.
 //   31..240   the game presents immediately (no wait for the vblank) and the
 //             command thread holds it to the target with a Pacer.

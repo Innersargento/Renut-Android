@@ -6,7 +6,7 @@ import java.io.*;
 
 /**
  * The pipeline recipes that ship inside the APK (assets/plume-recipes.seed), copied into the app's
- * files where the renderer reads them before the player's own list (plume_gpu.cpp, StartRecipes).
+ * files where the renderer reads them before the player's own list (plume/gpu/pipeline_cache.cpp, StartRecipes).
  * With them even the first start builds each scene's pipelines while its loading screen is up.
  * Copied again only when the APK changes.
  */

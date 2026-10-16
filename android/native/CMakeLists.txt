@@ -169,7 +169,7 @@ add_subdirectory("${REXGLUE_ROOT}/src/kernel" kernel)
 add_subdirectory("${REXGLUE_ROOT}/src/graphics" graphics)
 target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_VULKAN=1 REX_HAS_D3D12=0)
 target_compile_options(rexgpu-xenos PRIVATE -O3)
-# The native Plume backend (plume_gpu.cpp) derives from the plugin's
+# The native Plume backend (plume/gpu) derives from the plugin's
 # GraphicsSystem/CommandProcessor and uses its register decoding helpers, so
 # the plugin exports its symbols instead of only rex_gpu_create.
 set_target_properties(rexgpu-xenos PROPERTIES CXX_VISIBILITY_PRESET default
@@ -216,7 +216,12 @@ set(RENUT_RUNTIME_SOURCES
     # Shared with the Windows build
     guest/game_fixes.cpp guest/cheats.cpp guest/kernel_overrides.cpp guest/host_support.cpp
     d3d/d3d_layer.cpp d3d/native_d3d.cpp d3d/plume_d3d.cpp
-    plume/plume_renderer.cpp plume/plume_gpu.cpp plume/hiz_model.cpp plume/plume_textures.cpp plume/shader_cache_blob.S
+    plume/plume_renderer.cpp plume/hiz_model.cpp
+    plume/gpu/context.cpp plume/gpu/draw.cpp plume/gpu/hiz.cpp plume/gpu/host.cpp
+    plume/gpu/native_exec.cpp plume/gpu/options.cpp plume/gpu/patches.cpp plume/gpu/pipeline_cache.cpp
+    plume/gpu/profiling.cpp plume/gpu/recorder.cpp plume/gpu/report.cpp plume/gpu/resolve.cpp
+    plume/gpu/shaders.cpp plume/gpu/streams.cpp plume/gpu/support.cpp plume/gpu/swap.cpp
+    plume/gpu/targets.cpp plume/gpu/textures.cpp plume/plume_textures.cpp plume/shader_cache_blob.S
     vendor/smolv/smolv.cpp
     # Android only
     platform/android/runtime_jni.cpp platform/android/achievements_bridge.cpp

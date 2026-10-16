@@ -1,7 +1,7 @@
 # Hi-Z: o que o renderizador deixa de desenhar
 
 Implementado em 14/10/2026 (`src/plume/hiz_model.{h,cpp}`, a parte "Hi-Z" de
-`src/plume/plume_gpu.cpp`, `src/plume/shaders/hiz_*.comp`). Chave de teste:
+`src/plume/gpu/hiz.cpp`, `src/plume/shaders/hiz_*.comp`). Chave de teste:
 `files/plume-hiz` (relida a cada 30 quadros) ou o cvar `renut_plume_hiz`.
 
 | Modo | O que faz |
