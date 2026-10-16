@@ -115,7 +115,7 @@ void CheckWait(PPCContext& ctx, uint8_t* base) {
   }
   if (wait.fired || now - wait.since < std::chrono::milliseconds(1500)) return;
   // Only a wait nothing will end: every published list has run and the
-  // command processor is idle.
+  // GPU backend is idle.
   if (g_executor_busy.load(std::memory_order_relaxed) > 0 ||
       g_counts.lists_executed.load(std::memory_order_relaxed) <
           g_counts.lists_published.load(std::memory_order_relaxed)) {

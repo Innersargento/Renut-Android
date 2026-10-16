@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool) {
   struct InDraw {
     bool& flag;
@@ -11,11 +11,6 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     ~InDraw() { flag = false; }
   } in_draw(in_issue_draw_);
   if (g_predict.queued.load(std::memory_order_relaxed)) PredictPipelines();
-  // Only the native lists draw: a draw packet in the ring draws nothing.
-  if (!native_swapped_) {
-    ++native_ring_draws_dropped_;
-    return true;
-  }
   const gfx::RegisterFile& regs = *register_file_;
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) return true;  // resolves are records
@@ -555,7 +550,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     // kept buffer went away, the ring has not wrapped, and no export range
     // overlaps (exports change under draws).
     const BufferRange native_stream =
-        native_swapped_ && stream < native_streams_.size() ? native_streams_[stream] : BufferRange{};
+        stream < native_streams_.size() ? native_streams_[stream] : BufferRange{};
     StreamMemo& memo = stream_memo_[stream];
     const uint32_t* constant_words = reinterpret_cast<const uint32_t*>(&fetch);
     const uint64_t signature = repackable ? vs->repack_signature[stream] : 0;
@@ -1148,7 +1143,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   struct RefractionBoundsRestore {
-    PlumeCommandProcessor* self;
+    GpuBackend* self;
     const float* saved;
     bool active;
     ~RefractionBoundsRestore() {
@@ -1814,7 +1809,7 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     const uint32_t size = index_count * (is32 ? 4 : 2);
     // A quad list's indices are read back here to be split into triangles,
     // so they stay in the ring.
-    if (native_swapped_) stream_object_ = native_indices_;
+    stream_object_ = native_indices_;
     const bool uploaded =
         quad_list ? UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)
                   : GuestStream(index_buffer_info->guest_base, size, index_buffer_info->endianness,

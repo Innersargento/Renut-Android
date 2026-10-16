@@ -13,7 +13,7 @@ namespace renut::gpu {
 // out long before that. Whatever has not been sampled for a while goes; it is
 // decoded again if it comes back, and a resolve is only dropped when it has
 // been neither written nor read.
-void PlumeCommandProcessor::EvictIdleTextures() {
+void GpuBackend::EvictIdleTextures() {
   const uint32_t free_2d = kMaxTextures2D - next_descriptor_ + uint32_t(free_descriptors_.size());
   const uint32_t free_3d = kMaxTextures3D - next_3d_descriptor_ + uint32_t(free_3d_descriptors_.size());
   const uint32_t free_cube = kMaxTexturesCube - next_cube_descriptor_ + uint32_t(free_cube_descriptors_.size());
@@ -106,7 +106,7 @@ void PlumeCommandProcessor::EvictIdleTextures() {
   }
 }
 
-void PlumeCommandProcessor::BeginFrame() {
+void GpuBackend::BeginFrame() {
   SyncRecorder();
   slot_ = (slot_ + 1) % kPlumeFramesInFlight;
   // The slot's command list, ring slice and retired resources are all still in
@@ -181,7 +181,7 @@ void PlumeCommandProcessor::BeginFrame() {
 }
 
 // Resets the per-frame state that lives in the ring slice and opens the list.
-void PlumeCommandProcessor::StartList() {
+void GpuBackend::StartList() {
   SyncRecorder();
   upload_used_ = slice_base_;
   uploaded_streams_.clear();
@@ -220,7 +220,7 @@ void PlumeCommandProcessor::StartList() {
 
 // Runs what was recorded so far and waits, to make room in the upload ring.
 // A full drain: the slice cannot be rewritten while any frame still reads it.
-void PlumeCommandProcessor::Flush() {
+void GpuBackend::Flush() {
   FlushDeferred();
   if (!list_open_) return;
   L()->end();
@@ -232,7 +232,7 @@ void PlumeCommandProcessor::Flush() {
   StartList();
 }
 
-void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayout& current,
+void GpuBackend::Transition(RenderTexture* texture, RenderTextureLayout& current,
                                        RenderTextureLayout layout) {
   if (current == layout) return;
   RenderBarrierStages stages = (layout == RenderTextureLayout::COPY_SOURCE ||
@@ -261,7 +261,7 @@ void PlumeCommandProcessor::Transition(RenderTexture* texture, RenderTextureLayo
 
 
 
-uint32_t PlumeCommandProcessor::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first) {
+uint32_t GpuBackend::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first) {
   RenderTexture* texture = fitted ? r.fitted.get() : r.texture.get();
   if (!texture) return 0;
   // Only a resolve that kept its stencil (RG32F) reads differently as 8_8_8_8.
@@ -292,7 +292,7 @@ uint32_t PlumeCommandProcessor::SwizzledResolved(Resolved& r, bool fitted, uint3
   return s.descriptor;
 }
 
-uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint32_t height) {
+uint32_t GpuBackend::FittedResolved(Resolved& r, uint32_t width, uint32_t height) {
   if (!r.fitted || r.fitted_width != width || r.fitted_height != height) {
     RetireSwizzled(r);
     RetireTexture(r.fitted, r.fitted_descriptor);
@@ -342,7 +342,7 @@ uint32_t PlumeCommandProcessor::FittedResolved(Resolved& r, uint32_t width, uint
 // from bit 18 and height - 1 from bit 3; the width is the pitch, as for the
 // EDRAM targets).
 
-Target* PlumeCommandProcessor::NativeTarget(uint32_t slot, uint32_t info_register) {
+Target* GpuBackend::NativeTarget(uint32_t slot, uint32_t info_register) {
   const ListSurface& s = native_surfaces_[slot];
   if (!s.object) {
     ++surface_missing_;
@@ -352,7 +352,7 @@ Target* PlumeCommandProcessor::NativeTarget(uint32_t slot, uint32_t info_registe
   return SurfaceTarget(slot);
 }
 
-Target* PlumeCommandProcessor::SurfaceTarget(uint32_t slot) {
+Target* GpuBackend::SurfaceTarget(uint32_t slot) {
   const ListSurface& s = native_surfaces_[slot];
   if (!s.object) return nullptr;
   const bool depth = slot == 4;
@@ -408,7 +408,7 @@ Target* PlumeCommandProcessor::SurfaceTarget(uint32_t slot) {
   return &target;
 }
 
-void PlumeCommandProcessor::RetireFramebuffers() {
+void GpuBackend::RetireFramebuffers() {
   SyncRecorder();
   for (auto& [key, framebuffer] : framebuffers_)
     retired_framebuffer_slots_[slot_].push_back(std::move(framebuffer));
@@ -417,7 +417,7 @@ void PlumeCommandProcessor::RetireFramebuffers() {
   bound_framebuffer_ = nullptr;
 }
 
-bool PlumeCommandProcessor::GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height) {
+bool GpuBackend::GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height) {
   width = std::max(width, target.width);
   height = std::max(height, target.height);
   if (width == target.width && height == target.height) return true;
@@ -438,7 +438,7 @@ bool PlumeCommandProcessor::GrowSurfaceTarget(Target& target, uint32_t width, ui
   return true;
 }
 
-void PlumeCommandProcessor::MatchSurfaceSizes(std::array<Target*, 4>& colors, uint32_t color_count, Target*& depth) {
+void GpuBackend::MatchSurfaceSizes(std::array<Target*, 4>& colors, uint32_t color_count, Target*& depth) {
   Target* first = color_count ? colors[0] : depth;
   if (!first) return;
   uint32_t width = first->width, height = first->height;
@@ -454,7 +454,7 @@ void PlumeCommandProcessor::MatchSurfaceSizes(std::array<Target*, 4>& colors, ui
 
 // Targets of surfaces not drawn to for ten seconds go (a released surface's
 // object is reused for another).
-void PlumeCommandProcessor::EvictSurfaceTargets() {
+void GpuBackend::EvictSurfaceTargets() {
   if (swaps_ % 60) return;
   bool evicted = false;
   for (auto it = targets_.begin(); it != targets_.end();) {
@@ -470,7 +470,7 @@ void PlumeCommandProcessor::EvictSurfaceTargets() {
   if (evicted) RetireFramebuffers();
 }
 
-std::string PlumeCommandProcessor::SurfaceReport() {
+std::string GpuBackend::SurfaceReport() {
   size_t count = 0;
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
   std::string out = fmt::format(
@@ -491,7 +491,7 @@ std::string PlumeCommandProcessor::SurfaceReport() {
   return out;
 }
 
-RenderFramebuffer* PlumeCommandProcessor::GetFramebuffer(const std::array<Target*, 4>& colors,
+RenderFramebuffer* GpuBackend::GetFramebuffer(const std::array<Target*, 4>& colors,
                                                          uint32_t color_count, Target* depth) {
   // What SetFramebuffer labels the next pass with.
   color_count_of_pass_ = color_count;
@@ -524,7 +524,7 @@ RenderFramebuffer* PlumeCommandProcessor::GetFramebuffer(const std::array<Target
   return framebuffer.get();
 }
 
-void PlumeCommandProcessor::SetFramebuffer(RenderFramebuffer* framebuffer) {
+void GpuBackend::SetFramebuffer(RenderFramebuffer* framebuffer) {
   const bool recorder = OnRecorder();
   if (!recorder) SyncRecorder();
   if (!state_bound_) {
@@ -551,7 +551,7 @@ void PlumeCommandProcessor::SetFramebuffer(RenderFramebuffer* framebuffer) {
   }
 }
 
-Resolved& PlumeCommandProcessor::GetResolved(uint32_t address, RenderFormat format, uint32_t width,
+Resolved& GpuBackend::GetResolved(uint32_t address, RenderFormat format, uint32_t width,
                                              uint32_t height) {
   InvalidateResolvedLookups();
   Resolved& resolved = resolved_[ResolvedKey(address, format)];
@@ -582,7 +582,7 @@ Resolved& PlumeCommandProcessor::GetResolved(uint32_t address, RenderFormat form
 // seen if the game uses the surface again without clearing all of it, and then
 // RestoreAliasedDepth copies them back from the resolved image, which is still
 // the map as it was resolved - what the old path's surface held all along.
-Resolved* PlumeCommandProcessor::AliasDepthResolve(Target& source, uint32_t address) {
+Resolved* GpuBackend::AliasDepthResolve(Target& source, uint32_t address) {
   // The surface has a copy of its own pending: give it back before the image
   // goes, or the resolve would take an undefined one.
   if (source.restore_key) RestoreAliasedDepth(source, false);
@@ -654,13 +654,13 @@ Resolved* PlumeCommandProcessor::AliasDepthResolve(Target& source, uint32_t addr
 // pattern AliasDepthResolve waits for: a clear of all of it ends the cycle and
 // counts, anything else breaks the run. `whole` is a clear that covered the
 // surface; the caller restores or drops the contents itself.
-void PlumeCommandProcessor::NoteAliasedUse(Target& target, bool whole_clear) {
+void GpuBackend::NoteAliasedUse(Target& target, bool whole_clear) {
   if (!target.aliased_since_clear) return;
   target.aliased_since_clear = false;
   target.alias_cycles = whole_clear ? target.alias_cycles + 1 : 0;
 }
 
-bool PlumeCommandProcessor::RestoreAliasedDepth(Target& target, bool full_clear) {
+bool GpuBackend::RestoreAliasedDepth(Target& target, bool full_clear) {
   const uint64_t key = target.restore_key;
   const RenderTexture* image = target.restore_image;
   target.restore_key = 0;

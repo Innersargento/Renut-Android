@@ -10,7 +10,7 @@ Nada do que o reNut precisa a mais deles está num patch: fica no código do
 próprio reNut (`src/`):
 
 - o que o renderizador precisa do SDK sai de classes e ganchos que o SDK já
-  expõe (a thread do command processor é a do SDK; o loop dela é nosso);
+  expõe (a thread do backend de GPU é a do SDK; o loop dela é nosso);
 - as exportações do kernel que o reNut troca (ex.: `VdSwap`) são renomeadas na
   compilação do código do jogo (`guest/kernel_overrides.*`), sem tocar no SDK;
 - o que o Plume não expõe (estado dinâmico de stencil/blend, formatos de vértice

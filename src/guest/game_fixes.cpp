@@ -303,7 +303,7 @@ REX_HOOK_RAW(sub_823B18C8) {
 // D3D GPU hang handler @ 0x8265AB70, called by the fence watchdog
 // (nut_D3D_CBlocker_Check, sub_8264DCD0) after 5000 ticks of KTHREAD
 // kernel_time without GPU progress. On the console the GPU never falls that far
-// behind, but here the command processor can stall for seconds while shaders
+// behind, but here the GPU backend can stall for seconds while shaders
 // are translated and the driver compiles pipelines (entering the 3D menu
 // creates ~330 at once). The handler then dumps registers, marks the device as
 // hung and rewrites the ring read pointer, after which nothing renders. Return

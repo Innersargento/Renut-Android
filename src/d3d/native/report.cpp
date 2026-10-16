@@ -10,9 +10,9 @@ std::mutex g_report_mutex;
 std::string g_report_path;
 }  // namespace
 
-void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t bad,
+void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
                   const std::function<std::string()>& executor) {
-  static uint64_t last_frame = 0, last_draws = 0, last_dropped = 0;
+  static uint64_t last_frame = 0, last_draws = 0;
   if (frame % 30 == 0) {
     // The live switch for other devices' immediate calls.
     std::string path;
@@ -34,9 +34,9 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
   const double f = double(frame - last_frame);
   auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
   std::string out = fmt::format(
-      "native Direct3D lists - frames {}..{}\n\n== per frame: draws {:.1f}, ring draw packets ignored {:.1f}; "
+      "native Direct3D lists - frames {}..{}\n\n== per frame: draws {:.1f}; "
       "problems so far {}\n",
-      last_frame, frame, (draws - last_draws) / f, (ring_draws_dropped - last_dropped) / f, bad);
+      last_frame, frame, (draws - last_draws) / f, bad);
   out += fmt::format(
       "== front end (total): draws {}, flushes {}, shader loads {}, patched loads {}, begin vertices {}, "
       "runs {} (unknown {}), recordings {}, recording devices {}, immediate calls on another device {}, publishes {}, "
@@ -74,7 +74,6 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
   if (executor) out += executor();
   last_frame = frame;
   last_draws = draws;
-  last_dropped = ring_draws_dropped;
   std::string path;
   {
     std::lock_guard lock(g_report_mutex);

@@ -103,26 +103,26 @@ struct List {
 bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base);
 void OnLeave(uint32_t function, uint32_t r3, PPCContext& ctx, uint8_t* base);
 
-// The command processor's side: the immediate lists published so far, in
+// The GPU backend's side: the immediate lists published so far, in
 // order (each holds what the game recorded up to a ring kick-off).
 void TakePublished(std::vector<std::shared_ptr<const List>>& out);
 
 // The executor's counters, written with the front end's to files/native-d3d.txt
 // every 300 frames.
-void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, uint64_t bad,
+void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
                   const std::function<std::string()>& executor);
 // Where the report goes (the runtime's files directory).
 void SetFilesDirectory(std::string directory);
 // Native sync: VdSwap's frame (frontbuffer GPU address and size) as a record of
 // the swapping device's list; false when the swap goes through the ring.
 bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height);
-// Native sync: the command processor finished a published list.
+// Native sync: the GPU backend finished a published list.
 void NoteListExecuted();
-// Native sync: the command processor is running lists or presenting (a wait
+// Native sync: the GPU backend is running lists or presenting (a wait
 // meanwhile is no sign of a missing record).
 void SetExecutorBusy(bool busy);
 // The doorbell writes nothing to the ring, so a
-// publish wakes the command processor's worker, which then runs the lists itself.
+// publish wakes the GPU backend's worker, which then runs the lists itself.
 void SetWake(std::function<void()> wake);
 bool WorkPending();
 void TakeWorkPending();

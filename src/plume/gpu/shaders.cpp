@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-void PlumeCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+void GpuBackend::WriteRegister(uint32_t index, uint32_t value) {
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
     if (register_file_->values[index] != value) {
       register_file_->values[index] = value;
@@ -30,7 +30,7 @@ void PlumeCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
-gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
+gfx::Shader* GpuBackend::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                                const uint32_t* host_address, uint32_t dword_count) {
   // Across frames: an address and length are the shader last found there while
   // the guest has not written under them (see ShaderWatch). Looked up first,
@@ -80,7 +80,7 @@ gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, ui
   return result;
 }
 
-gfx::Shader* PlumeCommandProcessor::LoadShaderByContents(xenos::ShaderType shader_type,
+gfx::Shader* GpuBackend::LoadShaderByContents(xenos::ShaderType shader_type,
                                                          const uint32_t* host_address, uint32_t dword_count) {
   // The guest binds the same few hundred shaders thousands of times a frame,
   // and hashing the whole microcode each time was a steady few percent of
@@ -207,7 +207,7 @@ void DumpPipelineInternals(RenderPipeline& pipeline, const HostShader* vs, const
   std::fclose(file);
 }
 
-bool PlumeCommandProcessor::Drop(const char* reason, const HostShader* vs, const HostShader* ps) {
+bool GpuBackend::Drop(const char* reason, const HostShader* vs, const HostShader* ps) {
   const uint64_t vs_hash = vs && vs->entry ? vs->entry->hash : 0;
   const uint64_t ps_hash = ps && ps->entry ? ps->entry->hash : 0;
   const bool exports = vs && vs->entry && (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT);

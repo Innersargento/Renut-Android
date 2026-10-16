@@ -1,4 +1,4 @@
-// Vulkan context set-up and tear-down and the command processor's worker loop.
+// Vulkan context set-up and tear-down and the GPU backend's worker loop.
 #include "internal.h"
 
 namespace renut::gpu {
@@ -6,12 +6,12 @@ namespace renut::gpu {
 #include "plume/shaders/point_list.geom.inc"
 #include "plume/shaders/rect_list.geom.inc"
 
-bool PlumeCommandProcessor::SetupContext() {
+bool GpuBackend::SetupContext() {
   // Direct3D's doorbell wakes the worker through this (native_d3d.h).
-  native_d3d::SetWake([this] { write_ptr_index_event_->Set(); });
+  native_d3d::SetWake([this] { wake_->Set(); });
   auto* renderer = PlumeRenderer::Get();
   if (!renderer) {
-    REXLOG_ERROR("Renut: Plume command processor without a Plume renderer");
+    REXLOG_ERROR("Renut: Plume GPU backend without a Plume renderer");
     return false;
   }
   device_ = renderer->device();
@@ -225,7 +225,7 @@ bool PlumeCommandProcessor::SetupContext() {
   writeback_ = REXCVAR_GET(renut_plume_memexport_readback);
   writeback_fast_ = REXCVAR_GET(renut_plume_memexport_fast);
   BeginFrame();
-  REXLOG_INFO("Renut: Plume command processor ready ({} frames in flight, upload {} MB at {:X})",
+  REXLOG_INFO("Renut: Plume GPU backend ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);
   StartRecipes();
   device_watch_stop_ = false;
@@ -245,25 +245,15 @@ bool PlumeCommandProcessor::SetupContext() {
 // come (the doorbell wakes it); the primary ring is not read, only kept moving:
 // a write pointer that advanced is taken as consumed and the read pointer is
 // written back, which is all Direct3D looks at.
-void PlumeCommandProcessor::RunWorkerLoop() {
+void GpuBackend::RunWorkerLoop() {
   uint32_t idle = 0;
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
-      fn();
-    }
     bool worked = false;
     if (NativeWorkPending()) {
       RunNativeWork();
       worked = true;
     }
-    const uint32_t write_ptr_index = write_ptr_index_.load();
-    if (write_ptr_index != 0xBAADF00D && read_ptr_index_ != write_ptr_index) {
-      read_ptr_index_ = write_ptr_index;
-      if (read_ptr_writeback_ptr_) StoreBig(read_ptr_writeback_ptr_, read_ptr_index_);
-      worked = true;
-    }
+    if (service_hardware_ && service_hardware_()) worked = true;
     if (worked) {
       idle = 0;
       continue;
@@ -271,13 +261,13 @@ void PlumeCommandProcessor::RunWorkerLoop() {
     // Out of commands: spin for new ones, since waiting on the event costs more
     // than the wait is worth; it is waited on after a while to let the core rest.
     if (++idle > 500) {
-      rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
+      rex::thread::Wait(wake_.get(), true, std::chrono::milliseconds(5));
     }
     rex::thread::MaybeYield();
   }
 }
 
-void PlumeCommandProcessor::ShutdownContext() {
+void GpuBackend::ShutdownContext() {
   SyncRecorder();
   native_d3d::SetWake({});
   device_watch_stop_ = true;
@@ -362,7 +352,7 @@ void PlumeCommandProcessor::ShutdownContext() {
 // block as dynamic uniform buffers over the upload ring. Plume has no dynamic
 // descriptors, so the set is built in Vulkan and the layout Plume made is
 // rebuilt with it appended - sets 0 to 3 and the push constants unchanged.
-bool PlumeCommandProcessor::CreateConstantBuffers() {
+bool GpuBackend::CreateConstantBuffers() {
   VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
   auto* layout = static_cast<VulkanPipelineLayout*>(layout_.get());
   VkDescriptorSetLayoutBinding bindings[kConstantBindings] = {};

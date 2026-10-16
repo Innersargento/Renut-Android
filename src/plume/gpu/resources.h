@@ -173,7 +173,7 @@ struct Stats {
   uint64_t export_draws = 0, export_ranges = 0, export_reads = 0, export_merges = 0,
            export_refreshes = 0, export_barriers = 0;
   // Whether the frame is bound by this thread or by the game: the CPU time the
-  // command processor's thread actually ran (not wall clock), the part of it
+  // GPU backend's thread actually ran (not wall clock), the part of it
   // spent waiting for the GPU to hand a frame slot back, and the bytes it
   // copied into the ring - guest vertex and index streams, constant blocks.
   uint64_t cp_cpu_us = 0, slot_wait_us = 0, stream_bytes = 0, constant_bytes = 0;

@@ -7,7 +7,7 @@
 
 // The GPU the app hosts: the guest's video hardware as the game's Direct3D and
 // the kernel see it - the register window at 0x7FC80000, the vertical blank and
-// its interrupt, the ring and the command processor behind it. The SDK has no
+// its interrupt, the ring and the GPU backend behind it. The SDK has no
 // part in it (RuntimeConfig::graphics is null); the three Vd exports that
 // reach it are overridden in kernel_overrides.cpp.
 namespace renut::gpu {
@@ -18,9 +18,10 @@ class PlumeGpu {
     memory_ = dispatcher->memory();
     function_dispatcher_ = dispatcher;
     kernel_state_ = kernel;
-    processor_ = std::make_unique<PlumeCommandProcessor>(
-        memory_, kernel_state_, [this](uint32_t source, uint32_t cpu) { DispatchInterruptCallback(source, cpu); });
-    if (!processor_->Initialize()) return false;
+    backend_ = std::make_unique<GpuBackend>(
+        memory_, kernel_state_, [this](uint32_t source, uint32_t cpu) { DispatchInterruptCallback(source, cpu); },
+        [this] { return ServiceRing(); });
+    if (!backend_->Initialize()) return false;
     // The GPU's registers are 0x7FC80000-0x7FCFFFFF; the game reads the display
     // counters there and writes the ring's write pointer.
     memory_->AddVirtualMappedRange(0x7FC80000, 0xFFFF0000, 0x0000FFFF, this,
@@ -35,9 +36,9 @@ class PlumeGpu {
   }
 
   void Shutdown() {
-    if (processor_) {
-      processor_->Shutdown();
-      processor_.reset();
+    if (backend_) {
+      backend_->Shutdown();
+      backend_.reset();
     }
     if (vsync_thread_) {
       vsync_running_ = false;
@@ -51,12 +52,15 @@ class PlumeGpu {
     interrupt_callback_data_ = user_data;
     REXLOG_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
   }
+  // The ring the game's Direct3D sets up. It carries nothing the lists do not: a write pointer
+  // that moves is taken as consumed and the read pointer written back, which is all Direct3D
+  // looks at (to know there is room).
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
-    if (processor_) processor_->InitializeRingBuffer(ptr, size_log2);
+    ring_.read_index = 0;
+    ring_.base = ptr;
+    ring_.size = uint32_t(1) << (size_log2 + 3);
   }
-  void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
-    if (processor_) processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
-  }
+  void EnableReadPointerWriteBack(uint32_t ptr, uint32_t) { ring_.writeback = ptr; }
 
  private:
   // Runs the guest's interrupt callback on the calling thread, as the console's
@@ -72,9 +76,21 @@ class PlumeGpu {
                                            rex::countof(args));
   }
 
+  // Called by the renderer's worker on every pass.
+  bool ServiceRing() {
+    const uint32_t write_index = ring_.write_index.load();
+    if (write_index == 0xBAADF00D || ring_.read_index == write_index) return false;
+    ring_.read_index = write_index;
+    if (ring_.writeback) {
+      const uint32_t big = __builtin_bswap32(ring_.read_index);
+      std::memcpy(memory_->TranslatePhysical<uint8_t*>(ring_.writeback), &big, 4);
+    }
+    return true;
+  }
+
   void MarkVblank() {
     // The counter the game sees move, then the interrupt that runs its handler.
-    if (processor_) processor_->increment_counter();
+    if (backend_) backend_->increment_counter();
     DispatchInterruptCallback(0, 2);
   }
 
@@ -154,23 +170,30 @@ class PlumeGpu {
       default:
         break;
     }
-    return processor_ && r < gfx::RegisterFile::kRegisterCount ? processor_->ReadRegisterValue(r) : 0;
+    return backend_ && r < gfx::RegisterFile::kRegisterCount ? backend_->ReadRegisterValue(r) : 0;
   }
 
   void WriteRegister(uint32_t addr, uint32_t value) {
     const uint32_t r = (addr & 0xFFFF) / 4;
     if (r == 0x01C5) {  // CP_RB_WPTR
-      if (processor_) processor_->UpdateWritePointer(value);
+      ring_.write_index = value;
+      if (backend_) backend_->Wake();
       return;
     }
     if (r == 0x1844) return;  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
-    if (processor_ && r < gfx::RegisterFile::kRegisterCount) processor_->registers()->values[r] = value;
+    if (backend_ && r < gfx::RegisterFile::kRegisterCount) backend_->registers()->values[r] = value;
   }
 
   rex::memory::Memory* memory_ = nullptr;
   rex::runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
   rex::system::KernelState* kernel_state_ = nullptr;
-  std::unique_ptr<PlumeCommandProcessor> processor_;
+  std::unique_ptr<GpuBackend> backend_;
+  struct Ring {
+    uint32_t base = 0, size = 0;
+    uint32_t read_index = 0;  // the worker's thread only
+    uint32_t writeback = 0;   // where the read pointer is written back
+    std::atomic<uint32_t> write_index{0};
+  } ring_;
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;
   std::atomic<bool> vsync_running_{false};

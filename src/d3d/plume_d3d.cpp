@@ -1,7 +1,7 @@
 // Direct3D handlers for the native Plume renderer.
 //
 // Every call still flows to the game's own Direct3D, which records the PM4 the
-// Plume command processor (plume/gpu) executes. These only mirror the
+// Plume GPU backend (plume/gpu) executes. These only mirror the
 // clear colour, which the renderer shows while no frame has been resolved.
 #include "d3d_layer.h"
 #include "plume/plume_renderer.h"

@@ -3,47 +3,7 @@
 
 namespace renut::gpu {
 
-void PlumeCommandProcessor::NativeSwapIn() {
-  if (native_swapped_) return;
-  if (!native_regs_) {
-    // The device's initial state came as PM4 at start-up: begin from it.
-    native_regs_ = std::make_unique<gfx::RegisterFile>();
-    std::memcpy(native_regs_->values, register_file_->values, sizeof(native_regs_->values));
-  }
-  ring_regs_ = register_file_;
-  register_file_ = native_regs_.get();
-  ring_vs_ = active_vertex_shader_;
-  ring_ps_ = active_pixel_shader_;
-  active_vertex_shader_ = native_vs_;
-  active_pixel_shader_ = native_ps_;
-  ring_bin_mask_ = bin_mask_;
-  ring_bin_select_ = bin_select_;
-  bin_mask_ = native_bin_mask_;
-  bin_select_ = native_bin_select_;
-  // The constant blocks are compared with what was last uploaded only when
-  // marked written; another register file may hold anything.
-  for (auto& stage : constants_written_) std::fill(std::begin(stage), std::end(stage), true);
-  loop_constants_dirty_ = true;
-  native_swapped_ = true;
-}
-
-void PlumeCommandProcessor::NativeSwapOut() {
-  if (!native_swapped_) return;
-  native_vs_ = active_vertex_shader_;
-  native_ps_ = active_pixel_shader_;
-  native_bin_mask_ = bin_mask_;
-  native_bin_select_ = bin_select_;
-  register_file_ = ring_regs_;
-  active_vertex_shader_ = ring_vs_;
-  active_pixel_shader_ = ring_ps_;
-  bin_mask_ = ring_bin_mask_;
-  bin_select_ = ring_bin_select_;
-  for (auto& stage : constants_written_) std::fill(std::begin(stage), std::end(stage), true);
-  loop_constants_dirty_ = true;
-  native_swapped_ = false;
-}
-
-void PlumeCommandProcessor::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) {
+void GpuBackend::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) {
   if (first >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       uint64_t(first) + count <= uint64_t(XE_GPU_REG_SHADER_CONSTANT_LOOP_31) + 1) {
     StoreConstants(first, values, count);
@@ -52,8 +12,8 @@ void PlumeCommandProcessor::NativeWrite(uint32_t first, const uint32_t* values, 
   for (uint32_t i = 0; i < count; ++i) WriteRegister(first + i, values[i]);
 }
 
-// A draw record, as the command processor runs a DRAW_INDX packet.
-void PlumeCommandProcessor::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
+// A draw record, as the GPU backend runs a DRAW_INDX packet.
+void GpuBackend::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
   if ((flags & native_d3d::kDrawPredicated) &&
       !((bin_select_ & bin_mask_) != 0 || (bin_mask_ != 0 && renut::d3d::GetSingleBinTiling())) &&
       !OnPredicatedSkip(xenos::PM4_DRAW_INDX)) {
@@ -87,8 +47,8 @@ void PlumeCommandProcessor::NativeDraw(uint32_t flags, uint32_t initiator, uint3
             xenos::IsMajorModeExplicit(draw.major_mode, draw.prim_type));
 }
 
-bool PlumeCommandProcessor::RunNative(uint32_t until) {
-  bool found = false, swapped_here = false;
+bool GpuBackend::RunNative(uint32_t until) {
+  bool found = false;
   for (;;) {
     if (native_stack_.empty()) {
       if (native_queue_.empty()) {
@@ -109,10 +69,6 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
     }
     const uint32_t* w = words.data() + f.pos;
     const uint32_t op = w[0] & 0xFF;
-    if (!native_swapped_) {
-      NativeSwapIn();
-      swapped_here = true;
-    }
     switch (op) {
       case native_d3d::kOpRegs: {
         const uint32_t count = w[0] >> 8, first = w[1];
@@ -199,7 +155,6 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
         f.pos += 6;
         // As the ring had it: a history slot stamped with the vblank counter,
         // the swap, the counter moving on, the second slot.
-        NativeSwapOut();
         if (w[4]) StoreBig(w[4], counter());
         native_presenting_ = true;
         renut_note_guest_swap();
@@ -298,14 +253,12 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
         break;
     }
   }
-  if (swapped_here) NativeSwapOut();
   return found;
 }
 
 // A record of register writes and interrupts, in order (what a callback does without its
 // PM4 words, see d3d/native/): the same effects NativeCallback takes from the packets.
-void PlumeCommandProcessor::NativeEffects(const uint32_t* pairs, uint32_t count) {
-  NativeSwapOut();
+void GpuBackend::NativeEffects(const uint32_t* pairs, uint32_t count) {
   ++native_callbacks_;
   ++native_effects_applied_;
   for (uint32_t i = 0; i < count; ++i) {
@@ -324,7 +277,7 @@ void PlumeCommandProcessor::NativeEffects(const uint32_t* pairs, uint32_t count)
 // A clear record: Direct3D's clear of the current targets, without its draw.
 // The targets are the bound surfaces', and only the clear's rectangle is
 // cleared.
-void PlumeCommandProcessor::NativeClear(const uint32_t* w) {
+void GpuBackend::NativeClear(const uint32_t* w) {
   FlushDeferred();
   if (skip_mask_ & 134217728) return;
   const uint32_t flags = w[0] >> 8, present = w[17];

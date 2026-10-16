@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-bool PlumeCommandProcessor::ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+bool GpuBackend::ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
                                                draw_util::ResolveInfo& info) {
   if (!resolve_regs_) resolve_regs_ = std::make_unique<RegisterFile>();
   if (!resolve_vertices_) {
@@ -55,7 +55,7 @@ bool PlumeCommandProcessor::ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x
 
 // A resolve record: the copy registers Direct3D worked out, and the
 // rectangle its copy draw would have covered.
-void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
+void GpuBackend::NativeResolve(const uint32_t* w) {
   FlushDeferred();
   for (uint32_t i = 0; i < 12; ++i) WriteRegister(0x2318 + i, w[5 + i]);
   for (uint32_t i = 0; i < 6; ++i) WriteRegister(0x2000 + i, w[17 + i]);
@@ -90,7 +90,7 @@ void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
   capture_this_resolve_ = false;
 }
 
-bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces) {
+bool GpuBackend::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces) {
   ++stats_.resolves;
   // plume-skip bit 33554432 drops the resolve entirely. Attributing intervals
   // between timestamps proved unreliable on this tiler - the same frame read as
@@ -299,7 +299,7 @@ bool PlumeCommandProcessor::ExecuteResolve(const draw_util::ResolveInfo& info, c
   return true;
 }
 
-void PlumeCommandProcessor::LogResolveLine(const std::string& line) {
+void GpuBackend::LogResolveLine(const std::string& line) {
   if (miss_dump_directory_.empty()) return;
   const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
   if (FILE* file = std::fopen((root + "/plume-resolve.log").c_str(), "a")) {
@@ -316,7 +316,7 @@ void PlumeCommandProcessor::LogResolveLine(const std::string& line) {
 // hardware would have: 32x32 tiled, the resolve's endianness and red/blue order.
 // The fence the game waits on is recorded in the same list after the resolve, so it is
 // not signalled before this returns.
-void PlumeCommandProcessor::ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info,
+void GpuBackend::ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info,
                                             uint32_t base_address, uint32_t dest_x, uint32_t dest_y, uint32_t w,
                                             uint32_t h, uint32_t pitch, uint32_t bpp, uint32_t scale) {
   if (bpp != 4 || !dest.texture || !w || !h || !base_address || !scale) return;
@@ -384,7 +384,7 @@ void PlumeCommandProcessor::ReadbackResolve(Resolved& dest, const draw_util::Res
               photo_captures_, w, h, base_address, pitch, endian_value, swap_rb ? 1 : 0, written);
 }
 
-bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+bool GpuBackend::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                       RenderTexture* dest, uint32_t dest_x, uint32_t dest_y, bool with_stencil) {
   // Vulkan copies a depth aspect only to a buffer, so go through one: depth
   // to buffer (4 bytes per texel for D32_SFLOAT), buffer to the colour image.
@@ -470,7 +470,7 @@ bool PlumeCommandProcessor::CopyDepth(Target& source, uint32_t x, uint32_t y, ui
   return true;
 }
 
-void PlumeCommandProcessor::SnapshotResolved(Resolved& dest) {
+void GpuBackend::SnapshotResolved(Resolved& dest) {
   if (!snap_ || snap_width_ != dest.width || snap_height_ != dest.height || snap_format_ != dest.format) {
     snap_ = device_->createTexture(RenderTextureDesc::Texture2D(dest.width, dest.height, 1, dest.format));
     snap_width_ = dest.width;
@@ -497,7 +497,7 @@ void PlumeCommandProcessor::SnapshotResolved(Resolved& dest) {
 // leaves the compression metadata inconsistent, which shows up as a blocky,
 // darkened frame. Landing on SHADER_READ here guarantees the next frame's first
 // use transitions back, and a layout transition preserves the contents.
-void PlumeCommandProcessor::FlushImagesForNextFrame() {
+void GpuBackend::FlushImagesForNextFrame() {
   for (auto& [key, target] : targets_) {
     if (target.texture) Transition(target.texture.get(), target.layout, RenderTextureLayout::SHADER_READ);
   }
@@ -507,7 +507,7 @@ void PlumeCommandProcessor::FlushImagesForNextFrame() {
   }
 }
 
-void PlumeCommandProcessor::LogSkinned() {
+void GpuBackend::LogSkinned() {
   std::lock_guard<std::mutex> lock(skinned_mutex_);
   REXLOG_ERROR("Renut: Plume skinned vertex shaders seen: {}", skinned_seen_.size());
   for (const auto& [hash, seen] : skinned_seen_) {
@@ -516,7 +516,7 @@ void PlumeCommandProcessor::LogSkinned() {
   }
 }
 
-void PlumeCommandProcessor::ValidateRange(const char* what, uint64_t draw_hash, RenderBuffer* buffer, uint64_t offset,
+void GpuBackend::ValidateRange(const char* what, uint64_t draw_hash, RenderBuffer* buffer, uint64_t offset,
                                           uint32_t guest_address, uint32_t size, xenos::Endian endian) {
   if (!buffer || buffer == upload_.get() || !size) return;
   std::vector<uint8_t> guest(size);

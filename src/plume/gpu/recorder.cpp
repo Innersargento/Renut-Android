@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-void PlumeCommandProcessor::RecQueue(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
+void GpuBackend::RecQueue(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
   if (!rec_worker_.thread.joinable()) {
     rec_worker_.mutex = &rec_mutex_;
     rec_worker_.cv = &rec_cv_;
@@ -37,7 +37,7 @@ void PlumeCommandProcessor::RecQueue(const DrawPacket& pk, const DeferredSlot* s
   if (job.packets.size() >= kRecBatch) RecPost();
 }
 
-void PlumeCommandProcessor::RecPost() {
+void GpuBackend::RecPost() {
   if (!rec_pending_) return;
   if (rec_pending_->packets.empty()) return;
   {
@@ -51,7 +51,7 @@ void PlumeCommandProcessor::RecPost() {
 }
 
 // Waits until everything handed to the recorder has been recorded.
-void PlumeCommandProcessor::SyncRecorder() {
+void GpuBackend::SyncRecorder() {
   if (OnRecorder()) return;
   RecPost();
   const uint64_t target = rec_posted_.load(std::memory_order_acquire);
@@ -63,7 +63,7 @@ void PlumeCommandProcessor::SyncRecorder() {
   rec_done_cv_.wait(lock, [&] { return rec_completed_.load(std::memory_order_acquire) >= target; });
 }
 
-void PlumeCommandProcessor::RecThreadMain() {
+void GpuBackend::RecThreadMain() {
   pthread_setname_np(pthread_self(), "PlumeRecord");
   for (;;) {
     RecJob* job = nullptr;
@@ -100,7 +100,7 @@ void PlumeCommandProcessor::RecThreadMain() {
 
 // Records one packet: the pass, the pipeline and every piece of per-draw state
 // that differs from what the list already has bound, then the draw itself.
-void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
+void GpuBackend::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
   // Not from the recorder (the Hi-Z windows, the debug modes): nothing may be
   // in flight while this thread touches the bound state.
   if (!OnRecorder()) SyncRecorder();
@@ -275,7 +275,7 @@ void PlumeCommandProcessor::EmitDraw(const DrawPacket& pk, const DeferredSlot* s
 // signal. Names the draws of the last frames, new vertex/pixel pairs first -
 // the Mali takes the device down on a draw's data or program, and the draw is
 // recorded a frame or two before the submit that reports it.
-void PlumeCommandProcessor::ReportDeviceLost() {
+void GpuBackend::ReportDeviceLost() {
   unsigned long long avail_kb = 0;
   if (FILE* meminfo = std::fopen("/proc/meminfo", "r")) {
     char line[128];
@@ -359,7 +359,7 @@ void PlumeCommandProcessor::ReportDeviceLost() {
   }
 }
 
-void PlumeCommandProcessor::SyncEvery() {
+void GpuBackend::SyncEvery() {
   if (!list_open_) return;
   L()->end();
   list_open_ = false;
@@ -372,7 +372,7 @@ void PlumeCommandProcessor::SyncEvery() {
   StartList();
 }
 
-void PlumeCommandProcessor::SyncAfterDraw(const DrawPacket& pk) {
+void GpuBackend::SyncAfterDraw(const DrawPacket& pk) {
   if (!list_open_) return;
   L()->end();
   list_open_ = false;
@@ -437,7 +437,7 @@ void PlumeCommandProcessor::SyncAfterDraw(const DrawPacket& pk) {
 // Records the draws that are waiting, grouped by pipeline. The groups keep the
 // order in which each pipeline first appeared and the draws keep their order
 // inside a group, so a window whose draws share one pipeline is untouched.
-void PlumeCommandProcessor::FlushDeferred(uint32_t reason) {
+void GpuBackend::FlushDeferred(uint32_t reason) {
   if (deferred_.empty()) return;
   ++stats_.flush_windows[reason & 7];
   stats_.flush_draws[reason & 7] += deferred_.size();

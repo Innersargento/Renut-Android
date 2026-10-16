@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-void PlumeCommandProcessor::ReportMemory() {
+void GpuBackend::ReportMemory() {
   auto mb = [](uint64_t bytes) { return bytes >> 20; };
   // Base level plus the rest of the chain, in the 4-byte form every guest
   // texture is decoded to.
@@ -66,7 +66,7 @@ void PlumeCommandProcessor::ReportMemory() {
       mb(upload_slice_size_ * kPlumeFramesInFlight), rss_kb >> 10, swap_kb >> 10);
 }
 
-void PlumeCommandProcessor::Report() {
+void GpuBackend::Report() {
   SyncRecorder();
   stats_.drawn += rec_stats_.drawn;
   stats_.pipeline_binds += rec_stats_.pipeline_binds;

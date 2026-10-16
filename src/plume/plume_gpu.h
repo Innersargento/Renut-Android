@@ -31,7 +31,7 @@ void PlumeGpuSetInterruptCallback(uint32_t callback, uint32_t user_data);
 void PlumeGpuInitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
 void PlumeGpuEnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
 
-// Microcode the command processor meets without a recompiled shader is saved
+// Microcode the GPU backend meets without a recompiled shader is saved
 // here (first 32), to extend the capture.
 void SetPlumeMissDumpDirectory(const std::string& directory);
 

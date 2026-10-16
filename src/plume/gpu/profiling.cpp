@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-void PlumeCommandProcessor::WriteTimestamp() {
+void GpuBackend::WriteTimestamp() {
   if (!OnRecorder()) SyncRecorder();
   // plume-skip bit 67108864 turns the per-pass timing off. It writes ~138
   // timestamps a frame, mostly at render pass boundaries, and a timestamp there
@@ -20,7 +20,7 @@ void PlumeCommandProcessor::WriteTimestamp() {
 
 // Folds the timings a finished frame left behind into the running totals. The
 // interval between two marks is the pass that ran between them.
-void PlumeCommandProcessor::ReadTimestamps(uint32_t slot) {
+void GpuBackend::ReadTimestamps(uint32_t slot) {
   const uint32_t count = timestamp_count_[slot];
   timestamp_count_[slot] = 0;
   if (timestamp_pool_ == VK_NULL_HANDLE || count < 2) return;
@@ -55,7 +55,7 @@ void PlumeCommandProcessor::ReadTimestamps(uint32_t slot) {
 
 // A profiled draw's entry and its first timestamp. False when the frame has no
 // room for another pair, in which case the draw simply goes unmeasured.
-bool PlumeCommandProcessor::PairBegin(const DrawPacket& pk) {
+bool GpuBackend::PairBegin(const DrawPacket& pk) {
   if (pair_used_ + 2 > kPairQueries) return false;
   PairMark mark;
   mark.vs = pk.vs_hash;
@@ -70,7 +70,7 @@ bool PlumeCommandProcessor::PairBegin(const DrawPacket& pk) {
   return true;
 }
 
-void PlumeCommandProcessor::PairStamp() {
+void GpuBackend::PairStamp() {
   vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(list_)->vk,
                       pairprof_mode_ == 2 ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
                                           : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -80,7 +80,7 @@ void PlumeCommandProcessor::PairStamp() {
 
 // Folds a captured frame into the per-pair sums, and writes the report once the
 // last frame of the capture has been read.
-void PlumeCommandProcessor::ReadPairTimestamps(uint32_t slot) {
+void GpuBackend::ReadPairTimestamps(uint32_t slot) {
   if (!pair_pending_[slot]) return;
   pair_pending_[slot] = false;
   const uint32_t count = pair_count_[slot];
@@ -116,7 +116,7 @@ void PlumeCommandProcessor::ReadPairTimestamps(uint32_t slot) {
   }
 }
 
-void PlumeCommandProcessor::WritePairReport() {
+void GpuBackend::WritePairReport() {
   const uint32_t frames = pair_frames_;
   const uint32_t mode = pairprof_mode_;
   const uint64_t span_ns = pair_span_ns_, gap_ns = pair_gap_ns_, frame_ns = pair_frame_ns_;
@@ -148,7 +148,7 @@ void PlumeCommandProcessor::WritePairReport() {
 
   std::string out;
   out += fmt::format("# plume-pairprof mode {} ({}), {} frames, {} pairs, timestamp period {:.2f} ns\n", mode,
-                     mode == 2 ? "bottom of pipe: each draw alone" : "top of pipe: command processor clock",
+                     mode == 2 ? "bottom of pipe: each draw alone" : "top of pipe: GPU backend clock",
                      frames, rows.size(), timestamp_ns_);
   uint64_t draws = depth_only.draws + colour.draws;
   out += fmt::format("# per frame: {:.0f} draws, spans {:.0f} us, between draws {:.0f} us, first stamp to last {:.0f} us\n",

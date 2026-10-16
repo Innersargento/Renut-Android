@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-uint64_t PlumeCommandProcessor::Allocate(uint64_t size, uint64_t alignment) {
+uint64_t GpuBackend::Allocate(uint64_t size, uint64_t alignment) {
   const uint64_t limit = slice_base_ + upload_slice_size_;
   uint64_t offset = (upload_used_ + alignment - 1) & ~(alignment - 1);
   if (offset + size > limit) {
@@ -16,7 +16,7 @@ uint64_t PlumeCommandProcessor::Allocate(uint64_t size, uint64_t alignment) {
   return offset;
 }
 
-bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::Endian endian,
+bool GpuBackend::UploadGuest(uint32_t address, uint32_t size, xenos::Endian endian,
                                         uint64_t& offset) {
   if (!address || !size || size > (32u << 20)) return false;
   uint64_t key = (uint64_t(address) << 32) ^ (uint64_t(size) << 2) ^ uint64_t(endian);
@@ -33,7 +33,7 @@ bool PlumeCommandProcessor::UploadGuest(uint32_t address, uint32_t size, xenos::
   return true;
 }
 
-bool PlumeCommandProcessor::UploadRepacked(uint32_t address, uint32_t size, xenos::Endian endian,
+bool GpuBackend::UploadRepacked(uint32_t address, uint32_t size, xenos::Endian endian,
                                            const std::pair<uint32_t, uint32_t>* elements,
                                            uint32_t element_count, uint64_t& offset) {
   if (!address || !size || size > (4u << 20)) return false;
@@ -57,7 +57,7 @@ bool PlumeCommandProcessor::UploadRepacked(uint32_t address, uint32_t size, xeno
 
 // Whether a memory export range touches the stream: what the GPU wrote there
 // is not in guest memory.
-bool PlumeCommandProcessor::ExportOverlaps(uint32_t address, uint32_t size) const {
+bool GpuBackend::ExportOverlaps(uint32_t address, uint32_t size) const {
   if (exports_.empty()) return false;
   auto first = exports_.upper_bound(address);
   if (first != exports_.begin()) --first;
@@ -73,9 +73,9 @@ bool PlumeCommandProcessor::ExportOverlaps(uint32_t address, uint32_t size) cons
 // held, from the thread that wrote, so it only records the range. Returning
 // the range itself keeps rexglue from unwatching up to 4 MB around it, which
 // would leave other kept streams there unwatched without a call.
-std::pair<uint32_t, uint32_t> PlumeCommandProcessor::WatchHitThunk(void* context, uint32_t start,
+std::pair<uint32_t, uint32_t> GpuBackend::WatchHitThunk(void* context, uint32_t start,
                                                                    uint32_t length, bool) {
-  auto* self = static_cast<PlumeCommandProcessor*>(context);
+  auto* self = static_cast<GpuBackend*>(context);
   {
     std::lock_guard<std::mutex> lock(self->watch_mutex_);
     self->watch_hits_.emplace_back(start, length);
@@ -86,7 +86,7 @@ std::pair<uint32_t, uint32_t> PlumeCommandProcessor::WatchHitThunk(void* context
 
 // A kept stream the guest wrote over: the buffer goes once the frames in flight
 // are done with it, and it counts as dropped (see GuestStream).
-void PlumeCommandProcessor::DropKept(KeptStream& kept) {
+void GpuBackend::DropKept(KeptStream& kept) {
   ++stream_epoch_;
   // Earlier draws of this frame, and the frame before, may still read it.
   retired_buffers_[slot_].push_back(std::move(kept.buffer));
@@ -98,7 +98,7 @@ void PlumeCommandProcessor::DropKept(KeptStream& kept) {
   ++kept_drop_events_;
 }
 
-void PlumeCommandProcessor::DrainWatchHits() {
+void GpuBackend::DrainWatchHits() {
   const uint32_t serial = watch_serial_.load(std::memory_order_acquire);
   if (serial == watch_seen_) return;
   watch_seen_ = serial;
@@ -184,7 +184,7 @@ void PlumeCommandProcessor::DrainWatchHits() {
   }
 }
 
-bool PlumeCommandProcessor::RepackedStream(uint32_t address, uint32_t size, xenos::Endian endian,
+bool GpuBackend::RepackedStream(uint32_t address, uint32_t size, xenos::Endian endian,
                                            const std::pair<uint32_t, uint32_t>* elements, uint32_t element_count,
                                            RenderBuffer*& buffer, uint64_t& offset) {
   buffer = upload_.get();
@@ -244,7 +244,7 @@ bool PlumeCommandProcessor::RepackedStream(uint32_t address, uint32_t size, xeno
   return true;
 }
 
-bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::Endian endian,
+bool GpuBackend::GuestStream(uint32_t address, uint32_t size, xenos::Endian endian,
                                         RenderBuffer*& buffer, uint64_t& offset) {
   // Streams are kept up to this much in all; past it they are copied as before.
   const uint64_t kKeptBudget = kept_budget_;
@@ -336,7 +336,7 @@ bool PlumeCommandProcessor::GuestStream(uint32_t address, uint32_t size, xenos::
 // copies into exported ranges before the vertex fetches, stores and copies
 // that follow, and earlier fetches before later stores. It has to end the
 // render pass; the pass reopens on the same framebuffer at the next draw.
-void PlumeCommandProcessor::ExportBarrier() {
+void GpuBackend::ExportBarrier() {
   auto* vulkan = static_cast<VulkanCommandList*>(L());
   vulkan->endActiveRenderPass();
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -356,7 +356,7 @@ void PlumeCommandProcessor::ExportBarrier() {
 // The range a vertex shader exports into, holding [base, base + size). A new
 // one starts as a copy of guest memory and takes over, with their contents,
 // every range it overlaps.
-PlumeCommandProcessor::ExportRange* PlumeCommandProcessor::GetExport(uint32_t base, uint32_t size,
+GpuBackend::ExportRange* GpuBackend::GetExport(uint32_t base, uint32_t size,
                                                                      xenos::Endian endian) {
   uint32_t lo = base, hi = base + size;
   for (auto& [key, range] : exports_) {
@@ -422,7 +422,7 @@ PlumeCommandProcessor::ExportRange* PlumeCommandProcessor::GetExport(uint32_t ba
   return &exports_.emplace(lo, std::move(fresh)).first->second;
 }
 
-void PlumeCommandProcessor::RecordWritebacks() {
+void GpuBackend::RecordWritebacks() {
   auto& list = writebacks_[slot_];
   list.clear();
   if (!writeback_) return;
@@ -450,7 +450,7 @@ void PlumeCommandProcessor::RecordWritebacks() {
   }
 }
 
-void PlumeCommandProcessor::ApplyWritebacks(uint32_t slot) {
+void GpuBackend::ApplyWritebacks(uint32_t slot) {
   auto& list = writebacks_[slot];
   if (list.empty()) return;
   if (!writeback_) {
@@ -485,7 +485,7 @@ void PlumeCommandProcessor::ApplyWritebacks(uint32_t slot) {
 
 // Brings in what the CPU wrote to an exported range since it was last looked
 // at, once a frame.
-void PlumeCommandProcessor::RefreshExport(ExportRange& range) {
+void GpuBackend::RefreshExport(ExportRange& range) {
   if (range.checked_frame == swaps_) return;
   range.checked_frame = swaps_;
   const uint8_t* memory = memory_->TranslatePhysical<const uint8_t*>(range.base);
@@ -518,7 +518,7 @@ void PlumeCommandProcessor::RefreshExport(ExportRange& range) {
 // Where a draw reads a vertex stream: the exported range that holds it whole,
 // or the upload ring - with the exported stretches of a stream that is only
 // partly exported copied over the guest's bytes.
-bool PlumeCommandProcessor::BindStream(uint32_t address, uint32_t size, xenos::Endian endian,
+bool GpuBackend::BindStream(uint32_t address, uint32_t size, xenos::Endian endian,
                                        RenderBuffer*& buffer, uint64_t& offset) {
   buffer = upload_.get();
   if (exports_.empty()) return GuestStream(address, size, endian, buffer, offset);
@@ -589,7 +589,7 @@ bool PlumeCommandProcessor::BindStream(uint32_t address, uint32_t size, xenos::E
 
 // Puts `source` in the upload ring unless an earlier draw already left the
 // same bytes there - see the shadow buffers.
-bool PlumeCommandProcessor::CommitConstants(uint8_t* shadow, const void* source, size_t size,
+bool GpuBackend::CommitConstants(uint8_t* shadow, const void* source, size_t size,
                                             uint64_t& offset, bool* written) {
   // Nothing written into the block since it was last placed: the same bytes,
   // without comparing them.
@@ -615,7 +615,7 @@ bool PlumeCommandProcessor::CommitConstants(uint8_t* shadow, const void* source,
 // A triangle patch's grid has level + 1 - row points in row `row`, weighted by
 // their distance along each edge; a quad patch's is (level + 1)^2 points. The
 // triangles are the ones, in the order, the unindexed expansion drew.
-const PlumeCommandProcessor::PatchGrid* PlumeCommandProcessor::GetPatchGrid(bool quad, uint32_t level,
+const GpuBackend::PatchGrid* GpuBackend::GetPatchGrid(bool quad, uint32_t level,
                                                                             uint32_t patches) {
   PatchGrid& grid = patch_grids_[level | (quad ? 0x100u : 0u)];
   if (grid.patches >= patches) return &grid;

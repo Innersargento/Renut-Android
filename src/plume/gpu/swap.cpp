@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
   ExecutorBusy busy;
@@ -12,7 +12,7 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     // ring's swap; a present the lists hold has run what came before it).
     if (!native_presenting_) RunNative(UINT32_MAX);
     EvictSurfaceTargets();
-    native_d3d::NativeReport(swaps_, native_draws_, native_ring_draws_dropped_, native_bad_,
+    native_d3d::NativeReport(swaps_, native_draws_, native_bad_,
                              [this] { return SurfaceReport(); });
   }
   FlushDeferred();

@@ -80,14 +80,14 @@ Por quadro (média de 4 janelas de 300 quadros alternadas 0/2/3):
   (20,8 contra 24,7): cada teste é uma quebra de passe e uma cópia de profundidade
   da tela inteira. Por isso o padrão ficou em 2; o modo 3/4 existe para
   experimento e o aprendizado se espaça (a cada 600 quadros) quando nada é achado.
-* A thread do command processor está perto de 100% (cp_cpu ~14 s por 300 quadros),
+* A thread do backend de GPU está perto de 100% (cp_cpu ~14 s por 300 quadros),
   então descartar desenhos poupa GPU mas o FPS não sobe na mesma proporção.
 
 ## Medido de novo, com o corte barateado (celular, Showdown, câmera parada, 6 rodadas 0/2)
 
 * 5.630 draws por quadro; o modo 2 descarta 779 (13,8%): 275 de cor e 504 só de
   profundidade. Pipeline binds por quadro 2.308 -> 2.015.
-* CPU do command processor: 26,4 -> 23,5 ms por quadro (-11%), já contando o custo
+* CPU do backend de GPU: 26,4 -> 23,5 ms por quadro (-11%), já contando o custo
   do corte (~2,5 ms por quadro, amostrado).
 * GPU: 12,32 -> 11,82 Mcycles por quadro (-4,0%).
 * FPS: 37,3 -> 41,9 (+12%), com o modo 2 à frente em todos os 6 pares.

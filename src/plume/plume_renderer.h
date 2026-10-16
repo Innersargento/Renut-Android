@@ -29,7 +29,7 @@ struct PlumeWindowTag;
 using PlumeWindow = PlumeWindowTag;
 #endif
 
-// Frames the renderer keeps in flight. The command processor records frame N
+// Frames the renderer keeps in flight. The GPU backend records frame N
 // while the GPU runs N-1, so a frame costs the larger of the two instead of
 // their sum; it sizes the per-frame resources on both sides (command lists,
 // fences, acquire semaphores and the slices of the upload ring).

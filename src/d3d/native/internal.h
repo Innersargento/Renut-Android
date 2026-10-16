@@ -174,7 +174,7 @@ inline std::mutex g_wake_mutex;
 inline std::shared_ptr<std::function<void()>> g_wake;
 
 // Native sync. The watchdog: a Direct3D wait that has not moved for a while although the
-// command processor has run every published list means a GPU write the lists do not hold.
+// GPU backend has run every published list means a GPU write the lists do not hold.
 inline std::atomic<int32_t> g_executor_busy{0};
 
 // ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ inline struct FrontEnd {
   // again (most are recorded every frame).
   std::unordered_map<uint32_t, size_t> command_buffer_words;
   // The window scissor each device set last outside a recording, and the one
-  // the immediate list leaves the command processor with (unknown after a
+  // the immediate list leaves the GPU backend with (unknown after a
   // command buffer runs: it sets its own).
   std::unordered_map<uint32_t, std::array<uint32_t, 3>> window_clip;
   std::array<uint32_t, 3> immediate_clip{};
@@ -302,7 +302,7 @@ List* OwnRecording(uint32_t dev);
 std::unique_lock<std::recursive_mutex> LockUnlessOwn(uint32_t dev);
 
 // Before a call of `dev` goes into the immediate list: the window scissor it
-// set last, when the list leaves the command processor with another.
+// set last, when the list leaves the GPU backend with another.
 void PutBackClip(uint32_t dev, List& list);
 
 List& Current(uint32_t dev);
@@ -313,7 +313,7 @@ void Publish();
 // ---------------------------------------------------------------------------
 // Scratch guest memory for what Direct3D would put in the ring: vertex data
 // of BeginVertices, and vertex shaders patched for this draw's declaration.
-// It is read by the command processor when it runs the list, so it is reused
+// It is read by the GPU backend when it runs the list, so it is reused
 // only after it went round: 32 MB, a few dozen frames. Taken by several
 // recording threads at once.
 
@@ -376,7 +376,7 @@ void FetchConstants(Device& d, uint64_t mask);
 // is constant 95 - s (fetch slot (95 - s) / 3), set by SetStreamSource from
 // the object it keeps at +12460 + 4s (sub_8222A408). Its range is the
 // buffer's own (XGSetVertexBufferHeader: +24 the address | 3, +28 the size in
-// bytes | endian), which the command processor keeps as one buffer.
+// bytes | endian), which the GPU backend keeps as one buffer.
 void Streams(Device& d, uint32_t slots);
 
 // The index buffer an indexed draw reads (SetIndices keeps it at +12436;
@@ -535,7 +535,7 @@ void Swap(PPCContext& ctx);
 
 // ---------------------------------------------------------------------------
 // Native sync: what the GPU writes back for the CPU, recorded where Direct3D
-// asks for it, so the command processor need not walk the game's segments.
+// asks for it, so the GPU backend need not walk the game's segments.
 
 // PM4-less callbacks. What InsertCallback (sub_822052C8) writes is a pure function of its
 // arguments - it stores packets from registers and changes nothing in the device - so the
@@ -576,7 +576,7 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base);
 // register 1 (written back to +10900's block at +4), has the GPU wait for
 // that, queues the swap callback (InsertCallback, recorded by its own hook)
 // and has the GPU wait until the vertical-blank handler clears it again:
-// the command processor stalls there, and so does the game behind its
+// the GPU backend stalls there, and so does the game behind its
 // fences, at the presentation interval it chose (30 FPS).
 //
 // The frame-rate target (plume/frame_pacing.h) is applied here, per frame, so it

@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-uint64_t PlumeCommandProcessor::ProgramKey(const RenderGraphicsPipelineDesc& desc) {
+uint64_t GpuBackend::ProgramKey(const RenderGraphicsPipelineDesc& desc) {
   KeyBytes bytes;
   bytes.Put(desc.vertexShader);
   bytes.Put(desc.geometryShader);
@@ -15,7 +15,7 @@ uint64_t PlumeCommandProcessor::ProgramKey(const RenderGraphicsPipelineDesc& des
   return bytes.Hash();
 }
 
-void PlumeCommandProcessor::StartPipelineWorker() {
+void GpuBackend::StartPipelineWorker() {
   if (!pipeline_workers_.empty()) return;
   stop_pipeline_worker_ = false;
   lookup_on_workers_ = PlumePipelineLookupSupported();
@@ -125,7 +125,7 @@ void PlumeCommandProcessor::StartPipelineWorker() {
   }
 }
 
-void PlumeCommandProcessor::StopPipelineWorker() {
+void GpuBackend::StopPipelineWorker() {
   if (pipeline_workers_.empty()) return;
   {
     std::lock_guard lock(pipeline_mutex_);
@@ -142,7 +142,7 @@ void PlumeCommandProcessor::StopPipelineWorker() {
   pending_programs_.clear();
 }
 
-void PlumeCommandProcessor::CountJob(const PipelineJob& job) {
+void GpuBackend::CountJob(const PipelineJob& job) {
   stats_.pipeline_us += job.duration_us;
   ++stats_.pipelines;
   if (job.found) {
@@ -160,7 +160,7 @@ void PlumeCommandProcessor::CountJob(const PipelineJob& job) {
 // that never did (a scene change, a one-off effect) kept its slot forever, and
 // once 128 of those piled up every new pipeline compiled on the command list
 // thread again. Called once a frame, this installs them all.
-void PlumeCommandProcessor::ReapPipelines() {
+void GpuBackend::ReapPipelines() {
   for (auto it = pending_pipelines_.begin(); it != pending_pipelines_.end();) {
     PipelineJob& job = *it->second;
     if (!job.done.load(std::memory_order_acquire)) {
@@ -180,7 +180,7 @@ void PlumeCommandProcessor::ReapPipelines() {
   }
 }
 
-void PlumeCommandProcessor::StartRecipes() {
+void GpuBackend::StartRecipes() {
   recipes_ = REXCVAR_GET(renut_plume_precompile) && !g_miss_dump_directory.empty();
   if (!recipes_) return;
   const std::string files = g_miss_dump_directory.substr(0, g_miss_dump_directory.rfind('/'));
@@ -401,7 +401,7 @@ void PlumeCommandProcessor::StartRecipes() {
   }
 }
 
-void PlumeCommandProcessor::StopRecipes() {
+void GpuBackend::StopRecipes() {
   stop_precompile_ = true;
   g_precompile.predicting = false;
   {
@@ -438,7 +438,7 @@ void PlumeCommandProcessor::StopRecipes() {
 // (shaders and specialization), not that state, so the pipeline the draw makes
 // later finds its program built. Runs on the command thread, a few
 // milliseconds at a time.
-void PlumeCommandProcessor::PredictPipelines() {
+void GpuBackend::PredictPipelines() {
   std::vector<PlumeShaderPair> pairs;
   {
     std::lock_guard lock(g_predict.mutex);
@@ -596,14 +596,14 @@ void PlumeCommandProcessor::PredictPipelines() {
 
 // Flushed at once: a game closed by swiping it away never runs the shutdown
 // that would close the file.
-void PlumeCommandProcessor::WriteRecord(uint32_t size, const void* data) {
+void GpuBackend::WriteRecord(uint32_t size, const void* data) {
   if (!recipe_file_) return;
   std::fwrite(&size, sizeof(size), 1, recipe_file_);
   std::fwrite(data, 1, size & ~kRecipeTagBit, recipe_file_);
   std::fflush(recipe_file_);
 }
 
-std::unique_ptr<RenderPipeline> PlumeCommandProcessor::TakeRecipe(Recipe& recipe, uint64_t key) {
+std::unique_ptr<RenderPipeline> GpuBackend::TakeRecipe(Recipe& recipe, uint64_t key) {
   std::string bytes;
   RecipeWriter writer{bytes};
   VisitRecipe(writer, recipe);
@@ -630,7 +630,7 @@ std::unique_ptr<RenderPipeline> PlumeCommandProcessor::TakeRecipe(Recipe& recipe
   return nullptr;
 }
 
-void PlumeCommandProcessor::NoteSceneUse(uint64_t key) {
+void GpuBackend::NoteSceneUse(uint64_t key) {
   const uint32_t scene = g_precompile.scene.load(std::memory_order_relaxed);
   if (scene != tag_scene_) {
     tag_scene_ = scene;

@@ -7,7 +7,7 @@ namespace renut::gpu {
 #include "plume/shaders/patch_expand.comp.inc"
 #include "plume/shaders/patch_levels.comp.inc"
 
-bool PlumeCommandProcessor::CreatePackPipeline() {
+bool GpuBackend::CreatePackPipeline() {
   if (pack_pipeline_ != VK_NULL_HANDLE) return true;
   VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
   VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -33,7 +33,7 @@ bool PlumeCommandProcessor::CreatePackPipeline() {
   return true;
 }
 
-bool PlumeCommandProcessor::CreatePatchPipelines() {
+bool GpuBackend::CreatePatchPipelines() {
   if (patch_pipelines_[1] != VK_NULL_HANDLE) return true;
   if (patch_pipelines_failed_) return false;
   patch_pipelines_failed_ = true;
@@ -79,7 +79,7 @@ bool PlumeCommandProcessor::CreatePatchPipelines() {
 // GPU, so the GPU lays the draw out too (patch_levels.comp, then
 // patch_expand.comp) and the draw reads its index count from what they wrote.
 // False leaves the draw to the grid.
-bool PlumeCommandProcessor::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endian, uint32_t patches,
+bool GpuBackend::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endian, uint32_t patches,
                                                   uint32_t min_level, uint32_t max_level, AdaptiveDraw& out) {
   if (!CreatePatchPipelines()) return false;
   RenderBuffer* factors = nullptr;

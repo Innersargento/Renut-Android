@@ -77,7 +77,7 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
 }
 
 // D3DDevice_SetRingBufferParameters(device, ...) (sub_82657508), the device's first act: it
-// writes the first segment, whose type-0 packets set up the command processor. The one the CPU
+// writes the first segment, whose type-0 packets set up the GPU backend. The one the CPU
 // depends on is the scratch register writeback: SCRATCH_ADDR names the block (device + 10900,
 // which SynchronizeToPresentationInterval waits on at +4) and SCRATCH_UMSK (0x20037) which
 // registers are written back to it. Every later scratch write the lists carry (callbacks, the

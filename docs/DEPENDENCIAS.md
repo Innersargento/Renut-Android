@@ -26,8 +26,8 @@ git submodule update --init --recursive
 1. **A GPU é nossa; o SDK não tem sistema gráfico.** O `Runtime` é montado com
    `graphics` nulo e sem plugin de GPU (`gpu_plugin` vazio), a fronteira de
    renderização nativa do SDK. O app hospeda a GPU (`StartPlumeGpu`, depois do
-   `Setup`; `PlumeGpu` em plume/gpu/host.cpp) e o `PlumeCommandProcessor`
-   (plume/gpu/processor.h) roda numa thread própria, sem herdar de nada do SDK.
+   `Setup`; `PlumeGpu` em plume/gpu/host.cpp) e o `GpuBackend`
+   (plume/gpu/backend.h) roda numa thread própria, sem herdar de nada do SDK.
    O plugin `rexgpu-xenos` não é compilado nem ligado: só alguns auxiliares de
    decodificação saem das fontes do SDK, sem alteração, numa biblioteca pequena
    (`windows/xenos-helpers.cmake`: `RegisterFile`, a análise de microcódigo
@@ -77,7 +77,7 @@ git submodule update --init --recursive
 
 | O que o patch fazia | Destino |
 | --- | --- |
-| Ganchos do command processor (`OnPacketStart`, `OnIndirectBuffer`, trabalho nativo, `OnPredicatedSkip`, censo) | **Feito**: laço próprio na thread do SDK |
+| Ganchos do backend de GPU (`OnPacketStart`, `OnIndirectBuffer`, trabalho nativo, `OnPredicatedSkip`, censo) | **Feito**: laço próprio na thread do SDK |
 | `SetSingleBinTiling` | **Feito**: `renut::d3d::SetSingleBinTiling` |
 | `GetResolveInfoFromRect` | **Feito**: o SDK recebe um arquivo de registradores que descreve o retângulo (`ResolveInfoForRect`) |
 | `PresentFrontBuffer` e o gancho em `VdSwap` | **Feito**: `renut_imp_VdSwap` |

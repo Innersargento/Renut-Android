@@ -21,12 +21,12 @@ uint64_t ContentHash(const uint8_t* data, uint32_t span) {
 // texture is kept under. All of it is a pure function of the constant, and the
 // draw path asked for it once per texture slot of every draw: the busiest frame
 // of Showdown Town ran this arithmetic 169 thousand times, a quarter of the
-// command processor's time, for a few hundred distinct textures.
+// GPU backend's time, for a few hundred distinct textures.
 // The layout a fetch constant describes. Asked for the same constant at the
 // same slot draw after draw: the slot remembers the six words and what they
 // came to, and only a different constant (or a bumped object_epoch_) goes on to
 // hash them.
-const PlumeCommandProcessor::FetchLayout* PlumeCommandProcessor::LayoutOf(
+const GpuBackend::FetchLayout* GpuBackend::LayoutOf(
     const xenos::xe_gpu_texture_fetch_t& fetch) {
   static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
   if (!objkeys_ || fetch_slot_ < 0) return LayoutOfByContents(fetch);
@@ -43,7 +43,7 @@ const PlumeCommandProcessor::FetchLayout* PlumeCommandProcessor::LayoutOf(
   return layout;
 }
 
-const PlumeCommandProcessor::FetchLayout* PlumeCommandProcessor::LayoutOfByContents(
+const GpuBackend::FetchLayout* GpuBackend::LayoutOfByContents(
     const xenos::xe_gpu_texture_fetch_t& fetch) {
   // The memo key: six words mixed by multiply and fold. Six XXH3 calls for one
   // small input each were a visible slice of the command thread (this runs for
@@ -97,7 +97,7 @@ const PlumeCommandProcessor::FetchLayout* PlumeCommandProcessor::LayoutOfByConte
   return &layout;
 }
 
-uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address) return 0;
   const FetchLayout* fetch_layout = LayoutOf(fetch);
@@ -311,7 +311,7 @@ uint32_t PlumeCommandProcessor::GetGuestTexture(const xenos::xe_gpu_texture_fetc
   return texture.descriptor;
 }
 
-void PlumeCommandProcessor::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+void GpuBackend::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
                                         const std::vector<uint32_t>& rgba, uint32_t width,
                                         uint32_t height, const char* kind) {
   static uint32_t serial = 0;
@@ -336,7 +336,7 @@ void PlumeCommandProcessor::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fet
 //
 // One exception: a stacked texture's Z picks a slice of an array, and the guest
 // clamps a layer to the ends of the stack whatever the mode reads.
-uint32_t PlumeCommandProcessor::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t GpuBackend::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t key = uint32_t(fetch.mag_filter) | (uint32_t(fetch.min_filter) << 2) |
                        (uint32_t(fetch.mip_filter) << 4) | (uint32_t(fetch.aniso_filter) << 6) |
                        (uint32_t(fetch.clamp_x) << 9) | (uint32_t(fetch.clamp_y) << 12) |
@@ -414,7 +414,7 @@ uint32_t PlumeCommandProcessor::GetSampler(const xenos::xe_gpu_texture_fetch_t& 
 // slice into the next, so only a stack one slice deep can carry the guest's mip
 // chain; a deeper stack keeps the single level it had before, as every stack in
 // the menu does.
-uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t GpuBackend::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address || (skip_mask_ & 65536)) return 0;
   const uint32_t depth = uint32_t(fetch.size_2d.stack_depth) + 1;
@@ -518,7 +518,7 @@ uint32_t PlumeCommandProcessor::GetGuestStackedTexture(const xenos::xe_gpu_textu
 // off along one diagonal into sheets across the screen. Only the base level:
 // the vertex shaders that sample these do so at level 0, and a host 3D image
 // would halve its depth at each mip anyway.
-uint32_t PlumeCommandProcessor::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t GpuBackend::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address) return 0;
   std::vector<uint32_t> rgba;
@@ -589,7 +589,7 @@ uint32_t PlumeCommandProcessor::GetGuestVolumeTexture(const xenos::xe_gpu_textur
 
 // Cube maps (the sky dome): six 2D faces, +X -X +Y -Y +Z -Z, one after the
 // other at a 4 KB aligned stride, each decoded like a 2D texture.
-uint32_t PlumeCommandProcessor::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t GpuBackend::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address || (skip_mask_ & 16384)) return 0;
   uint64_t key = 0;

@@ -73,7 +73,7 @@ bool IsContainer(const uint8_t* data) {
 // Saves a complete shader container - the virtual part the object was built
 // from, followed by the physical part (literals and microcode) the GPU reads -
 // once the object is registered, so the microcode is byte for byte what the
-// command processor is handed (XGRegisterVertexShader patches it).
+// GPU backend is handed (XGRegisterVertexShader patches it).
 //
 // Object layout, from the recompiled XGRegisterVertexShader/PixelShader and
 // XGGetMicrocodeShaderParts: a vertex shader object is 872 bytes, a pixel

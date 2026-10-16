@@ -66,7 +66,7 @@ O front end nativo, dividido por assunto (tudo em `renut::native_d3d`; `internal
 
 ### plume/gpu/
 
-O processador de comandos do Plume, dividido por assunto. Tudo em `renut::gpu`; `internal.h` inclui, em cadeia, `base.h` (includes e auxiliares), `shader_store.h`, `recipes.h`, `formats.h`, `resources.h` e `processor.h` (a classe `PlumeCommandProcessor`). Nada fora de `gpu/` os inclui.
+O processador de comandos do Plume, dividido por assunto. Tudo em `renut::gpu`; `internal.h` inclui, em cadeia, `base.h` (includes e auxiliares), `shader_store.h`, `recipes.h`, `formats.h`, `resources.h` e `backend.h` (a classe `GpuBackend`). Nada fora de `gpu/` os inclui.
 
 | Arquivo | O que faz |
 |---|---|

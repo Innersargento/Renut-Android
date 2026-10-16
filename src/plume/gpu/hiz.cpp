@@ -7,7 +7,7 @@ namespace renut::gpu {
 #include "plume/shaders/hiz_mips.comp.inc"
 #include "plume/shaders/hiz_test.comp.inc"
 
-void PlumeCommandProcessor::HizIndexBox(uint64_t key, const HizBox& box) {
+void GpuBackend::HizIndexBox(uint64_t key, const HizBox& box) {
   auto add = [&](uint32_t base, uint32_t size) {
     if (!size) return;
     for (uint32_t block = base >> 16; block <= (base + size - 1) >> 16; ++block) {
@@ -35,7 +35,7 @@ void PlumeCommandProcessor::HizIndexBox(uint64_t key, const HizBox& box) {
 }
 
 // The guest wrote [start, start + length): the boxes made from any of it go.
-void PlumeCommandProcessor::HizDropBoxes(uint32_t start, uint32_t length) {
+void GpuBackend::HizDropBoxes(uint32_t start, uint32_t length) {
   if (!length) return;
   ++hiz_box_generation_;
   const uint32_t first = start >> 16, last = uint32_t((uint64_t(start) + length - 1) >> 16);
@@ -60,7 +60,7 @@ void PlumeCommandProcessor::HizDropBoxes(uint32_t start, uint32_t length) {
   }
 }
 
-PlumeCommandProcessor::HizModelEntry* PlumeCommandProcessor::HizModelFor(HostShader& vs) {
+GpuBackend::HizModelEntry* GpuBackend::HizModelFor(HostShader& vs) {
   if (!vs.bool_mask_decoded) {
     rex::string::StringBuffer disassembly;
     vs.AnalyzeUcode(disassembly);
@@ -98,7 +98,7 @@ PlumeCommandProcessor::HizModelEntry* PlumeCommandProcessor::HizModelFor(HostSha
 
 // The model against the SDK's interpreter, on two vertices of the draw about to
 // use it: what the symbolic executor claims must be what the microcode does.
-bool PlumeCommandProcessor::HizValidate(HostShader& vs, renut::hiz::Model& model,
+bool GpuBackend::HizValidate(HostShader& vs, renut::hiz::Model& model,
                                         const xenos::xe_gpu_vertex_fetch_t& fetch, uint32_t vertex_a,
                                         uint32_t vertex_b) {
   if (!gfx::ShaderInterpreter::CanInterpretShader(vs)) return false;
@@ -149,7 +149,7 @@ bool PlumeCommandProcessor::HizValidate(HostShader& vs, renut::hiz::Model& model
   return true;
 }
 
-const PlumeCommandProcessor::HizBox* PlumeCommandProcessor::HizBoxFor(
+const GpuBackend::HizBox* GpuBackend::HizBoxFor(
     const renut::hiz::Model& model, const xenos::xe_gpu_vertex_fetch_t& fetch, const IndexBufferInfo* index_info,
     uint32_t index_count, int32_t base_vertex) {
   DrainWatchHits();
@@ -304,7 +304,7 @@ const PlumeCommandProcessor::HizBox* PlumeCommandProcessor::HizBoxFor(
   return finish(true, true);
 }
 
-bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t index_count,
+bool GpuBackend::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t index_count,
                                         const IndexBufferInfo* index_info, bool color_pass) {
   const uint32_t kind = color_pass ? 1 : 0;
   hiz_test_.valid = false;
@@ -568,7 +568,7 @@ bool PlumeCommandProcessor::HizCullDraw(HostShader& vs, xenos::PrimitiveType pri
 // tests found feeds the prediction for the frames after.
 // ---------------------------------------------------------------------------
 
-bool PlumeCommandProcessor::HizCreatePipelines() {
+bool GpuBackend::HizCreatePipelines() {
   if (hiz_pipelines_[2] != VK_NULL_HANDLE) return true;
   if (hiz_pipelines_failed_) return false;
   hiz_pipelines_failed_ = true;
@@ -606,7 +606,7 @@ bool PlumeCommandProcessor::HizCreatePipelines() {
   return true;
 }
 
-void PlumeCommandProcessor::HizDestroy() {
+void GpuBackend::HizDestroy() {
   if (!device_) return;
   VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
   for (auto& pipeline : hiz_pipelines_) {
@@ -629,7 +629,7 @@ void PlumeCommandProcessor::HizDestroy() {
 // What a window's test needs, made once: the pipelines, the depth copy's
 // buffer (shared with the depth resolves), the pyramid, and this slot's
 // predicate and readback buffers.
-bool PlumeCommandProcessor::HizEnsureResources() {
+bool GpuBackend::HizEnsureResources() {
   if (!hiz_cond_ || !HizCreatePipelines()) return false;
   constexpr uint64_t kStagingSize = 4096ull * 2048 * 4;
   if (!depth_staging_) {
@@ -660,7 +660,7 @@ bool PlumeCommandProcessor::HizEnsureResources() {
 // Tests the records [first, first + count) of hiz_records_ against `target`'s
 // depth. On success the answers are in hiz_pred_[slot_] from record `base`
 // (hiz_pred_used_) on, and the render pass is closed (the next draw reopens it).
-bool PlumeCommandProcessor::HizRunTest(Target& target, uint32_t count, uint32_t* base_out) {
+bool GpuBackend::HizRunTest(Target& target, uint32_t count, uint32_t* base_out) {
   const uint32_t w = target.width, h = target.height;
   if (!count || uint64_t(w) * h * 4 > 4096ull * 2048 * 4 || target.format != RenderFormat::D32_FLOAT_S8_UINT) {
     return false;
@@ -818,7 +818,7 @@ bool PlumeCommandProcessor::HizRunTest(Target& target, uint32_t count, uint32_t*
 // and then a few windows that hold nothing back, to find out which draws are
 // hidden. When what the tests find drops under a few percent the second kind
 // becomes rare.
-bool PlumeCommandProcessor::HizFlushWindow(size_t n) {
+bool GpuBackend::HizFlushWindow(size_t n) {
   if (hiz_mode_ < 3 || !hiz_cond_) return false;
   Target* depth = nullptr;
   uint32_t testable = 0, remembered = 0;
@@ -909,7 +909,7 @@ bool PlumeCommandProcessor::HizFlushWindow(size_t n) {
 
 // The answers of a slot's last frame, once its fence has passed: what each key
 // was found to be, for the frames that follow.
-void PlumeCommandProcessor::HizReadResults(uint32_t slot) {
+void GpuBackend::HizReadResults(uint32_t slot) {
   std::vector<HizPending>& pending = hiz_pending_[slot];
   if (hiz_debug_pending_[slot] && hiz_read_[slot]) {
     const auto* all = static_cast<const float*>(hiz_read_[slot]->map());

@@ -1,5 +1,5 @@
 #pragma once
-// The command processor of the Plume GPU, split by concern across src/plume/gpu/.
+// The Plume GPU backend, split by concern across src/plume/gpu/.
 //
 // Headers, each including the one before it:
 //   base.h            includes, constants and small helpers
@@ -7,7 +7,7 @@
 //   recipes.h         pipeline recipes, precompilation and prediction
 //   formats.h         Xenos-to-Vulkan format and state translation
 //   resources.h       render targets, resolved images, guest textures, statistics
-//   processor.h       the PlumeCommandProcessor class
+//   backend.h         the GpuBackend class
 //
 // Sources:
 //   options.cpp       the renut_plume_* cvars
@@ -31,4 +31,4 @@
 //
 // All of it lives in renut::gpu. Nothing here is for other parts of the app; they use
 // plume_gpu.h.
-#include "processor.h"
+#include "backend.h"

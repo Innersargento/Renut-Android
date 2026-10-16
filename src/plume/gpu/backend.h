@@ -1,26 +1,29 @@
 #pragma once
-// The command processor class.
+// The GPU backend: the lists of d3d/native/, executed on Plume.
 #include "resources.h"
 
 namespace renut::gpu {
 
-// The GPU as the app hosts it: no SDK graphics system or command processor
-// stands behind it. The game's Direct3D records lists (d3d/native/) and
-// this runs them on its own worker thread; what the SDK's command processor
-// kept for us - the register file the CPU sees, the ring's write pointer and
-// read-pointer write-back, the scratch-register write-back, the vertical
-// blank counter - is the few members below.
+// The GPU backend: runs what the game's Direct3D recorded (the lists of d3d/native/) on
+// Plume, on its own worker thread. It is not a command processor: nothing here reads a
+// command stream or keeps a ring. The video hardware (the register window, the vertical
+// blank and its interrupt, the ring's pointers) is PlumeGpu's, in host.cpp; the worker
+// calls back into it on every pass (`service_hardware`). What the backend keeps of the
+// console's GPU registers is the register file the lists write and the draws read.
 
-class PlumeCommandProcessor final {
+class GpuBackend final {
  public:
-  PlumeCommandProcessor(rex::memory::Memory* memory, rex::system::KernelState* kernel,
-                        std::function<void(uint32_t, uint32_t)> dispatch_interrupt)
+  // `service_hardware` is called by the worker on every pass: the video hardware's own
+  // upkeep (the ring's pointers, in host.cpp), true when it had something to do.
+  GpuBackend(rex::memory::Memory* memory, rex::system::KernelState* kernel,
+                        std::function<void(uint32_t, uint32_t)> dispatch_interrupt,
+                        std::function<bool()> service_hardware)
       : memory_(memory),
         kernel_state_(kernel),
         dispatch_interrupt_(std::move(dispatch_interrupt)),
+        service_hardware_(std::move(service_hardware)),
         worker_running_(true),
-        write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
-        write_ptr_index_(0) {
+        wake_(rex::thread::Event::CreateAutoResetEvent(false)) {
     register_file_ = &registers_;
   }
 
@@ -30,7 +33,7 @@ class PlumeCommandProcessor final {
     worker_thread_ = rex::system::object_ref<rex::system::XHostThread>(
         new rex::system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
           if (!SetupContext()) {
-            rex::FatalError("Unable to setup command processor internal state");
+            rex::FatalError("Unable to setup GPU backend internal state");
             return 0;
           }
           RunWorkerLoop();
@@ -43,25 +46,14 @@ class PlumeCommandProcessor final {
   }
   void Shutdown() {
     worker_running_ = false;
-    write_ptr_index_event_->Set();
+    wake_->Set();
     if (worker_thread_) {
       worker_thread_->Wait(0, 0, 0, nullptr);
       worker_thread_.reset();
     }
   }
-  // The ring the game's Direct3D sets up. It carries nothing the lists do not
-  // (a write pointer that moves is consumed and the read pointer written
-  // back), but Direct3D reads that pointer to know there is room.
-  void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
-    read_ptr_index_ = 0;
-    primary_buffer_ptr_ = ptr;
-    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
-  }
-  void EnableReadPointerWriteBack(uint32_t ptr, uint32_t) { read_ptr_writeback_ptr_ = ptr; }
-  void UpdateWritePointer(uint32_t value) {
-    write_ptr_index_ = value;
-    write_ptr_index_event_->Set();
-  }
+  // Wakes the worker: a list was published, or the video hardware has work for it.
+  void Wake() { wake_->Set(); }
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
   gfx::RegisterFile* registers() { return &registers_; }
@@ -84,20 +76,15 @@ class PlumeCommandProcessor final {
   rex::memory::Memory* memory_ = nullptr;
   rex::system::KernelState* kernel_state_ = nullptr;
   std::function<void(uint32_t, uint32_t)> dispatch_interrupt_;
-  // The GPU's registers as the CPU sees them. register_file_ points here, or at
-  // the lists' own file while they run (NativeSwapIn/NativeSwapOut).
+  // The GPU's registers: the lists write them, the draws read them, and the CPU sees them
+  // through the register window (host.cpp).
   gfx::RegisterFile registers_;
   gfx::RegisterFile* register_file_ = nullptr;
   std::atomic<bool> worker_running_;
   rex::system::object_ref<rex::system::XHostThread> worker_thread_;
-  std::queue<std::function<void()>> pending_fns_;
+  std::function<bool()> service_hardware_;
   uint32_t counter_ = 0;
-  uint32_t primary_buffer_ptr_ = 0;
-  uint32_t primary_buffer_size_ = 0;
-  uint32_t read_ptr_index_ = 0;
-  uint32_t read_ptr_writeback_ptr_ = 0;
-  std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
-  std::atomic<uint32_t> write_ptr_index_;
+  std::unique_ptr<rex::thread::Event> wake_;
   std::unordered_map<uint32_t, uint32_t> extended_register_values_;
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
@@ -169,7 +156,7 @@ class PlumeCommandProcessor final {
   }
   // ---- Native Direct3D lists ----
   // All drawing comes from the front end's lists (d3d/native/), which run
-  // with a register file of their own as the command processor reaches the
+  // with a register file of their own as the GPU backend reaches the
   // ring segments they go with. The ring's own register file is the GPU's as
   // the CPU sees it (scratch registers, the writeback the callbacks read).
   struct ExecutorBusy {
@@ -179,7 +166,7 @@ class PlumeCommandProcessor final {
   // Whether the draw being run came from a predicated packet: the draws come
   // from the native lists, which carry no such packet, so this stays false.
   bool packet_predicated_ = false;
-  // The command processor's work loop. The SDK runs its own on the worker
+  // The GPU backend's work loop. The SDK runs its own on the worker
   // thread it creates, which calls SetupContext() first: this one runs from
   // there until the processor is shut down, so the SDK's loop is never entered.
   // It does what the SDK's does and, around the ring packets, the native work.
@@ -225,29 +212,18 @@ class PlumeCommandProcessor final {
   // Runs the published records until the end, or until the opaque-call
   // marker `until` (consumed; returns true), never past another marker.
   bool RunNative(uint32_t until);
-  void NativeSwapIn();
-  void NativeSwapOut();
   void NativeWrite(uint32_t first, const uint32_t* values, uint32_t count);
   void NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size);
   void NativeClear(const uint32_t* record);
   bool native_on_ = false;
   bool native_started_ = false;
-  bool native_swapped_ = false;    // the lists' state is in register_file_ & co.
-  std::unique_ptr<gfx::RegisterFile> native_regs_;
-  gfx::RegisterFile* ring_regs_ = nullptr;
-  gfx::Shader* native_vs_ = nullptr;
-  gfx::Shader* native_ps_ = nullptr;
-  gfx::Shader* ring_vs_ = nullptr;
-  gfx::Shader* ring_ps_ = nullptr;
-  uint64_t native_bin_mask_ = 0xFFFFFFFFull, native_bin_select_ = 0xFFFFFFFFull;
-  uint64_t ring_bin_mask_ = 0, ring_bin_select_ = 0;
   struct NativeFrame {
     std::shared_ptr<const native_d3d::List> list;
     size_t pos = 0;
   };
   std::vector<NativeFrame> native_stack_;
   std::deque<std::shared_ptr<const native_d3d::List>> native_queue_;
-  uint64_t native_draws_ = 0, native_ring_draws_dropped_ = 0, native_bad_ = 0;
+  uint64_t native_draws_ = 0, native_bad_ = 0;
   bool pred_pass_all_ = false;
   bool band_fragpos_ = false;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
