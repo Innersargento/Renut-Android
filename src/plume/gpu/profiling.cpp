@@ -3,38 +3,38 @@
 
 namespace renut::gpu {
 
-void GpuBackend::WriteTimestamp() {
-  if (!OnRecorder()) SyncRecorder();
+void Profiling::WriteTimestamp() {
+  if (!backend.recorder.OnRecorder()) backend.recorder.SyncRecorder();
   // plume-skip bit 67108864 turns the per-pass timing off. It writes ~138
   // timestamps a frame, mostly at render pass boundaries, and a timestamp there
   // can make a tiler flush - so its own cost has to be measurable.
-  if (timestamp_pool_ == VK_NULL_HANDLE || (skip_mask_ & 67108864) ||
+  if (backend.timestamp_pool_ == VK_NULL_HANDLE || (backend.skip_mask_ & 67108864) ||
       timestamps_used_ >= kMaxTimestamps) {
     return;
   }
-  vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(L())->vk,
-                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
-                      slot_ * kMaxTimestamps + timestamps_used_);
+  vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(backend.recorder.L())->vk,
+                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, backend.timestamp_pool_,
+                      backend.slot_ * kMaxTimestamps + timestamps_used_);
   ++timestamps_used_;
 }
 
 // Folds the timings a finished frame left behind into the running totals. The
 // interval between two marks is the pass that ran between them.
-void GpuBackend::ReadTimestamps(uint32_t slot) {
+void Profiling::ReadTimestamps(uint32_t slot) {
   const uint32_t count = timestamp_count_[slot];
   timestamp_count_[slot] = 0;
-  if (timestamp_pool_ == VK_NULL_HANDLE || count < 2) return;
+  if (backend.timestamp_pool_ == VK_NULL_HANDLE || count < 2) return;
   std::array<uint64_t, kMaxTimestamps> ticks{};
-  if (vkGetQueryPoolResults(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_,
+  if (vkGetQueryPoolResults(static_cast<VulkanDevice*>(backend.device_)->vk, backend.timestamp_pool_,
                             slot * kMaxTimestamps, count, count * sizeof(uint64_t), ticks.data(),
                             sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
     return;
   }
-  const auto& marks = pass_marks_[slot];
+  const auto& marks = backend.targets.pass_marks_[slot];
   for (uint32_t i = 0; i + 1 < count; ++i) {
     if (ticks[i + 1] <= ticks[i]) continue;
     const uint64_t ns = uint64_t(double(ticks[i + 1] - ticks[i]) * timestamp_ns_);
-    gpu_ns_ += ns;
+    backend.report.gpu_ns_ += ns;
     // Mark i opened the pass that the interval measures; the first interval is
     // whatever ran before any framebuffer was bound.
     uint64_t key = 0;
@@ -46,7 +46,7 @@ void GpuBackend::ReadTimestamps(uint32_t slot) {
       key |= uint64_t(m.resolve) << 62;
       draws = m.draws;
     }
-    PassTotal& total = pass_totals_[key];
+    PassTotal& total = backend.report.pass_totals_[key];
     total.ns += ns;
     total.passes += 1;
     total.draws += draws;
@@ -55,7 +55,7 @@ void GpuBackend::ReadTimestamps(uint32_t slot) {
 
 // A profiled draw's entry and its first timestamp. False when the frame has no
 // room for another pair, in which case the draw simply goes unmeasured.
-bool GpuBackend::PairBegin(const DrawPacket& pk) {
+bool Profiling::PairBegin(const DrawPacket& pk) {
   if (pair_used_ + 2 > kPairQueries) return false;
   PairMark mark;
   mark.vs = pk.vs_hash;
@@ -64,31 +64,31 @@ bool GpuBackend::PairBegin(const DrawPacket& pk) {
   mark.colors = uint8_t(pk.pass_colors);
   mark.depth = pk.pass_depth ? 1 : 0;
   mark.kind = uint8_t(pk.kind);
-  mark.switched = bound_pipeline_ != pk.pipeline ? 1 : 0;
-  pair_marks_[slot_].push_back(mark);
+  mark.switched = backend.recorder.bound_pipeline_ != pk.pipeline ? 1 : 0;
+  pair_marks_[backend.slot_].push_back(mark);
   PairStamp();
   return true;
 }
 
-void GpuBackend::PairStamp() {
-  vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(list_)->vk,
-                      pairprof_mode_ == 2 ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+void Profiling::PairStamp() {
+  vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(backend.targets.list_)->vk,
+                      backend.swap.pairprof_mode_ == 2 ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
                                           : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                      pair_pool_, slot_ * kPairQueries + pair_used_);
+                      backend.pair_pool_, backend.slot_ * kPairQueries + pair_used_);
   ++pair_used_;
 }
 
 // Folds a captured frame into the per-pair sums, and writes the report once the
 // last frame of the capture has been read.
-void GpuBackend::ReadPairTimestamps(uint32_t slot) {
+void Profiling::ReadPairTimestamps(uint32_t slot) {
   if (!pair_pending_[slot]) return;
   pair_pending_[slot] = false;
   const uint32_t count = pair_count_[slot];
   pair_count_[slot] = 0;
   const auto& marks = pair_marks_[slot];
-  if (pair_pool_ != VK_NULL_HANDLE && count >= 2 && marks.size() * 2 == count) {
+  if (backend.pair_pool_ != VK_NULL_HANDLE && count >= 2 && marks.size() * 2 == count) {
     std::vector<uint64_t> ticks(count);
-    if (vkGetQueryPoolResults(static_cast<VulkanDevice*>(device_)->vk, pair_pool_, slot * kPairQueries, count,
+    if (vkGetQueryPoolResults(static_cast<VulkanDevice*>(backend.device_)->vk, backend.pair_pool_, slot * kPairQueries, count,
                               count * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
                               VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
       auto ns = [&](uint64_t from, uint64_t to) {
@@ -111,21 +111,21 @@ void GpuBackend::ReadPairTimestamps(uint32_t slot) {
       ++pair_frames_;
     }
   }
-  if (pairprof_frames_left_ == 0 && std::none_of(pair_pending_.begin(), pair_pending_.end(), [](bool p) { return p; })) {
+  if (backend.swap.pairprof_frames_left_ == 0 && std::none_of(pair_pending_.begin(), pair_pending_.end(), [](bool p) { return p; })) {
     WritePairReport();
   }
 }
 
-void GpuBackend::WritePairReport() {
+void Profiling::WritePairReport() {
   const uint32_t frames = pair_frames_;
-  const uint32_t mode = pairprof_mode_;
+  const uint32_t mode = backend.swap.pairprof_mode_;
   const uint64_t span_ns = pair_span_ns_, gap_ns = pair_gap_ns_, frame_ns = pair_frame_ns_;
   std::map<std::pair<uint64_t, uint64_t>, PairTotal> totals;
   totals.swap(pair_totals_);
   pair_frames_ = 0;
   pair_span_ns_ = pair_gap_ns_ = pair_frame_ns_ = 0;
-  if (!frames || miss_dump_directory_.empty()) return;
-  const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+  if (!frames || backend.miss_dump_directory_.empty()) return;
+  const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
 
   struct Row {
     uint64_t vs, ps;

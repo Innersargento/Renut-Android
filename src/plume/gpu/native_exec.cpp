@@ -3,30 +3,30 @@
 
 namespace renut::gpu {
 
-void GpuBackend::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) {
+void Lists::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) {
   if (first >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       uint64_t(first) + count <= uint64_t(XE_GPU_REG_SHADER_CONSTANT_LOOP_31) + 1) {
     StoreConstants(first, values, count);
     return;
   }
-  for (uint32_t i = 0; i < count; ++i) WriteRegister(first + i, values[i]);
+  for (uint32_t i = 0; i < count; ++i) backend.shaders.WriteRegister(first + i, values[i]);
 }
 
 // A draw record, as the GPU backend runs a DRAW_INDX packet.
-void GpuBackend::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
+void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
   if ((flags & native_d3d::kDrawPredicated) &&
       !((bin_select_ & bin_mask_) != 0 || (bin_mask_ != 0 && renut::d3d::GetSingleBinTiling())) &&
       !OnPredicatedSkip(xenos::PM4_DRAW_INDX)) {
     return;
   }
-  WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator);
+  backend.shaders.WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator);
   reg::VGT_DRAW_INITIATOR draw;
   draw.value = initiator;
   IndexBufferInfo info;
   bool indexed = false;
   if (draw.source_select == xenos::SourceSelect::kDMA) {
-    WriteRegister(XE_GPU_REG_VGT_DMA_BASE, dma_base);
-    WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, dma_size);
+    backend.shaders.WriteRegister(XE_GPU_REG_VGT_DMA_BASE, dma_base);
+    backend.shaders.WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, dma_size);
     reg::VGT_DMA_SIZE size;
     size.value = dma_size;
     const uint32_t bytes = draw.index_size == xenos::IndexFormat::kInt16 ? 2 : 4;
@@ -40,14 +40,14 @@ void GpuBackend::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_bas
     ++native_bad_;
     return;
   }
-  const auto viz = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+  const auto viz = backend.register_file_->Get<reg::PA_SC_VIZ_QUERY>();
   if (viz.viz_query_ena && viz.kill_pix_post_hi_z) return;
   ++native_draws_;
-  IssueDraw(draw.prim_type, draw.num_indices, indexed ? &info : nullptr,
+  backend.draw.IssueDraw(draw.prim_type, draw.num_indices, indexed ? &info : nullptr,
             xenos::IsMajorModeExplicit(draw.major_mode, draw.prim_type));
 }
 
-bool GpuBackend::RunNative(uint32_t until) {
+bool Lists::RunNative(uint32_t until) {
   bool found = false;
   for (;;) {
     if (native_stack_.empty()) {
@@ -84,7 +84,7 @@ bool GpuBackend::RunNative(uint32_t until) {
       case native_d3d::kOpShader: {
         const auto type = xenos::ShaderType(w[1] & 3);
         const uint32_t address = w[1] & ~3u, dwords = w[2];
-        gfx::Shader* shader = LoadShader(type, address, memory_->TranslatePhysical<const uint32_t*>(address), dwords);
+        gfx::Shader* shader = backend.shaders.LoadShader(type, address, backend.memory_->TranslatePhysical<const uint32_t*>(address), dwords);
         if (type == xenos::ShaderType::kVertex) {
           active_vertex_shader_ = shader;
         } else {
@@ -122,7 +122,7 @@ bool GpuBackend::RunNative(uint32_t until) {
           break;
         }
         f.pos += native_d3d::kResolveWords;
-        NativeResolve(w);
+        backend.resolve.NativeResolve(w);
         break;
       case native_d3d::kOpClear:
         if (f.pos + native_d3d::kClearWords > words.size()) {
@@ -155,13 +155,13 @@ bool GpuBackend::RunNative(uint32_t until) {
         f.pos += 6;
         // As the ring had it: a history slot stamped with the vblank counter,
         // the swap, the counter moving on, the second slot.
-        if (w[4]) StoreBig(w[4], counter());
+        if (w[4]) StoreBig(w[4], backend.counter());
         native_presenting_ = true;
         renut_note_guest_swap();
-        IssueSwap(w[1], w[2], w[3]);
+        backend.swap.IssueSwap(w[1], w[2], w[3]);
         native_presenting_ = false;
-        increment_counter();
-        if (w[5]) StoreBig(w[5], counter());
+        backend.increment_counter();
+        if (w[5]) StoreBig(w[5], backend.counter());
         ++native_presents_;
         if (native_presents_ <= 3 || native_presents_ % 600 == 0) {
           REXLOG_INFO("Renut: native present {} ({:08X} {}x{}); fences {}, callbacks {}",
@@ -191,7 +191,7 @@ bool GpuBackend::RunNative(uint32_t until) {
         const uint32_t* q = w + 1;
         for (uint32_t stream = 0; stream < 18; ++stream) {
           if (!((mask >> stream) & 1)) continue;
-          native_streams_[stream] = {q[0], q[1]};
+          backend.draw.native_streams_[stream] = {q[0], q[1]};
           q += 2;
         }
         f.pos += n;
@@ -206,17 +206,17 @@ bool GpuBackend::RunNative(uint32_t until) {
         f.pos += 4;
         // As the GPU would, until the vertical-blank handler (another thread)
         // writes the value; never longer than a few frames.
-        const auto* word = memory_->TranslatePhysical<const uint32_t*>(w[1]);
+        const auto* word = backend.memory_->TranslatePhysical<const uint32_t*>(w[1]);
         const auto start = std::chrono::steady_clock::now();
-        ++native_waits_;
+        ++backend.targets.native_waits_;
         while ((__builtin_bswap32(__atomic_load_n(word, __ATOMIC_ACQUIRE)) & w[3]) != w[2]) {
           if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) {
-            ++native_wait_timeouts_;
+            ++backend.targets.native_wait_timeouts_;
             break;
           }
           std::this_thread::sleep_for(std::chrono::microseconds(250));
         }
-        native_wait_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        backend.targets.native_wait_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                                         std::chrono::steady_clock::now() - start)
                                         .count());
         break;
@@ -241,7 +241,7 @@ bool GpuBackend::RunNative(uint32_t until) {
         const uint32_t* p = w + 1;
         for (uint32_t slot = 0; slot < 5; ++slot) {
           if (!((slots >> slot) & 1)) continue;
-          native_surfaces_[slot] = {p[0], p[1], p[2], p[3]};
+          backend.targets.native_surfaces_[slot] = {p[0], p[1], p[2], p[3]};
           p += 4;
         }
         f.pos += n;
@@ -258,18 +258,18 @@ bool GpuBackend::RunNative(uint32_t until) {
 
 // A record of register writes and interrupts, in order (what a callback does without its
 // PM4 words, see d3d/native/): the same effects NativeCallback takes from the packets.
-void GpuBackend::NativeEffects(const uint32_t* pairs, uint32_t count) {
+void Lists::NativeEffects(const uint32_t* pairs, uint32_t count) {
   ++native_callbacks_;
   ++native_effects_applied_;
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t reg = pairs[2 * i], value = pairs[2 * i + 1];
     if (reg == 0xFFFFFFFFu) {
-      if (!dispatch_interrupt_) continue;
+      if (!backend.dispatch_interrupt_) continue;
       for (uint32_t cpu = 0; cpu < 6; ++cpu) {
-        if ((value >> cpu) & 1) dispatch_interrupt_(1, cpu);
+        if ((value >> cpu) & 1) backend.dispatch_interrupt_(1, cpu);
       }
     } else {
-      WriteRegister(reg, value);
+      backend.shaders.WriteRegister(reg, value);
     }
   }
 }
@@ -277,40 +277,40 @@ void GpuBackend::NativeEffects(const uint32_t* pairs, uint32_t count) {
 // A clear record: Direct3D's clear of the current targets, without its draw.
 // The targets are the bound surfaces', and only the clear's rectangle is
 // cleared.
-void GpuBackend::NativeClear(const uint32_t* w) {
-  FlushDeferred();
-  if (skip_mask_ & 134217728) return;
+void Lists::NativeClear(const uint32_t* w) {
+  backend.recorder.FlushDeferred();
+  if (backend.skip_mask_ & 134217728) return;
   const uint32_t flags = w[0] >> 8, present = w[17];
   const int32_t x1 = int32_t(w[1]), y1 = int32_t(w[2]), x2 = int32_t(w[3]), y2 = int32_t(w[4]);
   float color[4], z;
   std::memcpy(color, w + 5, sizeof(color));
   std::memcpy(&z, w + 9, sizeof(z));
   const uint32_t stencil = w[10] & 0xFF;
-  ++stats_.clears;
+  ++backend.stats_.clears;
   auto clip = [&](const Target& t) {
     const auto low = [&](int32_t v) { return int32_t(HostFloor(&t, uint32_t(std::max(v, 0)))); };
     const auto high = [&](int32_t v) { return int32_t(HostCeil(&t, uint32_t(std::max(v, 0)))); };
     return RenderRect(std::clamp(low(x1), 0, int32_t(t.width)), std::clamp(low(y1), 0, int32_t(t.height)),
                       std::clamp(high(x2), 0, int32_t(t.width)), std::clamp(high(y2), 0, int32_t(t.height)));
   };
-  Trace("native clear flags={:X} present={:X} rect=({},{})-({},{}) color=({}, {}, {}, {}) z={} s={}", flags,
+  backend.draw.Trace("native clear flags={:X} present={:X} rect=({},{})-({},{}) color=({}, {}, {}, {}) z={} s={}", flags,
         present, x1, y1, x2, y2, color[0], color[1], color[2], color[3], z, stencil);
   std::array<Target*, 4> cleared{};
   for (uint32_t i = 0; i < 4; ++i) {
     if (!((flags >> i) & 1) || !((present >> i) & 1)) continue;
-    Target* target = NativeTarget(i, w[12 + i]);
+    Target* target = backend.targets.NativeTarget(i, w[12 + i]);
     if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
     cleared[i] = target;
     const RenderRect rect = clip(*target);
     if (rect.right <= rect.left || rect.bottom <= rect.top) continue;
-    Transition(target->texture.get(), target->layout, RenderTextureLayout::COLOR_WRITE);
+    backend.targets.Transition(target->texture.get(), target->layout, RenderTextureLayout::COLOR_WRITE);
     std::array<Target*, 4> colors{target};
-    SetFramebuffer(GetFramebuffer(colors, 1, nullptr));
-    L()->clearColor(0, RenderColor(color[0], color[1], color[2], color[3]), &rect, 1);
+    backend.targets.SetFramebuffer(backend.targets.GetFramebuffer(colors, 1, nullptr));
+    backend.recorder.L()->clearColor(0, RenderColor(color[0], color[1], color[2], color[3]), &rect, 1);
   }
   const bool clear_depth = flags & 0x10, clear_stencil = flags & 0x20;
   if ((clear_depth || clear_stencil) && (present & 0x10)) {
-    if (Target* depth = NativeTarget(4, w[16])) {
+    if (Target* depth = backend.targets.NativeTarget(4, w[16])) {
       const RenderRect rect = clip(*depth);
       if (rect.right > rect.left && rect.bottom > rect.top) {
         // A surface whose image went to a depth resolve (AliasDepthResolve): a
@@ -321,8 +321,8 @@ void GpuBackend::NativeClear(const uint32_t* w) {
         if (depth->restore_key || depth->aliased_since_clear || depth->depth_undefined) {
           const bool whole = clear_depth && rect.left <= 0 && rect.top <= 0 && rect.right >= int32_t(depth->width) &&
                              rect.bottom >= int32_t(depth->height);
-          NoteAliasedUse(*depth, whole);
-          if (depth->restore_key) fresh = RestoreAliasedDepth(*depth, whole);
+          backend.targets.NoteAliasedUse(*depth, whole);
+          if (depth->restore_key) fresh = backend.targets.RestoreAliasedDepth(*depth, whole);
           if (depth->depth_undefined) {
             // The contents were given up (AliasDepthResolve): the stencil is
             // undefined as well, which a whole clear settles.
@@ -330,10 +330,10 @@ void GpuBackend::NativeClear(const uint32_t* w) {
             depth->depth_undefined = !whole;
           }
         }
-        Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+        backend.targets.Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
         std::array<Target*, 4> none{};
-        SetFramebuffer(GetFramebuffer(none, 0, depth));
-        L()->clearDepthStencil(clear_depth, clear_stencil || fresh, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
+        backend.targets.SetFramebuffer(backend.targets.GetFramebuffer(none, 0, depth));
+        backend.recorder.L()->clearDepthStencil(clear_depth, clear_stencil || fresh, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
       }
     }
   }

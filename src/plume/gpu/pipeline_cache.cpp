@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-uint64_t GpuBackend::ProgramKey(const RenderGraphicsPipelineDesc& desc) {
+uint64_t Pipelines::ProgramKey(const RenderGraphicsPipelineDesc& desc) {
   KeyBytes bytes;
   bytes.Put(desc.vertexShader);
   bytes.Put(desc.geometryShader);
@@ -15,7 +15,7 @@ uint64_t GpuBackend::ProgramKey(const RenderGraphicsPipelineDesc& desc) {
   return bytes.Hash();
 }
 
-void GpuBackend::StartPipelineWorker() {
+void Pipelines::StartPipelineWorker() {
   if (!pipeline_workers_.empty()) return;
   stop_pipeline_worker_ = false;
   lookup_on_workers_ = PlumePipelineLookupSupported();
@@ -74,7 +74,7 @@ void GpuBackend::StartPipelineWorker() {
         if (lookup_on_workers_ && !job->looked_up) {
           {
             PlumePipelineLookupOnly only;
-            try { job->result = CreateGraphicsPipeline(device_, job->desc); } catch (const std::exception&) {}
+            try { job->result = CreateGraphicsPipeline(backend.device_, job->desc); } catch (const std::exception&) {}
           }
           job->looked_up = true;
           if (job->result) {
@@ -100,7 +100,7 @@ void GpuBackend::StartPipelineWorker() {
             continue;
           }
         }
-        try { job->result = CreateGraphicsPipeline(device_, job->desc); }
+        try { job->result = CreateGraphicsPipeline(backend.device_, job->desc); }
         catch (const std::exception& e) { REXLOG_WARN("Renut: Plume async pipeline failed: {}", e.what()); }
         const uint64_t program = job->program;
         finish();
@@ -125,7 +125,7 @@ void GpuBackend::StartPipelineWorker() {
   }
 }
 
-void GpuBackend::StopPipelineWorker() {
+void Pipelines::StopPipelineWorker() {
   if (pipeline_workers_.empty()) return;
   {
     std::lock_guard lock(pipeline_mutex_);
@@ -138,20 +138,20 @@ void GpuBackend::StopPipelineWorker() {
   pipeline_ready_.notify_all();
   for (std::thread& worker : pipeline_workers_) worker.join();
   pipeline_workers_.clear();
-  pending_pipelines_.clear();
+  backend.draw.pending_pipelines_.clear();
   pending_programs_.clear();
 }
 
-void GpuBackend::CountJob(const PipelineJob& job) {
-  stats_.pipeline_us += job.duration_us;
-  ++stats_.pipelines;
+void Pipelines::CountJob(const PipelineJob& job) {
+  backend.stats_.pipeline_us += job.duration_us;
+  ++backend.stats_.pipelines;
   if (job.found) {
-    ++stats_.pipelines_found_ahead;
+    ++backend.stats_.pipelines_found_ahead;
   } else {
-    ++stats_.pipelines_compiled;
-    stats_.compile_us += job.duration_us;
+    ++backend.stats_.pipelines_compiled;
+    backend.stats_.compile_us += job.duration_us;
   }
-  if (job.waited) ++stats_.pipelines_waited;
+  if (job.waited) ++backend.stats_.pipelines_waited;
   auto program = pending_programs_.find(job.program);
   if (program != pending_programs_.end() && --program->second == 0) pending_programs_.erase(program);
 }
@@ -160,8 +160,8 @@ void GpuBackend::CountJob(const PipelineJob& job) {
 // that never did (a scene change, a one-off effect) kept its slot forever, and
 // once 128 of those piled up every new pipeline compiled on the command list
 // thread again. Called once a frame, this installs them all.
-void GpuBackend::ReapPipelines() {
-  for (auto it = pending_pipelines_.begin(); it != pending_pipelines_.end();) {
+void Pipelines::ReapPipelines() {
+  for (auto it = backend.draw.pending_pipelines_.begin(); it != backend.draw.pending_pipelines_.end();) {
     PipelineJob& job = *it->second;
     if (!job.done.load(std::memory_order_acquire)) {
       ++it;
@@ -171,16 +171,16 @@ void GpuBackend::ReapPipelines() {
     if (job.result) {
       std::unique_ptr<RenderPipeline>& slot = pipelines_[it->first];
       slot = std::move(job.result);
-      standins_[job.family] = slot.get();
+      backend.draw.standins_[job.family] = slot.get();
     } else {
-      failed_pipelines_.insert(it->first);
+      backend.draw.failed_pipelines_.insert(it->first);
       REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})", job.vs_hash, job.ps_hash);
     }
-    it = pending_pipelines_.erase(it);
+    it = backend.draw.pending_pipelines_.erase(it);
   }
 }
 
-void GpuBackend::StartRecipes() {
+void Pipelines::StartRecipes() {
   recipes_ = REXCVAR_GET(renut_plume_precompile) && !g_miss_dump_directory.empty();
   if (!recipes_) return;
   const std::string files = g_miss_dump_directory.substr(0, g_miss_dump_directory.rfind('/'));
@@ -255,7 +255,7 @@ void GpuBackend::StartRecipes() {
     recipe_file_ = std::fopen(path.c_str(), "ab");
   }
   if (!recipe_file_) REXLOG_WARN("Renut: Plume pipeline recipes cannot be written to {}", path);
-  if (low_memory_) {
+  if (backend.low_memory_) {
     REXLOG_INFO("Renut: Plume pipeline recipes: {} in {}; not built ahead in low-memory mode", recipes->size(), path);
     return;
   }
@@ -357,8 +357,8 @@ void GpuBackend::StartRecipes() {
         CompiledShader vs, ps;
         const ShaderCacheEntry* vs_entry = store_->FindContainer(first.vs);
         const ShaderCacheEntry* ps_entry = first.ps ? store_->FindContainer(first.ps) : nullptr;
-        bool ok = vs_entry && ShaderStore::BuildModules(device_, vs_entry, !first.domain, true, vs) &&
-                  (!first.ps || (ps_entry && ShaderStore::BuildModules(device_, ps_entry, false, false, ps)));
+        bool ok = vs_entry && ShaderStore::BuildModules(backend.device_, vs_entry, !first.domain, true, vs) &&
+                  (!first.ps || (ps_entry && ShaderStore::BuildModules(backend.device_, ps_entry, false, false, ps)));
         const RenderShader* vs_module = !ok                                   ? nullptr
                                         : first.form == kRecipeFetchSpec      ? vs.fetch_spec_module.get()
                                         : first.form == kRecipeDepth          ? vs.depth_module.get()
@@ -369,9 +369,9 @@ void GpuBackend::StartRecipes() {
           std::unique_ptr<RenderPipeline> pipeline;
           if (vs_module && !stop_precompile_.load(std::memory_order_relaxed)) {
             RenderGraphicsPipelineDesc desc = recipe.desc;
-            desc.pipelineLayout = layout_.get();
+            desc.pipelineLayout = backend.layout_.get();
             desc.vertexShader = vs_module;
-            desc.geometryShader = recipe.gs == 1 ? rect_list_gs_.get() : recipe.gs == 2 ? point_list_gs_.get() : nullptr;
+            desc.geometryShader = recipe.gs == 1 ? backend.draw.rect_list_gs_.get() : recipe.gs == 2 ? backend.draw.point_list_gs_.get() : nullptr;
             desc.pixelShader = recipe.ps ? ps.module.get() : nullptr;
             desc.inputElements = recipe.elements.data();
             desc.inputElementsCount = uint32_t(recipe.elements.size());
@@ -379,7 +379,7 @@ void GpuBackend::StartRecipes() {
             desc.inputSlotsCount = uint32_t(recipe.slots.size());
             desc.specConstants = recipe.constants.data();
             desc.specConstantsCount = uint32_t(recipe.constants.size());
-            try { pipeline = CreateGraphicsPipeline(device_, desc); } catch (const std::exception&) {}
+            try { pipeline = CreateGraphicsPipeline(backend.device_, desc); } catch (const std::exception&) {}
           }
           if (!pipeline) {
             ++failed;
@@ -401,7 +401,7 @@ void GpuBackend::StartRecipes() {
   }
 }
 
-void GpuBackend::StopRecipes() {
+void Pipelines::StopRecipes() {
   stop_precompile_ = true;
   g_precompile.predicting = false;
   {
@@ -438,7 +438,7 @@ void GpuBackend::StopRecipes() {
 // (shaders and specialization), not that state, so the pipeline the draw makes
 // later finds its program built. Runs on the command thread, a few
 // milliseconds at a time.
-void GpuBackend::PredictPipelines() {
+void Pipelines::PredictPipelines() {
   std::vector<PlumeShaderPair> pairs;
   {
     std::lock_guard lock(g_predict.mutex);
@@ -459,19 +459,19 @@ void GpuBackend::PredictPipelines() {
       predict_desc_[1].renderTargetCount = 0;
       predict_desc_set_[1] = true;
     }
-    auto* vs = static_cast<HostShader*>(LoadShaderByContents(
-        xenos::ShaderType::kVertex, memory_->TranslatePhysical<const uint32_t*>(pair.vs_address), pair.vs_dwords));
+    auto* vs = static_cast<HostShader*>(backend.shaders.LoadShaderByContents(
+        xenos::ShaderType::kVertex, backend.memory_->TranslatePhysical<const uint32_t*>(pair.vs_address), pair.vs_dwords));
     HostShader* ps = nullptr;
     if (pair.ps_dwords) {
-      ps = static_cast<HostShader*>(LoadShaderByContents(
-          xenos::ShaderType::kPixel, memory_->TranslatePhysical<const uint32_t*>(pair.ps_address), pair.ps_dwords));
+      ps = static_cast<HostShader*>(backend.shaders.LoadShaderByContents(
+          xenos::ShaderType::kPixel, backend.memory_->TranslatePhysical<const uint32_t*>(pair.ps_address), pair.ps_dwords));
     }
     if (!vs || !vs->entry || (pair.ps_dwords && (!ps || !ps->entry))) {
       ++unknown;
       continue;
     }
-    if (!vs->compiled) vs->compiled = store_->Build(device_, vs->entry, true, true);
-    if (ps && !ps->compiled) ps->compiled = store_->Build(device_, ps->entry, false);
+    if (!vs->compiled) vs->compiled = store_->Build(backend.device_, vs->entry, true, true);
+    if (ps && !ps->compiled) ps->compiled = store_->Build(backend.device_, ps->entry, false);
     if (!vs->compiled || (ps && !ps->compiled)) {
       ++unknown;
       continue;
@@ -535,7 +535,7 @@ void GpuBackend::PredictPipelines() {
     for (uint32_t l = 0; l < RENUT_SPEC_INPUT_REMAP_LOCATIONS; ++l) {
       if (input_remap[l]) recipe.constants.emplace_back(RENUT_SPEC_INPUT_REMAP_BASE + l, input_remap[l]);
     }
-    const bool fetch_spec = fetch_spec_mode_ && vs->compiled->fetch_spec_module;
+    const bool fetch_spec = backend.swap.fetch_spec_mode_ && vs->compiled->fetch_spec_module;
     if (fetch_spec) {
       for (const auto& [slot, entry] : vs->live_fetches) {
         for (uint32_t word = 0; word < 4; ++word) {
@@ -543,11 +543,11 @@ void GpuBackend::PredictPipelines() {
         }
       }
     }
-    if (rel_constants_mode_ && rel_constants_mode_ < 10 &&
+    if (backend.draw.rel_constants_mode_ && backend.draw.rel_constants_mode_ < 10 &&
         (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_REL_CONSTANTS)) {
-      recipe.constants.emplace_back(RENUT_SPEC_REL_CONSTANTS, rel_constants_mode_);
+      recipe.constants.emplace_back(RENUT_SPEC_REL_CONSTANTS, backend.draw.rel_constants_mode_);
     }
-    const bool depth = depth_strip_mode_ && !ps &&
+    const bool depth = backend.swap.depth_strip_mode_ && !ps &&
                        (fetch_spec ? vs->compiled->depth_fetch_spec_module : vs->compiled->depth_module);
     recipe.form = depth ? (fetch_spec ? kRecipeDepthFetchSpec : kRecipeDepth)
                         : (fetch_spec ? kRecipeFetchSpec : kRecipeModule);
@@ -596,14 +596,14 @@ void GpuBackend::PredictPipelines() {
 
 // Flushed at once: a game closed by swiping it away never runs the shutdown
 // that would close the file.
-void GpuBackend::WriteRecord(uint32_t size, const void* data) {
+void Pipelines::WriteRecord(uint32_t size, const void* data) {
   if (!recipe_file_) return;
   std::fwrite(&size, sizeof(size), 1, recipe_file_);
   std::fwrite(data, 1, size & ~kRecipeTagBit, recipe_file_);
   std::fflush(recipe_file_);
 }
 
-std::unique_ptr<RenderPipeline> GpuBackend::TakeRecipe(Recipe& recipe, uint64_t key) {
+std::unique_ptr<RenderPipeline> Pipelines::TakeRecipe(Recipe& recipe, uint64_t key) {
   std::string bytes;
   RecipeWriter writer{bytes};
   VisitRecipe(writer, recipe);
@@ -630,7 +630,7 @@ std::unique_ptr<RenderPipeline> GpuBackend::TakeRecipe(Recipe& recipe, uint64_t 
   return nullptr;
 }
 
-void GpuBackend::NoteSceneUse(uint64_t key) {
+void Pipelines::NoteSceneUse(uint64_t key) {
   const uint32_t scene = g_precompile.scene.load(std::memory_order_relaxed);
   if (scene != tag_scene_) {
     tag_scene_ = scene;

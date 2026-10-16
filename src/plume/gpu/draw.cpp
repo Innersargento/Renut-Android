@@ -3,32 +3,32 @@
 
 namespace renut::gpu {
 
-bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool) {
   struct InDraw {
     bool& flag;
     explicit InDraw(bool& f) : flag(f) { flag = true; }
     ~InDraw() { flag = false; }
   } in_draw(in_issue_draw_);
-  if (g_predict.queued.load(std::memory_order_relaxed)) PredictPipelines();
-  const gfx::RegisterFile& regs = *register_file_;
+  if (g_predict.queued.load(std::memory_order_relaxed)) backend.pipelines.PredictPipelines();
+  const gfx::RegisterFile& regs = *backend.register_file_;
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) return true;  // resolves are records
-  ++stats_.draws;
-  const uint32_t draw_index = frame_draw_++;
-  if (draw_index >= drawskip_first_ && draw_index < drawskip_end_) return true;
-  for (const ConstOverride& o : const_overrides_) {
+  ++backend.stats_.draws;
+  const uint32_t draw_index = backend.swap.frame_draw_++;
+  if (draw_index >= backend.swap.drawskip_first_ && draw_index < backend.swap.drawskip_end_) return true;
+  for (const ConstOverride& o : backend.swap.const_overrides_) {
     if (o.bool_word) {
-      uint32_t& word = register_file_->values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + o.reg];
+      uint32_t& word = backend.register_file_->values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + o.reg];
       word = (word | o.set) & ~o.clear;
       continue;
     }
     const uint32_t at = (o.pixel ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X) + o.reg * 4;
-    std::memcpy(&register_file_->values[at], o.value, sizeof(o.value));
+    std::memcpy(&backend.register_file_->values[at], o.value, sizeof(o.value));
     MarkConstantsWritten(at, 4);
   }
 
-  auto* vs = static_cast<HostShader*>(active_vertex_shader());
+  auto* vs = static_cast<HostShader*>(backend.active_vertex_shader());
   if (trace_ && (!vs || !vs->entry)) {
     const auto dc = draw_util::GetNormalizedDepthControl(regs);
     Trace("dropped vs={:016X} prim={} n={} mode={} rt0={:X} ds={:X} z={}{}{} f{} colormask={:X}",
@@ -39,11 +39,11 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           regs[XE_GPU_REG_RB_COLOR_MASK]);
   }
   if (!vs || !vs->entry) {
-    ++stats_.no_vs;
+    ++backend.stats_.no_vs;
     if (vs) {
-      auto* ps_miss = static_cast<HostShader*>(active_pixel_shader());
+      auto* ps_miss = static_cast<HostShader*>(backend.active_pixel_shader());
       const uint64_t ps_hash = ps_miss && ps_miss->entry ? ps_miss->entry->hash : 0;
-      ++missed_draws_[vs->ucode_data_hash()];
+      ++backend.report.missed_draws_[vs->ucode_data_hash()];
       if (missed_pairs_.insert(vs->ucode_data_hash() ^ ps_hash).second && missed_pairs_.size() <= 48) {
         REXLOG_INFO("Renut: Plume missing VS {:016X} with PS {:016X}, mode {}, prim {}, {} indices",
                     vs->ucode_data_hash(), ps_hash, uint32_t(edram_mode), uint32_t(prim_type), index_count);
@@ -51,17 +51,17 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     return true;
   }
-  auto* ps = static_cast<HostShader*>(active_pixel_shader());
+  auto* ps = static_cast<HostShader*>(backend.active_pixel_shader());
   const bool color_pass = edram_mode == xenos::EdramMode::kColorDepth;
   if (color_pass && (!ps || !ps->entry)) {
-    ++stats_.no_ps;
+    ++backend.stats_.no_ps;
     return true;
   }
   if (!color_pass) ps = nullptr;
-  if (!vs->compiled) vs->compiled = store_->Build(device_, vs->entry, true, true);
-  if (ps && !ps->compiled) ps->compiled = store_->Build(device_, ps->entry, false);
+  if (!vs->compiled) vs->compiled = backend.pipelines.store_->Build(backend.device_, vs->entry, true, true);
+  if (ps && !ps->compiled) ps->compiled = backend.pipelines.store_->Build(backend.device_, ps->entry, false);
   if (!vs->compiled || (ps && !ps->compiled)) {
-    ++stats_.bad_shader;
+    ++backend.stats_.bad_shader;
     return true;
   }
   if (!vs->elements_decoded) DecodeLiveElements(*vs);
@@ -101,9 +101,9 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       // have made.
       if (!vs->domain_decoded) {
         vs->domain_decoded = true;
-        vs->domain_entry = store_->FindDomain(vs->ucode_key, vs->loose_key);
+        vs->domain_entry = backend.pipelines.store_->FindDomain(vs->ucode_key, vs->loose_key);
         if (vs->domain_entry) {
-          vs->domain_compiled = store_->Build(device_, vs->domain_entry, false, true);
+          vs->domain_compiled = backend.pipelines.store_->Build(backend.device_, vs->domain_entry, false, true);
           std::vector<LiveElement> unused;
           DecodeLiveElements(*vs, vs->domain_entry, unused, vs->domain_live_fetches);
         }
@@ -116,7 +116,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       break;
   }
   if (topology == RenderPrimitiveTopology::UNKNOWN) {
-    ++stats_.skipped_prim;
+    ++backend.stats_.skipped_prim;
     if ((prim_type == xenos::PrimitiveType::kTrianglePatch || prim_type == xenos::PrimitiveType::kQuadPatch) &&
         patch_drop_logged_.insert(vs->entry->hash).second) {
       // Water with no domain form simply does not appear. tools/prepare.py dumps reads this line back.
@@ -134,7 +134,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     return true;
   }
   if ((rect_list && !rect_list_gs_) || (point_list && !point_list_gs_)) {
-    ++stats_.skipped_prim;
+    ++backend.stats_.skipped_prim;
     return true;
   }
 
@@ -145,28 +145,28 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // mesh draws (triangles through a vertex model) are ever dropped, never the
   // full-screen passes that read the scene's copies.
   hiz_test_.valid = false;
-  if (hiz_mode_ && !trace_ && !skip_mask_ && !bind_skip_ && !sync_draws_ && !patch_list && !rect_list &&
+  if (backend.report.hiz_mode_ && !trace_ && !backend.skip_mask_ && !backend.recorder.bind_skip_ && !sync_draws_ && !patch_list && !rect_list &&
       !point_list && vs->compiled && (!debug_shader_ || (vs->entry->hash != debug_shader_ &&
                                                           (!ps || ps->entry->hash != debug_shader_)))) {
     // One call in 16 is timed (the clock reads are a cost of their own).
     const bool timed = (++hiz_timer_phase_ & 15) == 0;
-    hiz_stage_timing_ = timed;
+    backend.hiz.hiz_stage_timing_ = timed;
     std::chrono::steady_clock::time_point cull_start;
     if (timed) cull_start = std::chrono::steady_clock::now();
-    const bool dropped = HizCullDraw(*vs, prim_type, index_count, index_buffer_info, color_pass);
+    const bool dropped = backend.hiz.HizCullDraw(*vs, prim_type, index_count, index_buffer_info, color_pass);
     if (timed) {
-      stats_.hiz_cull_ns += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      backend.stats_.hiz_cull_ns += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               std::chrono::steady_clock::now() - cull_start).count());
     }
     if (dropped) {
-      ++stats_.hiz_culled_total;
+      ++backend.stats_.hiz_culled_total;
       return true;
     }
   }
   // Render targets.
   const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
   const uint32_t pitch = surface.surface_pitch;
-  if (!pitch) return Drop("no pitch", vs, ps);
+  if (!pitch) return backend.shaders.Drop("no pitch", vs, ps);
   const uint32_t height = std::clamp<uint32_t>(regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y, 16, 4096);
   const uint32_t color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
   static constexpr gfx::Register kColorInfo[4] = {
@@ -184,9 +184,9 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     for (uint32_t i = 0; i < color_count; ++i) {
       reg::RB_COLOR_INFO info;
       info.value = regs[kColorInfo[i]];
-      colors[i] = NativeTarget(i, info.value);
+      colors[i] = backend.targets.NativeTarget(i, info.value);
       if (!colors[i]) {
-        ++stats_.no_target;
+        ++backend.stats_.no_target;
         return true;
       }
     }
@@ -195,44 +195,44 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   Target* depth = nullptr;
   if (depth_control.z_enable || depth_control.stencil_enable) {
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-    depth = NativeTarget(4, depth_info.value);
+    depth = backend.targets.NativeTarget(4, depth_info.value);
   }
   {
-    MatchSurfaceSizes(colors, color_count, depth);
+    backend.targets.MatchSurfaceSizes(colors, color_count, depth);
     for (uint32_t i = 0; i < color_count; ++i) {
       if (!colors[i]) {
-        ++stats_.no_target;
+        ++backend.stats_.no_target;
         return true;
       }
     }
   }
-  if (!color_count && !depth) return Drop("no color or depth", vs, ps);
+  if (!color_count && !depth) return backend.shaders.Drop("no color or depth", vs, ps);
   // Debug (plume-bind 16): drop depth-only draws - the shadow casters - to
   // price them.
-  if ((bind_skip_ & 16) && !color_count) return true;
+  if ((backend.recorder.bind_skip_ & 16) && !color_count) return true;
   // files/plume-shadowmin: a shadow caster with fewer indices than this casts
   // no shadow. Only depth-only draws that write depth into a target that is not
   // the screen's: a stencil mark, a memory export or the scene's own depth is
   // never dropped. Off (0) by default.
-  if (shadow_min_indices_ && !color_count && index_count < shadow_min_indices_ && pitch != 1280 &&
+  if (backend.swap.shadow_min_indices_ && !color_count && index_count < backend.swap.shadow_min_indices_ && pitch != 1280 &&
       depth_control.z_write_enable && !depth_control.stencil_enable &&
       !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
-    ++stats_.shadow_culled;
+    ++backend.stats_.shadow_culled;
     return true;
   }
   // MatchSurfaceSizes may have recreated a texture that an earlier slot also uses.
   for (uint32_t i = 0; i < color_count; ++i) {
-    Transition(colors[i]->texture.get(), colors[i]->layout, RenderTextureLayout::COLOR_WRITE);
+    backend.targets.Transition(colors[i]->texture.get(), colors[i]->layout, RenderTextureLayout::COLOR_WRITE);
   }
   if (depth) {
     // A surface whose image went to a depth resolve and is drawn to without
     // being cleared: what it held comes back (AliasDepthResolve).
-    if (depth->restore_key) RestoreAliasedDepth(*depth, false);
+    if (depth->restore_key) backend.targets.RestoreAliasedDepth(*depth, false);
     // Used again without a clear: not the pattern (and whatever it holds is what
     // it holds).
-    if (depth->aliased_since_clear) NoteAliasedUse(*depth, false);
+    if (depth->aliased_since_clear) backend.targets.NoteAliasedUse(*depth, false);
     depth->depth_undefined = false;
-    Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+    backend.targets.Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
   }
 
   // Textures used by the draw: resolved render targets, by guest address.
@@ -253,38 +253,38 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   };
   uint32_t used_slots = slots_of(vs) | slots_of(ps);
   // Debug: go back to binding every slot, to compare against a capture.
-  if (skip_mask_ & 1048576) used_slots = ~0u;
+  if (backend.skip_mask_ & 1048576) used_slots = ~0u;
   for (uint32_t remaining = used_slots; remaining;) {
     const uint32_t slot = uint32_t(__builtin_ctz(remaining));
     remaining &= remaining - 1;
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
     if (fetch.type != xenos::FetchConstantType::kTexture) continue;
-    sampler_descriptor[slot] = GetSampler(fetch);
+    sampler_descriptor[slot] = backend.textures.GetSampler(fetch);
     Resolved* found = FindResolved(fetch.base_address << 12);
     if (found && found->descriptor) {
       Resolved& r = *found;
-      if (snap_shader_ && !snap_taken_ && !r.depth && r.texture && ps && ps->entry->hash == snap_shader_ &&
-          !miss_dump_directory_.empty() &&
-          access((miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/plume-snap-dump").c_str(),
+      if (backend.swap.snap_shader_ && !backend.swap.snap_taken_ && !r.depth && r.texture && ps && ps->entry->hash == backend.swap.snap_shader_ &&
+          !backend.miss_dump_directory_.empty() &&
+          access((backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/')) + "/plume-snap-dump").c_str(),
                  F_OK) == 0) {
-        SnapshotResolved(r);
-        Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
+        backend.resolve.SnapshotResolved(r);
+        backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
       }
-      if (depth_dump_ps_ && !depth_dump_ && r.depth && !r.alias && r.texture && ps &&
-          ps->entry->hash == depth_dump_ps_) {
+      if (backend.swap.depth_dump_ps_ && !backend.swap.depth_dump_ && r.depth && !r.alias && r.texture && ps &&
+          ps->entry->hash == backend.swap.depth_dump_ps_) {
         const uint32_t bytes = r.format == RenderFormat::R32G32_FLOAT ? 8 : 4;
-        depth_dump_row_ = (r.width + 63) & ~63u;
-        depth_dump_ = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(depth_dump_row_) * r.height * bytes));
-        if (depth_dump_) {
-          Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
-          CopyTextureToBuffer(L(), depth_dump_.get(), r.texture.get(), r.width, r.height, depth_dump_row_, 0, 0,
+        backend.swap.depth_dump_row_ = (r.width + 63) & ~63u;
+        backend.swap.depth_dump_ = backend.device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(backend.swap.depth_dump_row_) * r.height * bytes));
+        if (backend.swap.depth_dump_) {
+          backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
+          CopyTextureToBuffer(backend.recorder.L(), backend.swap.depth_dump_.get(), r.texture.get(), r.width, r.height, backend.swap.depth_dump_row_, 0, 0,
                               nullptr);
-          Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
-          depth_dump_w_ = r.width;
-          depth_dump_h_ = r.height;
-          depth_dump_format_ = uint32_t(r.format);
-          depth_dump_generation_ = r.generation;
-          depth_dump_frame_ = r.written_frame;
+          backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
+          backend.swap.depth_dump_w_ = r.width;
+          backend.swap.depth_dump_h_ = r.height;
+          backend.swap.depth_dump_format_ = uint32_t(r.format);
+          backend.swap.depth_dump_generation_ = r.generation;
+          backend.swap.depth_dump_frame_ = r.written_frame;
         }
       }
       const uint32_t fw = uint32_t((uint64_t(fetch.size_2d.width + 1) * r.scale + 3) / 4);
@@ -297,36 +297,36 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       const bool depth_view = r.depth;
       const bool stencil_first = fetch.format == xenos::TextureFormat::k_8_8_8_8;
       if (fw < r.width || fh < r.height) {
-        texture_descriptor[slot] = FittedResolved(r, std::min(fw, r.width), std::min(fh, r.height));
-        if (depth_view && texture_descriptor[slot]) texture_descriptor[slot] = SwizzledResolved(r, true, swizzle, stencil_first);
+        texture_descriptor[slot] = backend.targets.FittedResolved(r, std::min(fw, r.width), std::min(fh, r.height));
+        if (depth_view && texture_descriptor[slot]) texture_descriptor[slot] = backend.targets.SwizzledResolved(r, true, swizzle, stencil_first);
       } else {
-        Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
-        texture_descriptor[slot] = depth_view ? SwizzledResolved(r, false, swizzle, stencil_first) : r.descriptor;
+        backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
+        texture_descriptor[slot] = depth_view ? backend.targets.SwizzledResolved(r, false, swizzle, stencil_first) : r.descriptor;
       }
     } else if (fetch.dimension == xenos::DataDimension::k2DOrStacked) {
-      fetch_slot_ = int(slot);
-      texture_descriptor[slot] = GetGuestTexture(fetch);
-      fetch_slot_ = -1;
-      if (fetch.stacked) stack_descriptor[slot] = GetGuestStackedTexture(fetch);
+      backend.textures.fetch_slot_ = int(slot);
+      texture_descriptor[slot] = backend.textures.GetGuestTexture(fetch);
+      backend.textures.fetch_slot_ = -1;
+      if (fetch.stacked) stack_descriptor[slot] = backend.textures.GetGuestStackedTexture(fetch);
     } else if (fetch.dimension == xenos::DataDimension::kCube) {
-      cube_descriptor[slot] = GetGuestCubeTexture(fetch);
+      cube_descriptor[slot] = backend.textures.GetGuestCubeTexture(fetch);
     } else if (fetch.dimension == xenos::DataDimension::k3D) {
       // tfetch3D reads the same table as a stack's.
-      stack_descriptor[slot] = GetGuestVolumeTexture(fetch);
+      stack_descriptor[slot] = backend.textures.GetGuestVolumeTexture(fetch);
     }
   }
 
   if (skip_shader_ && (vs->entry->hash == skip_shader_ || (ps && ps->entry->hash == skip_shader_))) {
     return true;
   }
-  if (arm_) {
+  if (backend.swap.arm_) {
     const uint64_t ps_hash = ps ? ps->entry->hash : 0;
     if (arm_target_) {
-      if ((vs->entry->hash == arm_target_ || ps_hash == arm_target_) && arm_new_.empty()) {
-        arm_new_.emplace_back(vs->entry->hash, ps_hash);
+      if ((vs->entry->hash == arm_target_ || ps_hash == arm_target_) && backend.swap.arm_new_.empty()) {
+        backend.swap.arm_new_.emplace_back(vs->entry->hash, ps_hash);
       }
-    } else if (arm_pairs_.insert(vs->entry->hash * 0x9E3779B97F4A7C15ull ^ ps_hash).second && !arm_learn_) {
-      arm_new_.emplace_back(vs->entry->hash, ps_hash);
+    } else if (backend.swap.arm_pairs_.insert(vs->entry->hash * 0x9E3779B97F4A7C15ull ^ ps_hash).second && !backend.swap.arm_learn_) {
+      backend.swap.arm_new_.emplace_back(vs->entry->hash, ps_hash);
     }
   }
   if (trace_) {
@@ -334,7 +334,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                    draw_index,
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
                                    index_count, uint32_t(edram_mode), pitch, height,
-                                   regs[XE_GPU_REG_RB_COLORCONTROL], color_mask, bin_mask_);
+                                   regs[XE_GPU_REG_RB_COLORCONTROL], color_mask, backend.lists.bin_mask_);
     if (packet_predicated_) line += " pred";
     for (uint32_t i = 0; i < color_count; ++i) {
       reg::RB_COLOR_INFO info;
@@ -417,7 +417,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       // <files>/plume-trace-ps names one more pixel shader (hex) whose
       // constants go into the trace at every draw, band by band.
       const bool chosen = trace_ps_ && ps->entry->hash == trace_ps_;
-      if (chosen || (cascades && traced_cascade_ps_.insert(ps->entry->hash).second)) {
+      if (chosen || (cascades && backend.swap.traced_cascade_ps_.insert(ps->entry->hash).second)) {
         std::string constants;
         for (uint32_t i = 0; i < 256; ++i) {
           float c[4];
@@ -449,7 +449,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   uint8_t* sh = shared_built_;
   // plume-skip bit 16777216 points every fetch at the 1x1 white texture in
   // slot 0: the sampling instructions stay, the texture bandwidth goes.
-  if (skip_mask_ & 16777216) {
+  if (backend.skip_mask_ & 16777216) {
     std::memset(texture_descriptor, 0, sizeof(texture_descriptor));
     std::memset(cube_descriptor, 0, sizeof(cube_descriptor));
     std::memset(stack_descriptor, 0, sizeof(stack_descriptor));
@@ -462,7 +462,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     if (debug_mode_ & 32) texture_descriptor[0] = 0;
   }
-  for (uint32_t mask = white_slots_; mask; mask &= mask - 1) texture_descriptor[__builtin_ctz(mask)] = 0;
+  for (uint32_t mask = backend.swap.white_slots_; mask; mask &= mask - 1) texture_descriptor[__builtin_ctz(mask)] = 0;
   std::memcpy(sh + RENUT_SHARED_TEXTURE2D_OFFSET, texture_descriptor, sizeof(texture_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURE3D_OFFSET, stack_descriptor, sizeof(stack_descriptor));
@@ -483,7 +483,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // Alpha to coverage (N&B's grass and foliage) has no samples to cover
   // without MSAA; like a single-sample A2C, keep the fragments at or above
   // half coverage.
-  const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(skip_mask_ & 4096);
+  const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(backend.skip_mask_ & 4096);
   bool alpha_test = ps && (alpha_test_enabled || alpha_to_mask);
   float alpha_ref = alpha_test_enabled ? regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF) : 0.5f;
   // The pixel shaders only clip(alpha - ref), i.e. pass at alpha >= ref. N&B's
@@ -522,8 +522,8 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     RenderBuffer* buffer;
     Trace("  stream{} {:08X}+{:X} e{}", stream, fetch.address << 2, fetch.size << 2, uint32_t(fetch.endian));
     if (trace_ && fetch.size && (fetch.size << 2) <= (1u << 20)) {
-      const auto* guest = memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2);
-      traced_streams_.push_back({frame_draw_ - 1, stream, uint32_t(fetch.address << 2),
+      const auto* guest = backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2);
+      backend.swap.traced_streams_.push_back({backend.swap.frame_draw_ - 1, stream, uint32_t(fetch.address << 2),
                                  std::vector<uint8_t>(guest, guest + (fetch.size << 2))});
     }
     // A stream with format 17 vectors the input assembler hands to the shader
@@ -564,14 +564,14 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       buffer = memo.buffer;
       offset = memo.offset;
       bound = memo.bound;
-      ++stats_.stream_memo_hits;
-    } else if (PooledStream* pooled = objkeys_ && !validate_windows_ && !sync_draws_ && !trace_
+      ++backend.stats_.stream_memo_hits;
+    } else if (PooledStream* pooled = backend.textures.objkeys_ && !validate_windows_ && !sync_draws_ && !trace_
                                           ? &stream_pool_[((uint64_t(constant_words[0]) * 0x9E3779B97F4A7C15ull) ^
                                                            (uint64_t(constant_words[1]) * 0xC2B2AE3D27D4EB4Full) ^
                                                            native_stream.base ^ signature) %
                                                           kStreamPoolSize]
                                           : nullptr;
-               pooled && pooled->frame == swaps_ && pooled->memo.buffer && pooled->memo.epoch == stream_epoch_ &&
+               pooled && pooled->frame == backend.swaps_ && pooled->memo.buffer && pooled->memo.epoch == stream_epoch_ &&
                pooled->memo.generation == upload_generation_ && pooled->memo.words[0] == constant_words[0] &&
                pooled->memo.words[1] == constant_words[1] && pooled->memo.native_base == native_stream.base &&
                pooled->memo.native_size == native_stream.size && pooled->memo.repack_signature == signature &&
@@ -581,19 +581,19 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       buffer = memo.buffer;
       offset = memo.offset;
       bound = memo.bound;
-      ++stats_.stream_memo_hits;
+      ++backend.stats_.stream_memo_hits;
     } else {
       bool repacked = false;
-      if (repackable && !ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
+      if (repackable && !backend.streams.ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
         buffer = upload_.get();
-        repacked = RepackedStream(fetch.address << 2, fetch.size << 2, fetch.endian, vs->repack[stream].data(),
+        repacked = backend.streams.RepackedStream(fetch.address << 2, fetch.size << 2, fetch.endian, vs->repack[stream].data(),
                                   uint32_t(vs->repack[stream].size()), buffer, offset);
         if (repacked) Trace("  stream{} repacked: {} format 17 element(s)", stream, vs->repack[stream].size());
       }
-      stream_object_ = native_stream;
-      bound = repacked || BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset);
-      stream_object_ = {};
-      if (!exports_.empty() && ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
+      backend.streams.stream_object_ = native_stream;
+      bound = repacked || backend.streams.BindStream(fetch.address << 2, fetch.size << 2, fetch.endian, buffer, offset);
+      backend.streams.stream_object_ = {};
+      if (!backend.streams.exports_.empty() && backend.streams.ExportOverlaps(fetch.address << 2, fetch.size << 2)) {
         memo.buffer = nullptr;  // an exported stream is not remembered
       } else {
         std::memcpy(memo.words, constant_words, sizeof(memo.words));
@@ -606,13 +606,13 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         memo.buffer = bound ? buffer : nullptr;
         memo.offset = offset;
         memo.bound = bound;
-        if (objkeys_ && memo.buffer && !validate_windows_ && !sync_draws_ && !trace_) {
+        if (backend.textures.objkeys_ && memo.buffer && !validate_windows_ && !sync_draws_ && !trace_) {
           PooledStream& pooled = stream_pool_[((uint64_t(constant_words[0]) * 0x9E3779B97F4A7C15ull) ^
                                                (uint64_t(constant_words[1]) * 0xC2B2AE3D27D4EB4Full) ^
                                                native_stream.base ^ signature) %
                                               kStreamPoolSize];
           pooled.memo = memo;
-          pooled.frame = swaps_;
+          pooled.frame = backend.swaps_;
         }
       }
     }
@@ -628,7 +628,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     for (uint32_t s = 0; s < RENUT_VERTEX_STREAM_COUNT; ++s) {
       if (!slot_sizes[s] || !slot_buffers[s]) continue;
       xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(s == RENUT_DIRECT_FETCH_STREAM ? 0 : 95 - s);
-      ValidateRange(fmt::format("stream{}", s).c_str(), vs->entry->hash, slot_buffers[s], slot_offsets[s],
+      backend.resolve.ValidateRange(fmt::format("stream{}", s).c_str(), vs->entry->hash, slot_buffers[s], slot_offsets[s],
                     fetch.address << 2, slot_sizes[s], fetch.endian);
     }
   }
@@ -645,7 +645,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       if (s == RENUT_DIRECT_FETCH_STREAM || !slot_sizes[s] || slot_sizes[s] > 256) continue;
       xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - s);
       std::vector<uint8_t> bytes(slot_sizes[s]);
-      CopySwapped(bytes.data(), memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), slot_sizes[s],
+      CopySwapped(bytes.data(), backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), slot_sizes[s],
                   fetch.endian);
       info += fmt::format(" data{}:", s);
       for (uint32_t i = 0; i + 4 <= bytes.size() && i < 64; i += 4) {
@@ -661,7 +661,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       if (s == RENUT_DIRECT_FETCH_STREAM || !slot_sizes[s] || !slot_buffers[s] || slot_buffers[s] == upload_.get()) continue;
       xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - s);
       std::vector<uint8_t> guest(slot_sizes[s]);
-      CopySwapped(guest.data(), memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), slot_sizes[s], fetch.endian);
+      CopySwapped(guest.data(), backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), slot_sizes[s], fetch.endian);
       const auto* window = static_cast<const uint8_t*>(slot_buffers[s]->map());
       if (!window) continue;
       uint32_t differ = 0, first = UINT32_MAX;
@@ -674,7 +674,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       slot_buffers[s]->unmap();
       if (differ) {
         info += fmt::format(" STALE{}[{}B differ of {}, first at {}]", s, differ, guest.size(), first);
-        ++sync_stale_streams_;
+        ++backend.recorder.sync_stale_streams_;
       }
     }
     // What the integer attributes hold over the vertices this draw names: a
@@ -686,7 +686,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       if (indexed) {
         const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
         std::vector<uint8_t> raw(size_t(index_count) * (is32 ? 4 : 2));
-        CopySwapped(raw.data(), memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
+        CopySwapped(raw.data(), backend.memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
                     uint32_t(raw.size()), index_buffer_info->endianness);
         for (uint32_t i = 0; i < index_count; ++i) {
           used.push_back(is32 ? reinterpret_cast<const uint32_t*>(raw.data())[i]
@@ -704,7 +704,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - e.slot);
         if (fetch.size == 0 || (fetch.size << 2) > (4u << 20)) continue;
         std::vector<uint8_t> stream(fetch.size << 2);
-        CopySwapped(stream.data(), memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2),
+        CopySwapped(stream.data(), backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2),
                     uint32_t(stream.size()), fetch.endian);
         const uint32_t width = e.format == 6 ? 1 : 2;
         const uint32_t count = e.format == 26 ? 4 : (e.format == 25 ? 2 : 4);
@@ -733,7 +733,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         info += fmt::format(" L{}[f{} {}..{} outside={}]", e.location, e.format, lo, hi, outside);
       }
     }
-    sync_draw_info_ = std::move(info);
+    backend.recorder.sync_draw_info_ = std::move(info);
   }
 
   // Memory export. What a shader exports into is named by the stream
@@ -765,12 +765,12 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       Trace("  eA c{} {:08X} {:08X} {:08X} {:08X} -> {:08X}+{:X} f{}", i, k[0], k[1], k[2], k[3], base,
             elements * element_bytes, (k[2] >> 8) & 0x3F);
       const uint32_t endian_bits = k[2] & 7;
-      ExportRange* range = GetExport(base, elements * element_bytes,
+      ExportRange* range = backend.streams.GetExport(base, elements * element_bytes,
                                      endian_bits <= 3 ? xenos::Endian(endian_bits) : xenos::Endian::k8in32);
       if (!range) continue;
-      if (range->read) ExportBarrier();
+      if (range->read) backend.streams.ExportBarrier();
       range->written = true;
-      range->exported_frame = swaps_;
+      range->exported_frame = backend.swaps_;
       bool listed = false;
       for (uint32_t r = 0; r < range_count; ++r) listed |= ranges[r * 4] == range->base;
       if (listed) continue;
@@ -781,8 +781,8 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       ++range_count;
     }
     std::memcpy(sh + RENUT_SHARED_EXPORT_OFFSET, ranges, sizeof(ranges));
-    ++stats_.export_draws;
-    ++export_draws_total_;
+    ++backend.stats_.export_draws;
+    ++backend.patches.export_draws_total_;
     if (trace_) {
       std::string line = "  export";
       for (uint32_t r = 0; r < range_count; ++r) {
@@ -854,7 +854,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (location < RENUT_INPUT_REMAP_COUNT) input_remap[location] = element->remap;
     // Debug: plume-skip bit 512 reverses every 16-bit pair a second time, the
     // old behaviour.
-    if (IsSixteenBitFormat(element->format) && (skip_mask_ & 512)) {
+    if (IsSixteenBitFormat(element->format) && (backend.skip_mask_ & 512)) {
       // Debug: the old behaviour, reversing the 16-bit pairs a second time.
       int which = -1;
       switch (element->usage) {
@@ -889,7 +889,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (index_buffer_info && index_buffer_info->guest_base) {
       const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
       std::vector<uint8_t> raw(size_t(index_count) * (is32 ? 4 : 2));
-      CopySwapped(raw.data(), memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
+      CopySwapped(raw.data(), backend.memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
                   uint32_t(raw.size()), index_buffer_info->endianness);
       for (uint32_t i = 0; i < index_count; ++i) {
         used.push_back(is32 ? reinterpret_cast<const uint32_t*>(raw.data())[i]
@@ -907,7 +907,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                           e.is_signed ? "s" : "", e.stride, e.offset, e.stride ? (fetch.size << 2) / e.stride : 0);
       if (e.format != 26 || e.normalized || !e.stride || fetch.size == 0) continue;
       std::vector<uint8_t> stream(fetch.size << 2);
-      CopySwapped(stream.data(), memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2),
+      CopySwapped(stream.data(), backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2),
                   uint32_t(stream.size()), fetch.endian);
       int32_t lo = INT32_MAX, hi = INT32_MIN;
       for (uint32_t v : used) {
@@ -986,29 +986,29 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
             entry[2], scale);
     }
   }
-  if (skip_mask_) {
+  if (backend.skip_mask_) {
     bool skinned = false, half_position = false;
     for (const LiveElement& e : vs->elements) {
       skinned |= e.usage == 2;
       half_position |= e.usage == 0 && e.format == 32;
     }
     const int32_t base = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
-    if (((skip_mask_ & 1) && int_inputs) || ((skip_mask_ & 2) && packed_inputs) ||
-        ((skip_mask_ & 4) && skinned) || ((skip_mask_ & 8) && half_position) ||
-        ((skip_mask_ & 16) && quad_list) || ((skip_mask_ & 32) && base != 0) ||
-        ((skip_mask_ & 64) && !skinned) || ((skip_mask_ & 128) && zero_used)) {
+    if (((backend.skip_mask_ & 1) && int_inputs) || ((backend.skip_mask_ & 2) && packed_inputs) ||
+        ((backend.skip_mask_ & 4) && skinned) || ((backend.skip_mask_ & 8) && half_position) ||
+        ((backend.skip_mask_ & 16) && quad_list) || ((backend.skip_mask_ & 32) && base != 0) ||
+        ((backend.skip_mask_ & 64) && !skinned) || ((backend.skip_mask_ & 128) && zero_used)) {
       return true;
     }
   }
-  if (skin_log_) {
+  if (backend.swap.skin_log_) {
     bool skinned = false;
     for (const LiveElement& e : vs->elements) skinned |= e.usage == 2;
     if (skinned) {
-      std::lock_guard<std::mutex> lock(skinned_mutex_);
-      SkinnedSeen& seen = skinned_seen_[vs->entry->hash];
-      if (!seen.draws++) seen.first_frame = swaps_;
-      seen.last_frame = swaps_;
-      if (skin_skip_.count(vs->entry->hash)) return true;
+      std::lock_guard<std::mutex> lock(backend.swap.skinned_mutex_);
+      SkinnedSeen& seen = backend.resolve.skinned_seen_[vs->entry->hash];
+      if (!seen.draws++) seen.first_frame = backend.swaps_;
+      seen.last_frame = backend.swaps_;
+      if (backend.swap.skin_skip_.count(vs->entry->hash)) return true;
     }
   }
   if (zero_used) input_slots.emplace_back(kZeroBinding, 0);
@@ -1034,8 +1034,8 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     window_y = float(offset.window_y_offset);
   }
   const bool keep_pixel_center =
-      pixel_center_debug_ == 0 ||
-      (pixel_center_debug_ == 1 && edram_mode != xenos::EdramMode::kDepthOnly);
+      backend.swap.pixel_center_debug_ == 0 ||
+      (backend.swap.pixel_center_debug_ == 1 && edram_mode != xenos::EdramMode::kDepthOnly);
   if (keep_pixel_center && regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
     window_x += 0.5f;
     window_y += 0.5f;
@@ -1069,7 +1069,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   const bool band_split_scene = g_renut_scene_split_mode.load(std::memory_order_relaxed) == 5 &&
                                 !REXCVAR_GET(renut_scene_msaa) &&
                                 regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280;
-  const uint32_t draw_bands = band_split_scene && packet_predicated_ ? uint32_t(bin_mask_) & 0xF : 0;
+  const uint32_t draw_bands = band_split_scene && packet_predicated_ ? uint32_t(backend.lists.bin_mask_) & 0xF : 0;
   constexpr float kBandSplit = 384.f;  // 2x MSAA at 720p: bands of 384 and 336 rows
   std::memcpy(sh + RENUT_SHARED_VIEWPORT_OFFSET, scale_offset, sizeof(scale_offset));
   // Pixels that read their position relative to a band (renutFragPos): none
@@ -1078,7 +1078,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // Debug (<files>/plume-band-fragpos "1"): with scene MSAA off, pixels below
   // row 384 of the scene read their position relative to the lower band, as
   // the console's lower-band replay gave them.
-  if (band_fragpos_ && !REXCVAR_GET(renut_scene_msaa) && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280 &&
+  if (backend.swap.band_fragpos_ && !REXCVAR_GET(renut_scene_msaa) && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280 &&
       std::fabs(viewport.height) >= 700.f) {
     band_split = 384.f;
   }
@@ -1132,9 +1132,9 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   constexpr uint32_t kRefractionBoundsAt = XE_GPU_REG_SHADER_CONSTANT_256_X + 5 * 4;
   float refraction_saved[4] = {};
   bool refraction_fixed = false;
-  if (refraction_fix_ && ps && ps->entry && ps->entry->hash == kRefractionSpritePs &&
+  if (backend.swap.refraction_fix_ && ps && ps->entry && ps->entry->hash == kRefractionSpritePs &&
       !REXCVAR_GET(renut_scene_msaa)) {
-    float* bounds = reinterpret_cast<float*>(&register_file_->values[kRefractionBoundsAt]);
+    float* bounds = reinterpret_cast<float*>(&backend.register_file_->values[kRefractionBoundsAt]);
     if (bounds[1] > bounds[2]) {
       std::memcpy(refraction_saved, bounds, sizeof(refraction_saved));
       std::swap(bounds[1], bounds[2]);
@@ -1143,12 +1143,12 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
   }
   struct RefractionBoundsRestore {
-    GpuBackend* self;
+    Draw* self;
     const float* saved;
     bool active;
     ~RefractionBoundsRestore() {
       if (!active) return;
-      std::memcpy(&self->register_file_->values[kRefractionBoundsAt], saved, 4 * sizeof(float));
+      std::memcpy(&self->backend.register_file_->values[kRefractionBoundsAt], saved, 4 * sizeof(float));
       self->MarkConstantsWritten(kRefractionBoundsAt, 4);
     }
   } refraction_restore{this, refraction_saved, refraction_fixed};
@@ -1165,31 +1165,31 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     bool placed = true;
     // Depth-only draws have no fragment shader, so its constants can wait
     // until a color draw actually needs them.
-    for (uint32_t stage = 0; stage < (ps || !shadow_native_constants_ ? 2u : 1u) && placed; ++stage) {
+    for (uint32_t stage = 0; stage < (ps || !backend.swap.shadow_native_constants_ ? 2u : 1u) && placed; ++stage) {
       uint8_t* shadow = stage ? ps_shadow_ : vs_shadow_;
       const auto* file = reinterpret_cast<const uint8_t*>(
           &regs.values[stage ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X]);
       for (uint32_t chunk = 0; chunk < kConstantChunks && placed; ++chunk) {
-        placed = CommitConstants(shadow + chunk * kConstantChunkSize, file + chunk * kConstantChunkSize,
+        placed = backend.streams.CommitConstants(shadow + chunk * kConstantChunkSize, file + chunk * kConstantChunkSize,
                                  kConstantChunkSize, constant_offsets_[stage][chunk],
                                  &constants_written_[stage][chunk]);
       }
     }
     if (placed && rel_active) {
-      placed = CommitConstants(vs_all_shadow_,
+      placed = backend.streams.CommitConstants(vs_all_shadow_,
                                reinterpret_cast<const uint8_t*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]),
                                kStageConstantSize, vs_all_offset_, nullptr);
     }
     if (!placed ||
-        !CommitConstants(shared_shadow_, shared_built_, RENUT_SHARED_HOT_SIZE, shared_offset_) ||
-        !CommitConstants(shared_shadow_ + RENUT_SHARED_HOT_SIZE, shared_built_ + RENUT_SHARED_HOT_SIZE,
+        !backend.streams.CommitConstants(shared_shadow_, shared_built_, RENUT_SHARED_HOT_SIZE, shared_offset_) ||
+        !backend.streams.CommitConstants(shared_shadow_ + RENUT_SHARED_HOT_SIZE, shared_built_ + RENUT_SHARED_HOT_SIZE,
                          RENUT_SHARED_SIZE - RENUT_SHARED_HOT_SIZE, shared_cold_offset_)) {
-      return Drop("constants upload", vs, ps);
+      return backend.shaders.Drop("constants upload", vs, ps);
     }
   } while (generation != upload_generation_);
 
-  if (twin_dedupe_ && packet_predicated_ && !REXCVAR_GET(renut_scene_msaa)) {
-    const uint64_t tiles = bin_mask_ & 0xF;
+  if (backend.swap.twin_dedupe_ && packet_predicated_ && !REXCVAR_GET(renut_scene_msaa)) {
+    const uint64_t tiles = backend.lists.bin_mask_ & 0xF;
     // Only the draws seen recorded twice: screen-space rectangles (the
     // shadow multiply) and the water's patches. Objects the game splits by
     // band must all run, and the band jobs may draw look-alikes.
@@ -1235,17 +1235,17 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       sig = XXH3_64bits_withSeed(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 192 * sizeof(uint32_t), sig);
       bool twin = false;
       for (const TwinEntry& e : twin_ring_) {
-        if (e.frame == swaps_ && e.sig == sig && (e.mask & tiles) == 0) {
+        if (e.frame == backend.swaps_ && e.sig == sig && (e.mask & tiles) == 0) {
           twin = true;
           break;
         }
       }
       if (twin) {
-        ++stats_.twin_skipped;
-        Trace("twin of an earlier draw under mask {:X}, skipped", uint64_t(bin_mask_));
+        ++backend.stats_.twin_skipped;
+        Trace("twin of an earlier draw under mask {:X}, skipped", uint64_t(backend.lists.bin_mask_));
         return true;
       }
-      twin_ring_[twin_pos_++ % twin_ring_.size()] = {sig, tiles, swaps_};
+      twin_ring_[twin_pos_++ % twin_ring_.size()] = {sig, tiles, backend.swaps_};
     }
   }
 
@@ -1259,7 +1259,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (scissor_rect.bottom >= 720) {
     if (draw_bands == 0x3) {
       scissor_rect.bottom = std::min(scissor_rect.bottom, int32_t(kBandSplit));
-      ++stats_.band_widened;
+      ++backend.stats_.band_widened;
     } else if (draw_bands == 0xC) {
       scissor_rect.top = std::max(scissor_rect.top, int32_t(kBandSplit));
     }
@@ -1272,15 +1272,15 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET));
   }
   if (scissor_rect.right <= scissor_rect.left || scissor_rect.bottom <= scissor_rect.top) {
-    return Drop("empty scissor", vs, ps);
+    return backend.shaders.Drop("empty scissor", vs, ps);
   }
 
   // Pipeline.
   const auto raster = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
   const bool polygonal = draw_util::IsPrimitivePolygonal(false, prim_type);
   RenderCullMode cull = RenderCullMode::NONE;
-  if (polygonal && !(skip_mask_ & 131072)) {
-    if (raster.cull_front && raster.cull_back) return Drop("culls both faces", vs, ps);
+  if (polygonal && !(backend.skip_mask_ & 131072)) {
+    if (raster.cull_front && raster.cull_back) return backend.shaders.Drop("culls both faces", vs, ps);
     if (raster.cull_front) cull = RenderCullMode::FRONT;
     else if (raster.cull_back) cull = RenderCullMode::BACK;
   }
@@ -1293,7 +1293,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     alpha_test = false;
   }
   const bool depth_enabled =
-      depth && depth_control.z_enable && !(skip_mask_ & 1024) && !(debug_draw && (debug_mode_ & 1));
+      depth && depth_control.z_enable && !(backend.skip_mask_ & 1024) && !(debug_draw && (debug_mode_ & 1));
   const bool depth_write = depth_enabled && depth_control.z_write_enable;
   // Polygon offset, converted like the Xenia Vulkan path does: the constant is
   // a fraction of the depth range, times 2^24 for a float depth target (Vulkan
@@ -1302,12 +1302,12 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // so a positive offset moves toward the camera here too.
   int32_t depth_bias = 0;
   float depth_slope = 0.0f;
-  if (poly_offset_ && depth_enabled) {
+  if (backend.swap.poly_offset_ && depth_enabled) {
     float slope_scale = 0.0f, offset = 0.0f;
     draw_util::GetPreferredFacePolygonOffset(regs, polygonal, slope_scale, offset);
-    const float bias = offset * 16777216.0f * poly_offset_scale_;
+    const float bias = offset * 16777216.0f * backend.swap.poly_offset_scale_;
     if (std::isfinite(bias)) depth_bias = int32_t(std::clamp(bias, -2.0e9f, 2.0e9f));
-    const float slope = slope_scale * xenos::kPolygonOffsetScaleSubpixelUnit * poly_offset_scale_;
+    const float slope = slope_scale * xenos::kPolygonOffsetScaleSubpixelUnit * backend.swap.poly_offset_scale_;
     if (std::isfinite(slope)) depth_slope = slope;
   }
   // Stencil: the game marks pixels in the stencil buffer and later draws shade
@@ -1359,7 +1359,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     // renut_plume_no_bloom: the bright pass (scene * its alpha + glow) writes
     // black, so every blur after it and the final add are black too.
-    if (no_bloom_ && ps && ps->entry->hash == 0x1B958C7DC860BBBEull && IsBlendable(colors[i]->format)) {
+    if (backend.no_bloom_ && ps && ps->entry->hash == 0x1B958C7DC860BBBEull && IsBlendable(colors[i]->format)) {
       b.blendEnabled = true;
       b.srcBlend = b.dstBlend = b.srcBlendAlpha = b.dstBlendAlpha = RenderBlend::ZERO;
       b.blendOp = b.blendOpAlpha = RenderBlendOperation::ADD;
@@ -1421,7 +1421,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // comes from the shader's own vfetch instructions, so it is the same on every
   // draw that uses this shader and adds no pipelines of its own.
   CompiledShader* vertex_compiled = patch_list ? vs->domain_compiled : vs->compiled;
-  const bool fetch_spec = fetch_spec_mode_ && vertex_compiled && vertex_compiled->fetch_spec_module;
+  const bool fetch_spec = backend.swap.fetch_spec_mode_ && vertex_compiled && vertex_compiled->fetch_spec_module;
   // The table is the same on every draw of the shader. With key reuse the key
   // takes one hash of it (made once, kept on the shader) and the constants
   // themselves are laid into spec_constants only when a pipeline has to be
@@ -1429,7 +1429,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   const auto& fetch_table = patch_list ? vs->domain_live_fetches : vs->live_fetches;
   uint64_t fetch_table_hash = 0;
   if (fetch_spec) {
-    if (key_reuse_) {
+    if (backend.swap.key_reuse_) {
       uint64_t& cached = vs->fetch_spec_hash[patch_list ? 1 : 0];
       if (!cached) {
         uint64_t h = 0x9E3779B97F4A7C15ull;
@@ -1504,7 +1504,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // but its position, so it can have the form that does not write them
   // (spirv_rewrites.h).
   RenderShader* depth_module = nullptr;
-  if (depth_strip_mode_ && !ps && plain_draw && vertex_compiled) {
+  if (backend.swap.depth_strip_mode_ && !ps && plain_draw && vertex_compiled) {
     depth_module = fetch_spec ? vertex_compiled->depth_fetch_spec_module.get() : vertex_compiled->depth_module.get();
   }
   const bool depth_strip = depth_module != nullptr;
@@ -1524,7 +1524,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // for it without faulting: attachments, primitive and vertex input. Only the
   // plume-skip bit below uses it.
   uint64_t interface_key = 0;
-  if (skip_mask_ & 262144) {
+  if (backend.skip_mask_ & 262144) {
     HashCombine(interface_key, topology);
     HashCombine(interface_key, rect_list);
     HashCombine(interface_key, point_list);
@@ -1545,7 +1545,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   }
   std::unique_ptr<RenderPipeline>* pipeline_node = pipeline_memo_.Find(key);
   if (!pipeline_node) {
-    pipeline_node = &pipelines_[key];
+    pipeline_node = &backend.pipelines.pipelines_[key];
     pipeline_memo_.Put(key, pipeline_node);
   }
   auto& pipeline = *pipeline_node;
@@ -1564,7 +1564,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       spec_constants.insert(at, table.begin(), table.end());
     }
     RenderGraphicsPipelineDesc desc;
-    desc.pipelineLayout = layout_.get();
+    desc.pipelineLayout = backend.layout_.get();
     desc.vertexShader = depth_strip ? depth_module
                         : fetch_spec ? vertex_compiled->fetch_spec_module.get()
                                      : vertex_compiled->module.get();
@@ -1598,7 +1598,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     desc.specConstantsCount = uint32_t(spec_constants.size());
     // The pipeline built ahead from the recipe file (StartRecipes), if this
     // start had it; a pipeline not in the file yet is written to it.
-    if (recipes_ && !pending_pipelines_.count(key) &&
+    if (backend.pipelines.recipes_ && !pending_pipelines_.count(key) &&
         !failed_pipelines_.count(key)) {
       Recipe recipe;
       recipe.vs = (patch_list ? vs->domain_entry : vs->entry)->hash;
@@ -1609,16 +1609,16 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       recipe.gs = rect_list ? 1 : point_list ? 2 : 0;
       recipe.desc = desc;
       recipe.elements = input_elements;
-      if (!predict_desc_set_[ps ? 0 : 1] && !patch_list && !rect_list && !point_list) {
-        predict_desc_[ps ? 0 : 1] = desc;
-        predict_desc_set_[ps ? 0 : 1] = true;
+      if (!backend.pipelines.predict_desc_set_[ps ? 0 : 1] && !patch_list && !rect_list && !point_list) {
+        backend.pipelines.predict_desc_[ps ? 0 : 1] = desc;
+        backend.pipelines.predict_desc_set_[ps ? 0 : 1] = true;
       }
       recipe.slots = input_slots;
       recipe.constants = spec_constants;
-      pipeline = TakeRecipe(recipe, key);
+      pipeline = backend.pipelines.TakeRecipe(recipe, key);
       if (pipeline) {
-        ++stats_.pipelines;
-        ++stats_.pipelines_prebuilt;
+        ++backend.stats_.pipelines;
+        ++backend.stats_.pipelines_prebuilt;
       }
     }
     // Exporting shaders feed later draws and sometimes the guest CPU. Never
@@ -1633,7 +1633,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         auto found = standins_.find(family);
         if (found == standins_.end()) return false;
         standin = found->second;
-        ++drops_[{"pipeline stand-in", vs->entry->hash, ps ? ps->entry->hash : 0, false}];
+        ++backend.report.drops_[{"pipeline stand-in", vs->entry->hash, ps ? ps->entry->hash : 0, false}];
         return true;
       };
       // A draw that goes without its pipeline says so to the job, which
@@ -1643,15 +1643,15 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       auto missed = [&](PipelineJob& job) {
         const uint32_t weight = (ps ? 4u : 1u) * (1u + std::min<uint32_t>(index_count, 65535u) / 512u);
         job.demand.fetch_add(weight, std::memory_order_relaxed);
-        job.wanted_frame.store(swaps_, std::memory_order_relaxed);
+        job.wanted_frame.store(backend.swaps_, std::memory_order_relaxed);
       };
       auto pending = pending_pipelines_.find(key);
       if (pending != pending_pipelines_.end()) {
         if (!pending->second->done.load(std::memory_order_acquire)) {
           missed(*pending->second);
-          if (!use_standin(pending->second->family)) return Drop("pipeline compiling", vs, ps);
+          if (!use_standin(pending->second->family)) return backend.shaders.Drop("pipeline compiling", vs, ps);
         } else {
-          CountJob(*pending->second);
+          backend.pipelines.CountJob(*pending->second);
           pipeline = std::move(pending->second->result);
           if (pipeline) standins_[pending->second->family] = pipeline.get();
           pending_pipelines_.erase(pending);
@@ -1667,7 +1667,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           std::memset(family_bytes.data + bool_spans[i], 0, sizeof(RenderSpecConstant::value));
         }
         const uint64_t family = family_bytes.Hash();
-        const uint64_t program = ProgramKey(desc);
+        const uint64_t program = backend.pipelines.ProgramKey(desc);
         // Most new pipelines differ from one already built only in blending,
         // depth, targets or vertex layout, which the driver does not compile
         // for: their program is in its cache - from this run or an earlier one
@@ -1675,36 +1675,36 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         // frame, the draw is drawn now instead of a frame or more later. Not
         // for a program a worker has yet to finish: the cache cannot have it.
         bool looked_up = false;
-        if (lookup_here_ && lookup_spent_us_ < lookup_budget_us_ && !pending_programs_.count(program)) {
+        if (lookup_here_ && lookup_spent_us_ < lookup_budget_us_ && !backend.pipelines.pending_programs_.count(program)) {
           const auto lookup_start = std::chrono::steady_clock::now();
           {
             PlumePipelineLookupOnly only;
-            pipeline = CreateGraphicsPipeline(device_, desc);
+            pipeline = CreateGraphicsPipeline(backend.device_, desc);
           }
           const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now() - lookup_start).count());
           lookup_spent_us_ += us;
-          stats_.lookup_us += us;
+          backend.stats_.lookup_us += us;
           looked_up = true;
           if (pipeline) {
-            ++stats_.pipelines;
-            ++stats_.pipelines_found_here;
-            stats_.pipeline_us += us;
+            ++backend.stats_.pipelines;
+            ++backend.stats_.pipelines_found_here;
+            backend.stats_.pipeline_us += us;
             standins_[family] = pipeline.get();
             // A lookup that takes a compile's time is a driver that compiled
             // anyway; on this thread that is the stall the workers exist for.
-            if (us > 40000 && swaps_ > 300 && ++slow_lookups_ >= 5) {
+            if (us > 40000 && backend.swaps_ > 300 && ++slow_lookups_ >= 5) {
               lookup_here_ = false;
               REXLOG_WARN("Renut: Plume pipeline lookups at the draw compiled instead; left to the workers");
             }
           } else {
-            ++stats_.lookups_missed;
+            ++backend.stats_.lookups_missed;
           }
         }
         if (!pipeline) {
           // Past the limit the draw waits for a free slot rather than compiling
           // here: a stall on the command list thread is what this option avoids.
-          if (pending_pipelines_.size() >= 4096) return Drop("pipeline queue full", vs, ps);
+          if (pending_pipelines_.size() >= 4096) return backend.shaders.Drop("pipeline queue full", vs, ps);
           auto job = std::make_shared<PipelineJob>();
           job->desc = desc;
           job->elements = input_elements;
@@ -1718,31 +1718,31 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           const bool covered = use_standin(family);
           job->urgent = !covered;
           missed(*job);
-          StartPipelineWorker();
-          ++pending_programs_[program];
+          backend.pipelines.StartPipelineWorker();
+          ++backend.pipelines.pending_programs_[program];
           pending_pipelines_.emplace(key, job);
           {
-            std::lock_guard lock(pipeline_mutex_);
-            (!looked_up && lookup_on_workers_ ? pipeline_lookup_queue_
-             : covered                        ? pipeline_queue_
-                                              : pipeline_urgent_queue_).push_back(std::move(job));
+            std::lock_guard lock(backend.pipelines.pipeline_mutex_);
+            (!looked_up && backend.pipelines.lookup_on_workers_ ? backend.pipelines.pipeline_lookup_queue_
+             : covered                        ? backend.pipelines.pipeline_queue_
+                                              : backend.pipelines.pipeline_urgent_queue_).push_back(std::move(job));
           }
-          pipeline_ready_.notify_all();
-          if (!covered) return Drop("pipeline compiling", vs, ps);
+          backend.pipelines.pipeline_ready_.notify_all();
+          if (!covered) return backend.shaders.Drop("pipeline compiling", vs, ps);
         }
       }
     }
     if (!pipeline && !standin && !failed_pipelines_.count(key) && !pending_pipelines_.count(key)) {
       const auto pipeline_start = std::chrono::steady_clock::now();
-      pipeline = CreateGraphicsPipeline(device_, desc);
-      stats_.pipeline_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+      pipeline = CreateGraphicsPipeline(backend.device_, desc);
+      backend.stats_.pipeline_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::steady_clock::now() - pipeline_start)
                                          .count());
-      ++stats_.pipelines;
+      ++backend.stats_.pipelines;
     }
     if (pipeline && getenv("RENUT_PIPELINE_STATS")) LogPipelineStatistics(*pipeline, vs, ps);
     if (pipeline && getenv("RENUT_PIPELINE_IR")) {
-      DumpPipelineInternals(*pipeline, vs, ps, miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')));
+      DumpPipelineInternals(*pipeline, vs, ps, backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/')));
     }
     if (!pipeline && !standin) {
       REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
@@ -1750,10 +1750,10 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
   }
   if (!pipeline && !standin) {
-    ++stats_.bad_shader;
+    ++backend.stats_.bad_shader;
     return true;
   }
-  if (recipes_ && pipeline) NoteSceneUse(key);
+  if (backend.pipelines.recipes_ && pipeline) backend.pipelines.NoteSceneUse(key);
 
   // Indices.
   uint32_t vertex_count = index_count;
@@ -1777,27 +1777,27 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     uint32_t level = std::clamp(uint32_t(wanted > 1.0f ? wanted : 1.0f), 1u, kMaxPatchLevel);
     // files/plume-patchlevel: a share of the guest's level, in percent. The
     // grid has level^2 cells, so half the level is a quarter of the vertices.
-    if (patch_level_percent_ < 100) level = std::max(1u, level * patch_level_percent_ / 100);
+    if (backend.swap.patch_level_percent_ < 100) level = std::max(1u, level * backend.swap.patch_level_percent_ / 100);
     indexed = false;
     if (!patches) {
-      ++stats_.skipped_prim;
+      ++backend.stats_.skipped_prim;
       return true;
     }
     // In adaptive mode the "indices" are the factors, three per triangle
     // patch, which the guest exported just before: those patches are cut per
     // edge on the GPU, most of them - all that are off screen - into a single
     // triangle. Quad patches stay on the grid.
-    if (adaptive_mode_ && !quad_patch &&
+    if (backend.swap.adaptive_mode_ && !quad_patch &&
         regs.Get<reg::VGT_HOS_CNTL>().tess_mode == xenos::TessellationMode::kAdaptive && index_buffer_info &&
         index_buffer_info->guest_base && index_buffer_info->format == xenos::IndexFormat::kInt32) {
       const float least = regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
       const uint32_t min_level = std::clamp(uint32_t(least > 1.0f ? least : 1.0f), 1u, level);
-      adaptive = ExpandAdaptivePatches(index_buffer_info->guest_base, index_buffer_info->endianness, patches,
+      adaptive = backend.patches.ExpandAdaptivePatches(index_buffer_info->guest_base, index_buffer_info->endianness, patches,
                                        min_level, level, adaptive_draw);
     }
     if (!adaptive) {
-      patch_grid = GetPatchGrid(quad_patch, level, patches);
-      if (!patch_grid) return Drop("patch grid", vs, ps);
+      patch_grid = backend.streams.GetPatchGrid(quad_patch, level, patches);
+      if (!patch_grid) return backend.shaders.Drop("patch grid", vs, ps);
       vertex_count = patches * patch_grid->indices_per_patch;
     } else {
       vertex_count = 0;
@@ -1809,15 +1809,15 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     const uint32_t size = index_count * (is32 ? 4 : 2);
     // A quad list's indices are read back here to be split into triangles,
     // so they stay in the ring.
-    stream_object_ = native_indices_;
+    backend.streams.stream_object_ = backend.lists.native_indices_;
     const bool uploaded =
-        quad_list ? UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)
-                  : GuestStream(index_buffer_info->guest_base, size, index_buffer_info->endianness,
+        quad_list ? backend.streams.UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)
+                  : backend.streams.GuestStream(index_buffer_info->guest_base, size, index_buffer_info->endianness,
                                 index_buffer, index_offset);
-    stream_object_ = {};
-    if (!uploaded) return Drop("index upload", vs, ps);
+    backend.streams.stream_object_ = {};
+    if (!uploaded) return backend.shaders.Drop("index upload", vs, ps);
     if (validate_windows_ && !quad_list) {
-      ValidateRange("index", vs->entry->hash, index_buffer, index_offset, index_buffer_info->guest_base, size,
+      backend.resolve.ValidateRange("index", vs->entry->hash, index_buffer, index_offset, index_buffer_info->guest_base, size,
                     index_buffer_info->endianness);
     }
     index_bytes = size;
@@ -1825,8 +1825,8 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (quad_list) {
     // Two triangles per quad, as 32-bit indices.
     const uint32_t quads = index_count / 4;
-    uint64_t offset = Allocate(uint64_t(quads) * 6 * 4, 256);
-    if (offset == UINT64_MAX) return Drop("upload full", vs, ps);
+    uint64_t offset = backend.streams.Allocate(uint64_t(quads) * 6 * 4, 256);
+    if (offset == UINT64_MAX) return backend.shaders.Drop("upload full", vs, ps);
     auto* out = reinterpret_cast<uint32_t*>(Pointer(offset));
     for (uint32_t q = 0; q < quads; ++q) {
       uint32_t v[4];
@@ -1854,26 +1854,26 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // recorded, grouped by pipeline, when the window closes; any other draw
   // closes the window and is recorded at once. Nothing from here on reads the
   // register file for the draw's sake, so it can wait.
-  RenderFramebuffer* framebuffer = GetFramebuffer(colors, color_count, depth);
+  RenderFramebuffer* framebuffer = backend.targets.GetFramebuffer(colors, color_count, depth);
   if (!framebuffer) {
-    ++stats_.no_target;
+    ++backend.stats_.no_target;
     return true;
   }
   DrawPacket pk;
   pk.framebuffer = framebuffer;
-  pk.pass_colors = color_count_of_pass_;
-  pk.pass_depth = depth_of_pass_;
+  pk.pass_colors = backend.targets.color_count_of_pass_;
+  pk.pass_depth = backend.targets.depth_of_pass_;
   pk.pipeline = standin ? standin : pipeline.get();
   pk.interface_key = interface_key;
   pk.vs_hash = vs->entry->hash ^ (uint64_t(rel_constants_mode_ >= 10 ? rel_variant : 0) << 60);
   pk.ps_hash = ps ? ps->entry->hash : 0;
-  if (trail_) {
+  if (backend.swap.trail_) {
     pk.s0_addr = streams[0];
     pk.s0_size = slot_sizes[0];
     pk.s10_addr = streams[10];
     pk.s10_size = slot_sizes[10];
   }
-  if (trail_) {
+  if (backend.swap.trail_) {
     for (uint32_t i = 0; i < RENUT_VERTEX_STREAM_COUNT; ++i) {
       pk.stream_addr[i] = streams[i];
       pk.stream_size[i] = slot_sizes[i];
@@ -1894,8 +1894,8 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   }
   // Inactive fragment bindings still need a valid offset. Keep their values
   // uncommitted so the next draw with a fragment shader uploads them.
-  const bool skip_ps_constants = !ps && shadow_native_constants_;
-  const uint64_t unused_ps_offset = slice_base_;
+  const bool skip_ps_constants = !ps && backend.swap.shadow_native_constants_;
+  const uint64_t unused_ps_offset = backend.targets.slice_base_;
   pk.push[0] = Address(constant_offsets_[0][0]);
   pk.push[1] = Address(skip_ps_constants ? unused_ps_offset : constant_offsets_[1][0]);
   pk.push[2] = Address(shared_offset_);
@@ -1915,7 +1915,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   pk.viewport = viewport;
   // plume-skip bit 8388608 scissors every draw to one pixel: vertex work and
   // binning stay, fragment work goes. What is left is the per-draw cost.
-  if (skip_mask_ & 8388608) scissor_rect = RenderRect(0, 0, 1, 1);
+  if (backend.skip_mask_ & 8388608) scissor_rect = RenderRect(0, 0, 1, 1);
   // A shadow map drawn at a fraction of the guest's resolution (see Target).
   if (extent && extent->scale != 4) {
     const float fraction = float(extent->scale) / 4.f;
@@ -1943,7 +1943,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                           patch_grid->patches * patch_grid->points_per_patch * 4 *
                                               uint32_t(sizeof(float)));
     } else if (slot.index == kZeroBinding) {
-      entry.view = RenderVertexBufferView(RenderBufferReference(upload_.get(), zero_offset_), 64);
+      entry.view = RenderVertexBufferView(RenderBufferReference(upload_.get(), backend.zero_offset_), 64);
     } else {
       entry.view = RenderVertexBufferView(RenderBufferReference(slot_buffers[slot.index], slot_offsets[slot.index]),
                                           slot_sizes[slot.index]);
@@ -1998,16 +1998,16 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   }
   // plume-skip bit 1073741824 records everything but the draw itself: the
   // state, pipeline and constant changes are all that reach the GPU.
-  stats_.vertices += vertex_count;
-  if (rect_list || point_list) ++stats_.gs_draws;
+  backend.stats_.vertices += vertex_count;
+  if (rect_list || point_list) ++backend.stats_.gs_draws;
   if (patch_list) {
-    ++stats_.patch_draws;
-    stats_.patch_vertices += vertex_count;
+    ++backend.stats_.patch_draws;
+    backend.stats_.patch_vertices += vertex_count;
   }
   // plume-skip bit 2147483648 submits only each draw's first triangle: the
   // per-draw state and setup stay, the vertex work goes.
-  const uint32_t draw_count = (skip_mask_ & 2147483648u) ? std::min(vertex_count, 3u) : vertex_count;
-  if (skip_mask_ & 1073741824) {
+  const uint32_t draw_count = (backend.skip_mask_ & 2147483648u) ? std::min(vertex_count, 3u) : vertex_count;
+  if (backend.skip_mask_ & 1073741824) {
     pk.kind = DrawPacket::Kind::kNone;
   } else if (indexed) {
     // The ring is bound whole and each draw starts at its own indices, which
@@ -2047,7 +2047,7 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // order.
   bool defer = false;
   uint64_t window_signature = 0;
-  if (defer_mode_ && !sync_draws_ && !trace_ && !skip_mask_ && !bind_skip_ && !debug_draw && !patch_list &&
+  if (backend.swap.defer_mode_ && !sync_draws_ && !trace_ && !backend.skip_mask_ && !backend.recorder.bind_skip_ && !debug_draw && !patch_list &&
       !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && depth_write) {
     const xenos::CompareFunction zf = depth_control.zfunc;
     const bool strict = zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual ||
@@ -2072,21 +2072,21 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // which is exactly where order decides: it stays in order. Shadow maps use
     // a bias too, and do not care.
     const bool biased = raster.poly_offset_front_enable || raster.poly_offset_back_enable;
-    defer = strict && stencil_ok && (!color_pass || (defer_mode_ >= 2 && opaque && !biased));
+    defer = strict && stencil_ok && (!color_pass || (backend.swap.defer_mode_ >= 2 && opaque && !biased));
     // Hi-Z: tested against the depth the pass holds when the window closes. Not
     // biased draws (the bias moves their depth), and only the "closer wins"
     // functions, whose fragments pass when they are nearer.
-    if (hiz_mode_ >= 3 && hiz_test_.valid) {
+    if (backend.report.hiz_mode_ >= 3 && hiz_test_.valid) {
       // Where the boxed draws go: not deferred, biased, other depth function, no depth.
-      ++stats_.hiz_boxed_draws;
-      if (!defer) ++stats_.hiz_why_not[0];
-      else if (biased) ++stats_.hiz_why_not[1];
-      else if (!(zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual)) ++stats_.hiz_why_not[2];
-      else if (!depth || !depth->texture) ++stats_.hiz_why_not[3];
+      ++backend.stats_.hiz_boxed_draws;
+      if (!defer) ++backend.stats_.hiz_why_not[0];
+      else if (biased) ++backend.stats_.hiz_why_not[1];
+      else if (!(zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual)) ++backend.stats_.hiz_why_not[2];
+      else if (!depth || !depth->texture) ++backend.stats_.hiz_why_not[3];
     }
-    if (defer && hiz_mode_ >= 3 && hiz_cond_ && hiz_test_.valid && !biased && depth && depth->texture &&
+    if (defer && backend.report.hiz_mode_ >= 3 && backend.hiz.hiz_cond_ && hiz_test_.valid && !biased && depth && depth->texture &&
         (zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual) &&
-        (color_pass || hiz_mode_ >= 4)) {
+        (color_pass || backend.report.hiz_mode_ >= 4)) {
       const float fraction = float(depth->scale) / 4.f;
       pk.hiz_depth = depth;
       pk.hiz_texture = depth->texture.get();
@@ -2107,18 +2107,18 @@ bool GpuBackend::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
   }
   if (defer) {
-    if (!deferred_.empty() && deferred_signature_ != window_signature) FlushDeferred(1);
+    if (!backend.recorder.deferred_.empty() && deferred_signature_ != window_signature) backend.recorder.FlushDeferred(1);
     deferred_signature_ = window_signature;
     pk.first_slot = uint32_t(deferred_slots_.size());
     deferred_slots_.insert(deferred_slots_.end(), draw_slots_.begin(), draw_slots_.end());
-    deferred_.push_back(pk);
-    ++stats_.deferred_draws;
-    if (deferred_.size() >= (hiz_mode_ >= 3 ? kMaxDeferredHiz : kMaxDeferred)) FlushDeferred(2);
+    backend.recorder.deferred_.push_back(pk);
+    ++backend.stats_.deferred_draws;
+    if (backend.recorder.deferred_.size() >= (backend.report.hiz_mode_ >= 3 ? kMaxDeferredHiz : kMaxDeferred)) backend.recorder.FlushDeferred(2);
     return true;
   }
-  FlushDeferred(3);
-  if (RecActive()) RecQueue(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
-  else EmitDraw(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
+  backend.recorder.FlushDeferred(3);
+  if (backend.recorder.RecActive()) backend.recorder.RecQueue(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
+  else backend.recorder.EmitDraw(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
   return true;
 }
 

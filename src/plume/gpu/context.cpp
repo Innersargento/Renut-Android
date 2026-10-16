@@ -17,7 +17,7 @@ bool GpuBackend::SetupContext() {
   device_ = renderer->device();
   queue_ = renderer->queue();
   miss_dump_directory_ = g_miss_dump_directory;
-  store_ = std::make_unique<ShaderStore>();
+  pipelines.store_ = std::make_unique<ShaderStore>();
 
   // Descriptor sets: the recompiled shaders' bindless heaps (register t0 in
   // spaces 0..2 and s0 in space 3 map to set N, binding 0).
@@ -53,7 +53,7 @@ bool GpuBackend::SetupContext() {
     return false;
   }
   set_samplers_->setSampler(kSamplerDefault, samplers_[kSamplerDefault].get());
-  next_sampler_ = kSamplerDefault + 1;
+  textures.next_sampler_ = kSamplerDefault + 1;
 
   {
     const uint64_t total_ram = renutPhysicalMemoryBytes();
@@ -64,15 +64,15 @@ bool GpuBackend::SetupContext() {
       // slice this size overflows there and costs a drain of the GPU each
       // time, which is the price of not holding 256 MB of RAM for it.
       upload_slice_size_ = 64ull << 20;
-      kept_budget_ = 96ull << 20;
+      streams.kept_budget_ = 96ull << 20;
       max_texture_dim_ = 512;
-      texture_budget_ = 256ull << 20;
+      targets.texture_budget_ = 256ull << 20;
     }
     if (const int32_t dim = REXCVAR_GET(renut_plume_texture_max_dim); dim > 0) max_texture_dim_ = uint32_t(dim);
     REXLOG_INFO("Renut: Plume memory profile {}: {} MB of RAM, ring {} MB a slice, kept streams {} MB, textures "
                 "{} MB over {} px",
-                low_memory_ ? "low" : "full", total_ram >> 20, upload_slice_size_ >> 20, kept_budget_ >> 20,
-                texture_budget_ >> 20, max_texture_dim_);
+                low_memory_ ? "low" : "full", total_ram >> 20, upload_slice_size_ >> 20, streams.kept_budget_ >> 20,
+                targets.texture_budget_ >> 20, max_texture_dim_);
   }
   {
     // Adreno has BC1-BC5 sampling, Mali does not: asked of the driver, since
@@ -82,40 +82,40 @@ bool GpuBackend::SetupContext() {
     bc_supported_ = features.textureCompressionBC == VK_TRUE;
     // ARM's vendor id.
     trail_device_default_ = static_cast<VulkanDevice*>(device_)->physicalDeviceProperties.vendorID == 0x13B5;
-    trail_ = trail_device_default_;
+    swap.trail_ = trail_device_default_;
   }
-  bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
+  swap.bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
   REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
-              bc_mode_ ? "on" : "off");
+              swap.bc_mode_ ? "on" : "off");
   texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
-  shader_cache_ = REXCVAR_GET(renut_plume_shader_cache);
-  key_reuse_ = REXCVAR_GET(renut_plume_key_reuse);
+  swap.shader_cache_ = REXCVAR_GET(renut_plume_shader_cache);
+  swap.key_reuse_ = REXCVAR_GET(renut_plume_key_reuse);
   REXLOG_INFO("Renut: Plume texture quality: {}",
               texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
-  shadow_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
-  REXLOG_INFO("Renut: Plume shadow map resolution: {}/4 of the guest's", shadow_scale_);
-  internal_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_internal_resolution), 0, 2));
-  REXLOG_INFO("Renut: Plume internal resolution: {}/4 of the guest's", internal_scale_);
+  targets.shadow_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
+  REXLOG_INFO("Renut: Plume shadow map resolution: {}/4 of the guest's", targets.shadow_scale_);
+  targets.internal_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_internal_resolution), 0, 2));
+  REXLOG_INFO("Renut: Plume internal resolution: {}/4 of the guest's", targets.internal_scale_);
   // One slice per frame in flight, after the permanent allocations.
   const uint64_t upload_bytes = upload_slice_size_ * kPlumeFramesInFlight + 4096;
-  upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
+  draw.upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(
       upload_bytes, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::CONSTANT |
                         RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::STORAGE));
-  if (!upload_) {
+  if (!draw.upload_) {
     REXLOG_ERROR("Renut: Plume upload buffer unavailable");
     return false;
   }
-  upload_data_ = static_cast<uint8_t*>(upload_->map());
-  upload_address_ = upload_->getDeviceAddress();
+  upload_data_ = static_cast<uint8_t*>(draw.upload_->map());
+  upload_address_ = draw.upload_->getDeviceAddress();
   if (!CreateConstantBuffers()) {
     REXLOG_ERROR("Renut: Plume constant buffers unavailable");
     return false;
   }
-  watch_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(WatchHitThunk, this);
+  watch_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(Streams::WatchHitThunk, &streams);
 
   {
     auto* vulkan_device = static_cast<VulkanDevice*>(device_);
-    timestamp_ns_ = vulkan_device->physicalDeviceProperties.limits.timestampPeriod;
+    profiling.timestamp_ns_ = vulkan_device->physicalDeviceProperties.limits.timestampPeriod;
     VkQueryPoolCreateInfo info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     info.queryType = VK_QUERY_TYPE_TIMESTAMP;
     info.queryCount = kMaxTimestamps * kPlumeFramesInFlight;
@@ -130,30 +130,30 @@ bool GpuBackend::SetupContext() {
     }
   }
   for (auto& list : lists_) list = queue_->createCommandList();
-  list_ = lists_[0].get();
-  defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
-  hiz_cond_ = PlumeConditionalRenderingSupported();
-  hiz_force_ = getenv("RENUT_HIZ_FORCE") != nullptr;
-  hiz_verify_ = getenv("RENUT_HIZ_VERIFY") != nullptr;
-  hiz_debug_ = getenv("RENUT_HIZ_DEBUG") != nullptr;
-  if (hiz_verify_) {
+  targets.list_ = lists_[0].get();
+  swap.defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
+  hiz.hiz_cond_ = PlumeConditionalRenderingSupported();
+  hiz.hiz_force_ = getenv("RENUT_HIZ_FORCE") != nullptr;
+  hiz.hiz_verify_ = getenv("RENUT_HIZ_VERIFY") != nullptr;
+  hiz.hiz_debug_ = getenv("RENUT_HIZ_DEBUG") != nullptr;
+  if (hiz.hiz_verify_) {
     VkQueryPoolCreateInfo query_info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     query_info.queryType = VK_QUERY_TYPE_OCCLUSION;
     query_info.queryCount = kHizMaxQueries * kPlumeFramesInFlight;
-    if (vkCreateQueryPool(static_cast<VulkanDevice*>(device_)->vk, &query_info, nullptr, &hiz_query_pool_) !=
+    if (vkCreateQueryPool(static_cast<VulkanDevice*>(device_)->vk, &query_info, nullptr, &hiz.hiz_query_pool_) !=
         VK_SUCCESS) {
-      hiz_query_pool_ = VK_NULL_HANDLE;
+      hiz.hiz_query_pool_ = VK_NULL_HANDLE;
     }
   }
-  hiz_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 4));
-  fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
-  depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
-  rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
+  report.hiz_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 4));
+  swap.fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
+  swap.depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
+  draw.rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
   no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
   no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
-  adaptive_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1));
-  if (no_shadows_) shadow_min_indices_ = UINT32_MAX;
-  fence_ = device_->createCommandFence();
+  swap.adaptive_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1));
+  if (no_shadows_) swap.shadow_min_indices_ = UINT32_MAX;
+  recorder.fence_ = device_->createCommandFence();
 
   // Fallback textures: opaque white, for every slot without a texture yet.
   white_2d_ = device_->createTexture(RenderTextureDesc::Texture2D(1, 1, 1, RenderFormat::R8G8B8A8_UNORM));
@@ -166,42 +166,42 @@ bool GpuBackend::SetupContext() {
   cube_view.dimension = RenderTextureViewDimension::TEXTURE_CUBE;
   white_cube_view_ = white_cube_->createTextureView(cube_view);
 
-  rect_list_gs_ = device_->createShader(k_rect_list_geom, sizeof(k_rect_list_geom), "main",
+  draw.rect_list_gs_ = device_->createShader(k_rect_list_geom, sizeof(k_rect_list_geom), "main",
                                         RenderShaderFormat::SPIRV);
-  point_list_gs_ = device_->createShader(k_point_list_geom, sizeof(k_point_list_geom), "main",
+  draw.point_list_gs_ = device_->createShader(k_point_list_geom, sizeof(k_point_list_geom), "main",
                                          RenderShaderFormat::SPIRV);
 
-  upload_used_ = 0;
-  uint64_t white = Allocate(4 * 6, 256);
-  std::memset(Pointer(white), 0xFF, 4 * 6);
-  zero_offset_ = Allocate(64, 16);
-  std::memset(Pointer(zero_offset_), 0, 64);
+  streams.upload_used_ = 0;
+  uint64_t white = streams.Allocate(4 * 6, 256);
+  std::memset(draw.Pointer(white), 0xFF, 4 * 6);
+  zero_offset_ = streams.Allocate(64, 16);
+  std::memset(draw.Pointer(zero_offset_), 0, 64);
   // Everything after these belongs to a frame's slice.
-  slice_origin_ = (upload_used_ + 255) & ~255ull;
-  L()->begin();
-  L()->barriers(RenderBarrierStage::COPY,
+  targets.slice_origin_ = (streams.upload_used_ + 255) & ~255ull;
+  recorder.L()->begin();
+  recorder.L()->barriers(RenderBarrierStage::COPY,
                   std::array{RenderTextureBarrier(white_2d_.get(), RenderTextureLayout::COPY_DEST),
                              RenderTextureBarrier(white_3d_.get(), RenderTextureLayout::COPY_DEST),
                              RenderTextureBarrier(white_cube_.get(), RenderTextureLayout::COPY_DEST)}
                       .data(),
                   3);
-  auto footprint = RenderTextureCopyLocation::PlacedFootprint(upload_.get(), RenderFormat::R8G8B8A8_UNORM,
+  auto footprint = RenderTextureCopyLocation::PlacedFootprint(draw.upload_.get(), RenderFormat::R8G8B8A8_UNORM,
                                                               1, 1, 1, 64, white);
-  L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_2d_.get()), footprint);
-  L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_3d_.get()), footprint);
+  recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_2d_.get()), footprint);
+  recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_3d_.get()), footprint);
   for (uint32_t face = 0; face < 6; ++face) {
-    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_cube_.get(), 0, face), footprint);
+    recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(white_cube_.get(), 0, face), footprint);
   }
-  L()->barriers(RenderBarrierStage::GRAPHICS,
+  recorder.L()->barriers(RenderBarrierStage::GRAPHICS,
                   std::array{RenderTextureBarrier(white_2d_.get(), RenderTextureLayout::SHADER_READ),
                              RenderTextureBarrier(white_3d_.get(), RenderTextureLayout::SHADER_READ),
                              RenderTextureBarrier(white_cube_.get(), RenderTextureLayout::SHADER_READ)}
                       .data(),
                   3);
-  L()->end();
-  const RenderCommandList* lists = list_;
-  queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
-  queue_->waitForCommandFence(fence_.get());
+  recorder.L()->end();
+  const RenderCommandList* lists = targets.list_;
+  queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, recorder.fence_.get());
+  queue_->waitForCommandFence(recorder.fence_.get());
   for (uint32_t i = 0; i < kMaxTextures2D; ++i) {
     set_2d_->setTexture(i, white_2d_.get(), RenderTextureLayout::SHADER_READ);
   }
@@ -212,27 +212,27 @@ bool GpuBackend::SetupContext() {
     set_cube_->setTexture(i, white_cube_.get(), RenderTextureLayout::SHADER_READ,
                           white_cube_view_.get());
   }
-  lookup_budget_us_ = uint64_t(REXCVAR_GET(renut_plume_pipeline_lookup_ms)) * 1000;
-  lookup_here_ = lookup_budget_us_ && PlumePipelineLookupSupported();
+  draw.lookup_budget_us_ = uint64_t(REXCVAR_GET(renut_plume_pipeline_lookup_ms)) * 1000;
+  draw.lookup_here_ = draw.lookup_budget_us_ && PlumePipelineLookupSupported();
   REXLOG_INFO("Renut: Plume pipelines: {} compile, {}, boolean registers {}",
               REXCVAR_GET(renut_plume_async_pipelines) ? "async" : "sync",
-              lookup_here_ ? fmt::format("cache lookups at the draw up to {} ms a frame", lookup_budget_us_ / 1000)
+              draw.lookup_here_ ? fmt::format("cache lookups at the draw up to {} ms a frame", draw.lookup_budget_us_ / 1000)
                            : std::string("no cache lookups at the draw"),
               REXCVAR_GET(renut_plume_bool_spec) ? "specialized" : "read from the shared block");
-  validate_windows_ = g_validate_windows;
+  draw.validate_windows_ = g_validate_windows;
   dedupe_descriptors_ = g_dedupe_descriptors;
   if (dedupe_descriptors_) REXLOG_INFO("Renut: Plume 2D descriptors are written once per texture (plume-dedupe-desc)");
-  writeback_ = REXCVAR_GET(renut_plume_memexport_readback);
-  writeback_fast_ = REXCVAR_GET(renut_plume_memexport_fast);
-  BeginFrame();
+  swap.writeback_ = REXCVAR_GET(renut_plume_memexport_readback);
+  swap.writeback_fast_ = REXCVAR_GET(renut_plume_memexport_fast);
+  targets.BeginFrame();
   REXLOG_INFO("Renut: Plume GPU backend ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);
-  StartRecipes();
+  pipelines.StartRecipes();
   device_watch_stop_ = false;
   device_watch_.thread = std::thread([this] {
     while (!device_watch_stop_.load()) {
       if (PlumeDeviceLost()) {
-        ReportDeviceLost();
+        recorder.ReportDeviceLost();
         return;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -268,46 +268,46 @@ void GpuBackend::RunWorkerLoop() {
 }
 
 void GpuBackend::ShutdownContext() {
-  SyncRecorder();
+  recorder.SyncRecorder();
   native_d3d::SetWake({});
   device_watch_stop_ = true;
   if (device_watch_.thread.joinable()) device_watch_.thread.join();
-  StopPipelineWorker();
-  StopRecipes();
-  if (list_open_) {
-    L()->end();
-    list_open_ = false;
+  pipelines.StopPipelineWorker();
+  pipelines.StopRecipes();
+  if (recorder.list_open_) {
+    recorder.L()->end();
+    recorder.list_open_ = false;
   }
   // Frames may still be running; nothing below may be freed under them.
   if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForAllSlots();
-  pipelines_.clear();
-  standins_.clear();
-  pipeline_memo_.Clear();
-  framebuffers_.clear();
-  ++object_epoch_;
-  targets_.clear();
-  resolved_.clear();
-  InvalidateResolvedLookups();
-  ++export_epoch_;
-  exports_.clear();
-  patch_grids_.clear();
+  pipelines.pipelines_.clear();
+  draw.standins_.clear();
+  draw.pipeline_memo_.Clear();
+  targets.framebuffers_.clear();
+  ++targets.object_epoch_;
+  targets.targets_.clear();
+  targets.resolved_.clear();
+  targets.InvalidateResolvedLookups();
+  ++draw.export_epoch_;
+  streams.exports_.clear();
+  streams.patch_grids_.clear();
   if (watch_handle_) {
     memory_->UnregisterPhysicalMemoryInvalidationCallback(watch_handle_);
     watch_handle_ = nullptr;
   }
-  ++stream_epoch_;
-    kept_streams_.clear();
-  kept_memo_.Clear();
-  kept_bytes_ = 0;
-  for (auto& retired : retired_buffers_) retired.clear();
-  for (auto& buffer : writeback_buffers_) buffer.reset();
-  for (auto& list : writebacks_) list.clear();
-  shader_lookup_.clear();
-  shader_memo_.Clear();
-  shader_watch_memo_.Clear();
-  shader_watch_.clear();
-  shader_block_index_.clear();
-  shaders_.clear();
+  ++draw.stream_epoch_;
+    streams.kept_streams_.clear();
+  streams.kept_memo_.Clear();
+  streams.kept_bytes_ = 0;
+  for (auto& retired : streams.retired_buffers_) retired.clear();
+  for (auto& buffer : streams.writeback_buffers_) buffer.reset();
+  for (auto& list : streams.writebacks_) list.clear();
+  shaders.shader_lookup_.clear();
+  shaders.shader_memo_.Clear();
+  shaders.shader_watch_memo_.Clear();
+  streams.shader_watch_.clear();
+  streams.shader_block_index_.clear();
+  shaders.shaders_.clear();
   if (timestamp_pool_ != VK_NULL_HANDLE) {
     vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_, nullptr);
     timestamp_pool_ = VK_NULL_HANDLE;
@@ -316,28 +316,28 @@ void GpuBackend::ShutdownContext() {
     vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, pair_pool_, nullptr);
     pair_pool_ = VK_NULL_HANDLE;
   }
-  if (upload_) upload_->unmap();
-  upload_.reset();
+  if (draw.upload_) draw.upload_->unmap();
+  draw.upload_.reset();
   {
     VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
-    if (pack_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, pack_pipeline_, nullptr);
+    if (patches.pack_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, patches.pack_pipeline_, nullptr);
     if (pack_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, pack_layout_, nullptr);
     if (pack_module_ != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, pack_module_, nullptr);
-    pack_pipeline_ = VK_NULL_HANDLE;
+    patches.pack_pipeline_ = VK_NULL_HANDLE;
     pack_layout_ = VK_NULL_HANDLE;
     pack_module_ = VK_NULL_HANDLE;
     for (uint32_t i = 0; i < 2; ++i) {
-      if (patch_pipelines_[i] != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, patch_pipelines_[i], nullptr);
+      if (patches.patch_pipelines_[i] != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, patches.patch_pipelines_[i], nullptr);
       if (patch_modules_[i] != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, patch_modules_[i], nullptr);
-      patch_pipelines_[i] = VK_NULL_HANDLE;
+      patches.patch_pipelines_[i] = VK_NULL_HANDLE;
       patch_modules_[i] = VK_NULL_HANDLE;
     }
-    if (patch_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, patch_layout_, nullptr);
-    HizDestroy();
-    patch_layout_ = VK_NULL_HANDLE;
-    for (auto& buffer : patch_out_) buffer.reset();
-    stencil_staging_.reset();
-    packed_staging_.reset();
+    if (patches.patch_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, patches.patch_layout_, nullptr);
+    hiz.HizDestroy();
+    patches.patch_layout_ = VK_NULL_HANDLE;
+    for (auto& buffer : patches.patch_out_) buffer.reset();
+    resolve.stencil_staging_.reset();
+    resolve.packed_staging_.reset();
     if (constants_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(vk_device, constants_pool_, nullptr);
     if (constants_set_layout_ != VK_NULL_HANDLE) {
       vkDestroyDescriptorSetLayout(vk_device, constants_set_layout_, nullptr);
@@ -394,7 +394,7 @@ bool GpuBackend::CreateConstantBuffers() {
   allocate.descriptorSetCount = 1;
   allocate.pSetLayouts = &constants_set_layout_;
   if (vkAllocateDescriptorSets(vk_device, &allocate, &constants_set_) != VK_SUCCESS) return false;
-  const VkBuffer ring = static_cast<VulkanBuffer*>(upload_.get())->vk;
+  const VkBuffer ring = static_cast<VulkanBuffer*>(draw.upload_.get())->vk;
   VkDescriptorBufferInfo infos[kConstantBindings];
   static_assert(RENUT_SHARED_HOT_SIZE % 16 == 0 && RENUT_SHARED_SIZE % 16 == 0);
   for (uint32_t i = 0; i < kSharedHotBinding; ++i) infos[i] = {ring, 0, kConstantChunkSize};

@@ -7,24 +7,24 @@ namespace renut::gpu {
 #include "plume/shaders/patch_expand.comp.inc"
 #include "plume/shaders/patch_levels.comp.inc"
 
-bool GpuBackend::CreatePackPipeline() {
+bool Patches::CreatePackPipeline() {
   if (pack_pipeline_ != VK_NULL_HANDLE) return true;
-  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  VkDevice vk_device = static_cast<VulkanDevice*>(backend.device_)->vk;
   VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
   module_info.codeSize = sizeof(k_depth_stencil_pack_comp);
   module_info.pCode = k_depth_stencil_pack_comp;
-  if (vkCreateShaderModule(vk_device, &module_info, nullptr, &pack_module_) != VK_SUCCESS) return false;
+  if (vkCreateShaderModule(vk_device, &module_info, nullptr, &backend.pack_module_) != VK_SUCCESS) return false;
   VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
   VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   layout_info.pushConstantRangeCount = 1;
   layout_info.pPushConstantRanges = &range;
-  if (vkCreatePipelineLayout(vk_device, &layout_info, nullptr, &pack_layout_) != VK_SUCCESS) return false;
+  if (vkCreatePipelineLayout(vk_device, &layout_info, nullptr, &backend.pack_layout_) != VK_SUCCESS) return false;
   VkComputePipelineCreateInfo pipeline_info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
   pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-  pipeline_info.stage.module = pack_module_;
+  pipeline_info.stage.module = backend.pack_module_;
   pipeline_info.stage.pName = "main";
-  pipeline_info.layout = pack_layout_;
+  pipeline_info.layout = backend.pack_layout_;
   if (vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pack_pipeline_) !=
       VK_SUCCESS) {
     pack_pipeline_ = VK_NULL_HANDLE;
@@ -33,11 +33,11 @@ bool GpuBackend::CreatePackPipeline() {
   return true;
 }
 
-bool GpuBackend::CreatePatchPipelines() {
+bool Patches::CreatePatchPipelines() {
   if (patch_pipelines_[1] != VK_NULL_HANDLE) return true;
   if (patch_pipelines_failed_) return false;
   patch_pipelines_failed_ = true;
-  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  VkDevice vk_device = static_cast<VulkanDevice*>(backend.device_)->vk;
   if (patch_layout_ == VK_NULL_HANDLE) {
     VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
     VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -52,11 +52,11 @@ bool GpuBackend::CreatePatchPipelines() {
     VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     module_info.codeSize = code[i].second;
     module_info.pCode = code[i].first;
-    if (vkCreateShaderModule(vk_device, &module_info, nullptr, &patch_modules_[i]) != VK_SUCCESS) return false;
+    if (vkCreateShaderModule(vk_device, &module_info, nullptr, &backend.patch_modules_[i]) != VK_SUCCESS) return false;
     VkComputePipelineCreateInfo pipeline_info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    pipeline_info.stage.module = patch_modules_[i];
+    pipeline_info.stage.module = backend.patch_modules_[i];
     pipeline_info.stage.pName = "main";
     pipeline_info.layout = patch_layout_;
     if (vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &patch_pipelines_[i]) !=
@@ -79,16 +79,16 @@ bool GpuBackend::CreatePatchPipelines() {
 // GPU, so the GPU lays the draw out too (patch_levels.comp, then
 // patch_expand.comp) and the draw reads its index count from what they wrote.
 // False leaves the draw to the grid.
-bool GpuBackend::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endian, uint32_t patches,
+bool Patches::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endian, uint32_t patches,
                                                   uint32_t min_level, uint32_t max_level, AdaptiveDraw& out) {
   if (!CreatePatchPipelines()) return false;
   RenderBuffer* factors = nullptr;
   uint64_t factors_offset = 0;
-  if (!BindStream(factors_base, patches * 12, endian, factors, factors_offset) || !factors) return false;
+  if (!backend.streams.BindStream(factors_base, patches * 12, endian, factors, factors_offset) || !factors) return false;
   const uint64_t factors_address = factors->getDeviceAddress() + factors_offset;
   const uint32_t levels = min_level | (max_level << 8);
-  Trace("  adaptive patches {} factors {:08X} levels {}..{}", patches, factors_base, min_level, max_level);
-  if (patch_reuse_.frame == swaps_ && patch_reuse_.factors == factors_address && patch_reuse_.patches == patches &&
+  backend.draw.Trace("  adaptive patches {} factors {:08X} levels {}..{}", patches, factors_base, min_level, max_level);
+  if (patch_reuse_.frame == backend.swaps_ && patch_reuse_.factors == factors_address && patch_reuse_.patches == patches &&
       patch_reuse_.levels == levels && patch_reuse_.exports == export_draws_total_) {
     out = patch_reuse_.draw;
     return true;
@@ -101,18 +101,18 @@ bool GpuBackend::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endi
   const uint64_t records_bytes = uint64_t(patches) * 16;
   const uint64_t need = records_bytes + 32 + 16 + points * 16 + indices * 4;
   if (need > (256ull << 20)) return false;
-  std::unique_ptr<RenderBuffer>& buffer = patch_out_[slot_];
+  std::unique_ptr<RenderBuffer>& buffer = patch_out_[backend.slot_];
   uint64_t at = (patch_out_used_ + 15) & ~uint64_t(15);
-  if (!buffer || at + need > patch_out_capacity_[slot_]) {
-    const uint64_t capacity = std::max({need, patch_out_capacity_[slot_] * 2, uint64_t(4) << 20});
-    auto made = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+  if (!buffer || at + need > patch_out_capacity_[backend.slot_]) {
+    const uint64_t capacity = std::max({need, patch_out_capacity_[backend.slot_] * 2, uint64_t(4) << 20});
+    auto made = backend.device_->createBuffer(RenderBufferDesc::DefaultBuffer(
         capacity, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::STORAGE |
                       RenderBufferFlag::DEVICE_ADDRESSABLE));  // the layer adds the indirect usage
     if (!made) return false;
     // Draws recorded earlier this frame may still read the old one.
-    if (buffer) retired_buffers_[slot_].push_back(std::move(buffer));
+    if (buffer) backend.streams.retired_buffers_[backend.slot_].push_back(std::move(buffer));
     buffer = std::move(made);
-    patch_out_capacity_[slot_] = capacity;
+    patch_out_capacity_[backend.slot_] = capacity;
     at = 0;
   }
   const uint64_t records_at = at;
@@ -123,7 +123,7 @@ bool GpuBackend::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endi
   const uint64_t base = buffer->getDeviceAddress();
 
   // Raw Vulkan, outside the render pass; it reopens at the draw.
-  auto* vulkan = static_cast<VulkanCommandList*>(L());
+  auto* vulkan = static_cast<VulkanCommandList*>(backend.recorder.L());
   vulkan->endActiveRenderPass();
   VkCommandBuffer cb = vulkan->vk;
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -162,14 +162,14 @@ bool GpuBackend::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endi
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
                        0, 1, &barrier, 0, nullptr, 0, nullptr);
   // The compute layout's push constants may disturb the graphics ones.
-  pushed_constants_[0] = pushed_constants_[1] = pushed_constants_[2] = UINT64_MAX;
-  ++stats_.adaptive_patch_draws;
+  backend.targets.pushed_constants_[0] = backend.targets.pushed_constants_[1] = backend.targets.pushed_constants_[2] = UINT64_MAX;
+  ++backend.stats_.adaptive_patch_draws;
 
   out.buffer = buffer.get();
   out.points_offset = points_at;
   out.points_bytes = points * 16;
   out.args_offset = args_at;
-  patch_reuse_.frame = swaps_;
+  patch_reuse_.frame = backend.swaps_;
   patch_reuse_.factors = factors_address;
   patch_reuse_.patches = patches;
   patch_reuse_.levels = levels;

@@ -26,24 +26,24 @@ uint64_t ContentHash(const uint8_t* data, uint32_t span) {
 // same slot draw after draw: the slot remembers the six words and what they
 // came to, and only a different constant (or a bumped object_epoch_) goes on to
 // hash them.
-const GpuBackend::FetchLayout* GpuBackend::LayoutOf(
+const FetchLayout* Textures::LayoutOf(
     const xenos::xe_gpu_texture_fetch_t& fetch) {
   static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
   if (!objkeys_ || fetch_slot_ < 0) return LayoutOfByContents(fetch);
   SlotObject& object = slot_objects_[uint32_t(fetch_slot_) & 31];
   const uint32_t* words = reinterpret_cast<const uint32_t*>(&fetch);
-  if (object.epoch == object_epoch_ && std::memcmp(object.words, words, sizeof(object.words)) == 0) {
+  if (object.epoch == backend.targets.object_epoch_ && std::memcmp(object.words, words, sizeof(object.words)) == 0) {
     return object.layout;
   }
   const FetchLayout* layout = LayoutOfByContents(fetch);
   std::memcpy(object.words, words, sizeof(object.words));
-  object.epoch = object_epoch_;
+  object.epoch = backend.targets.object_epoch_;
   object.layout = layout;
   object.texture = nullptr;
   return layout;
 }
 
-const GpuBackend::FetchLayout* GpuBackend::LayoutOfByContents(
+const FetchLayout* Textures::LayoutOfByContents(
     const xenos::xe_gpu_texture_fetch_t& fetch) {
   // The memo key: six words mixed by multiply and fold. Six XXH3 calls for one
   // small input each were a visible slice of the command thread (this runs for
@@ -75,8 +75,8 @@ const GpuBackend::FetchLayout* GpuBackend::LayoutOfByContents(
   uint32_t base_page, mip_page, top_level, last_level;
   gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
       &base_page, &mip_page, &top_level, &last_level);
-  if (skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
-  if (skip_mask_ & 8192) last_level = top_level;
+  if (backend.skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
+  if (backend.skip_mask_ & 8192) last_level = top_level;
   layout.levels = last_level - top_level + 1;
   layout.top_level = top_level;
   HashCombine(key, last_level);
@@ -97,7 +97,7 @@ const GpuBackend::FetchLayout* GpuBackend::LayoutOfByContents(
   return &layout;
 }
 
-uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address) return 0;
   const FetchLayout* fetch_layout = LayoutOf(fetch);
@@ -108,22 +108,22 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
   std::array<const uint8_t*, 14> data{};
   uint64_t content = 0;
   for (uint32_t i = 0; i < levels; ++i) {
-    data[i] = memory_->TranslatePhysical<const uint8_t*>(fetch_layout->starts[i]);
+    data[i] = backend.memory_->TranslatePhysical<const uint8_t*>(fetch_layout->starts[i]);
   }
   // The guest's top mips a low-memory host does not keep: a texture a side of
   // 2048 held as RGBA8 is 21 MB with its chain and 1.4 MB from 512 down, and
   // at this render size nothing shows the difference. Coordinates are
   // normalised, so the shaders sample the smaller image the same way.
   uint32_t skip = 0;
-  if (max_texture_dim_) {
-    while (skip + 1 < levels && std::max(layouts[skip].width, layouts[skip].height) > max_texture_dim_) ++skip;
+  if (backend.max_texture_dim_) {
+    while (skip + 1 < levels && std::max(layouts[skip].width, layouts[skip].height) > backend.max_texture_dim_) ++skip;
   }
   // Texture quality: one mip lower for half, two for quarter, on a texture the
   // guest filters across mips, and never to a side under 64 px. What it reads
   // from its base level alone (the interface, fonts) is not touched.
-  if (texture_quality_ && !fetch_layout->base_map) {
+  if (backend.texture_quality_ && !fetch_layout->base_map) {
     uint32_t reduced = 0;
-    while (reduced < texture_quality_ && reduced + 1 < levels &&
+    while (reduced < backend.texture_quality_ && reduced + 1 < levels &&
            std::max(layouts[reduced + 1].width, layouts[reduced + 1].height) >= 64) {
       ++reduced;
     }
@@ -133,14 +133,14 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
   // The slot's own record of the texture its constant resolved to last draw
   // (see SlotObject), checked against the layout it was made for.
   SlotObject* slot_object = objkeys_ && fetch_slot_ >= 0 ? &slot_objects_[uint32_t(fetch_slot_) & 31] : nullptr;
-  if (slot_object && (slot_object->epoch != object_epoch_ || slot_object->layout != fetch_layout)) {
+  if (slot_object && (slot_object->epoch != backend.targets.object_epoch_ || slot_object->layout != fetch_layout)) {
     slot_object = nullptr;
   }
   GuestTexture* texture_node = slot_object ? slot_object->texture : nullptr;
   if (!texture_node) {
     texture_node = texture_memo_.Find(key);
     if (!texture_node) {
-      texture_node = &guest_textures_[key];
+      texture_node = &backend.targets.guest_textures_[key];
       texture_memo_.Put(key, texture_node);
     }
     if (slot_object) slot_object->texture = texture_node;
@@ -150,7 +150,7 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
   // The block format this texture is kept in: its own when the device samples
   // it and the blocks fit, RGBA8 decoded on the CPU otherwise (and always while
   // a texture dump asks for the decoded pixels).
-  const BcKind want = bc_supported_ && bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()
+  const BcKind want = backend.bc_supported_ && backend.swap.bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()
                           ? BcKindFor(fetch.format)
                           : BcKind::kNone;
   // Checked once per frame; the draws after the first reuse the result. A
@@ -158,16 +158,16 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
   // checked at all - hashing every texture in use every frame was a tenth of
   // this thread - except once every 256 frames, in case a write went around
   // the watch.
-  DrainWatchHits();
+  backend.streams.DrainWatchHits();
   const bool unchanged =
-      texture.checked_frame == swaps_ || (texture.watched && ((swaps_ + key) & 255) != 0);
+      texture.checked_frame == backend.swaps_ || (texture.watched && ((backend.swaps_ + key) & 255) != 0);
   if (texture.texture && unchanged && texdump_directory_.empty() && texture.bc == want && texture.skip == skip) {
-    texture.checked_frame = swaps_;
-    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    texture.checked_frame = backend.swaps_;
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
-  texture.checked_frame = swaps_;
-  if (keep_streams_ && !texture.watched) {
+  texture.checked_frame = backend.swaps_;
+  if (backend.swap.keep_streams_ && !texture.watched) {
     // Watch first, hash second, so that a write landing in between is seen.
     texture.watch_begin = {UINT32_MAX, UINT32_MAX};
     texture.watch_end = {0, 0};
@@ -182,10 +182,10 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
         texture.watch_begin[which] = texture.watch_end[which] = 0;
         continue;
       }
-      memory_->EnablePhysicalMemoryAccessCallbacks(texture.watch_begin[which],
+      backend.memory_->EnablePhysicalMemoryAccessCallbacks(texture.watch_begin[which],
                                                    texture.watch_end[which] - texture.watch_begin[which],
                                                    true, false);
-      IndexBlocks(texture_block_index_, texture.watch_begin[which],
+      backend.streams.IndexBlocks(backend.streams.texture_block_index_, texture.watch_begin[which],
                   texture.watch_end[which] - texture.watch_begin[which], key);
     }
     texture.watched = true;
@@ -194,7 +194,7 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
   for (uint32_t i = skip; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
   if (!texdump_directory_.empty() && dumped_.insert(key).second) texture.content = ~content;
   if (texture.texture && texture.content == content && texture.bc == want && texture.skip == skip) {
-    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
   std::vector<uint32_t> rgba;
@@ -208,7 +208,7 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
   }
   if (kind == BcKind::kNone && !DecodeTextureLevel(fetch, layouts[skip], data[skip], 0, rgba)) {
     texture.failed = true;
-    ++stats_.texture_failures;
+    ++backend.stats_.texture_failures;
     if (unsupported_formats_.insert(uint32_t(fetch.format)).second) {
       REXLOG_WARN("Renut: Plume does not decode texture format {} yet", uint32_t(fetch.format));
     }
@@ -228,8 +228,8 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
   // this frame may still reference it, and the upload is ordered after them.
   if (!texture.texture || texture.levels != host_levels || texture.width != width || texture.height != height ||
       texture.bc != kind) {
-    RetireGuestTexture(texture);
-    texture.texture = device_->createTexture(RenderTextureDesc::Texture2D(width, height, host_levels, host_format));
+    backend.targets.RetireGuestTexture(texture);
+    texture.texture = backend.device_->createTexture(RenderTextureDesc::Texture2D(width, height, host_levels, host_format));
     texture.levels = host_levels;
     texture.width = width;
     texture.height = height;
@@ -269,14 +269,14 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
     }
   }
   texture.content = content;
-  if (!texture.descriptor) texture.descriptor = AllocateTextureDescriptor();
+  if (!texture.descriptor) texture.descriptor = backend.targets.AllocateTextureDescriptor();
   if (!texture.descriptor) {
     // Out of descriptors: try again next frame, once eviction has freed some,
     // rather than keep this texture white for as long as it stays in use.
     texture.content = ~content;
     return 0;
   }
-  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
+  backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
   uint32_t w = width, h = height;
   for (uint32_t level = 0; level < host_levels; ++level) {
     w = layouts[skip + level].width;
@@ -287,31 +287,31 @@ uint32_t GpuBackend::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch)
       if (level && !CopyTextureLevelBlocks(fetch, layouts[skip + level], data[skip + level], blocks)) {
         blocks.assign(size_t((w + 3) / 4) * ((h + 3) / 4) * BcBlockBytes(kind), 0);
       }
-      const uint64_t staging = Allocate(blocks.size(), 512);
+      const uint64_t staging = backend.streams.Allocate(blocks.size(), 512);
       if (staging == UINT64_MAX) return 0;
-      std::memcpy(Pointer(staging), blocks.data(), blocks.size());
+      std::memcpy(backend.draw.Pointer(staging), blocks.data(), blocks.size());
       // The row is counted in texels and a multiple of the 4-texel block.
-      L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
+      backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
                                RenderTextureCopyLocation::PlacedFootprint(
-                                   upload_.get(), host_format, w, h, 1, ((w + 3) / 4) * 4, staging));
+                                   backend.draw.upload_.get(), host_format, w, h, 1, ((w + 3) / 4) * 4, staging));
       continue;
     }
     if (level && !DecodeTextureLevel(fetch, layouts[skip + level], data[skip + level], 0, rgba)) return 0;
-    const uint64_t staging = Allocate(uint64_t(w) * h * 4, 512);
+    const uint64_t staging = backend.streams.Allocate(uint64_t(w) * h * 4, 512);
     if (staging == UINT64_MAX) return 0;
-    std::memcpy(Pointer(staging), rgba.data(), size_t(w) * h * 4);
-    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
+    std::memcpy(backend.draw.Pointer(staging), rgba.data(), size_t(w) * h * 4);
+    backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
                              RenderTextureCopyLocation::PlacedFootprint(
-                                 upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, w, staging));
+                                 backend.draw.upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, w, staging));
   }
-  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
-  SetTexture2D(texture.descriptor, texture.texture.get(), texture.view.get());
-  ++stats_.textures_decoded;
-  if (kind != BcKind::kNone) ++stats_.textures_bc;
+  backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  backend.targets.SetTexture2D(texture.descriptor, texture.texture.get(), texture.view.get());
+  ++backend.stats_.textures_decoded;
+  if (kind != BcKind::kNone) ++backend.stats_.textures_bc;
   return texture.descriptor;
 }
 
-void GpuBackend::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+void Textures::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
                                         const std::vector<uint32_t>& rgba, uint32_t width,
                                         uint32_t height, const char* kind) {
   static uint32_t serial = 0;
@@ -336,7 +336,7 @@ void GpuBackend::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
 //
 // One exception: a stacked texture's Z picks a slice of an array, and the guest
 // clamps a layer to the ends of the stack whatever the mode reads.
-uint32_t GpuBackend::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t key = uint32_t(fetch.mag_filter) | (uint32_t(fetch.min_filter) << 2) |
                        (uint32_t(fetch.mip_filter) << 4) | (uint32_t(fetch.aniso_filter) << 6) |
                        (uint32_t(fetch.clamp_x) << 9) | (uint32_t(fetch.clamp_y) << 12) |
@@ -344,7 +344,7 @@ uint32_t GpuBackend::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
                        ((uint32_t(fetch.lod_bias) & 0x3FF) << 19);
   // The fallback is the old behaviour: linear everywhere, no anisotropy, and
   // every axis wrapped, for comparing a capture against.
-  if (skip_mask_ & 524288) return kSamplerDefault;
+  if (backend.skip_mask_ & 524288) return kSamplerDefault;
   if (const uint32_t* memo = sampler_memo_.Find(key)) return *memo;
   auto found = sampler_indices_.find(key);
   if (found != sampler_indices_.end()) {
@@ -395,11 +395,11 @@ uint32_t GpuBackend::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
                            : RenderBorderColor::TRANSPARENT_BLACK;
   }
 
-  std::unique_ptr<RenderSampler> sampler = device_->createSampler(desc);
+  std::unique_ptr<RenderSampler> sampler = backend.device_->createSampler(desc);
   if (!sampler) return kSamplerDefault;
   const uint32_t index = next_sampler_++;
-  samplers_[index] = std::move(sampler);
-  set_samplers_->setSampler(index, samplers_[index].get());
+  backend.samplers_[index] = std::move(sampler);
+  backend.set_samplers_->setSampler(index, backend.samplers_[index].get());
   sampler_indices_.emplace(key, index);
   return index;
 }
@@ -414,9 +414,9 @@ uint32_t GpuBackend::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
 // slice into the next, so only a stack one slice deep can carry the guest's mip
 // chain; a deeper stack keeps the single level it had before, as every stack in
 // the menu does.
-uint32_t GpuBackend::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
-  if (!address || (skip_mask_ & 65536)) return 0;
+  if (!address || (backend.skip_mask_ & 65536)) return 0;
   const uint32_t depth = uint32_t(fetch.size_2d.stack_depth) + 1;
   uint64_t key = 0;
   HashCombine(key, fetch.dword_0 & ~0x3FFu);
@@ -428,8 +428,8 @@ uint32_t GpuBackend::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t&
   uint32_t base_page, mip_page, top_level, last_level;
   gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
       &base_page, &mip_page, &top_level, &last_level);
-  if (skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
-  if (depth > 1 || (skip_mask_ & (8192 | 262144))) last_level = top_level;
+  if (backend.skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
+  if (depth > 1 || (backend.skip_mask_ & (8192 | 262144))) last_level = top_level;
   const uint32_t levels = last_level - top_level + 1;
   HashCombine(key, last_level);
   HashCombine(key, uint32_t(fetch.packed_mips));
@@ -440,20 +440,20 @@ uint32_t GpuBackend::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t&
     if (!LocateTextureLevel(fetch, top_level + i, level)) return 0;
     const uint64_t start = (uint64_t(level.from_mips ? mip_page : base_page) << 12) + level.offset;
     if (!start || start + level.extent > 0x20000000ull) return 0;
-    data[i] = memory_->TranslatePhysical<const uint8_t*>(uint32_t(start));
+    data[i] = backend.memory_->TranslatePhysical<const uint8_t*>(uint32_t(start));
   }
   GuestTexture& texture = guest_stacks_[key];
   if (texture.failed) return 0;
-  if (texture.texture && texture.checked_frame == swaps_ && texdump_directory_.empty()) {
-    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  if (texture.texture && texture.checked_frame == backend.swaps_ && texdump_directory_.empty()) {
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
-  texture.checked_frame = swaps_;
+  texture.checked_frame = backend.swaps_;
   uint64_t content = 0;
   for (uint32_t i = 0; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
   if (!texdump_directory_.empty() && dumped_.insert(key ^ 2).second) texture.content = ~content;
   if (texture.texture && texture.content == content) {
-    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
   // Every level is decoded before the image is touched: a level that fails
@@ -464,7 +464,7 @@ uint32_t GpuBackend::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t&
     for (uint32_t z = 0; z < depth; ++z) {
       if (!DecodeTextureLevel(fetch, layouts[i], data[i], z, slice)) {
         texture.failed = true;
-        ++stats_.texture_failures;
+        ++backend.stats_.texture_failures;
         return 0;
       }
       if (!texdump_directory_.empty()) {
@@ -480,8 +480,8 @@ uint32_t GpuBackend::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t&
   }
   if (!texture.texture || texture.width != width || texture.height != height ||
       texture.depth != depth || texture.levels != levels) {
-    if (texture.texture) retired_slots_[slot_].push_back(std::move(texture.texture));
-    texture.texture = device_->createTexture(
+    if (texture.texture) backend.targets.retired_slots_[backend.slot_].push_back(std::move(texture.texture));
+    texture.texture = backend.device_->createTexture(
         RenderTextureDesc::Texture3D(width, height, depth, levels, RenderFormat::R8G8B8A8_UNORM));
     texture.width = width;
     texture.height = height;
@@ -494,20 +494,20 @@ uint32_t GpuBackend::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t&
     }
   }
   texture.content = content;
-  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
+  backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
   for (uint32_t i = 0; i < levels; ++i) {
     const uint32_t w = layouts[i].width, h = layouts[i].height;
-    const uint64_t staging = Allocate(uint64_t(w) * h * depth * 4, 512);
+    const uint64_t staging = backend.streams.Allocate(uint64_t(w) * h * depth * 4, 512);
     if (staging == UINT64_MAX) return 0;
-    std::memcpy(Pointer(staging), all[i].data(), all[i].size() * 4);
-    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), i),
+    std::memcpy(backend.draw.Pointer(staging), all[i].data(), all[i].size() * 4);
+    backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), i),
                              RenderTextureCopyLocation::PlacedFootprint(
-                                 upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, depth, w,
+                                 backend.draw.upload_.get(), RenderFormat::R8G8B8A8_UNORM, w, h, depth, w,
                                  staging));
   }
-  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
-  set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
-  ++stats_.textures_decoded;
+  backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  backend.set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
+  ++backend.stats_.textures_decoded;
   return texture.descriptor;
 }
 
@@ -518,7 +518,7 @@ uint32_t GpuBackend::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t&
 // off along one diagonal into sheets across the screen. Only the base level:
 // the vertex shaders that sample these do so at level 0, and a host 3D image
 // would halve its depth at each mip anyway.
-uint32_t GpuBackend::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address) return 0;
   std::vector<uint32_t> rgba;
@@ -532,22 +532,22 @@ uint32_t GpuBackend::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& 
   HashCombine(key, fetch.dword_1);
   HashCombine(key, fetch.dword_2);
   HashCombine(key, fetch.swizzle);
-  const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(address);
+  const uint8_t* data = backend.memory_->TranslatePhysical<const uint8_t*>(address);
   GuestTexture& texture = guest_volumes_[key];
   if (texture.failed) return 0;
-  if (texture.texture && texture.checked_frame == swaps_) {
-    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  if (texture.texture && texture.checked_frame == backend.swaps_) {
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
-  texture.checked_frame = swaps_;
+  texture.checked_frame = backend.swaps_;
   const uint64_t content = ContentHash(data, extent);
   if (texture.texture && texture.content == content) {
-    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
   if (!DecodeTexture3D(fetch, data, rgba, width, height, depth, extent)) {
     texture.failed = true;
-    ++stats_.texture_failures;
+    ++backend.stats_.texture_failures;
     REXLOG_WARN("Renut: Plume could not decode volume texture {:08X} f{} {}x{}x{}", address,
                 uint32_t(fetch.format), width, height, depth);
     return 0;
@@ -557,8 +557,8 @@ uint32_t GpuBackend::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& 
     if (!texture.descriptor) return 0;
   }
   if (!texture.texture || texture.width != width || texture.height != height || texture.depth != depth) {
-    if (texture.texture) retired_slots_[slot_].push_back(std::move(texture.texture));
-    texture.texture = device_->createTexture(
+    if (texture.texture) backend.targets.retired_slots_[backend.slot_].push_back(std::move(texture.texture));
+    texture.texture = backend.device_->createTexture(
         RenderTextureDesc::Texture3D(width, height, depth, 1, RenderFormat::R8G8B8A8_UNORM));
     texture.width = width;
     texture.height = height;
@@ -573,43 +573,43 @@ uint32_t GpuBackend::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& 
                 width, height, depth, uint32_t(fetch.tiled));
   }
   texture.content = content;
-  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
-  const uint64_t staging = Allocate(uint64_t(rgba.size()) * 4, 512);
+  backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
+  const uint64_t staging = backend.streams.Allocate(uint64_t(rgba.size()) * 4, 512);
   if (staging == UINT64_MAX) return 0;
-  std::memcpy(Pointer(staging), rgba.data(), rgba.size() * 4);
-  L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0),
+  std::memcpy(backend.draw.Pointer(staging), rgba.data(), rgba.size() * 4);
+  backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0),
                            RenderTextureCopyLocation::PlacedFootprint(
-                               upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, depth, width,
+                               backend.draw.upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, depth, width,
                                staging));
-  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
-  set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
-  ++stats_.textures_decoded;
+  backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  backend.set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
+  ++backend.stats_.textures_decoded;
   return texture.descriptor;
 }
 
 // Cube maps (the sky dome): six 2D faces, +X -X +Y -Y +Z -Z, one after the
 // other at a 4 KB aligned stride, each decoded like a 2D texture.
-uint32_t GpuBackend::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
-  if (!address || (skip_mask_ & 16384)) return 0;
+  if (!address || (backend.skip_mask_ & 16384)) return 0;
   uint64_t key = 0;
   HashCombine(key, fetch.dword_0 & ~0x3FFu);
   HashCombine(key, fetch.dword_1);
   HashCombine(key, fetch.dword_2);
   HashCombine(key, fetch.swizzle);
-  const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(address);
+  const uint8_t* data = backend.memory_->TranslatePhysical<const uint8_t*>(address);
   const uint32_t face_stride = (TextureBaseSpan(fetch) + 4095) & ~4095u;
-  GuestTexture& texture = guest_cubes_[key];
+  GuestTexture& texture = backend.targets.guest_cubes_[key];
   if (texture.failed) return 0;
-  if (texture.texture && texture.checked_frame == swaps_ && texdump_directory_.empty()) {
-    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  if (texture.texture && texture.checked_frame == backend.swaps_ && texdump_directory_.empty()) {
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
-  texture.checked_frame = swaps_;
+  texture.checked_frame = backend.swaps_;
   const uint64_t content = ContentHash(data, face_stride * 6);
   if (!texdump_directory_.empty() && dumped_.insert(key ^ 1).second) texture.content = ~content;
   if (texture.texture && texture.content == content) {
-    Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
   std::vector<uint32_t> faces[6];
@@ -619,7 +619,7 @@ uint32_t GpuBackend::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fe
     if (!face_stride || !DecodeTexture2D(fetch, data + size_t(face) * face_stride, faces[face], w, h) ||
         (face && (w != width || h != height)) || w != h) {
       texture.failed = true;
-      ++stats_.texture_failures;
+      ++backend.stats_.texture_failures;
       return 0;
     }
     width = w;
@@ -633,7 +633,7 @@ uint32_t GpuBackend::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fe
     if (!texture.descriptor) return 0;
   }
   if (!texture.texture) {
-    texture.texture = device_->createTexture(RenderTextureDesc::Texture(
+    texture.texture = backend.device_->createTexture(RenderTextureDesc::Texture(
         RenderTextureDimension::TEXTURE_2D, width, height, 1, 1, 6, RenderFormat::R8G8B8A8_UNORM,
         RenderTextureFlag::CUBE));
     if (!texture.texture) {
@@ -647,20 +647,20 @@ uint32_t GpuBackend::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fe
     texture.layout = RenderTextureLayout::UNKNOWN;
   }
   texture.content = content;
-  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
+  backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::COPY_DEST);
   for (uint32_t face = 0; face < 6; ++face) {
-    const uint64_t staging = Allocate(uint64_t(width) * height * 4, 512);
+    const uint64_t staging = backend.streams.Allocate(uint64_t(width) * height * 4, 512);
     if (staging == UINT64_MAX) return 0;
-    std::memcpy(Pointer(staging), faces[face].data(), size_t(width) * height * 4);
-    L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0, face),
+    std::memcpy(backend.draw.Pointer(staging), faces[face].data(), size_t(width) * height * 4);
+    backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0, face),
                              RenderTextureCopyLocation::PlacedFootprint(
-                                 upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, 1, width,
+                                 backend.draw.upload_.get(), RenderFormat::R8G8B8A8_UNORM, width, height, 1, width,
                                  staging));
   }
-  Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
-  set_cube_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ,
+  backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+  backend.set_cube_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ,
                         texture.view.get());
-  ++stats_.textures_decoded;
+  ++backend.stats_.textures_decoded;
   return texture.descriptor;
 }
 

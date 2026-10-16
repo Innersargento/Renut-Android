@@ -3,11 +3,11 @@
 
 namespace renut::gpu {
 
-void GpuBackend::WriteRegister(uint32_t index, uint32_t value) {
+void Shaders::WriteRegister(uint32_t index, uint32_t value) {
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    if (register_file_->values[index] != value) {
-      register_file_->values[index] = value;
-      MarkConstantsWritten(index, 1);
+    if (backend.register_file_->values[index] != value) {
+      backend.register_file_->values[index] = value;
+      backend.draw.MarkConstantsWritten(index, 1);
     }
     return;
   }
@@ -15,7 +15,7 @@ void GpuBackend::WriteRegister(uint32_t index, uint32_t value) {
     extended_register_values_.insert_or_assign(index, value);
     return;
   }
-  gfx::RegisterFile& regs = *register_file_;
+  gfx::RegisterFile& regs = *backend.register_file_;
   // Volatile: the waits in the lists' sync read these from other threads.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
@@ -23,33 +23,33 @@ void GpuBackend::WriteRegister(uint32_t index, uint32_t value) {
     // pacing read in memory.
     const uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
     if ((1u << scratch_reg) & regs.values[XE_GPU_REG_SCRATCH_UMSK]) {
-      StoreBig(regs.values[XE_GPU_REG_SCRATCH_ADDR] + scratch_reg * 4, value);
+      backend.lists.StoreBig(regs.values[XE_GPU_REG_SCRATCH_ADDR] + scratch_reg * 4, value);
     }
   } else if (index == XE_GPU_REG_COHER_STATUS_HOST) {
     const_cast<volatile uint32_t&>(regs.values[index]) |= UINT32_C(0x80000000);
   }
 }
 
-gfx::Shader* GpuBackend::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
+gfx::Shader* Shaders::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                                const uint32_t* host_address, uint32_t dword_count) {
   // Across frames: an address and length are the shader last found there while
   // the guest has not written under them (see ShaderWatch). Looked up first,
   // so a shader the game binds every frame is never hashed again.
   ShaderWatch* watch = nullptr;
   uint64_t watch_key = 0;
-  if (shader_cache_ && guest_address && dword_count && dword_count <= (64u << 10)) {
-    DrainWatchHits();
+  if (backend.swap.shader_cache_ && guest_address && dword_count && dword_count <= (64u << 10)) {
+    backend.streams.DrainWatchHits();
     watch_key = (uint64_t(guest_address) << 32) | dword_count;
     watch = shader_watch_memo_.Find(watch_key);
     if (!watch) {
-      auto found = shader_watch_.find(watch_key);
-      if (found != shader_watch_.end()) {
+      auto found = backend.streams.shader_watch_.find(watch_key);
+      if (found != backend.streams.shader_watch_.end()) {
         watch = &found->second;
         shader_watch_memo_.Put(watch_key, watch);
       }
     }
     if (watch && watch->valid) {
-      ++shader_cache_hits_;
+      ++backend.report.shader_cache_hits_;
       return watch->shader;
     }
   }
@@ -58,14 +58,14 @@ gfx::Shader* GpuBackend::LoadShader(xenos::ShaderType shader_type, uint32_t gues
   bool watched = false;
   if (watch_key) {
     if (!watch) {
-      watch = &shader_watch_[watch_key];
+      watch = &backend.streams.shader_watch_[watch_key];
       shader_watch_memo_.Put(watch_key, watch);
     }
     const uint32_t bytes = dword_count * 4;
-    const bool dynamic = watch->drops >= 3 && swaps_ - watch->dropped_frame < 900;
-    if (!dynamic && memory_->GetPhysicalHeap()->QueryRangeAccess(guest_address, guest_address + bytes - 1) ==
+    const bool dynamic = watch->drops >= 3 && backend.swaps_ - watch->dropped_frame < 900;
+    if (!dynamic && backend.memory_->GetPhysicalHeap()->QueryRangeAccess(guest_address, guest_address + bytes - 1) ==
                         rex::memory::PageAccess::kReadWrite) {
-      memory_->EnablePhysicalMemoryAccessCallbacks(guest_address, bytes, true, false);
+      backend.memory_->EnablePhysicalMemoryAccessCallbacks(guest_address, bytes, true, false);
       watched = true;
     }
   }
@@ -75,22 +75,22 @@ gfx::Shader* GpuBackend::LoadShader(xenos::ShaderType shader_type, uint32_t gues
     watch->base = guest_address;
     watch->bytes = dword_count * 4;
     watch->valid = true;
-    IndexBlocks(shader_block_index_, guest_address, dword_count * 4, watch_key);
+    backend.streams.IndexBlocks(backend.streams.shader_block_index_, guest_address, dword_count * 4, watch_key);
   }
   return result;
 }
 
-gfx::Shader* GpuBackend::LoadShaderByContents(xenos::ShaderType shader_type,
+gfx::Shader* Shaders::LoadShaderByContents(xenos::ShaderType shader_type,
                                                          const uint32_t* host_address, uint32_t dword_count) {
   // The guest binds the same few hundred shaders thousands of times a frame,
   // and hashing the whole microcode each time was a steady few percent of
   // this thread. Within a frame an address and length stand for the shader
   // found there first: microcode a draw of this frame may still run is not
   // rewritten under it.
-  if (shader_lookup_frame_ != swaps_) {
+  if (shader_lookup_frame_ != backend.swaps_) {
     shader_lookup_.clear();
     shader_memo_.Clear();
-    shader_lookup_frame_ = swaps_;
+    shader_lookup_frame_ = backend.swaps_;
   }
   const uint64_t memo_key = uint64_t(reinterpret_cast<uintptr_t>(host_address)) ^ (uint64_t(dword_count) << 48);
   if (HostShader* memo = shader_memo_.Find(memo_key)) return memo;
@@ -106,12 +106,12 @@ gfx::Shader* GpuBackend::LoadShaderByContents(xenos::ShaderType shader_type,
     const size_t ucode_bytes = size_t(dword_count) * sizeof(uint32_t);
     shader->ucode_key = ucode::Key(host_address, ucode_bytes);
     shader->loose_key = ucode::LooseKey(host_address, ucode_bytes);
-    shader->entry = store_->Find(shader->ucode_key, shader->loose_key);
+    shader->entry = backend.pipelines.store_->Find(shader->ucode_key, shader->loose_key);
     if (!shader->entry && missed_.insert(hash).second && missed_.size() <= 32) {
       REXLOG_WARN("Renut: Plume has no recompiled {} shader for microcode {:016X} ({} dwords)",
                   shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash, dword_count);
-      if (!miss_dump_directory_.empty()) {
-        auto path = fmt::format("{}/{}_{:016X}.ucode", miss_dump_directory_,
+      if (!backend.miss_dump_directory_.empty()) {
+        auto path = fmt::format("{}/{}_{:016X}.ucode", backend.miss_dump_directory_,
                                 shader_type == xenos::ShaderType::kVertex ? "vs" : "ps", hash);
         if (FILE* file = std::fopen(path.c_str(), "wb")) {
           std::fwrite(host_address, 4, dword_count, file);
@@ -207,12 +207,12 @@ void DumpPipelineInternals(RenderPipeline& pipeline, const HostShader* vs, const
   std::fclose(file);
 }
 
-bool GpuBackend::Drop(const char* reason, const HostShader* vs, const HostShader* ps) {
+bool Shaders::Drop(const char* reason, const HostShader* vs, const HostShader* ps) {
   const uint64_t vs_hash = vs && vs->entry ? vs->entry->hash : 0;
   const uint64_t ps_hash = ps && ps->entry ? ps->entry->hash : 0;
   const bool exports = vs && vs->entry && (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT);
-  ++drops_[{reason, vs_hash, ps_hash, exports}];
-  Trace("dropped ({}) vs={:016X} ps={:016X}{}", reason, vs_hash, ps_hash, exports ? " memexport" : "");
+  ++backend.report.drops_[{reason, vs_hash, ps_hash, exports}];
+  backend.draw.Trace("dropped ({}) vs={:016X} ps={:016X}{}", reason, vs_hash, ps_hash, exports ? " memexport" : "");
   return true;
 }
 

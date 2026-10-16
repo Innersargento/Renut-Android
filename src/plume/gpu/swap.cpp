@@ -3,51 +3,51 @@
 
 namespace renut::gpu {
 
-void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
   ExecutorBusy busy;
   if (native_on_) {
     // Everything the lists hold for this frame, before it is shown (from the
     // ring's swap; a present the lists hold has run what came before it).
-    if (!native_presenting_) RunNative(UINT32_MAX);
-    EvictSurfaceTargets();
-    native_d3d::NativeReport(swaps_, native_draws_, native_bad_,
-                             [this] { return SurfaceReport(); });
+    if (!backend.lists.native_presenting_) backend.lists.RunNative(UINT32_MAX);
+    backend.targets.EvictSurfaceTargets();
+    native_d3d::NativeReport(backend.swaps_, backend.lists.native_draws_, backend.lists.native_bad_,
+                             [this] { return backend.targets.SurfaceReport(); });
   }
-  FlushDeferred();
-  if (skin_log_ && swaps_ == 930) LogSkinned();
-  if (validate_windows_ && swaps_ % 60 == 0) {
-    REXLOG_INFO("Renut: Plume validation at swap {}: {} ranges compared, {} stale", swaps_, validate_ranges_, validate_stale_);
+  backend.recorder.FlushDeferred();
+  if (skin_log_ && backend.swaps_ == 930) backend.resolve.LogSkinned();
+  if (backend.draw.validate_windows_ && backend.swaps_ % 60 == 0) {
+    REXLOG_INFO("Renut: Plume validation at swap {}: {} ranges compared, {} stale", backend.swaps_, backend.resolve.validate_ranges_, backend.resolve.validate_stale_);
   }
   // Before anything is picked for presenting: the one that is moves on to
   // COPY_SOURCE below, which is a transition of its own.
-  FlushImagesForNextFrame();
+  backend.resolve.FlushImagesForNextFrame();
   RenderTexture* source = nullptr;
-  Resolved* found = FindResolved(frontbuffer_ptr);
+  Resolved* found = backend.draw.FindResolved(frontbuffer_ptr);
   if (resolve_log_) {
-    LogResolveLine(fmt::format("f={} swap front={:08X} {}x{} found={}", swaps_, frontbuffer_ptr, frontbuffer_width,
+    backend.resolve.LogResolveLine(fmt::format("f={} swap front={:08X} {}x{} found={}", backend.swaps_, frontbuffer_ptr, frontbuffer_width,
                                frontbuffer_height, found != nullptr));
   }
   if (found && found->texture) {
     Resolved& r = *found;
-    Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
+    backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
     source = r.texture.get();
     frontbuffer_width = std::min(frontbuffer_width, r.width);
     frontbuffer_height = std::min(frontbuffer_height, r.height);
   }
   bool snap_dump = false;
-  if (snap_taken_ && snap_) {
-    Transition(snap_.get(), snap_layout_, RenderTextureLayout::COPY_SOURCE);
-    source = snap_.get();
+  if (snap_taken_ && backend.resolve.snap_) {
+    backend.targets.Transition(backend.resolve.snap_.get(), backend.resolve.snap_layout_, RenderTextureLayout::COPY_SOURCE);
+    source = backend.resolve.snap_.get();
     frontbuffer_width = std::min(frontbuffer_width, snap_width_);
     frontbuffer_height = std::min(frontbuffer_height, snap_height_);
-    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
-    if (!miss_dump_directory_.empty() && access((root + "/plume-snap-dump").c_str(), F_OK) == 0) {
+    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
+    if (!backend.miss_dump_directory_.empty() && access((root + "/plume-snap-dump").c_str(), F_OK) == 0) {
       snap_dump_row_ = (snap_width_ + 63) & ~63u;
-      snap_dump_ = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(snap_dump_row_) * snap_height_ * 4));
+      snap_dump_ = backend.device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(snap_dump_row_) * snap_height_ * 4));
       if (snap_dump_) {
-        CopyTextureToBuffer(L(), snap_dump_.get(), snap_.get(), snap_width_, snap_height_, snap_dump_row_, 0, 0,
+        CopyTextureToBuffer(backend.recorder.L(), snap_dump_.get(), backend.resolve.snap_.get(), snap_width_, snap_height_, snap_dump_row_, 0, 0,
                             nullptr);
         snap_dump = true;
       }
@@ -60,43 +60,43 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   // once the frame has run, next to the guest bytes it started from.
   std::unique_ptr<RenderBuffer> export_dump;
   std::vector<std::pair<uint64_t, const ExportRange*>> export_dump_at;
-  if (trace_ && !exports_.empty()) {
+  if (backend.draw.trace_ && !backend.streams.exports_.empty()) {
     uint64_t total = 0;
-    for (const auto& [key, range] : exports_) total += range.size;
-    if (total <= (16u << 20)) export_dump = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(total));
+    for (const auto& [key, range] : backend.streams.exports_) total += range.size;
+    if (total <= (16u << 20)) export_dump = backend.device_->createBuffer(RenderBufferDesc::ReadbackBuffer(total));
     if (export_dump) {
-      ExportBarrier();
+      backend.streams.ExportBarrier();
       uint64_t at = 0;
-      for (const auto& [key, range] : exports_) {
-        L()->copyBufferRegion(RenderBufferReference(export_dump.get(), at),
+      for (const auto& [key, range] : backend.streams.exports_) {
+        backend.recorder.L()->copyBufferRegion(RenderBufferReference(export_dump.get(), at),
                                 RenderBufferReference(range.buffer.get(), 0), range.size);
         export_dump_at.emplace_back(at, &range);
         at += range.size;
       }
     }
   }
-  RecordWritebacks();
+  backend.streams.RecordWritebacks();
   // FlushImagesForNextFrame already closed any open pass with its barriers.
-  WriteTimestamp();
-  timestamp_count_[slot_] = timestamps_used_;
-  pair_count_[slot_] = pair_used_;
-  pair_pending_[slot_] = pair_capture_;
-  pair_capture_ = false;
-  L()->end();
-  list_open_ = false;
+  backend.profiling.WriteTimestamp();
+  backend.profiling.timestamp_count_[backend.slot_] = backend.profiling.timestamps_used_;
+  backend.profiling.pair_count_[backend.slot_] = backend.profiling.pair_used_;
+  backend.profiling.pair_pending_[backend.slot_] = backend.targets.pair_capture_;
+  backend.targets.pair_capture_ = false;
+  backend.recorder.L()->end();
+  backend.recorder.list_open_ = false;
   const auto submit_start = std::chrono::steady_clock::now();
   if (renderer) {
-    renderer->SubmitAndPresent(list_, source, frontbuffer_width, frontbuffer_height, slot_);
-    if (writeback_ && !writeback_fast_ && !writebacks_[slot_].empty()) {
-      renderer->WaitForSlot(slot_);
-      ApplyWritebacks(slot_);
+    renderer->SubmitAndPresent(backend.targets.list_, source, frontbuffer_width, frontbuffer_height, backend.slot_);
+    if (writeback_ && !writeback_fast_ && !backend.streams.writebacks_[backend.slot_].empty()) {
+      renderer->WaitForSlot(backend.slot_);
+      backend.streams.ApplyWritebacks(backend.slot_);
     }
   }
   const auto submit_end = std::chrono::steady_clock::now();
-  stats_.submit_us +=
+  backend.stats_.submit_us +=
       uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(submit_end - submit_start).count());
   if (frame_start_.time_since_epoch().count()) {
-    stats_.frame_us += uint64_t(
+    backend.stats_.frame_us += uint64_t(
         std::chrono::duration_cast<std::chrono::microseconds>(submit_end - frame_start_).count());
   }
   frame_start_ = submit_end;
@@ -110,7 +110,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   }
   if (snap_dump && renderer) {
     renderer->WaitForAllSlots();
-    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
     if (FILE* file = std::fopen((root + "/plume-snap.rgba").c_str(), "wb")) {
       std::fprintf(file, "%u %u %u %u\n", snap_width_, snap_height_, snap_dump_row_, uint32_t(snap_format_));
       std::fwrite(snap_dump_->map(), 4, size_t(snap_dump_row_) * snap_height_, file);
@@ -127,7 +127,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   }
   if (depth_dump_ && renderer) {
     renderer->WaitForAllSlots();
-    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
     const uint32_t bytes = depth_dump_format_ == uint32_t(RenderFormat::R32G32_FLOAT) ? 8 : 4;
     if (FILE* file = std::fopen((root + "/plume-depth.f32").c_str(), "wb")) {
       std::fprintf(file, "%u %u %u %u %llu %llu\n", depth_dump_w_, depth_dump_h_, depth_dump_row_, bytes,
@@ -142,22 +142,22 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     REXLOG_INFO("Renut: Plume depth resolve written ({}x{}, {} bytes a texel)", depth_dump_w_, depth_dump_h_, bytes);
   }
   const uint64_t cpu_now = ThreadCpuMicroseconds();
-  if (cpu_at_swap_) stats_.cp_cpu_us += cpu_now - cpu_at_swap_;
+  if (cpu_at_swap_) backend.stats_.cp_cpu_us += cpu_now - cpu_at_swap_;
   cpu_at_swap_ = cpu_now;
-  if (trace_) {
-    Trace("swap front={:08X} {}x{} found={}", frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+  if (backend.draw.trace_) {
+    backend.draw.Trace("swap front={:08X} {}x{} found={}", frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
           source != nullptr);
-    for (auto& [key, target] : targets_) {
-      Trace("  target base={:X} fmt={} depth={} {}x{}", key & 0xFFF, (key >> 12) & 0xF, (key >> 16) & 1,
+    for (auto& [key, target] : backend.targets.targets_) {
+      backend.draw.Trace("  target base={:X} fmt={} depth={} {}x{}", key & 0xFFF, (key >> 12) & 0xF, (key >> 16) & 1,
             target.width, target.height);
     }
-    for (const auto& [key, r] : resolved_) {
-      Trace("  resolved {:08X} host={}x{} f{} guest={}x{}/{} gen={} frame={}", uint32_t(key),
+    for (const auto& [key, r] : backend.targets.resolved_) {
+      backend.draw.Trace("  resolved {:08X} host={}x{} f{} guest={}x{}/{} gen={} frame={}", uint32_t(key),
             r.width, r.height, uint32_t(r.format), r.guest_pitch, r.guest_height, r.guest_bpp,
             r.generation, r.written_frame);
     }
     for (const TracedStream& t : traced_streams_) {
-      const auto* now = memory_->TranslatePhysical<const uint8_t*>(t.address);
+      const auto* now = backend.memory_->TranslatePhysical<const uint8_t*>(t.address);
       uint32_t changed = 0, first = UINT32_MAX;
       for (uint32_t i = 0; i < t.bytes.size(); i += 4) {
         if (std::memcmp(now + i, t.bytes.data() + i, 4)) {
@@ -166,19 +166,19 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         }
       }
       if (changed) {
-        Trace("  stale draw #{} stream{} {:08X}+{:X}: {} of {} dwords changed since, first at +{:X}", t.draw,
+        backend.draw.Trace("  stale draw #{} stream{} {:08X}+{:X}: {} of {} dwords changed since, first at +{:X}", t.draw,
               t.stream, t.address, t.bytes.size(), changed, t.bytes.size() / 4, first);
       }
     }
     traced_streams_.clear();
-    std::fclose(trace_);
-    trace_ = nullptr;
+    std::fclose(backend.draw.trace_);
+    backend.draw.trace_ = nullptr;
     traced_cascade_ps_.clear();
     REXLOG_INFO("Renut: Plume frame trace written");
-    if (export_dump && renderer && !miss_dump_directory_.empty()) {
+    if (export_dump && renderer && !backend.miss_dump_directory_.empty()) {
       renderer->WaitForAllSlots();
       const std::string directory =
-          miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/" + trace_dump_name_;
+          backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/')) + "/" + trace_dump_name_;
       renutMakeDirectory(directory);
       const auto* data = static_cast<const uint8_t*>(export_dump->map());
       for (const auto& [at, range] : export_dump_at) {
@@ -188,7 +188,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
           std::fclose(file);
         }
         if (FILE* file = std::fopen((name + ".guest").c_str(), "wb")) {
-          std::fwrite(memory_->TranslatePhysical<const uint8_t*>(range->base), 1, range->size, file);
+          std::fwrite(backend.memory_->TranslatePhysical<const uint8_t*>(range->base), 1, range->size, file);
           std::fclose(file);
         }
       }
@@ -196,27 +196,27 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       REXLOG_INFO("Renut: Plume wrote {} exported ranges", export_dump_at.size());
     }
   }
-  ++swaps_;
-  if (g_predict.queued.load(std::memory_order_relaxed)) PredictPipelines();
-  if (!pending_pipelines_.empty()) ReapPipelines();
-  lookup_spent_us_ = 0;
-  pipeline_frame_.store(swaps_, std::memory_order_relaxed);
-  if (!miss_dump_directory_.empty()) {
-    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
-    if (swaps_ % 30 == 0) {
+  ++backend.swaps_;
+  if (g_predict.queued.load(std::memory_order_relaxed)) backend.pipelines.PredictPipelines();
+  if (!backend.draw.pending_pipelines_.empty()) backend.pipelines.ReapPipelines();
+  backend.draw.lookup_spent_us_ = 0;
+  pipeline_frame_.store(backend.swaps_, std::memory_order_relaxed);
+  if (!backend.miss_dump_directory_.empty()) {
+    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
+    if (backend.swaps_ % 30 == 0) {
       const bool arm = access((root + "/plume-trace-arm").c_str(), F_OK) == 0;
       if (arm && !arm_) {
         arm_pairs_.clear();
-        arm_target_ = 0;
+        backend.draw.arm_target_ = 0;
         if (FILE* file = std::fopen((root + "/plume-trace-arm").c_str(), "r")) {
           unsigned long long target = 0;
-          if (std::fscanf(file, "%llx", &target) == 1) arm_target_ = target;
+          if (std::fscanf(file, "%llx", &target) == 1) backend.draw.arm_target_ = target;
           std::fclose(file);
         }
-        arm_learn_ = arm_target_ ? 0 : 150;
+        arm_learn_ = backend.draw.arm_target_ ? 0 : 150;
         arm_burst_ = arm_left_ = 0;
-        if (arm_target_) {
-          REXLOG_INFO("Renut: Plume trace armed on shader {:016X}", arm_target_);
+        if (backend.draw.arm_target_) {
+          REXLOG_INFO("Renut: Plume trace armed on shader {:016X}", backend.draw.arm_target_);
         } else {
           REXLOG_INFO("Renut: Plume trace armed, learning the scene's shaders");
         }
@@ -224,7 +224,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       arm_ = arm;
     }
     if (arm_learn_ && !--arm_learn_) REXLOG_INFO("Renut: Plume trace armed with {} shader pairs", arm_pairs_.size());
-    if (arm_ && !trace_ && !arm_left_ && !arm_new_.empty() && arm_burst_ < 6) {
+    if (arm_ && !backend.draw.trace_ && !arm_left_ && !arm_new_.empty() && arm_burst_ < 6) {
       ++arm_burst_;
       arm_left_ = 3;
       for (const auto& [vs_hash, ps_hash] : arm_new_) {
@@ -233,34 +233,34 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       }
     }
     arm_new_.clear();
-    if (arm_left_ && !trace_) {
+    if (arm_left_ && !backend.draw.trace_) {
       const std::string name = fmt::format("{}/plume-trace-arm-{}-{}.txt", root, arm_burst_, 4 - arm_left_);
-      trace_ = std::fopen(name.c_str(), "w");
+      backend.draw.trace_ = std::fopen(name.c_str(), "w");
       trace_dump_name_ = fmt::format("exportdump-arm-{}-{}", arm_burst_, 4 - arm_left_);
       --arm_left_;
     }
   }
-  if (!miss_dump_directory_.empty() && !trace_) {
+  if (!backend.miss_dump_directory_.empty() && !backend.draw.trace_) {
     // Every frame: a request made when something looks wrong has to catch the
     // frame that shows it.
-    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
     if (std::remove((root + "/plume-trace-request").c_str()) == 0) {
-      trace_ = std::fopen((root + "/plume-trace.txt").c_str(), "w");
+      backend.draw.trace_ = std::fopen((root + "/plume-trace.txt").c_str(), "w");
       trace_dump_name_ = "exportdump";
     }
   }
-  if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
-    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
-    texdump_directory_.clear();
+  if (backend.swaps_ % 30 == 0 && !backend.miss_dump_directory_.empty()) {
+    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
+    backend.textures.texdump_directory_.clear();
     if (std::remove((root + "/plume-texdump-request").c_str()) == 0) {
-      texdump_directory_ = root + "/texdump";
-      renutMakeDirectory(texdump_directory_);
-      dumped_.clear();
+      backend.textures.texdump_directory_ = root + "/texdump";
+      renutMakeDirectory(backend.textures.texdump_directory_);
+      backend.textures.dumped_.clear();
       REXLOG_INFO("Renut: Plume dumping the next frame's textures");
     }
   }
-  if (swaps_ % 30 == 0 && !miss_dump_directory_.empty()) {
-    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
+  if (backend.swaps_ % 30 == 0 && !backend.miss_dump_directory_.empty()) {
+    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
     uint32_t mask = 0;
     uint32_t bind_skip = 0;
     bool shadow_native_constants = true;
@@ -277,8 +277,8 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       if (std::fscanf(file, "%u", &bind_skip) != 1) bind_skip = 0;
       std::fclose(file);
     }
-    if (bind_skip != bind_skip_) REXLOG_INFO("Renut: Plume bind skip {}", bind_skip);
-    bind_skip_ = bind_skip;
+    if (bind_skip != backend.recorder.bind_skip_) REXLOG_INFO("Renut: Plume bind skip {}", bind_skip);
+    backend.recorder.bind_skip_ = bind_skip;
     {
       int defer = std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2);
       if (FILE* file = std::fopen((root + "/plume-defer").c_str(), "r")) {
@@ -292,7 +292,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       defer_mode_ = uint32_t(defer);
     }
     {
-      bool trail = trail_device_default_;
+      bool trail = backend.trail_device_default_;
       if (FILE* file = std::fopen((root + "/plume-trail").c_str(), "r")) {
         int value = trail;
         if (std::fscanf(file, "%d", &value) == 1) trail = value != 0;
@@ -312,7 +312,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       }
       if (recorder != rec_enabled_) {
         REXLOG_INFO("Renut: Plume recording thread {}", recorder ? "on" : "off");
-        SyncRecorder();
+        backend.recorder.SyncRecorder();
       }
       rec_enabled_ = recorder;
     }
@@ -325,12 +325,12 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         if (std::fscanf(file, "%d", &value) == 1) objkeys = value != 0;
         std::fclose(file);
       }
-      if (objkeys != objkeys_) {
+      if (objkeys != backend.textures.objkeys_) {
         REXLOG_INFO("Renut: Plume object keys {}", objkeys ? "on" : "off");
-        ++object_epoch_;
-        ++stream_epoch_;
+        ++backend.targets.object_epoch_;
+        ++backend.draw.stream_epoch_;
       }
-      objkeys_ = objkeys;
+      backend.textures.objkeys_ = objkeys;
     }
     {
       // files/plume-shadercache and files/plume-keyreuse: 0 puts the old path
@@ -347,9 +347,9 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       const bool shader_cache = read_switch("plume-shadercache", REXCVAR_GET(renut_plume_shader_cache));
       if (shader_cache != shader_cache_) {
         REXLOG_INFO("Renut: Plume shader cache {}", shader_cache ? "on" : "off");
-        shader_watch_.clear();
-        shader_watch_memo_.Clear();
-        shader_block_index_.clear();
+        backend.streams.shader_watch_.clear();
+        backend.shaders.shader_watch_memo_.Clear();
+        backend.streams.shader_block_index_.clear();
       }
       shader_cache_ = shader_cache;
       const bool key_reuse = read_switch("plume-keyreuse", REXCVAR_GET(renut_plume_key_reuse));
@@ -357,7 +357,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         REXLOG_INFO("Renut: Plume pipeline key reuse {}", key_reuse ? "on" : "off");
         // Keys made the other way name different pipelines: the memos go, the
         // pipelines are found again (or made) under the new keys.
-        pipeline_memo_.Clear();
+        backend.draw.pipeline_memo_.Clear();
       }
       key_reuse_ = key_reuse;
     }
@@ -368,10 +368,10 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         if (std::fscanf(file, "%d", &value) == 1) hiz = std::clamp(value, 0, 4);
         std::fclose(file);
       }
-      if (uint32_t(hiz) != hiz_mode_) {
+      if (uint32_t(hiz) != backend.report.hiz_mode_) {
         REXLOG_INFO("Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor, 3 + occlusion, 4 + occlusion of depth-only draws)", hiz);
       }
-      hiz_mode_ = uint32_t(hiz);
+      backend.report.hiz_mode_ = uint32_t(hiz);
       bool skip = true;
       if (FILE* file = std::fopen((root + "/plume-hizskip").c_str(), "r")) {
         int value = 1;
@@ -416,10 +416,10 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         REXLOG_INFO("Renut: Plume BC textures {}: the 2D guest textures are uploaded again", bc ? "on" : "off");
         bc_mode_ = uint32_t(bc);
         // Every 2D texture is rebuilt in the other form the next time it is drawn.
-        for (auto& [key, texture] : guest_textures_) RetireGuestTexture(texture);
-        guest_textures_.clear();
-        texture_memo_.Clear();
-        ++object_epoch_;
+        for (auto& [key, texture] : backend.targets.guest_textures_) backend.targets.RetireGuestTexture(texture);
+        backend.targets.guest_textures_.clear();
+        backend.textures.texture_memo_.Clear();
+        ++backend.targets.object_epoch_;
       }
     }
     {
@@ -429,10 +429,10 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         if (std::fscanf(file, "%d", &value) == 1) quality = std::clamp(value, 0, 2);
         std::fclose(file);
       }
-      if (uint32_t(quality) != texture_quality_) {
+      if (uint32_t(quality) != backend.texture_quality_) {
         REXLOG_INFO("Renut: Plume texture quality {} (each texture is uploaded again when it is next drawn)",
                     quality == 0 ? "full" : quality == 1 ? "half" : "quarter");
-        texture_quality_ = uint32_t(quality);
+        backend.texture_quality_ = uint32_t(quality);
       }
     }
     {
@@ -442,11 +442,11 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         if (std::fscanf(file, "%d", &value) == 1) rel = (value >= 0 && value <= 2) || value == 11 || value == 12 ? value : 0;
         std::fclose(file);
       }
-      if (uint32_t(rel) != rel_constants_mode_) {
+      if (uint32_t(rel) != backend.draw.rel_constants_mode_) {
         REXLOG_INFO("Renut: Plume relative vertex constants mode {} (0 four blocks, 1 one block, 2 one block loaded, "
                     "11/12 alternate 0 with 1/2 per draw)", rel);
       }
-      rel_constants_mode_ = uint32_t(rel);
+      backend.draw.rel_constants_mode_ = uint32_t(rel);
     }
     {
       int depth_strip = std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1);
@@ -483,8 +483,8 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       patch_level_percent_ = percent;
     }
     {
-      unsigned int minimum = no_shadows_ ? UINT32_MAX : 0;
-      if (!no_shadows_) if (FILE* file = std::fopen((root + "/plume-shadowmin").c_str(), "r")) {
+      unsigned int minimum = backend.no_shadows_ ? UINT32_MAX : 0;
+      if (!backend.no_shadows_) if (FILE* file = std::fopen((root + "/plume-shadowmin").c_str(), "r")) {
         if (std::fscanf(file, "%u", &minimum) != 1) minimum = 0;
         std::fclose(file);
       }
@@ -498,12 +498,12 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       const int read = std::fscanf(file, "%d %d", &mode, &frames);
       std::fclose(file);
       std::remove((root + "/plume-pairprof").c_str());
-      if (read >= 1 && mode >= 1 && pair_pool_ != VK_NULL_HANDLE && pairprof_frames_left_ == 0) {
+      if (read >= 1 && mode >= 1 && backend.pair_pool_ != VK_NULL_HANDLE && pairprof_frames_left_ == 0) {
         pairprof_mode_ = uint32_t(std::min(mode, 2));
         pairprof_frames_left_ = uint32_t(std::clamp(read >= 2 ? frames : 3, 1, 16));
-        pair_totals_.clear();
-        pair_frames_ = 0;
-        pair_span_ns_ = pair_gap_ns_ = pair_frame_ns_ = 0;
+        backend.profiling.pair_totals_.clear();
+        backend.profiling.pair_frames_ = 0;
+        backend.profiling.pair_span_ns_ = backend.profiling.pair_gap_ns_ = backend.profiling.pair_frame_ns_ = 0;
         REXLOG_INFO("Renut: Plume pair profile: mode {}, {} frames", pairprof_mode_, pairprof_frames_left_);
       }
     }
@@ -538,25 +538,25 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       if (std::fscanf(file, "%u", &mask) != 1) mask = 0;
       std::fclose(file);
     }
-    if (mask != skip_mask_) {
+    if (mask != backend.skip_mask_) {
       REXLOG_INFO("Renut: Plume skip mask {:X}", mask);
       // Two of its bits change how a level's layout is worked out.
-      fetch_layouts_.clear();
-      layout_memo_.Clear();
-      ++object_epoch_;
+      backend.textures.fetch_layouts_.clear();
+      backend.textures.layout_memo_.Clear();
+      ++backend.targets.object_epoch_;
     }
-    skip_mask_ = mask;
+    backend.skip_mask_ = mask;
     const bool sync_draws = access((root + "/plume-syncdraws").c_str(), F_OK) == 0;
-    if (sync_draws != sync_draws_) REXLOG_INFO("Renut: Plume synced draws {}", sync_draws ? "on" : "off");
-    sync_draws_ = sync_draws;
+    if (sync_draws != backend.draw.sync_draws_) REXLOG_INFO("Renut: Plume synced draws {}", sync_draws ? "on" : "off");
+    backend.draw.sync_draws_ = sync_draws;
     {
       unsigned every = 0;
       if (FILE* file = std::fopen((root + "/plume-syncevery").c_str(), "r")) {
         if (std::fscanf(file, "%u", &every) != 1) every = 0;
         std::fclose(file);
       }
-      if (every != sync_every_) REXLOG_INFO("Renut: Plume list submitted and waited for every {} draws", every);
-      sync_every_ = every;
+      if (every != backend.recorder.sync_every_) REXLOG_INFO("Renut: Plume list submitted and waited for every {} draws", every);
+      backend.recorder.sync_every_ = every;
     }
     {
       unsigned long long watch = 0;
@@ -564,30 +564,30 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         if (std::fscanf(file, "%llx", &watch) != 1) watch = 0;
         std::fclose(file);
       }
-      sync_watch_ = watch;
+      backend.recorder.sync_watch_ = watch;
       unsigned long long delay = 0;
       unsigned mask = 15;
       if (FILE* file = std::fopen((root + "/plume-retire-delay").c_str(), "r")) {
         if (std::fscanf(file, "%llu %u", &delay, &mask) < 1) delay = 0;
         std::fclose(file);
       }
-      if (delay != retire_delay_ || mask != retire_mask_) {
+      if (delay != backend.targets.retire_delay_ || mask != backend.targets.retire_mask_) {
         REXLOG_INFO("Renut: Plume retired objects (classes {:X}) kept {} frames", mask, delay);
       }
-      retire_delay_ = delay;
-      retire_mask_ = mask;
+      backend.targets.retire_delay_ = delay;
+      backend.targets.retire_mask_ = mask;
     }
     const bool keep_streams = access((root + "/plume-no-persist").c_str(), F_OK) != 0;
     if (keep_streams != keep_streams_) {
       REXLOG_INFO("Renut: Plume kept streams {}", keep_streams ? "on" : "off");
       if (!keep_streams) {
-        for (auto& [key, kept] : kept_streams_) {
-          if (kept.buffer) retired_buffers_[slot_].push_back(std::move(kept.buffer));
+        for (auto& [key, kept] : backend.streams.kept_streams_) {
+          if (kept.buffer) backend.streams.retired_buffers_[backend.slot_].push_back(std::move(kept.buffer));
         }
-        ++stream_epoch_;
-    kept_streams_.clear();
-  kept_memo_.Clear();
-        kept_bytes_ = 0;
+        ++backend.draw.stream_epoch_;
+    backend.streams.kept_streams_.clear();
+  backend.streams.kept_memo_.Clear();
+        backend.streams.kept_bytes_ = 0;
       }
     }
     keep_streams_ = keep_streams;
@@ -703,8 +703,8 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       if (std::fscanf(file, "%llx", &skip_shader) != 1) skip_shader = 0;
       std::fclose(file);
     }
-    if (skip_shader != skip_shader_) REXLOG_INFO("Renut: Plume dropping shader {:016X}", skip_shader);
-    skip_shader_ = skip_shader;
+    if (skip_shader != backend.draw.skip_shader_) REXLOG_INFO("Renut: Plume dropping shader {:016X}", skip_shader);
+    backend.draw.skip_shader_ = skip_shader;
     {
       std::unordered_set<uint64_t> list;
       bool present = false;
@@ -726,7 +726,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       if (std::fscanf(file, "%u", &debug_mode) != 1) debug_mode = 7;
       std::fclose(file);
     }
-    debug_mode_ = debug_mode;
+    backend.draw.debug_mode_ = debug_mode;
     unsigned int white_slots = 0;
     if (FILE* file = std::fopen((root + "/plume-white-slots").c_str(), "r")) {
       if (std::fscanf(file, "%x", &white_slots) != 1) white_slots = 0;
@@ -739,7 +739,7 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       if (std::fscanf(file, "%llx", &trace_ps) != 1) trace_ps = 0;
       std::fclose(file);
     }
-    trace_ps_ = trace_ps;
+    backend.draw.trace_ps_ = trace_ps;
     unsigned int pixel_center = 0;
     if (FILE* file = std::fopen((root + "/plume-pixel-center").c_str(), "r")) {
       if (std::fscanf(file, "%u", &pixel_center) != 1) pixel_center = 0;
@@ -747,8 +747,8 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     }
     if (pixel_center != pixel_center_debug_) REXLOG_INFO("Renut: Plume pixel centre mode {}", pixel_center);
     pixel_center_debug_ = pixel_center;
-    if (debug_shader != debug_shader_) REXLOG_INFO("Renut: Plume debugging shader {:016X}", debug_shader);
-    debug_shader_ = debug_shader;
+    if (debug_shader != backend.draw.debug_shader_) REXLOG_INFO("Renut: Plume debugging shader {:016X}", debug_shader);
+    backend.draw.debug_shader_ = debug_shader;
   }
   // A range nothing has exported into for a while goes back to guest memory.
   // Emitters export every frame they are alive, so a couple of seconds is
@@ -757,18 +757,18 @@ void GpuBackend::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   // wrote with the bytes the range's snapshot already held kept the old
   // level's exported vertices - triangles across the screen after a few
   // trips between Showdown Town and Nutty Acres.
-  for (auto it = exports_.begin(); it != exports_.end();) {
-    if (it->second.exported_frame + 30 < swaps_) {
-      retired_buffers_[slot_].push_back(std::move(it->second.buffer));
-      ++export_epoch_;
-      it = exports_.erase(it);
+  for (auto it = backend.streams.exports_.begin(); it != backend.streams.exports_.end();) {
+    if (it->second.exported_frame + 30 < backend.swaps_) {
+      backend.streams.retired_buffers_[backend.slot_].push_back(std::move(it->second.buffer));
+      ++backend.draw.export_epoch_;
+      it = backend.streams.exports_.erase(it);
     } else {
       ++it;
     }
   }
-  if (swaps_ % 300 == 1) Report();
-  if (swaps_ % 15 == 3) ReportMemory();
-  BeginFrame();
+  if (backend.swaps_ % 300 == 1) backend.report.Report();
+  if (backend.swaps_ % 15 == 3) backend.report.ReportMemory();
+  backend.targets.BeginFrame();
 }
 
 }  // namespace renut::gpu

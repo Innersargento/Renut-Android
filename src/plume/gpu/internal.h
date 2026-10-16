@@ -7,7 +7,12 @@
 //   recipes.h         pipeline recipes, precompilation and prediction
 //   formats.h         Xenos-to-Vulkan format and state translation
 //   resources.h       render targets, resolved images, guest textures, statistics
-//   backend.h         the GpuBackend class
+//   types.h           types and constants of the backend (hoisted out of its class)
+//   targets.h, textures.h, pipelines.h, streams.h, shaders.h, lists.h, draw.h, recorder.h,
+//   hiz.h, resolve.h, patches.h, swap.h, profiling.h, report.h
+//                     the subsystems: one struct each, with its state and its methods
+//   backend.h         GpuBackend, which owns them; a subsystem reaches the others and the shared
+//                     state (device, memory, statistics) through its `backend` reference
 //
 // Sources:
 //   options.cpp       the renut_plume_* cvars

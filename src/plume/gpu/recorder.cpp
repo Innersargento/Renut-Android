@@ -3,7 +3,7 @@
 
 namespace renut::gpu {
 
-void GpuBackend::RecQueue(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
+void Recorder::RecQueue(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
   if (!rec_worker_.thread.joinable()) {
     rec_worker_.mutex = &rec_mutex_;
     rec_worker_.cv = &rec_cv_;
@@ -37,7 +37,7 @@ void GpuBackend::RecQueue(const DrawPacket& pk, const DeferredSlot* slots, uint3
   if (job.packets.size() >= kRecBatch) RecPost();
 }
 
-void GpuBackend::RecPost() {
+void Recorder::RecPost() {
   if (!rec_pending_) return;
   if (rec_pending_->packets.empty()) return;
   {
@@ -51,7 +51,7 @@ void GpuBackend::RecPost() {
 }
 
 // Waits until everything handed to the recorder has been recorded.
-void GpuBackend::SyncRecorder() {
+void Recorder::SyncRecorder() {
   if (OnRecorder()) return;
   RecPost();
   const uint64_t target = rec_posted_.load(std::memory_order_acquire);
@@ -63,7 +63,7 @@ void GpuBackend::SyncRecorder() {
   rec_done_cv_.wait(lock, [&] { return rec_completed_.load(std::memory_order_acquire) >= target; });
 }
 
-void GpuBackend::RecThreadMain() {
+void Recorder::RecThreadMain() {
   pthread_setname_np(pthread_self(), "PlumeRecord");
   for (;;) {
     RecJob* job = nullptr;
@@ -100,28 +100,28 @@ void GpuBackend::RecThreadMain() {
 
 // Records one packet: the pass, the pipeline and every piece of per-draw state
 // that differs from what the list already has bound, then the draw itself.
-void GpuBackend::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
+void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
   // Not from the recorder (the Hi-Z windows, the debug modes): nothing may be
   // in flight while this thread touches the bound state.
   if (!OnRecorder()) SyncRecorder();
-  const bool pair_stamped = pair_capture_ && PairBegin(pk);
+  const bool pair_stamped = backend.targets.pair_capture_ && backend.profiling.PairBegin(pk);
   if (OnRecorder()) {
-    emit_colors_ = pk.pass_colors;
-    emit_depth_ = pk.pass_depth;
+    backend.targets.emit_colors_ = pk.pass_colors;
+    backend.targets.emit_depth_ = pk.pass_depth;
   } else {
-    color_count_of_pass_ = pk.pass_colors;
-    depth_of_pass_ = pk.pass_depth;
+    backend.targets.color_count_of_pass_ = pk.pass_colors;
+    backend.targets.depth_of_pass_ = pk.pass_depth;
   }
-  SetFramebuffer(pk.framebuffer);
+  backend.targets.SetFramebuffer(pk.framebuffer);
   // plume-skip bit 262144 keeps the bound pipeline whenever it can stand in
   // for the draw's own (same attachments and vertex input): the picture is
   // wrong, and what the GPU saves is the price of switching programs.
-  const bool keep_pipeline = (skip_mask_ & 262144) && bound_pipeline_ && pk.interface_key == bound_interface_key_;
+  const bool keep_pipeline = (backend.skip_mask_ & 262144) && bound_pipeline_ && pk.interface_key == bound_interface_key_;
   if (bound_pipeline_ != pk.pipeline && !keep_pipeline) {
     L()->setPipeline(pk.pipeline);
     bound_pipeline_ = pk.pipeline;
     bound_interface_key_ = pk.interface_key;
-    ++rec_stats_.pipeline_binds;
+    ++backend.report.rec_stats_.pipeline_binds;
   }
   // Dynamic state of the pipelines that use it (the Vulkan layer makes it so,
   // see plume_renderer.cpp): not part of Plume's interface, so on the command
@@ -135,15 +135,15 @@ void GpuBackend::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint3
       vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, pk.stencil_write_mask);
     }
   }
-  if (std::memcmp(pk.push, pushed_constants_, sizeof(pk.push)) != 0 &&
-             !((bind_skip_ & 2) && pushed_constants_[0] != UINT64_MAX)) {
+  if (std::memcmp(pk.push, backend.targets.pushed_constants_, sizeof(pk.push)) != 0 &&
+             !((bind_skip_ & 2) && backend.targets.pushed_constants_[0] != UINT64_MAX)) {
     L()->setGraphicsPushConstants(0, pk.push, 0, sizeof(pk.push));
-    std::memcpy(pushed_constants_, pk.push, sizeof(pk.push));
+    std::memcpy(backend.targets.pushed_constants_, pk.push, sizeof(pk.push));
   }
   if (std::memcmp(pk.constant_offsets, bound_constant_offsets_, sizeof(pk.constant_offsets)) != 0 &&
       !((bind_skip_ & 1) && bound_constant_offsets_[0] != UINT32_MAX)) {
     vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(L())->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            static_cast<VulkanPipelineLayout*>(layout_.get())->vk, 4, 1, &constants_set_,
+                            static_cast<VulkanPipelineLayout*>(backend.layout_.get())->vk, 4, 1, &backend.constants_set_,
                             kConstantBindings, pk.constant_offsets);
     std::memcpy(bound_constant_offsets_, pk.constant_offsets, sizeof(pk.constant_offsets));
   }
@@ -165,7 +165,7 @@ void GpuBackend::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint3
   for (uint32_t i = 0; i < slot_count; ++i) {
     const RenderInputSlot& slot = slots[i].slot;
     const RenderVertexBufferView& view = slots[i].view;
-    VertexBinding& bound = bound_vertex_buffers_[slot.index];
+    VertexBinding& bound = backend.targets.bound_vertex_buffers_[slot.index];
     if ((bound.buffer != view.buffer.ref || bound.offset != view.buffer.offset) &&
         !((bind_skip_ & 4) && bound.buffer)) {
       // Straight to Vulkan: Plume's wrapper goes through two thread_local
@@ -181,23 +181,23 @@ void GpuBackend::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint3
     }
   }
   // A draw the Hi-Z test answered for runs only where the answer is non-zero.
-  const bool predicated = pk.hiz_pred_offset != UINT32_MAX && hiz_pred_[slot_] != nullptr &&
+  const bool predicated = pk.hiz_pred_offset != UINT32_MAX && backend.hiz.hiz_pred_[backend.slot_] != nullptr &&
                           pk.kind != DrawPacket::Kind::kNone;
   VkCommandBuffer predicate_cb = VK_NULL_HANDLE;
-  const bool queried = pk.hiz_query != UINT32_MAX && hiz_query_pool_ != VK_NULL_HANDLE &&
+  const bool queried = pk.hiz_query != UINT32_MAX && backend.hiz.hiz_query_pool_ != VK_NULL_HANDLE &&
                        pk.kind != DrawPacket::Kind::kNone;
   if (queried) {
     auto* vulkan = static_cast<VulkanCommandList*>(L());
     vulkan->checkActiveRenderPass();
     predicate_cb = vulkan->vk;
-    vkCmdBeginQuery(predicate_cb, hiz_query_pool_, pk.hiz_query, 0);
+    vkCmdBeginQuery(predicate_cb, backend.hiz.hiz_query_pool_, pk.hiz_query, 0);
   }
   if (predicated) {
     auto* vulkan = static_cast<VulkanCommandList*>(L());
     vulkan->checkActiveRenderPass();
     predicate_cb = vulkan->vk;
     VkConditionalRenderingBeginInfoEXT info = {VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
-    info.buffer = static_cast<VulkanBuffer*>(hiz_pred_[slot_].get())->vk;
+    info.buffer = static_cast<VulkanBuffer*>(backend.hiz.hiz_pred_[backend.slot_].get())->vk;
     info.offset = pk.hiz_pred_offset;
     vkCmdBeginConditionalRenderingEXT(predicate_cb, &info);
   }
@@ -223,23 +223,23 @@ void GpuBackend::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint3
   }
   if (predicated) {
     vkCmdEndConditionalRenderingEXT(predicate_cb);
-    ++rec_stats_.predicated;
+    ++backend.report.rec_stats_.predicated;
   }
-  if (queried) vkCmdEndQuery(predicate_cb, hiz_query_pool_, pk.hiz_query);
-  if (pair_stamped) PairStamp();
-  ++rec_stats_.drawn;
-  if (!pass_marks_[slot_].empty()) ++pass_marks_[slot_].back().draws;
-  if (trail_) {
+  if (queried) vkCmdEndQuery(predicate_cb, backend.hiz.hiz_query_pool_, pk.hiz_query);
+  if (pair_stamped) backend.profiling.PairStamp();
+  ++backend.report.rec_stats_.drawn;
+  if (!backend.targets.pass_marks_[backend.slot_].empty()) ++backend.targets.pass_marks_[backend.slot_].back().draws;
+  if (backend.swap.trail_) {
     // Only one draw in eight asks (a hash lookup a draw was over 1% of this
     // thread): the report of a lost device calls a pair new from its first
     // frame, and an unknown one is simply not called new.
     uint64_t first_frame = 0;
-    if ((rec_stats_.drawn & 7) == 0) {
-      first_frame = pair_first_frame_.try_emplace(pk.vs_hash * 1099511628211ull ^ pk.ps_hash, swaps_).first->second;
+    if ((backend.report.rec_stats_.drawn & 7) == 0) {
+      first_frame = pair_first_frame_.try_emplace(pk.vs_hash * 1099511628211ull ^ pk.ps_hash, backend.swaps_).first->second;
     }
     const uint64_t at = recent_draw_count_.load(std::memory_order_relaxed);
     RecentDraw& recent = recent_draws_[at % kRecentDraws];
-    recent = {swaps_, pk.vs_hash, pk.ps_hash, uint64_t(uintptr_t(pk.pipeline)),
+    recent = {backend.swaps_, pk.vs_hash, pk.ps_hash, uint64_t(uintptr_t(pk.pipeline)),
               uint64_t(uintptr_t(pk.framebuffer)), pk.s0_addr, pk.s10_addr, first_frame,
               uint32_t(pk.kind), pk.count, pk.first, pk.s0_size, pk.s10_size};
     std::memcpy(recent.stream_addr, pk.stream_addr, sizeof(recent.stream_addr));
@@ -262,7 +262,7 @@ void GpuBackend::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint3
     }
     recent_draw_count_.store(at + 1, std::memory_order_release);
   }
-  if (sync_draws_) {
+  if (backend.draw.sync_draws_) {
     SyncAfterDraw(pk);
   } else if (sync_every_ > 1 && ++sync_every_counter_ >= sync_every_) {
     sync_every_counter_ = 0;
@@ -275,7 +275,7 @@ void GpuBackend::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint3
 // signal. Names the draws of the last frames, new vertex/pixel pairs first -
 // the Mali takes the device down on a draw's data or program, and the draw is
 // recorded a frame or two before the submit that reports it.
-void GpuBackend::ReportDeviceLost() {
+void Recorder::ReportDeviceLost() {
   unsigned long long avail_kb = 0;
   if (FILE* meminfo = std::fopen("/proc/meminfo", "r")) {
     char line[128];
@@ -284,21 +284,21 @@ void GpuBackend::ReportDeviceLost() {
     }
     std::fclose(meminfo);
   }
-  const uint64_t now = swaps_;
+  const uint64_t now = backend.swaps_;
   REXLOG_ERROR("Renut: Plume device lost at swap {}; {} MB of RAM available; {} draws recorded", now,
                avail_kb >> 10, recent_draw_count_.load());
   REXLOG_ERROR("Renut: Plume 2D descriptor writes {} (skipped {} as unchanged)", descriptor_writes_,
                descriptor_writes_skipped_);
-  if (validate_windows_) {
-    REXLOG_ERROR("Renut: Plume validation: {} ranges compared, {} stale", validate_ranges_, validate_stale_);
+  if (backend.draw.validate_windows_) {
+    REXLOG_ERROR("Renut: Plume validation: {} ranges compared, {} stale", backend.resolve.validate_ranges_, backend.resolve.validate_stale_);
   }
-  if (skin_log_) LogSkinned();
+  if (backend.swap.skin_log_) backend.resolve.LogSkinned();
   const uint64_t total = recent_draw_count_.load(std::memory_order_acquire);
   const uint64_t begin = total > kRecentDraws ? total - kRecentDraws : 0;
   // Every draw of the last two frames with the memory it reads, for matching
   // against the fault address the kernel logs (dmesg, via adb bugreport).
-  if (!miss_dump_directory_.empty()) {
-    const std::string path = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/')) + "/plume-lost.txt";
+  if (!backend.miss_dump_directory_.empty()) {
+    const std::string path = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/')) + "/plume-lost.txt";
     if (FILE* out = std::fopen(path.c_str(), "w")) {
       std::fprintf(out, "device lost at swap %llu\n", (unsigned long long)now);
       for (uint64_t i = begin; i < total; ++i) {
@@ -359,26 +359,26 @@ void GpuBackend::ReportDeviceLost() {
   }
 }
 
-void GpuBackend::SyncEvery() {
+void Recorder::SyncEvery() {
   if (!list_open_) return;
   L()->end();
   list_open_ = false;
-  const RenderCommandList* lists = list_;
-  queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
-  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  const RenderCommandList* lists = backend.targets.list_;
+  backend.queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
+  VkDevice vk_device = static_cast<VulkanDevice*>(backend.device_)->vk;
   VkFence vk_fence = static_cast<VulkanCommandFence*>(fence_.get())->vk;
   const VkResult result = vkWaitForFences(vk_device, 1, &vk_fence, VK_TRUE, 3000000000ull);
   if (result == VK_SUCCESS) vkResetFences(vk_device, 1, &vk_fence);
-  StartList();
+  backend.targets.StartList();
 }
 
-void GpuBackend::SyncAfterDraw(const DrawPacket& pk) {
+void Recorder::SyncAfterDraw(const DrawPacket& pk) {
   if (!list_open_) return;
   L()->end();
   list_open_ = false;
-  const RenderCommandList* lists = list_;
-  queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
-  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  const RenderCommandList* lists = backend.targets.list_;
+  backend.queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, fence_.get());
+  VkDevice vk_device = static_cast<VulkanDevice*>(backend.device_)->vk;
   VkFence vk_fence = static_cast<VulkanCommandFence*>(fence_.get())->vk;
   const auto wait_start = std::chrono::steady_clock::now();
   const VkResult result = vkWaitForFences(vk_device, 1, &vk_fence, VK_TRUE, 3000000000ull);
@@ -405,47 +405,47 @@ void GpuBackend::SyncAfterDraw(const DrawPacket& pk) {
     REXLOG_ERROR(
         "Renut: Plume GPU failed ({}) after {} ms on synced draw #{} in frame {}: vs={:016X} ps={:016X} kind={} "
         "count={} first={} base={} pipeline={}",
-        int(result), wait_ms, sync_draw_count_, swaps_, pk.vs_hash, pk.ps_hash, int(pk.kind), pk.count, pk.first,
+        int(result), wait_ms, sync_draw_count_, backend.swaps_, pk.vs_hash, pk.ps_hash, int(pk.kind), pk.count, pk.first,
         pk.base_vertex, static_cast<const void*>(pk.pipeline));
     REXLOG_ERROR("Renut: Plume   {} streams of synced draws had a stale kept window before this one", sync_stale_streams_);
     const auto first_ok = sync_first_ok_.find(pk.vs_hash * 1099511628211ull ^ pk.ps_hash);
     if (first_ok != sync_first_ok_.end()) REXLOG_ERROR("Renut: Plume   first OK draw of this pair {}", first_ok->second);
-    sync_draws_ = false;
+    backend.draw.sync_draws_ = false;
   } else {
     vkResetFences(vk_device, 1, &vk_fence);
     if (sync_draw_info_.find("STALE") != std::string::npos && sync_stale_logged_ < 200) {
       ++sync_stale_logged_;
-      REXLOG_INFO("Renut: Plume stale window under draw #{} frame {}: {}", sync_draw_count_, swaps_, sync_draw_info_);
+      REXLOG_INFO("Renut: Plume stale window under draw #{} frame {}: {}", sync_draw_count_, backend.swaps_, sync_draw_info_);
     }
     if (sync_watch_ && (pk.vs_hash == sync_watch_ || pk.ps_hash == sync_watch_) && sync_watch_count_ < 600) {
       ++sync_watch_count_;
-      REXLOG_INFO("Renut: Plume watched draw #{} frame {} pipeline={} fb={} ok: {}", sync_draw_count_, swaps_,
+      REXLOG_INFO("Renut: Plume watched draw #{} frame {} pipeline={} fb={} ok: {}", sync_draw_count_, backend.swaps_,
                   static_cast<const void*>(pk.pipeline), static_cast<const void*>(pk.framebuffer), sync_draw_info_);
     }
     // Each pair is named once, the first time it ran to completion.
     if (sync_seen_.insert(pk.vs_hash * 1099511628211ull ^ pk.ps_hash).second) {
       sync_first_ok_[pk.vs_hash * 1099511628211ull ^ pk.ps_hash] =
-          fmt::format("frame {} pipeline={} fb={}: {}", swaps_, static_cast<const void*>(pk.pipeline),
+          fmt::format("frame {} pipeline={} fb={}: {}", backend.swaps_, static_cast<const void*>(pk.pipeline),
                       static_cast<const void*>(pk.framebuffer), sync_draw_info_);
       REXLOG_INFO("Renut: Plume synced draw #{} ok, new pair (frame {}): vs={:016X} ps={:016X} count={}",
-                  sync_draw_count_, swaps_, pk.vs_hash, pk.ps_hash, pk.count);
+                  sync_draw_count_, backend.swaps_, pk.vs_hash, pk.ps_hash, pk.count);
     }
   }
-  StartList();
+  backend.targets.StartList();
 }
 
 // Records the draws that are waiting, grouped by pipeline. The groups keep the
 // order in which each pipeline first appeared and the draws keep their order
 // inside a group, so a window whose draws share one pipeline is untouched.
-void GpuBackend::FlushDeferred(uint32_t reason) {
+void Recorder::FlushDeferred(uint32_t reason) {
   if (deferred_.empty()) return;
-  ++stats_.flush_windows[reason & 7];
-  stats_.flush_draws[reason & 7] += deferred_.size();
+  ++backend.stats_.flush_windows[reason & 7];
+  backend.stats_.flush_draws[reason & 7] += deferred_.size();
   // Taken out first: recording goes through L(), which must find nothing waiting.
   flushing_.swap(deferred_);
-  flushing_slots_.swap(deferred_slots_);
+  backend.draw.flushing_slots_.swap(backend.draw.deferred_slots_);
   deferred_.clear();
-  deferred_slots_.clear();
+  backend.draw.deferred_slots_.clear();
   const size_t n = flushing_.size();
   defer_order_.resize(n);
   defer_groups_.clear();
@@ -472,19 +472,19 @@ void GpuBackend::FlushDeferred(uint32_t reason) {
   for (size_t i = 0; i < n; ++i) {
     if (i == 0 || flushing_[defer_order_[i]].pipeline != flushing_[defer_order_[i - 1]].pipeline) ++after;
   }
-  ++stats_.defer_windows;
-  stats_.defer_binds_before += before;
-  stats_.defer_binds_after += after;
-  if (!HizFlushWindow(n)) {
+  ++backend.stats_.defer_windows;
+  backend.stats_.defer_binds_before += before;
+  backend.stats_.defer_binds_after += after;
+  if (!backend.hiz.HizFlushWindow(n)) {
     const bool async = RecActive();
     for (size_t i = 0; i < n; ++i) {
       const DrawPacket& pk = flushing_[defer_order_[i]];
-      if (async) RecQueue(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
-      else EmitDraw(pk, flushing_slots_.data() + pk.first_slot, pk.slot_count);
+      if (async) RecQueue(pk, backend.draw.flushing_slots_.data() + pk.first_slot, pk.slot_count);
+      else EmitDraw(pk, backend.draw.flushing_slots_.data() + pk.first_slot, pk.slot_count);
     }
   }
   flushing_.clear();
-  flushing_slots_.clear();
+  backend.draw.flushing_slots_.clear();
 }
 
 
