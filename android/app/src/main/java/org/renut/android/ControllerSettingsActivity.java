@@ -38,14 +38,14 @@ public final class ControllerSettingsActivity extends androidx.activity.Componen
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         Transitions.slideOpen(this);
-        getWindow().setStatusBarColor(Color.rgb(12, 23, 28));
-        getWindow().setNavigationBarColor(Color.rgb(12, 23, 28));
+        getWindow().setStatusBarColor(Color.rgb(16,10,6));
+        getWindow().setNavigationBarColor(Color.rgb(16,10,6));
         ScrollView scroll = new ScrollView(this);
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         int pad = dp(20);
         body.setPadding(pad, pad, pad, pad);
-        body.setBackgroundColor(Color.rgb(12, 23, 28));
+        body.setBackgroundColor(Color.rgb(16,10,6));
         scroll.addView(body);
         setContentView(scroll);
 

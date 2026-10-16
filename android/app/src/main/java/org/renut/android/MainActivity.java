@@ -43,12 +43,12 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             return;
         }
         BundledDriver.sync(this,getPreferences(0));  // unpacks the Turnip that ships in the APK and makes it the default on Adreno
-        getWindow().setStatusBarColor(Color.rgb(12,23,28));
-        getWindow().setNavigationBarColor(Color.rgb(12,23,28));
-        LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(Color.rgb(12,23,28));setContentView(root);
+        getWindow().setStatusBarColor(Color.rgb(16,10,6));
+        getWindow().setNavigationBarColor(Color.rgb(16,10,6));
+        LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(Color.rgb(16,10,6));setContentView(root);
         FrameLayout pages=new FrameLayout(this);root.addView(pages,new LinearLayout.LayoutParams(-1,0,1));
         ScrollView savesPage=new ScrollView(this);pages.addView(savesPage);
-        LinearLayout savesBody=new LinearLayout(this);savesBody.setOrientation(LinearLayout.VERTICAL);savesBody.setPadding(dp(24),dp(28),dp(24),dp(28));savesBody.setBackgroundColor(Color.rgb(12,23,28));savesPage.addView(savesBody);
+        LinearLayout savesBody=new LinearLayout(this);savesBody.setOrientation(LinearLayout.VERTICAL);savesBody.setPadding(dp(24),dp(28),dp(24),dp(28));savesBody.setBackgroundColor(Color.rgb(16,10,6));savesPage.addView(savesBody);
         savesBody.addView(text("RENUT  /  SAVES",13,Color.rgb(103,223,174)));
         TextView savesTitle=text("Seus saves",34,ink);savesTitle.setTypeface(null,Typeface.BOLD);savesBody.addView(savesTitle);
         LinearLayout saveCard=card(savesBody,"ARQUIVOS DO JOGO");
@@ -64,7 +64,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         });
         ScrollView scroll=new ScrollView(this);pages.addView(scroll);scroll.setVisibility(View.GONE);
         LinearLayout body=new LinearLayout(this); body.setOrientation(LinearLayout.VERTICAL); body.setPadding(dp(24),dp(28),dp(24),dp(28));
-        body.setBackgroundColor(Color.rgb(12,23,28)); scroll.addView(body);
+        body.setBackgroundColor(Color.rgb(16,10,6)); scroll.addView(body);
         body.setOnApplyWindowInsetsListener((v,insets)->{
             v.setPadding(dp(24),dp(28)+insets.getSystemWindowInsetTop(),dp(24),dp(28)+insets.getSystemWindowInsetBottom()); return insets;
         });
@@ -181,7 +181,7 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     private TextView text(String value,int size,int color){TextView t=new TextView(this);t.setText(value);t.setTextSize(size);t.setTextColor(color);t.setPadding(0,dp(7),0,dp(9));return t;}
     private LinearLayout card(LinearLayout parent,String label){
         LinearLayout box=new LinearLayout(this);box.setOrientation(LinearLayout.VERTICAL);box.setPadding(dp(18),dp(14),dp(18),dp(14));
-        GradientDrawable bg=new GradientDrawable();bg.setColor(Color.rgb(22,39,46));bg.setCornerRadius(dp(18));box.setBackground(bg);
+        GradientDrawable bg=new GradientDrawable();bg.setColor(Color.rgb(30,20,12));bg.setCornerRadius(dp(18));box.setBackground(bg);
         LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);lp.topMargin=dp(18);parent.addView(box,lp);
         box.addView(text(label,12,Color.rgb(103,223,174)));return box;
     }

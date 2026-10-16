@@ -28,7 +28,7 @@ final class TextPrompt extends FrameLayout {
         void onAnswer(String text, boolean cancelled);
     }
 
-    private static final int ACCENT = Color.rgb(255, 155, 69), SURFACE = Color.rgb(28, 30, 33);
+    private static final int ACCENT = Color.rgb(255, 155, 69), SURFACE = Color.rgb(30, 20, 12);
     private static final int TEXT = Color.rgb(244, 240, 235), MUTED = Color.rgb(168, 162, 156);
 
     private final Listener listener;
@@ -179,7 +179,7 @@ final class TextPrompt extends FrameLayout {
         shape.setCornerRadius(dp(12));
         if (filled) {
             shape.setColor(ACCENT);
-            button.setTextColor(Color.rgb(16, 17, 19));
+            button.setTextColor(Color.rgb(16, 10, 6));
         } else {
             shape.setColor(Color.TRANSPARENT);
             shape.setStroke(dp(1), MUTED);

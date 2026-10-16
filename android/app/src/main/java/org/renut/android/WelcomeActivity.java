@@ -30,8 +30,8 @@ public final class WelcomeActivity extends androidx.activity.ComponentActivity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        getWindow().setStatusBarColor(Color.rgb(16, 17, 19));
-        getWindow().setNavigationBarColor(Color.rgb(16, 17, 19));
+        getWindow().setStatusBarColor(Color.rgb(16, 10, 6));
+        getWindow().setNavigationBarColor(Color.rgb(16, 10, 6));
         importOnly = getIntent().getBooleanExtra(EXTRA_IMPORT_ONLY, false);
         // First run comes up over the launcher's redirect (fade); a re-import slides in from Configurações.
         if (importOnly) Transitions.slideOpen(this); else Transitions.fadeOpen(this);

@@ -111,8 +111,8 @@ private fun pageTransition(forward: Boolean): ContentTransform {
         (slideOutHorizontally(tween(300)) { -travel(it) } + fadeOut(tween(160)))
 }
 
-private val Background = Color(0xFF101113)
-private val Surface = Color(0xFF1C1E21)
+private val Background = Color(0xFF100A06)
+private val Surface = Color(0xFF1E140C)
 private val Accent = Color(0xFFFF9B45)
 private val Text = Color(0xFFF4F0EB)
 private val Muted = Color(0xFFA8A29C)
@@ -211,7 +211,7 @@ class GameMenu internal constructor(private val activity: RuntimeActivity) {
             surface = Surface, onSurface = Text, onBackground = Text,
             secondary = Accent, secondaryContainer = Color(0xFF4B301F),
             onSecondaryContainer = Accent, surfaceVariant = Surface,
-            onSurfaceVariant = Muted, outline = Color(0xFF3A3B3D)
+            onSurfaceVariant = Muted, outline = Color(0xFF3E2C1F)
         ), content = content
     )
 }
@@ -445,7 +445,7 @@ private val NAV_ENTRIES = listOf(
                             LinearProgressIndicator(
                                 progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
                                 modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-                                color = Accent, trackColor = Color(0xFF3A3B3D))
+                                color = Accent, trackColor = Color(0xFF3E2C1F))
                         }
                         Text("${data.earnedGamerscore} G", color = Accent, fontWeight = FontWeight.Bold)
                     }
@@ -518,7 +518,7 @@ private val NAV_ENTRIES = listOf(
             }
             Box(
                 Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(14.dp))
-                    .background(Color(0xFF34363A)).clickable { viewing = index }
+                    .background(Color(0xFF38271A)).clickable { viewing = index }
             ) {
                 thumb?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
             }
@@ -642,7 +642,7 @@ private val SKIN_LABELS = listOf(
                     LinearProgressIndicator(
                         progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
                         modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
-                        color = Accent, trackColor = Color(0xFF3A3B3D))
+                        color = Accent, trackColor = Color(0xFF3E2C1F))
                     Text(stringResource(R.string.ach_gamerscore, data.earnedGamerscore, data.gamerscore), color = Muted, fontSize = 13.sp)
                 }
             }
@@ -663,11 +663,11 @@ private val SKIN_LABELS = listOf(
     val icon = remember(item.icon) { item.icon?.let { runCatching { BitmapFactory.decodeFile(it.path)?.asImageBitmap() }.getOrNull() } }
     val gray = remember { ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(0f) }) }
     val pad = if (compact) 10.dp else 14.dp
-    Card(colors = CardDefaults.cardColors(containerColor = if (compact) Color(0xFF26282B) else Surface),
+    Card(colors = CardDefaults.cardColors(containerColor = if (compact) Color(0xFF2A1C11) else Surface),
         shape = RoundedCornerShape(if (compact) 12.dp else 16.dp), modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.padding(pad), horizontalArrangement = Arrangement.spacedBy(pad), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(if (compact) 42.dp else 56.dp).clip(RoundedCornerShape(if (compact) 9.dp else 12.dp))
-                .background(Color(0xFF34363A)).alpha(if (unlocked) 1f else 0.45f)) {
+                .background(Color(0xFF38271A)).alpha(if (unlocked) 1f else 0.45f)) {
                 if (icon != null) Image(icon, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, colorFilter = if (unlocked) null else gray)
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -911,8 +911,8 @@ private val SKIN_LABELS = listOf(
     Row(
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
-            .background(Color(0xFF111214))
-            .border(1.dp, Color(0xFF3A3D42), RoundedCornerShape(10.dp))
+            .background(Color(0xFF120B06))
+            .border(1.dp, Color(0xFF40301F), RoundedCornerShape(10.dp))
             .alpha(if (enabled) 1f else 0.5f)
             .clickable(enabled = enabled, onClick = onClick)
             .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
@@ -989,7 +989,7 @@ private val SidebarWidth = 360.dp
             // Flush with the left edge and as tall as the screen; the camera cutout only
             // pushes the content in, the panel itself still reaches the edge.
             Sidebar(activity, menu, Modifier.fillMaxHeight().width(SidebarWidth + cutoutStart())
-                .background(Color(0xF21C1E21))
+                .background(Color(0xF21E140C))
                 // The sidebar swallows taps on its empty areas so they do not reach the scrim.
                 .clickable(interactionSource = noRipple, indication = null) { }
                 .windowInsetsPadding(WindowInsets.displayCutout))
@@ -1013,7 +1013,7 @@ private val SidebarWidth = 360.dp
 
 @Composable private fun PausedChip(menu: GameMenu, modifier: Modifier) {
     Row(
-        modifier.clip(RoundedCornerShape(bottomStart = 18.dp, bottomEnd = 18.dp)).background(Color(0xE61C1E21))
+        modifier.clip(RoundedCornerShape(bottomStart = 18.dp, bottomEnd = 18.dp)).background(Color(0xE61E140C))
             .padding(horizontal = 14.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1139,7 +1139,7 @@ private val SidebarWidth = 360.dp
                 LinearProgressIndicator(
                     progress = { if (data.count() == 0) 0f else data.unlocked.size / data.count().toFloat() },
                     modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-                    color = Accent, trackColor = Color(0xFF3A3B3D))
+                    color = Accent, trackColor = Color(0xFF3E2C1F))
             }
         }
         if (data.unlocked.isNotEmpty()) {
@@ -1214,7 +1214,7 @@ private val SidebarWidth = 360.dp
 
 @Composable private fun PadRow(pad: ExternalController.Pad, onRole: (Int) -> Unit) {
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF26282B)).padding(12.dp),
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF2A1C11)).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1240,7 +1240,7 @@ private val SidebarWidth = 360.dp
 ) {
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
-            .background(if (highlighted) Color(0xFF4B301F) else Color(0xFF26282B))
+            .background(if (highlighted) Color(0xFF4B301F) else Color(0xFF2A1C11))
             .clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1258,7 +1258,7 @@ private val SidebarWidth = 360.dp
     var position by remember { mutableFloatStateOf(RuntimeOptions.sliderFromFps(activity.uiFpsTarget()).toFloat()) }
     val fps = RuntimeOptions.fpsFromSlider(Math.round(position))
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF26282B))
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF2A1C11))
             .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 2.dp)
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1278,7 +1278,7 @@ private val SidebarWidth = 360.dp
 
 @Composable private fun SidebarToggle(icon: ImageVector, title: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF26282B))
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF2A1C11))
             .clickable { onCheckedChange(!checked) }.padding(start = 12.dp, end = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1426,11 +1426,11 @@ private val SidebarWidth = 360.dp
         Text(model.message, color = Text, fontSize = 15.sp)
         if (model.fraction < 0f) LinearProgressIndicator(
             modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
-            color = Accent, trackColor = Color(0xFF3A3B3D))
+            color = Accent, trackColor = Color(0xFF3E2C1F))
         else LinearProgressIndicator(
             progress = { model.fraction.coerceIn(0f, 1f) },
             modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
-            color = Accent, trackColor = Color(0xFF3A3B3D))
+            color = Accent, trackColor = Color(0xFF3E2C1F))
         if (model.fraction >= 0f) Text("${(model.fraction.coerceIn(0f, 1f) * 100).toInt()}%", color = Accent, fontWeight = FontWeight.Bold)
         Text(stringResource(R.string.install_dont_close), color = Muted, fontSize = 13.sp)
     }
@@ -1691,7 +1691,7 @@ private fun moveElement(model: LayoutEditorModel, id: String, by: androidx.compo
     val sampleTemp = remember { runCatching { ThermalReader(context).read() }.getOrDefault("").ifEmpty { "BAT 36°" } }
 
     Box(
-        Modifier.fillMaxSize().background(Color(0xFF0B0C0E)).onSizeChanged { size = it }
+        Modifier.fillMaxSize().background(Color(0xFF0C0704)).onSizeChanged { size = it }
             .pointerInput(Unit) { detectTapGestures { p -> model.picked = pickElement(model, p, size) } }
             .pointerInput(Unit) {
                 detectDragGestures(
@@ -1713,7 +1713,7 @@ private fun moveElement(model: LayoutEditorModel, id: String, by: androidx.compo
             val h = this.size.height.toInt()
             val canvas = drawContext.canvas.nativeCanvas
             val unit = minOf(w, h) / 10f
-            drawRect(Color(0xFF121418))
+            drawRect(Color(0xFF150D07))
             for (id in HudLayout.IDS) {
                 val shape = HudLayout.shape(model.profile, id, w, h)
                 val shown = HudLayout.visible(model.profile, id)
@@ -1758,7 +1758,7 @@ private fun moveElement(model: LayoutEditorModel, id: String, by: androidx.compo
                 .widthIn(max = 292.dp).heightIn(max = maxPanelHeight)
                 // A touch on the panel is the panel's, not a pick of the element under it.
                 .pointerInput(Unit) { detectTapGestures { } },
-            colors = CardDefaults.cardColors(containerColor = Color(0xE61C1E21)), shape = RoundedCornerShape(16.dp)
+            colors = CardDefaults.cardColors(containerColor = Color(0xE61E140C)), shape = RoundedCornerShape(16.dp)
         ) {
             Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 // The title: drag here to move the panel.

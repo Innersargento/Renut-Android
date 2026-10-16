@@ -37,7 +37,7 @@ final class AchievementToast extends LinearLayout {
         setGravity(Gravity.CENTER_VERTICAL);
         setPadding(dp(10), dp(10), dp(18), dp(10));
         GradientDrawable background = new GradientDrawable();
-        background.setColor(Color.rgb(28, 30, 33));
+        background.setColor(Color.rgb(30, 20, 12));
         background.setCornerRadius(dp(18));
         background.setStroke(dp(2), Color.rgb(255, 155, 69));
         setBackground(background);
@@ -100,7 +100,7 @@ final class AchievementToast extends LinearLayout {
         showing = true;
         Bitmap bitmap = item.icon == null ? null : BitmapFactory.decodeFile(item.icon.getPath());
         if (bitmap != null) icon.setImageBitmap(bitmap); else icon.setImageDrawable(null);
-        icon.setBackgroundColor(Color.rgb(52, 54, 58));
+        icon.setBackgroundColor(Color.rgb(56, 39, 26));
         title.setText(item.label);
         detail.setText(item.gamerscore > 0 ? item.gamerscore + " G · " + item.description : item.description);
         int widest = Math.min(dp(380), getResources().getDisplayMetrics().widthPixels - dp(32));
