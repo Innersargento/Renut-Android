@@ -37,7 +37,22 @@ src/
 | `d3d_hooks.inc` | Um `REX_HOOK_RAW` por função, agrupado em *Taken* (o front end nativo assume), *Observed* (o original roda, o reNut lê ou ajusta) e *Forwarded* (só contada) |
 | `d3d_layer.{h,cpp}` | `Enter`/`Leave` comuns: conta, encaminha ao original ou entrega a um handler |
 | `plume_d3d.cpp` | Handlers do modo Plume |
-| `native_d3d.{h,cpp}` | Front end D3D nativo: listas e sincronização sem PM4/EDRAM |
+| `native_d3d.h` | API do front end D3D nativo (listas e sincronização sem PM4/EDRAM); a implementação está em `native/` |
+
+### d3d/native/
+
+O front end nativo, dividido por assunto (tudo em `renut::native_d3d`; `internal.h` guarda os tipos e o estado compartilhado).
+
+| Arquivo | O que faz |
+|---|---|
+| `internal.h` | Tipos, contadores, listas, memória de rascunho e declarações |
+| `lists.cpp` | Listas de gravação, publicação |
+| `flush.cpp` | O flush de estado (`SetPending_*` refeito a partir do device) |
+| `draws.cpp` | Draws, clears e resolves |
+| `commands.cpp` | Command buffers, predicação, clip de superfície, Swap |
+| `sync.cpp` | O que a GPU escreve de volta para a CPU: fences, callbacks, espera do swap |
+| `entry.cpp` | Pontos de entrada públicos (`OnEnter`/`OnLeave`...) |
+| `report.cpp` | O relatório em `files/native-d3d.txt` |
 
 ## plume/
 
@@ -51,11 +66,11 @@ src/
 
 ### plume/gpu/
 
-O processador de comandos do Plume, dividido por assunto. Tudo em `renut::gpu`; `internal.h` declara os tipos e a classe `PlumeCommandProcessor`, e nada fora de `gpu/` o inclui.
+O processador de comandos do Plume, dividido por assunto. Tudo em `renut::gpu`; `internal.h` inclui, em cadeia, `base.h` (includes e auxiliares), `shader_store.h`, `recipes.h`, `formats.h`, `resources.h` e `processor.h` (a classe `PlumeCommandProcessor`). Nada fora de `gpu/` os inclui.
 
 | Arquivo | O que faz |
 |---|---|
-| `internal.h` | Tipos, auxiliares e a classe `PlumeCommandProcessor` |
+| `internal.h` | Índice: inclui os cabeçalhos acima |
 | `options.cpp` | Os cvars `renut_plume_*` |
 | `support.cpp` | Funções livres: formatos, blend, entradas de shader, receitas, mapa de microcódigo |
 | `pipeline_cache.cpp` | Threads de pipelines, arquivo de receitas, predição de pipelines |

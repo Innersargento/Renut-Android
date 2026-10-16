@@ -91,7 +91,7 @@ jogo ao descarregar uma cena, e não para o FPS liberado.
 | Carregador Vulkan | `vulkan-1.dll` | `platform/windows/platform_windows.cpp` |
 | Memória do guest | a vista `0xE0000000` fica 0x1000 acima; `GuestPtr()` aplica o deslocamento nas leituras diretas | `src/guest/guest_address.h` |
 | Página zero | `protect_zero=false` (o jogo lê campos de ponteiros nulos) | `platform/windows/main_windows.cpp` |
-| Ponteiros inválidos no device | `GuestCommitted()` antes de desreferenciar streams/superfícies/índices | `d3d/native_d3d.cpp` |
+| Ponteiros inválidos no device | `GuestCommitted()` antes de desreferenciar streams/superfícies/índices | `d3d/native/flush.cpp` |
 | Canário de pilha | valor constante; o do libssp mudava sob uma thread que o SDK inicia em construtor estático ("stack smashing detected") | `platform/windows/platform_windows.cpp` |
 
 ## Armadilhas já resolvidas

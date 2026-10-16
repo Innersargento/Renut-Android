@@ -67,7 +67,7 @@ void ForceSceneSinglePass(uint8_t* base) {
 // immediate mode; preserve the original routine's device bookkeeping. Anything
 // but the game's own 30 FPS asks for the immediate one here, as before the
 // frame-rate slider; a target that changes later is also applied per frame at the
-// swap's synchronization point (native_d3d.cpp SynchronizeToPresentationInterval).
+// swap's synchronization point (d3d/native/sync.cpp SynchronizeToPresentationInterval).
 // What the game ends up with is noted, so that the command thread paces the frames
 // itself whenever the vblank does not (frame_pacing.h VblankPaces).
 extern "C" void __imp__rex_setParamInterval(PPCContext& __restrict, uint8_t*);
@@ -331,7 +331,7 @@ REX_HOOK_RAW(sub_8265AB70) {
 // shader runs as its binding 0 holds it - the microcode Plume sees.
 namespace {
 
-// Direct3D's view of physical memory (native_d3d.cpp's Phys).
+// Direct3D's view of physical memory (d3d/native/internal.h's Phys).
 uint32_t Physical(uint32_t address) { return (address & 0x1FFFFFFF) + (((address >> 20) + 0x200) & 0x1000); }
 
 }  // namespace
@@ -400,7 +400,7 @@ REX_HOOK_RAW(sub_82B673D0) {
   std::vector<renut::PlumeShaderPair> predicted;
   for (const auto& [vs, ps, alpha] : pairs) {
     renut::PlumeShaderPair pair;
-    // Vertex shader binding 0, and the pixel shader's microcode (native_d3d.cpp).
+    // Vertex shader binding 0, and the pixel shader's microcode (d3d/native/flush.cpp).
     const uint32_t vs_info = GuestWord(base, vs + 112 * 8) + vs;
     pair.vs_address = Physical(GuestWord(base, vs_info + 872) + GuestWord(base, vs + 32));
     pair.vs_dwords = GuestWord(base, vs_info + 876) >> 2;

@@ -66,7 +66,7 @@ O botão de validação somente CPU continua usando o modo de análise do SDK. O
 
 ## Ponte RexGlue → Plume (0.3)
 
-`src/platform/android/plume_graphics.cpp` implementa `IGraphicsSystem`. A apresentação do quadro acontece na troca de `VdSwap` (`src/guest/kernel_overrides.cpp`), sem alterar o SDK.
+O renderizador (`src/plume/`) apresenta o quadro; isso acontece na troca de `VdSwap` (`src/guest/kernel_overrides.cpp`), sem alterar o SDK.
 
 O teste percorre memória física do runtime → ABI real de `VdSwap` → backend Plume → Vulkan → superfície Android. A apresentação aceita RGBA8 linear ou tiled 2D, conversões de endian e swizzle, com validação de formato, dimensões, pitch, limites e acesso à memória. O ajuste de proporção e a conversão de pixels são feitos na CPU, com barras pretas. Trata-se de uma ponte inicial de framebuffer, não de uma implementação de processamento gráfico Xenos.
 

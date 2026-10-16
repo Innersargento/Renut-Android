@@ -17,7 +17,6 @@
 #include <android/native_window_jni.h>
 #include <rex/graphics/xenos.h>
 #include "d3d/native_d3d.h"
-#include "plume_graphics.h"
 #include "android_game_window.h"
 #include "touch_input.h"
 #include "d3d/d3d_layer.h"
@@ -218,60 +217,6 @@ static std::string javaString(JNIEnv* env,jstring value){
   std::string result(chars);env->ReleaseStringUTFChars(value,chars);return result;
 }
 
-static void validateSwap(rex::Runtime& runtime,renut::PlumeGraphics& graphics) {
-  namespace xenos=rex::graphics::xenos;
-  auto* memory=runtime.memory();
-  const uint32_t width=320,height=180,pitch=320;
-  REXSYS_INFO("Plume test: allocating guest framebuffer");
-  uint32_t pixels=memory->SystemHeapAlloc(pitch*height*4,4096,rex::memory::kSystemHeapPhysical);
-  uint32_t parameters=memory->SystemHeapAlloc(1024,32);
-  if(!pixels||!parameters)throw std::runtime_error("Memória do teste gráfico indisponível.");
-  struct Free {rex::memory::Memory* memory;uint32_t a,b;~Free(){memory->SystemHeapFree(a);memory->SystemHeapFree(b);}} free{memory,pixels,parameters};
-  rex::runtime::ThreadState thread(UINT32_MAX,parameters+512,0,memory);
-  rex::runtime::ThreadState::Bind(&thread);
-  auto& ctx=*thread.context();
-  auto store=[&](uint32_t address,uint32_t value){rex::memory::store_and_swap<uint32_t>(memory->TranslateVirtual(address),value);};
-  xenos::xe_gpu_texture_fetch_t fetch{};
-  fetch.type=xenos::FetchConstantType::kTexture;
-  fetch.format=xenos::TextureFormat::k_8_8_8_8;fetch.pitch=pitch>>5;
-  fetch.base_address=pixels>>12;fetch.dimension=xenos::DataDimension::k2DOrStacked;
-  fetch.size_2d.width=width-1;fetch.size_2d.height=height-1;
-  fetch.swizzle=0|(1<<3)|(2<<6)|(3<<9);
-  // Invalid guest descriptors must fail before a GPU submission or unsafe read.
-  auto invalid=fetch;invalid.base_address=memory->GetPhysicalAddress(pixels)>>12;
-  auto rejected=[&](const xenos::xe_gpu_texture_fetch_t& value,const char* expected){
-    try {graphics.PresentFrontBuffer(&value.dword_0,width,height);}
-    catch(const std::runtime_error& e){if(std::string(e.what()).find(expected)!=std::string::npos)return;throw;}
-    throw std::runtime_error("Descriptor inválido foi aceito pelo renderer.");
-  };
-  auto badFormat=invalid;badFormat.format=static_cast<xenos::TextureFormat>(63);
-  rejected(badFormat,"formato");
-  auto badPitch=invalid;badPitch.pitch=0;rejected(badPitch,"Pitch");
-  auto badAddress=invalid;badAddress.base_address=0x1FFFF;rejected(badAddress,"memória física");
-  REXSYS_INFO("Plume test: invalid format, pitch and address rejected");
-  for(unsigned i=0;i<6;++i)store(parameters+256+i*4,(&fetch.dword_0)[i]);
-  store(parameters+288,pixels);store(parameters+292,uint32_t(fetch.format));store(parameters+296,0);
-  store(parameters+300,width);store(parameters+304,height);
-  auto* bytes=memory->TranslateVirtual(pixels);
-  REXSYS_INFO("Plume test: framebuffer {:08X}, parameters {:08X}",pixels,parameters);
-  for(unsigned frame=0;frame<180&&!render_stopped;++frame){
-    for(uint32_t y=0;y<height;++y)for(uint32_t x=0;x<width;++x){
-      auto offset=(y*pitch+x)*4;
-      bytes[offset]=uint8_t(x*255/width);bytes[offset+1]=uint8_t(y*255/height);
-      bytes[offset+2]=((x+frame*3)/20+y/20)%2?220:30;bytes[offset+3]=255;
-    }
-    // Exercise the same imported Xbox kernel ABI called by the recompiled game.
-    ctx.r3.u64=parameters;ctx.r4.u64=parameters+256;
-    ctx.r5.u64=ctx.r6.u64=ctx.r7.u64=parameters+320;
-    ctx.r8.u64=parameters+288;ctx.r9.u64=parameters+292;ctx.r10.u64=parameters+296;
-    store(ctx.r1.u32+0x54,parameters+300);store(ctx.r1.u32+0x5C,parameters+304);
-    if(frame==0)REXSYS_INFO("Plume test: calling VdSwap");
-    __imp__VdSwap(ctx,runtime.virtual_membase());
-    std::this_thread::sleep_for(std::chrono::milliseconds(33));
-  }
-  if(render_stopped)throw std::runtime_error("Teste gráfico interrompido.");
-}
-
 static void checkpoint(const std::filesystem::path& root, const std::string& message) {
   __android_log_print(ANDROID_LOG_INFO, "reNutRuntime", "%s", message.c_str());
   std::ofstream(root / "runtime-report.txt", std::ios::app) << message << '\n';
@@ -353,7 +298,6 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     rex::Runtime runtime(game, root / "runtime-user", {}, root / "runtime-cache", root / "runtime-metadata");
     rex::RuntimeConfig config;
     config.tool_mode = surface==nullptr;
-    renut::PlumeGraphics* graphics=nullptr;
     if(launch){
       if(!surface)throw std::runtime_error("Superfície indisponível para o jogo.");
       if(!std::filesystem::is_directory(game / "Bundle"))
@@ -421,13 +365,6 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
         return input;
       };
       note("Inicializando tradutor Xenos → SPIR-V e renderizador Vulkan.");
-    }else if(surface){
-      auto* window=ANativeWindow_fromSurface(env,surface);
-      if(!window)throw std::runtime_error("Superfície Android indisponível.");
-      std::unique_ptr<ANativeWindow,decltype(&ANativeWindow_release)> owned(window,ANativeWindow_release);
-      auto backend=std::make_unique<renut::PlumeGraphics>(window,javaString(env,hooks),javaString(env,driverDirectory),javaString(env,driverLibrary),render_stopped);
-      graphics=backend.get();config.graphics=std::move(backend);
-      note("Conectando VdSwap ao Plume; imagem de teste, não cena do jogo.");
     }
     config.kernel_init = rex::kernel::InitializeKernel;
     note("Inicializando memória, kernel e tabela de funções...");
@@ -475,6 +412,10 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       while(!render_stopped && !game_context->HasQuitFromUIThread()){
         game_context->ExecutePendingFunctionsFromUIThread();game_window->Pump();
         if(std::chrono::steady_clock::now()-started>std::chrono::seconds(1) && !thread->is_running())break;
+        if(renut::PlumeDeviceLost()){
+          note("A GPU foi perdida (VK_ERROR_DEVICE_LOST); encerrando a sessão. Detalhes em rexglue-runtime.log e plume-lost.txt.");
+          break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
       }
       note("Encerrando a sessão do jogo.");
@@ -487,7 +428,6 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       game_window->SetPresenter(nullptr);
       game_context->ExecutePendingFunctionsFromUIThread();
     }
-    if(graphics){validateSwap(runtime,*graphics);note(graphics->report());}
     renut::TextInputStop();
     renut::adpf::Stop();
     renut::AchievementsStop(runtime);
@@ -500,7 +440,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     renut::StopPlumeGpu();
     runtime.Shutdown();
     if(auto* plume=renut::PlumeRenderer::Get()){note(plume->report());renut::PlumeRenderer::Stop();}
-    note(launch?"Sessão experimental encerrada; consulte o log para verificar a renderização.":surface?"Ponte VdSwap → Plume validada com framebuffer de teste. As cenas e os shaders do jogo ainda não são renderizados.":
+    note(launch?"Sessão experimental encerrada; consulte o log para verificar a renderização.":
         "Validação concluída. O jogo ainda não foi iniciado; gráficos e áudio não são exercitados neste teste.");
   } catch (const std::exception& e) {
     note(std::string("Falha: ") + e.what());

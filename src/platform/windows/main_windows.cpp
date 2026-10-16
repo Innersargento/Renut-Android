@@ -308,6 +308,12 @@ int main(int argc, char** argv) {
         Note("A thread principal do jogo terminou.");
         break;
       }
+      if (renut::PlumeDeviceLost()) {
+        Note("A GPU foi perdida (VK_ERROR_DEVICE_LOST); encerrando a sessão. Detalhes em rexglue-runtime.log e plume-lost.txt.");
+        MessageBoxW(window, L"A GPU parou de responder (VK_ERROR_DEVICE_LOST).\nO reNut vai fechar; o motivo está em rexglue-runtime.log.",
+                    L"reNut", MB_OK | MB_ICONERROR);
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(8));
     }
     if (g_quit) Note("Janela fechada.");

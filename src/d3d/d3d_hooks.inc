@@ -13,7 +13,7 @@
 //              shadow registers, which the native front end reads at draw time.
 //
 // All three share one body on purpose: the dispositions are documentation of the
-// code in native_d3d.cpp (OnEnter, SingleTile) and d3d_layer.cpp (Leave), not a
+// code in d3d/native/ (OnEnter, SingleTile) and d3d_layer.cpp (Leave), not a
 // second switch. When one of those changes, move the function here. The list of
 // names (enum Function) is d3d_functions.inc; a function must be in both.
 
@@ -23,7 +23,7 @@
 
 REX_EXTERN(__imp__sub_826567C8);
 REX_HOOK_RAW(sub_826567C8) {  // D3DDevice_DrawIndexedVertices
-  // the draw becomes a draw record of the host list (native_d3d.cpp)
+  // the draw becomes a draw record of the host list (d3d/native/)
   Taken(kD3DDevice_DrawIndexedVertices, __imp__sub_826567C8, ctx, base);
 }
 

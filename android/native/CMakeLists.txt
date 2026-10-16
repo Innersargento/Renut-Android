@@ -215,7 +215,8 @@ set_source_files_properties("${RENUT_SRC}/plume/shader_cache_blob.S" PROPERTIES
 set(RENUT_RUNTIME_SOURCES
     # Shared with the Windows build
     guest/game_fixes.cpp guest/cheats.cpp guest/kernel_overrides.cpp guest/host_support.cpp
-    d3d/d3d_layer.cpp d3d/native_d3d.cpp d3d/plume_d3d.cpp
+    d3d/d3d_layer.cpp d3d/plume_d3d.cpp
+    d3d/native/lists.cpp d3d/native/flush.cpp d3d/native/draws.cpp d3d/native/commands.cpp d3d/native/sync.cpp d3d/native/entry.cpp d3d/native/report.cpp
     plume/plume_renderer.cpp plume/hiz_model.cpp
     plume/gpu/context.cpp plume/gpu/draw.cpp plume/gpu/hiz.cpp plume/gpu/host.cpp
     plume/gpu/native_exec.cpp plume/gpu/options.cpp plume/gpu/patches.cpp plume/gpu/pipeline_cache.cpp
@@ -225,7 +226,7 @@ set(RENUT_RUNTIME_SOURCES
     vendor/smolv/smolv.cpp
     # Android only
     platform/android/runtime_jni.cpp platform/android/achievements_bridge.cpp
-    platform/android/text_input_bridge.cpp platform/android/adpf.cpp platform/android/plume_graphics.cpp
+    platform/android/text_input_bridge.cpp platform/android/adpf.cpp platform/android/vulkan_entry.cpp
     platform/android/renut_audio.cpp platform/android/xam_users.cpp platform/android/query_protect.cpp
     platform/android/hardware_concurrency.cpp)
 list(TRANSFORM RENUT_RUNTIME_SOURCES PREPEND "${RENUT_SRC}/")

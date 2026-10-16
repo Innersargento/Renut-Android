@@ -303,7 +303,7 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
 }
 
 // A record of register writes and interrupts, in order (what a callback does without its
-// PM4 words, see native_d3d.cpp): the same effects NativeCallback takes from the packets.
+// PM4 words, see d3d/native/): the same effects NativeCallback takes from the packets.
 void PlumeCommandProcessor::NativeEffects(const uint32_t* pairs, uint32_t count) {
   NativeSwapOut();
   ++native_callbacks_;

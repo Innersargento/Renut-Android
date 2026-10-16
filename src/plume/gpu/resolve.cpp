@@ -68,7 +68,7 @@ void PlumeCommandProcessor::NativeResolve(const uint32_t* w) {
   // register is RB_COLOR_INFO, _DEPTH_INFO or RB_COLOR1..3_INFO.
   static constexpr uint32_t kRegisterOfSlot[5] = {1, 3, 4, 5, 2};
   // Bit 8 of the source word: Photo Mode's capture routine issued this resolve
-  // (native_d3d.cpp), the one copied to the CPU. Not tied to an address: the
+  // (d3d/native/), the one copied to the CPU. Not tied to an address: the
   // scratch texture it resolves into is built on the spot.
   capture_this_resolve_ = (w[23] & 0x100) != 0;
   const uint32_t slot = std::min(w[23] & 0xFFu, 4u);
