@@ -19,7 +19,6 @@
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 #include <rex/ppc/func.h>
-#include <rex/graphics/command_processor.h>
 #include <rex/system/kernel_state.h>
 #include <rex/hook.h>
 

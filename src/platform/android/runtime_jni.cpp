@@ -415,8 +415,8 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       renut::SetPlumeMissDumpDirectory((root / "plume-miss").string());
       renut::SetPlumePipelineCachePath((root / (plume_env.empty() ? std::string("plume-pipelines.bin")
           : "plume-pipelines-" + std::to_string(std::hash<std::string>{}(plume_env)) + ".bin")).string());
-      config.graphics.reset(renut::CreatePlumeGraphicsSystem());
-      if(!config.graphics)throw std::runtime_error("Backend gráfico indisponível.");
+      // No graphics system for the Runtime (the SDK's native-rendering boundary): the app
+      // hosts the Plume GPU itself, right after Setup (renut::StartPlumeGpu below).
       // reNut's own AAudio output (renut_audio.cpp), not the SDK's SDL backend.
       config.audio_factory=[](rex::runtime::FunctionDispatcher* dispatcher){return renut::audio::Create(dispatcher);};
       config.input_factory=[](bool tool_mode){
@@ -440,6 +440,11 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     auto status = runtime.Setup(PPCImageConfig, std::move(config));
     if (status != X_STATUS_SUCCESS) throw std::runtime_error(fmt::format("Setup falhou: {:08X}", status));
     note("Runtime inicializado.");
+    if(launch){
+      if(!renut::StartPlumeGpu(runtime.function_dispatcher(),runtime.kernel_state()))
+        throw std::runtime_error("Backend gráfico indisponível.");
+      note("GPU do Plume hospedada pelo app (o Runtime não tem sistema gráfico).");
+    }
     {
       std::lock_guard<std::mutex> lock(audio_mutex);
       g_audio=static_cast<rex::audio::AudioSystem*>(runtime.audio_system());
@@ -468,8 +473,6 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       throw std::runtime_error("Resultado ARM64 divergente.");
     note("Função original 0x82296D30 executada em ARM64: resultado correto.");
     if(launch){
-      if(auto* presenter=runtime.graphics_system()->presenter())game_window->SetPresenter(presenter);
-      runtime.graphics_system()->InitializeShaderStorage(root / "runtime-cache",runtime.kernel_state()->title_id(),false);
       note("Iniciando o ponto de entrada do Banjo; acompanhe rexglue-runtime.log.");
       auto thread=runtime.LaunchModule();
       if(!thread)throw std::runtime_error("Falha ao iniciar a thread principal do jogo.");
@@ -500,6 +503,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       std::lock_guard<std::mutex> lock(audio_mutex);
       g_audio=nullptr;
     }
+    renut::StopPlumeGpu();
     runtime.Shutdown();
     if(auto* plume=renut::PlumeRenderer::Get()){note(plume->report());renut::PlumeRenderer::Stop();}
     note(launch?"Sessão experimental encerrada; consulte o log para verificar a renderização.":surface?"Ponte VdSwap → Plume validada com framebuffer de teste. As cenas e os shaders do jogo ainda não são renderizados.":

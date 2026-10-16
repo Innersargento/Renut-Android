@@ -56,14 +56,16 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 #include <tuple>
 #include <type_traits>
 #include <memory>
+#include <queue>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include <xxhash.h>
 
-#include <rex/graphics/command_processor.h>
-#include <rex/graphics/graphics_system.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/system/xthread.h>
+#include <rex/thread.h>
 #include <rex/graphics/pipeline/shader/interpreter.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -1428,25 +1430,117 @@ struct Stats {
   uint64_t hiz_why[5] = {};
 };
 
-class PlumeCommandProcessor final : public gfx::CommandProcessor {
+// The GPU as the app hosts it: no SDK graphics system or command processor
+// stands behind it. The game's Direct3D records lists (native_d3d.cpp) and
+// this runs them on its own worker thread; what the SDK's command processor
+// kept for us - the register file the CPU sees, the ring's write pointer and
+// read-pointer write-back, the scratch-register write-back, the vertical
+// blank counter - is the few members below.
+class PlumeCommandProcessor final {
  public:
-  PlumeCommandProcessor(gfx::GraphicsSystem* graphics_system, rex::system::KernelState* kernel)
-      : CommandProcessor(graphics_system, kernel) {}
+  PlumeCommandProcessor(rex::memory::Memory* memory, rex::system::KernelState* kernel,
+                        std::function<void(uint32_t, uint32_t)> dispatch_interrupt)
+      : memory_(memory),
+        kernel_state_(kernel),
+        dispatch_interrupt_(std::move(dispatch_interrupt)),
+        worker_running_(true),
+        write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
+        write_ptr_index_(0) {
+    register_file_ = &registers_;
+  }
+
+  // Starts the worker ("GPU Commands"): SetupContext runs on it, then the loop.
+  bool Initialize() {
+    worker_running_ = true;
+    worker_thread_ = rex::system::object_ref<rex::system::XHostThread>(
+        new rex::system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+          if (!SetupContext()) {
+            rex::FatalError("Unable to setup command processor internal state");
+            return 0;
+          }
+          RunWorkerLoop();
+          ShutdownContext();
+          return 0;
+        }));
+    worker_thread_->set_name("GPU Commands");
+    worker_thread_->Create();
+    return true;
+  }
+  void Shutdown() {
+    worker_running_ = false;
+    write_ptr_index_event_->Set();
+    if (worker_thread_) {
+      worker_thread_->Wait(0, 0, 0, nullptr);
+      worker_thread_.reset();
+    }
+  }
+  // The ring the game's Direct3D sets up. It carries nothing the lists do not
+  // (a write pointer that moves is consumed and the read pointer written
+  // back), but Direct3D reads that pointer to know there is room.
+  void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+    read_ptr_index_ = 0;
+    primary_buffer_ptr_ = ptr;
+    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  }
+  void EnableReadPointerWriteBack(uint32_t ptr, uint32_t) { read_ptr_writeback_ptr_ = ptr; }
+  void UpdateWritePointer(uint32_t value) {
+    write_ptr_index_ = value;
+    write_ptr_index_event_->Set();
+  }
+  uint32_t counter() const { return counter_; }
+  void increment_counter() { counter_++; }
+  gfx::RegisterFile* registers() { return &registers_; }
+  gfx::Shader* active_vertex_shader() const { return active_vertex_shader_; }
+  gfx::Shader* active_pixel_shader() const { return active_pixel_shader_; }
+  uint32_t ReadRegisterValue(uint32_t index) const {
+    if (index < gfx::RegisterFile::kRegisterCount) return registers_.values[index];
+    auto it = extended_register_values_.find(index);
+    return it != extended_register_values_.end() ? it->second : 0;
+  }
 
  protected:
-  bool SetupContext() override;
-  void ShutdownContext() override;
-  void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
-                 uint32_t frontbuffer_height) override;
+  struct IndexBufferInfo {
+    xenos::IndexFormat format = xenos::IndexFormat::kInt16;
+    xenos::Endian endianness = xenos::Endian::kNone;
+    uint32_t count = 0;
+    uint32_t guest_base = 0;
+    size_t length = 0;
+  };
+  rex::memory::Memory* memory_ = nullptr;
+  rex::system::KernelState* kernel_state_ = nullptr;
+  std::function<void(uint32_t, uint32_t)> dispatch_interrupt_;
+  // The GPU's registers as the CPU sees them. register_file_ points here, or at
+  // the lists' own file while they run (NativeSwapIn/NativeSwapOut).
+  gfx::RegisterFile registers_;
+  gfx::RegisterFile* register_file_ = nullptr;
+  std::atomic<bool> worker_running_;
+  rex::system::object_ref<rex::system::XHostThread> worker_thread_;
+  std::queue<std::function<void()>> pending_fns_;
+  uint32_t counter_ = 0;
+  uint32_t primary_buffer_ptr_ = 0;
+  uint32_t primary_buffer_size_ = 0;
+  uint32_t read_ptr_index_ = 0;
+  uint32_t read_ptr_writeback_ptr_ = 0;
+  std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+  std::atomic<uint32_t> write_ptr_index_;
+  std::unordered_map<uint32_t, uint32_t> extended_register_values_;
+  uint64_t bin_select_ = 0xFFFFFFFFull;
+  uint64_t bin_mask_ = 0xFFFFFFFFull;
+  gfx::Shader* active_vertex_shader_ = nullptr;
+  gfx::Shader* active_pixel_shader_ = nullptr;
+
+  bool SetupContext();
+  void ShutdownContext();
+  void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width, uint32_t frontbuffer_height);
   gfx::Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
-                          const uint32_t* host_address, uint32_t dword_count) override;
+                          const uint32_t* host_address, uint32_t dword_count);
   // Register writes. The shader constants (ALU, fetch, boolean and loop,
   // 0x4000-0x4927) have no side effects in the base class, and the guest
   // writes thousands of them a frame through one virtual call each: those
   // ranges are swapped in bulk here, and every write into a stage's float
   // constants marks that stage's block as needing a look (CommitConstants).
-  void WriteRegister(uint32_t index, uint32_t value) override;
-  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  void WriteRegister(uint32_t index, uint32_t value);
+  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   // Marks the constant blocks (kConstantChunks per stage, each bound on its
   // own - see set 4 in shader_common.h) that a write lands in.
   void MarkConstantsWritten(uint32_t first, uint32_t count) {
@@ -1504,51 +1598,12 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   // with a register file of their own as the command processor reaches the
   // ring segments they go with. The ring's own register file is the GPU's as
   // the CPU sees it (scratch registers, the writeback the callbacks read).
-  void OnPacketStart() {
-    if (!native_checked_) {
-      native_on_ = native_d3d::GetMode() == native_d3d::Mode::kNative;
-      native_checked_ = true;
-    }
-    if (!wake_registered_) {
-      wake_registered_ = true;
-      native_d3d::SetWake([this] { write_ptr_index_event_->Set(); });
-    }
-  }
-  // The ring's segments: the lists recorded with one run as the command
-  // processor reaches it, and one recorded with native sync is not walked -
-  // the list holds what it writes back. A segment no list names is walked.
-  bool OnIndirectBuffer(uint32_t ptr, uint32_t count, bool primary) {
-    if (!native_on_ || !primary) return false;
-    ExecutorBusy busy;
-    run_to_segment_ = ptr & 0x1FFFFFFF;
-    segment_found_ = false;
-    RunNative(UINT32_MAX);
-    run_to_segment_ = 0;
-    segment_found_ = false;
-    auto it = segment_sync_.find(ptr & 0x1FFFFFFF);
-    if (it == segment_sync_.end()) {
-      ++segments_unnamed_;
-      return false;
-    }
-    const bool skip = it->second;
-    segment_sync_.erase(it);
-    ++(skip ? segments_skipped_ : segments_walked_);
-    if (skip && segments_skipped_ <= 3) {
-      REXLOG_INFO("Renut: native sync: segment {:08X} not walked ({} fences, {} presents, {} callbacks so far)", ptr,
-                  native_fences_, native_presents_, native_callbacks_);
-    }
-    return skip;
-  }
   struct ExecutorBusy {
     ExecutorBusy() { native_d3d::SetExecutorBusy(true); }
     ~ExecutorBusy() { native_d3d::SetExecutorBusy(false); }
   };
-  uint32_t run_to_segment_ = 0;
-  // The ring packet being read (OnPacketCensus), and whether the draw being run
-  // came from a predicated packet. The SDK's command processor ignores ring
-  // draws here and the draws that count come from the native lists, which carry
-  // no such packet, so this stays false.
-  uint32_t census_packet_address_ = 0;
+  // Whether the draw being run came from a predicated packet: the draws come
+  // from the native lists, which carry no such packet, so this stays false.
   bool packet_predicated_ = false;
   // The command processor's work loop. The SDK runs its own on the worker
   // thread it creates, which calls SetupContext() first: this one runs from
@@ -1559,68 +1614,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1, draw_util::ResolveInfo& info);
   std::unique_ptr<RegisterFile> resolve_regs_;
   uint32_t resolve_vertices_ = 0;
-  uint32_t ExecuteRing(uint32_t read_index, uint32_t write_index);
-  bool ExecuteRingPacket(rex::memory::RingBuffer* reader);
-  // One segment (an indirect buffer), packet by packet, so that each is counted as it is read.
-  void WalkSegment(uint32_t cpu_ptr, uint32_t count, uint32_t depth);
-  bool segment_found_ = false;
-  std::unordered_map<uint32_t, bool> segment_sync_;
   bool native_presenting_ = false;
   uint64_t native_fences_ = 0, native_presents_ = 0, native_callbacks_ = 0;
   uint64_t native_waits_ = 0, native_wait_timeouts_ = 0, native_wait_us_ = 0;
-  uint64_t segments_skipped_ = 0, segments_walked_ = 0, segments_unnamed_ = 0;
-  void NativeCallback(const uint32_t* words, uint32_t count);
-  // ---- PM4 census: what is still read as PM4 (reported in native-d3d.txt) ----
-  // [phase: 0 boot, before the 4th swap; 1 steady][origin: 0 ring, 1 walked segment, 2 callback words]
-  struct Pm4Census {
-    uint64_t type3[2][3][128] = {};
-    uint64_t type0[2][3] = {}, type12[2][3] = {}, padding[2][3] = {};
-    std::map<uint32_t, uint64_t> regs[2][3];  // type-0 base register -> packets
-    uint64_t steady_first_swap = 0;
-  } census_;
-  void CensusCount(uint32_t packet, uint32_t origin) {
-    const uint32_t phase = swaps_ >= 4 ? 1 : 0;
-    if (phase && !census_.steady_first_swap) census_.steady_first_swap = swaps_;
-    if (packet == 0) {
-      ++census_.padding[phase][origin];
-      return;
-    }
-    switch (packet >> 30) {
-      case 0:
-        ++census_.type0[phase][origin];
-        ++census_.regs[phase][origin][packet & 0x7FFF];
-        break;
-      case 3:
-        ++census_.type3[phase][origin][(packet >> 8) & 127];
-        break;
-      default:
-        ++census_.type12[phase][origin];
-        break;
-    }
-  }
-  void OnPacketCensus(uint32_t packet, uint32_t depth) {
-    CensusCount(packet, depth ? 1 : 0);
-    if (swaps_ < 4) CensusBootPacket(packet, depth);
-  }
-
-  void CensusBootPacket(uint32_t packet, uint32_t depth) {
-    if (boot_log_.size() > (1u << 20)) return;
-    const uint32_t* at = memory_->TranslatePhysical<const uint32_t*>(census_packet_address_);
-    uint32_t n = 0;
-    switch (packet >> 30) {
-      case 0:
-      case 3:
-        n = ((packet >> 16) & 0x3FFF) + 1;
-        break;
-      default:
-        break;
-    }
-    boot_log_ += fmt::format("{} {:08X} {:08X}", depth ? "seg" : "ring", census_packet_address_, packet);
-    for (uint32_t i = 0; i < n && i < 6; ++i) boot_log_ += fmt::format(" {:08X}", __builtin_bswap32(at[1 + i]));
-    if (n > 6) boot_log_ += fmt::format(" ...+{}", n - 6);
-    boot_log_ += "\n";
-  }
-  std::string Pm4CensusReport();
   // A dword the GPU writes back (big-endian), at a GPU address.
   void StoreBig(uint32_t physical, uint32_t value) {
     const uint32_t big = __builtin_bswap32(value);
@@ -1637,7 +1633,7 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   uint64_t object_streams_ = 0, window_streams_ = 0;
   bool native_checked_ = false;
   // ---- PM4-less: work that does not come through the ring ----
-  // Lists published while renut-pm4-doorbell is 1 are run by the worker itself.
+  // Lists the front end published are run by the worker itself.
   bool NativeWorkPending() { return native_d3d::WorkPending(); }
   void RunNativeWork() {
     native_d3d::TakeWorkPending();
@@ -1652,10 +1648,6 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   void NativeEffects(const uint32_t* pairs, uint32_t count);
   uint64_t native_effects_applied_ = 0;
   bool wake_registered_ = false;
-  // The first boot packets (before swap 4) as read, with their payloads, for the walk that
-  // PM4-less boot has to replace: written once to <files>/pm4-boot.txt.
-  std::string boot_log_;
-  bool boot_log_written_ = false;
   // Runs the published records until the end, or until the opaque-call
   // marker `until` (consumed; returns true), never past another marker.
   bool RunNative(uint32_t until);
@@ -1685,9 +1677,9 @@ class PlumeCommandProcessor final : public gfx::CommandProcessor {
   bool pred_pass_all_ = false;
   bool band_fragpos_ = false;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
-                 IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
+                 IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
   // Resolves come as records (NativeResolve); the ring's copy draws do nothing.
-  bool IssueCopy() override { return true; }
+  bool IssueCopy() { return true; }
   bool ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces);
   // The picture Photo Mode takes: the game's capture routine (sub_82535F20, hooked in
   // guest/game_fixes.cpp) names the resolve it is about to read with the CPU, and only
@@ -3461,7 +3453,8 @@ void PlumeCommandProcessor::NoteSceneUse(uint64_t key) {
 }
 
 bool PlumeCommandProcessor::SetupContext() {
-  if (!CommandProcessor::SetupContext()) return false;
+  // Direct3D's doorbell wakes the worker through this (native_d3d.h).
+  native_d3d::SetWake([this] { write_ptr_index_event_->Set(); });
   auto* renderer = PlumeRenderer::Get();
   if (!renderer) {
     REXLOG_ERROR("Renut: Plume command processor without a Plume renderer");
@@ -3691,110 +3684,43 @@ bool PlumeCommandProcessor::SetupContext() {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
   });
-  RunWorkerLoop();
   return true;
 }
 
+// The worker's loop. The lists the game's Direct3D published are run as they
+// come (the doorbell wakes it); the primary ring is not read, only kept moving:
+// a write pointer that advanced is taken as consumed and the read pointer is
+// written back, which is all Direct3D looks at.
 void PlumeCommandProcessor::RunWorkerLoop() {
+  uint32_t idle = 0;
   while (worker_running_) {
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
       fn();
     }
-    if (NativeWorkPending()) RunNativeWork();
-
-    uint32_t write_ptr_index = write_ptr_index_.load();
-    if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
-      // Out of commands: spin for new ones, as the SDK does, since waiting on
-      // the event costs more than the wait is worth; it is waited on after a
-      // while to let the core rest.
-      PrepareForWait();
-      uint32_t loop_count = 0;
-      do {
-        if (loop_count > 500) {
-          rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
-        }
-        rex::thread::MaybeYield();
-        loop_count++;
-        write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() && !NativeWorkPending() &&
-               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
-      ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty() || NativeWorkPending()) continue;
+    bool worked = false;
+    if (NativeWorkPending()) {
+      RunNativeWork();
+      worked = true;
     }
-    read_ptr_index_ = ExecuteRing(read_ptr_index_, write_ptr_index);
-    if (read_ptr_writeback_ptr_) {
-      StoreBig(read_ptr_writeback_ptr_, read_ptr_index_);
+    const uint32_t write_ptr_index = write_ptr_index_.load();
+    if (write_ptr_index != 0xBAADF00D && read_ptr_index_ != write_ptr_index) {
+      read_ptr_index_ = write_ptr_index;
+      if (read_ptr_writeback_ptr_) StoreBig(read_ptr_writeback_ptr_, read_ptr_index_);
+      worked = true;
     }
+    if (worked) {
+      idle = 0;
+      continue;
+    }
+    // Out of commands: spin for new ones, since waiting on the event costs more
+    // than the wait is worth; it is waited on after a while to let the core rest.
+    if (++idle > 500) {
+      rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
+    }
+    rex::thread::MaybeYield();
   }
-}
-
-uint32_t PlumeCommandProcessor::ExecuteRing(uint32_t read_index, uint32_t write_index) {
-  rex::memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
-  reader.set_read_offset(read_index * sizeof(uint32_t));
-  reader.set_write_offset(write_index * sizeof(uint32_t));
-  do {
-    OnPacketStart();
-    census_packet_address_ = uint32_t(reader.read_ptr() - uintptr_t(memory_->physical_membase()));
-    if (!ExecuteRingPacket(&reader)) {
-      REXLOG_ERROR("Renut: primary ring buffer: failed to execute a packet");
-      break;
-    }
-  } while (reader.read_count());
-  OnPrimaryBufferEnd();
-  return write_index;
-}
-
-// One packet of the primary ring. An INDIRECT_BUFFER (the segments the game's
-// Direct3D submits) is what the native lists are synchronized with; the rest is
-// the SDK's.
-bool PlumeCommandProcessor::ExecuteRingPacket(rex::memory::RingBuffer* reader) {
-  const auto at = reader->read_offset();
-  const uint32_t header = reader->ReadAndSwap<uint32_t>();
-  OnPacketCensus(header, 0);
-  if ((header >> 30) == 3 && !(header & 1)) {
-    const uint32_t opcode = (header >> 8) & 0x7F;
-    if ((opcode == xenos::PM4_INDIRECT_BUFFER || opcode == xenos::PM4_INDIRECT_BUFFER_PFD) &&
-        ((header >> 16) & 0x3FFF) == 1 && reader->read_count() >= 2 * sizeof(uint32_t)) {
-      const uint32_t list_ptr = reader->ReadAndSwap<uint32_t>();
-      const uint32_t list_length = reader->ReadAndSwap<uint32_t>() & 0xFFFFF;
-      if (OnIndirectBuffer(list_ptr, list_length, true)) return true;
-      WalkSegment(xenos::GpuToCpu(list_ptr), list_length, 1);
-      return true;
-    }
-  }
-  reader->set_read_offset(at);
-  return ExecutePacket(reader);
-}
-
-void PlumeCommandProcessor::WalkSegment(uint32_t cpu_ptr, uint32_t count, uint32_t depth) {
-  rex::memory::RingBuffer reader(memory_->TranslatePhysical(cpu_ptr), count * sizeof(uint32_t));
-  reader.set_write_offset(count * sizeof(uint32_t));
-  const uint32_t saved_address = census_packet_address_;
-  do {
-    const auto at = reader.read_offset();
-    census_packet_address_ =
-        uint32_t(reader.read_ptr() - uintptr_t(memory_->physical_membase()));
-    const uint32_t header = reader.ReadAndSwap<uint32_t>();
-    OnPacketCensus(header, depth);
-    if ((header >> 30) == 3 && !(header & 1)) {
-      const uint32_t opcode = (header >> 8) & 0x7F;
-      if ((opcode == xenos::PM4_INDIRECT_BUFFER || opcode == xenos::PM4_INDIRECT_BUFFER_PFD) &&
-          ((header >> 16) & 0x3FFF) == 1 && reader.read_count() >= 2 * sizeof(uint32_t)) {
-        const uint32_t list_ptr = reader.ReadAndSwap<uint32_t>();
-        const uint32_t list_length = reader.ReadAndSwap<uint32_t>() & 0xFFFFF;
-        WalkSegment(xenos::GpuToCpu(list_ptr), list_length, depth + 1);
-        continue;
-      }
-    }
-    reader.set_read_offset(at);
-    if (!ExecutePacket(&reader)) {
-      REXLOG_ERROR("Renut: indirect buffer: failed to execute a packet");
-      break;
-    }
-  } while (reader.read_count());
-  census_packet_address_ = saved_address;
 }
 
 void PlumeCommandProcessor::ShutdownContext() {
@@ -3876,7 +3802,6 @@ void PlumeCommandProcessor::ShutdownContext() {
     constants_set_layout_ = VK_NULL_HANDLE;
     constants_set_ = VK_NULL_HANDLE;
   }
-  CommandProcessor::ShutdownContext();
 }
 
 // Set 4 of the pipeline layout: the stages' constant files and the shared
@@ -5332,64 +5257,18 @@ static const char* Pm4OpcodeName(uint32_t op) {
   }
 }
 
-std::string PlumeCommandProcessor::Pm4CensusReport() {
-  if (!boot_log_written_ && swaps_ >= 4 && !miss_dump_directory_.empty()) {
-    boot_log_written_ = true;
-    const std::string root = miss_dump_directory_.substr(0, miss_dump_directory_.rfind('/'));
-    if (FILE* file = std::fopen((root + "/pm4-boot.txt").c_str(), "w")) {
-      std::fwrite(boot_log_.data(), 1, boot_log_.size(), file);
-      std::fclose(file);
-    }
-  }
-  static const char* kPhase[2] = {"boot", "steady"};
-  static const char* kOrigin[3] = {"primary ring", "walked segments", "callback words copied into lists"};
-  const uint64_t frames =
-      census_.steady_first_swap && swaps_ >= census_.steady_first_swap ? swaps_ - census_.steady_first_swap + 1 : 0;
-  std::string out = fmt::format("== pm4 still read as PM4 (boot = before swap 4; steady = {} frames since; "
-                                "{} structured effect records applied instead of words)\n",
-                                frames, native_effects_applied_);
-  bool any = false;
-  for (uint32_t phase = 0; phase < 2; ++phase) {
-    for (uint32_t origin = 0; origin < 3; ++origin) {
-      uint64_t t3 = 0;
-      for (uint32_t op = 0; op < 128; ++op) t3 += census_.type3[phase][origin][op];
-      const uint64_t t0 = census_.type0[phase][origin], t12 = census_.type12[phase][origin];
-      const uint64_t pad = census_.padding[phase][origin], total = t3 + t0 + t12 + pad;
-      if (!total) continue;
-      any = true;
-      const double per = phase && frames ? double(total) / double(frames) : 0.0;
-      out += fmt::format("   {} / {}: {} packets{} (type-3 {}, type-0 {}, type-1/2 {}, zero {})\n", kPhase[phase],
-                         kOrigin[origin], total, phase && frames ? fmt::format(", {:.1f} a frame", per) : std::string(),
-                         t3, t0, t12, pad);
-      for (uint32_t op = 0; op < 128; ++op) {
-        const uint64_t n = census_.type3[phase][origin][op];
-        if (n) out += fmt::format("      type-3 0x{:02X} {}: {}\n", op, Pm4OpcodeName(op), n);
-      }
-      std::vector<std::pair<uint64_t, uint32_t>> regs;
-      for (const auto& [reg, n] : census_.regs[phase][origin]) regs.push_back({n, reg});
-      std::sort(regs.rbegin(), regs.rend());
-      for (size_t i = 0; i < regs.size() && i < 12; ++i) {
-        out += fmt::format("      type-0 base register 0x{:04X}: {}\n", regs[i].second, regs[i].first);
-      }
-    }
-  }
-  if (!any) out += "   none\n";
-  return out;
-}
-
 std::string PlumeCommandProcessor::SurfaceReport() {
   size_t count = 0;
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
   std::string out = fmt::format(
       "== surfaces: {} targets now, {} created, {} grown, {} evicted; register/surface mismatches {}, "
       "slots without a surface {}\n== resolves: {} into their texture object, {} by address\n"
-      "== executor: segments {} not walked, {} walked, {} named by no list; fences {}, presents {}, callbacks {}, "
+      "== executor: fences {}, presents {}, callbacks {}, "
       "vblank waits {} ({} ms, {} timed out); streams kept by buffer {}, by window {}\n",
       count, surface_created_, surface_grown_, surface_evicted_, surface_mismatch_, surface_missing_,
-      object_resolves_, address_resolves_count_, segments_skipped_, segments_walked_, segments_unnamed_,
+      object_resolves_, address_resolves_count_,
       native_fences_, native_presents_, native_callbacks_, native_waits_, native_wait_us_ / 1000,
       native_wait_timeouts_, object_streams_, window_streams_);
-  out += Pm4CensusReport();
   for (const auto& [key, t] : targets_) {
     if (!(key & kSurfaceTargetKey)) continue;
     out += fmt::format("   surface {:08X} {} {}x{} base {} format {} last frame {}\n", t.surface,
@@ -6262,7 +6141,23 @@ void PlumeCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     }
     return;
   }
-  CommandProcessor::WriteRegister(index, value);
+  if (index >= gfx::RegisterFile::kRegisterCount) {
+    extended_register_values_.insert_or_assign(index, value);
+    return;
+  }
+  gfx::RegisterFile& regs = *register_file_;
+  // Volatile: the waits in the lists' sync read these from other threads.
+  const_cast<volatile uint32_t&>(regs.values[index]) = value;
+  if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
+    // Scratch register write-back: what a callback's waits and the swap's
+    // pacing read in memory.
+    const uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
+    if ((1u << scratch_reg) & regs.values[XE_GPU_REG_SCRATCH_UMSK]) {
+      StoreBig(regs.values[XE_GPU_REG_SCRATCH_ADDR] + scratch_reg * 4, value);
+    }
+  } else if (index == XE_GPU_REG_COHER_STATUS_HOST) {
+    const_cast<volatile uint32_t&>(regs.values[index]) |= UINT32_C(0x80000000);
+  }
 }
 
 void PlumeCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
@@ -6275,7 +6170,9 @@ void PlumeCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     MarkConstantsWritten(start_index, num_registers);
     return;
   }
-  CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    WriteRegister(start_index + i, rex::memory::load_and_swap<uint32_t>(base + i));
+  }
 }
 
 gfx::Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
@@ -6571,10 +6468,6 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
       if (native_stack_.empty()) native_d3d::NoteListExecuted();
       continue;
     }
-    if (segment_found_) {
-      // The list that goes with the segment being reached has run.
-      break;
-    }
     const uint32_t* w = words.data() + f.pos;
     const uint32_t op = w[0] & 0xFF;
     if (!native_swapped_) {
@@ -6677,10 +6570,8 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
         if (w[5]) StoreBig(w[5], counter());
         ++native_presents_;
         if (native_presents_ <= 3 || native_presents_ % 600 == 0) {
-          REXLOG_INFO("Renut: native present {} ({:08X} {}x{}); segments {} not walked, {} walked, {} unnamed; "
-                      "fences {}, callbacks {}",
-                      native_presents_, w[1], w[2], w[3], segments_skipped_, segments_walked_, segments_unnamed_,
-                      native_fences_, native_callbacks_);
+          REXLOG_INFO("Renut: native present {} ({:08X} {}x{}); fences {}, callbacks {}",
+                      native_presents_, w[1], w[2], w[3], native_fences_, native_callbacks_);
         }
         break;
       }
@@ -6693,40 +6584,6 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
         }
         f.pos += 1 + 2 * size_t(count);
         NativeEffects(w + 1, count);
-        break;
-      }
-      case native_d3d::kOpCallback: {
-        const uint32_t count = w[0] >> 8;
-        if (f.pos + 1 + count > words.size()) {
-          ++native_bad_;
-          f.pos = words.size();
-          break;
-        }
-        f.pos += 1 + count;
-        NativeCallback(w + 1, count);
-        break;
-      }
-      case native_d3d::kOpSegments: {
-        const uint32_t count = w[0] >> 8;
-        if (f.pos + 2 + count > words.size()) {
-          ++native_bad_;
-          f.pos = words.size();
-          break;
-        }
-        if (segment_sync_.size() > 4096) segment_sync_.clear();
-        for (uint32_t i = 0; i < count; ++i) {
-          segment_sync_[w[2 + i]] = (w[1] & 1) != 0;
-          if (run_to_segment_ && w[2 + i] == run_to_segment_) segment_found_ = true;
-        }
-        f.pos += 2 + count;
-        if (segment_found_) {
-          // Close what has run, so the list counts as done now.
-          while (!native_stack_.empty() &&
-                 native_stack_.back().pos >= native_stack_.back().list->words.size()) {
-            native_stack_.pop_back();
-            if (native_stack_.empty()) native_d3d::NoteListExecuted();
-          }
-        }
         break;
       }
       case native_d3d::kOpStreams: {
@@ -6806,11 +6663,6 @@ bool PlumeCommandProcessor::RunNative(uint32_t until) {
   return found;
 }
 
-// The PM4 InsertCallback wrote (kOpCallback), on the ring's state: register
-// writes - the scratch registers naming the callback, which the command
-// processor writes back to memory - and the interrupt that runs it on the
-// CPUs it names. The waits for the CPU need nothing here: the interrupt runs
-// the callback on this thread before the next record.
 // A record of register writes and interrupts, in order (what a callback does without its
 // PM4 words, see native_d3d.cpp): the same effects NativeCallback takes from the packets.
 void PlumeCommandProcessor::NativeEffects(const uint32_t* pairs, uint32_t count) {
@@ -6820,47 +6672,12 @@ void PlumeCommandProcessor::NativeEffects(const uint32_t* pairs, uint32_t count)
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t reg = pairs[2 * i], value = pairs[2 * i + 1];
     if (reg == 0xFFFFFFFFu) {
-      if (!graphics_system_) continue;
+      if (!dispatch_interrupt_) continue;
       for (uint32_t cpu = 0; cpu < 6; ++cpu) {
-        if ((value >> cpu) & 1) graphics_system_->DispatchInterruptCallback(1, cpu);
+        if ((value >> cpu) & 1) dispatch_interrupt_(1, cpu);
       }
     } else {
       WriteRegister(reg, value);
-    }
-  }
-}
-
-void PlumeCommandProcessor::NativeCallback(const uint32_t* words, uint32_t count) {
-  NativeSwapOut();
-  ++native_callbacks_;
-  for (uint32_t i = 0; i < count;) {
-    const uint32_t header = words[i];
-    CensusCount(header, 2);
-    switch (header >> 30) {
-      case 0: {
-        const uint32_t first = header & 0x7FFF, n = ((header >> 16) & 0x3FFF) + 1;
-        const bool one = (header >> 15) & 1;
-        for (uint32_t j = 0; j < n && i + 1 + j < count; ++j) WriteRegister(one ? first : first + j, words[i + 1 + j]);
-        i += 1 + n;
-        break;
-      }
-      case 1:
-        i += 3;
-        break;
-      case 2:
-        i += 1;
-        break;
-      default: {
-        const uint32_t opcode = (header >> 8) & 0x7F, n = ((header >> 16) & 0x3FFF) + 1;
-        if (opcode == xenos::PM4_INTERRUPT && i + 1 < count && graphics_system_) {
-          const uint32_t cpus = words[i + 1];
-          for (uint32_t cpu = 0; cpu < 6; ++cpu) {
-            if ((cpus >> cpu) & 1) graphics_system_->DispatchInterruptCallback(1, cpu);
-          }
-        }
-        i += 1 + n;
-        break;
-      }
     }
   }
 }
@@ -12320,32 +12137,77 @@ void PlumeCommandProcessor::Report() {
 // Graphics system
 // ---------------------------------------------------------------------------
 
-class PlumeGraphicsSystem final : public gfx::GraphicsSystem {
+// The GPU the app hosts: the guest's video hardware as the game's Direct3D and
+// the kernel see it - the register window at 0x7FC80000, the vertical blank and
+// its interrupt, the ring and the command processor behind it. The SDK has no
+// part in it (RuntimeConfig::graphics is null); the three Vd exports that
+// reach it are overridden in kernel_overrides.cpp.
+class PlumeGpu {
  public:
-  std::string name() const override { return "Plume"; }
-
-  // The SDK starts its vblank worker here; this replaces it with the clock below
-  // once the base has set the rest up (its Shutdown joins whatever thread is held
-  // in vsync_worker_thread_, so that stays the owner).
-  rex::X_STATUS SetupGuestGpu(rex::runtime::FunctionDispatcher* dispatcher,
-                              rex::system::KernelState* kernel) override {
-    using rex::X_STATUS;
-    const X_STATUS status = gfx::GraphicsSystem::SetupGuestGpu(dispatcher, kernel);
-    if (status != X_STATUS_SUCCESS) return status;
-    vsync_worker_running_ = false;
-    if (vsync_worker_thread_) {
-      vsync_worker_thread_->Wait(0, 0, 0, nullptr);
-      vsync_worker_thread_.reset();
-    }
-    vsync_worker_running_ = true;
-    vsync_worker_thread_ = rex::system::object_ref<rex::system::XHostThread>(
+  bool Setup(rex::runtime::FunctionDispatcher* dispatcher, rex::system::KernelState* kernel) {
+    memory_ = dispatcher->memory();
+    function_dispatcher_ = dispatcher;
+    kernel_state_ = kernel;
+    processor_ = std::make_unique<PlumeCommandProcessor>(
+        memory_, kernel_state_, [this](uint32_t source, uint32_t cpu) { DispatchInterruptCallback(source, cpu); });
+    if (!processor_->Initialize()) return false;
+    // The GPU's registers are 0x7FC80000-0x7FCFFFFF; the game reads the display
+    // counters there and writes the ring's write pointer.
+    memory_->AddVirtualMappedRange(0x7FC80000, 0xFFFF0000, 0x0000FFFF, this,
+                                   reinterpret_cast<rex::runtime::MMIOReadCallback>(ReadRegisterThunk),
+                                   reinterpret_cast<rex::runtime::MMIOWriteCallback>(WriteRegisterThunk));
+    vsync_running_ = true;
+    vsync_thread_ = rex::system::object_ref<rex::system::XHostThread>(
         new rex::system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() { return VblankClock(); }));
-    vsync_worker_thread_->set_name("GPU VSync");
-    vsync_worker_thread_->Create();
-    return status;
+    vsync_thread_->set_name("GPU VSync");
+    vsync_thread_->Create();
+    return true;
   }
 
- protected:
+  void Shutdown() {
+    if (processor_) {
+      processor_->Shutdown();
+      processor_.reset();
+    }
+    if (vsync_thread_) {
+      vsync_running_ = false;
+      vsync_thread_->Wait(0, 0, 0, nullptr);
+      vsync_thread_.reset();
+    }
+  }
+
+  void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
+    interrupt_callback_ = callback;
+    interrupt_callback_data_ = user_data;
+    REXLOG_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
+  }
+  void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+    if (processor_) processor_->InitializeRingBuffer(ptr, size_log2);
+  }
+  void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
+    if (processor_) processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
+  }
+
+ private:
+  // Runs the guest's interrupt callback on the calling thread, as the console's
+  // GPU interrupt would on the CPU it names.
+  void DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+    if (!interrupt_callback_) return;
+    auto* thread = rex::system::XThread::GetCurrentThread();
+    if (!thread) return;
+    if (cpu == 0xFFFFFFFF) cpu = 2;
+    thread->SetActiveCpu(cpu);
+    uint64_t args[] = {source, interrupt_callback_data_};
+    function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
+                                           rex::countof(args));
+  }
+
+  void MarkVblank() {
+    // The counter the game sees move, then the interrupt that runs its handler.
+    if (processor_) processor_->increment_counter();
+    DispatchInterruptCallback(0, 2);
+  }
+
   // The guest's vertical blank: one MarkVblank per refresh of the video mode the
   // game set (60 Hz), which is what its presentation interval counts and so what
   // holds it at 30 FPS.
@@ -12366,7 +12228,7 @@ class PlumeGraphicsSystem final : public gfx::GraphicsSystem {
     const double hz = std::max(1.0, double(float(mode.refresh_rate)));
     auto next = Clock::now();
     bool first = true;
-    while (vsync_worker_running_) {
+    while (vsync_running_) {
       // Host time per vblank: a guest period stretched by the guest clock's scale.
       const double scale = std::max(0.001, rex::chrono::Clock::guest_time_scalar());
       const double seconds = REXCVAR_GET(vsync) ? 1.0 / hz : 0.001;
@@ -12377,7 +12239,7 @@ class PlumeGraphicsSystem final : public gfx::GraphicsSystem {
       }
       // Waits in slices so that a long period (paused) still notices the stop.
       for (;;) {
-        if (!vsync_worker_running_) return 0;
+        if (!vsync_running_) return 0;
         const auto now = Clock::now();
         if (now >= next) break;
         const auto remaining = next - now;
@@ -12393,16 +12255,95 @@ class PlumeGraphicsSystem final : public gfx::GraphicsSystem {
     }
     return 0;
   }
-  // Presentation belongs to PlumeRenderer; there is no RexGlue provider.
-  void CreateProvider(bool) override {}
-  std::unique_ptr<gfx::CommandProcessor> CreateCommandProcessor() override {
-    return std::make_unique<PlumeCommandProcessor>(this, kernel_state_);
+
+  static uint32_t ReadRegisterThunk(void*, PlumeGpu* gpu, uint32_t addr) { return gpu->ReadRegister(addr); }
+  static void WriteRegisterThunk(void*, PlumeGpu* gpu, uint32_t addr, uint32_t value) {
+    gpu->WriteRegister(addr, value);
   }
+
+  uint32_t ReadRegister(uint32_t addr) {
+    const uint32_t r = (addr & 0xFFFF) / 4;
+    switch (r) {
+      case 0x0F00:  // RB_EDRAM_TIMING
+        return 0x08100748;
+      case 0x0F01:  // RB_BC_CONTROL
+        return 0x0000200E;
+      case 0x194C: {  // R500_D1MODE_V_COUNTER
+        rex::system::X_VIDEO_MODE mode;
+        rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
+        return std::min(uint32_t(mode.display_height), uint32_t(0x0FFF));
+      }
+      case 0x1951:  // interrupt status
+        return 1;   // vblank
+      case 0x1961: {  // AVIVO_D1MODE_VIEWPORT_SIZE: [width(0x0FFF), height(0x0FFF)]
+        rex::system::X_VIDEO_MODE mode;
+        rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
+        return (std::min(uint32_t(mode.display_width), uint32_t(0x0FFF)) << 16) |
+               std::min(uint32_t(mode.display_height), uint32_t(0x0FFF));
+      }
+      default:
+        break;
+    }
+    return processor_ && r < gfx::RegisterFile::kRegisterCount ? processor_->ReadRegisterValue(r) : 0;
+  }
+
+  void WriteRegister(uint32_t addr, uint32_t value) {
+    const uint32_t r = (addr & 0xFFFF) / 4;
+    if (r == 0x01C5) {  // CP_RB_WPTR
+      if (processor_) processor_->UpdateWritePointer(value);
+      return;
+    }
+    if (r == 0x1844) return;  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
+    if (processor_ && r < gfx::RegisterFile::kRegisterCount) processor_->registers()->values[r] = value;
+  }
+
+  rex::memory::Memory* memory_ = nullptr;
+  rex::runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
+  rex::system::KernelState* kernel_state_ = nullptr;
+  std::unique_ptr<PlumeCommandProcessor> processor_;
+  uint32_t interrupt_callback_ = 0;
+  uint32_t interrupt_callback_data_ = 0;
+  std::atomic<bool> vsync_running_{false};
+  rex::system::object_ref<rex::system::XHostThread> vsync_thread_;
 };
 
 }  // namespace
 
-rex::system::IGraphicsSystem* CreatePlumeGraphicsSystem() { return new PlumeGraphicsSystem(); }
+// The GPU hosted by the app (plume_gpu.h).
+namespace {
+std::unique_ptr<PlumeGpu> g_hosted_gpu;
+}  // namespace
+
+bool StartPlumeGpu(rex::runtime::FunctionDispatcher* dispatcher, rex::system::KernelState* kernel) {
+  if (g_hosted_gpu) return true;
+  auto gpu = std::make_unique<PlumeGpu>();
+  if (!gpu->Setup(dispatcher, kernel)) {
+    gpu->Shutdown();
+    return false;
+  }
+  g_hosted_gpu = std::move(gpu);
+  return true;
+}
+
+void StopPlumeGpu() {
+  if (!g_hosted_gpu) return;
+  g_hosted_gpu->Shutdown();
+  g_hosted_gpu.reset();
+}
+
+bool PlumeGpuHosted() { return g_hosted_gpu != nullptr; }
+
+void PlumeGpuSetInterruptCallback(uint32_t callback, uint32_t user_data) {
+  if (g_hosted_gpu) g_hosted_gpu->SetInterruptCallback(callback, user_data);
+}
+
+void PlumeGpuInitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  if (g_hosted_gpu) g_hosted_gpu->InitializeRingBuffer(ptr, size_log2);
+}
+
+void PlumeGpuEnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
+  if (g_hosted_gpu) g_hosted_gpu->EnableReadPointerWriteBack(ptr, block_size_log2);
+}
 
 void SetPlumeMissDumpDirectory(const std::string& directory) {
   std::error_code error;

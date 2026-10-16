@@ -23,6 +23,7 @@
 #include "guest_address.h"
 #include "host_support.h"
 #include "d3d/native_d3d.h"
+#include "plume/plume_gpu.h"
 #if defined(__ANDROID__)
 #include "platform/android/renut_audio.h"
 #endif
@@ -74,6 +75,25 @@ extern "C" void renut_imp_VdSwap(PPCContext& __restrict ctx, uint8_t* base) {
     }
   }
   __imp__VdSwap(ctx, base);
+}
+
+// The video exports the SDK routes to its graphics system (xboxkrnl_video.cpp:
+// the interrupt callback, the ring buffer and its read pointer write-back). The
+// Runtime has none, since the app hosts the GPU (plume_gpu.h): these are the
+// app's, and the SDK's own functions are not reached.
+// (callback, user data)
+extern "C" void renut_imp_VdSetGraphicsInterruptCallback(PPCContext& __restrict ctx, uint8_t*) {
+  renut::PlumeGpuSetInterruptCallback(ctx.r3.u32, ctx.r4.u32);
+}
+
+// (physical address, log2 of the size)
+extern "C" void renut_imp_VdInitializeRingBuffer(PPCContext& __restrict ctx, uint8_t*) {
+  renut::PlumeGpuInitializeRingBuffer(ctx.r3.u32, ctx.r4.u32);
+}
+
+// (address, log2 of the block size)
+extern "C" void renut_imp_VdEnableRingBufferRPtrWriteBack(PPCContext& __restrict ctx, uint8_t*) {
+  renut::PlumeGpuEnableReadPointerWriteBack(ctx.r3.u32, ctx.r4.u32);
 }
 
 #if defined(__ANDROID__)

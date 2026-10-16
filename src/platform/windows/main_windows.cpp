@@ -255,8 +255,8 @@ int main(int argc, char** argv) {
     renut::SetPlumeMissDumpDirectory((data_dir / "plume-miss").string());
     renut::SetPlumePipelineCachePath((data_dir / "plume-pipelines.bin").string());
 
-    config.graphics.reset(renut::CreatePlumeGraphicsSystem());
-    if (!config.graphics) throw std::runtime_error("Backend gráfico indisponível.");
+    // The Runtime gets no graphics system (the SDK's native-rendering boundary): the app
+    // hosts the Plume GPU itself, right after Setup.
     config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
     config.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
     config.kernel_init = rex::kernel::InitializeKernel;
@@ -264,14 +264,15 @@ int main(int argc, char** argv) {
     Note("Inicializando memória, kernel e tabela de funções...");
     auto status = runtime.Setup(PPCImageConfig, std::move(config));
     if (status != X_STATUS_SUCCESS) throw std::runtime_error("Setup falhou: " + std::to_string(status));
+    if (!renut::StartPlumeGpu(runtime.function_dispatcher(), runtime.kernel_state()))
+      throw std::runtime_error("Backend gráfico indisponível.");
+    Note("GPU do Plume hospedada pelo app (o Runtime não tem sistema gráfico).");
     Note("Runtime inicializado.");
     status = runtime.LoadXexImage("game:\\default.xex");
     if (status != X_STATUS_SUCCESS)
       throw std::runtime_error("Carregamento do XEX falhou: " + std::to_string(status));
     Note("XEX carregado.");
 
-    runtime.graphics_system()->InitializeShaderStorage(data_dir / "runtime-cache",
-                                                       runtime.kernel_state()->title_id(), false);
     Note("Iniciando o ponto de entrada do jogo.");
     auto thread = runtime.LaunchModule();
     if (!thread) throw std::runtime_error("Falha ao iniciar a thread principal do jogo.");
@@ -313,6 +314,7 @@ int main(int argc, char** argv) {
     Note("Encerrando a sessão do jogo.");
     if (auto* plume = renut::PlumeRenderer::Get()) plume->ReleaseForShutdown();
     runtime.kernel_state()->TerminateTitle();
+    renut::StopPlumeGpu();
     runtime.Shutdown();
     if (auto* plume = renut::PlumeRenderer::Get()) {
       Note(plume->report());

@@ -53,15 +53,6 @@
 #include <rex/system/xmemory.h>
 
 
-REXCVAR_DEFINE_INT32(renut_native_sync_after_swaps, 0, "reNut",
-                     "Native sync starts once the game has swapped this many times; before that the "
-                     "command processor walks the game's segments. 0 (the default) = from the device's "
-                     "first act, so no PM4 is read at all; 3 was the boot walked by the command processor");
-REXCVAR_DEFINE_BOOL(renut_native_sync, true, "reNut",
-                    "Native Direct3D lists: they also carry the fences, "
-                    "swaps and callbacks, and the command processor no longer walks the game's "
-                    "command segments");
-
 // Guest functions the front end calls, as the Direct3D it replaces does.
 extern "C" {
 REX_FUNC(sub_822127F8);  // vertex shader binding check / rebind to the declaration
@@ -163,26 +154,17 @@ struct Counters {
   std::atomic<uint64_t> surface_clips{0}, tiled_surface_clips{0}, foreign_immediate{0}, devices{0};
   std::atomic<uint64_t> fences{0}, presents{0}, callbacks{0}, doorbells{0}, native_doorbells{0};
   std::atomic<uint64_t> stuck_waits{0}, lists_published{0}, lists_executed{0}, indexed_up{0};
-  std::atomic<uint64_t> effects_checked{0}, effect_mismatches{0}, effect_records{0}, doorbells_skipped{0};
+  std::atomic<uint64_t> effect_records{0}, doorbells_skipped{0};
   std::atomic<uint64_t> worker_runs{0};
 } g_counts;
 
-// PM4-less sync, live switches (files/renut-pm4-callbacks, files/renut-pm4-doorbell, read every
-// 30 frames; no file = the default, 1 and 1): callbacks 0 = the PM4 words InsertCallback wrote go
-// into the lists, 1 = the lists carry its effects (kOpEffects), 2 = words executed and the
-// effects checked against them. doorbell 0 = AddCallsToPrimaryBuffer writes the ring as ever,
-// 1 = it does not, and a publish wakes the worker instead of the ring doing it.
-std::atomic<int> g_pm4_callbacks{1};
-std::atomic<int> g_pm4_doorbell{1};
+// A published list wakes the worker, which runs the lists itself: the ring carries nothing.
 std::atomic<bool> g_work_pending{false};
 std::mutex g_wake_mutex;
 std::shared_ptr<std::function<void()>> g_wake;
-std::string g_first_mismatch;
 
-// Native sync. The watchdog: a Direct3D wait that has not moved for a while
-// although the command processor has run every published list means a GPU
-// write the lists do not hold; it is then completed and the ring walked again.
-std::atomic<bool> g_sync_fallback{false};
+// Native sync. The watchdog: a Direct3D wait that has not moved for a while although the
+// command processor has run every published list means a GPU write the lists do not hold.
 std::atomic<int32_t> g_executor_busy{0};
 
 // ---------------------------------------------------------------------------
@@ -355,7 +337,7 @@ void Publish() {
   }
   g_counts.publishes.fetch_add(1, std::memory_order_relaxed);
   g_counts.lists_published.fetch_add(1, std::memory_order_relaxed);
-  if (g_pm4_doorbell.load(std::memory_order_relaxed) == 1 && g_front.sync_recording) {
+  if (g_front.sync_recording) {
     g_work_pending.store(true, std::memory_order_release);
     std::shared_ptr<std::function<void()>> wake;
     {
@@ -1619,11 +1601,7 @@ void Swap(PPCContext& ctx) {
 // Native sync: what the GPU writes back for the CPU, recorded where Direct3D
 // asks for it, so the command processor need not walk the game's segments.
 
-bool SyncWanted() {
-  return GetMode() == Mode::kNative && REXCVAR_GET(renut_native_sync) &&
-         g_front.swaps_seen >= uint32_t(std::max(0, REXCVAR_GET(renut_native_sync_after_swaps))) &&
-         !g_sync_fallback.load(std::memory_order_relaxed);
-}
+bool SyncWanted() { return GetMode() == Mode::kNative; }
 
 // PM4-less callbacks. What InsertCallback (sub_822052C8) writes is a pure function of its
 // arguments - it stores packets from registers and changes nothing in the device - so the
@@ -1654,39 +1632,6 @@ Effects CallbackEffects(uint32_t flags, uint32_t function, uint32_t context) {
   return out;
 }
 
-// The same effects read back from the words the original wrote at ring+4 .. ring+4*words:
-// type-0 register writes and the INTERRUPT packet, as the executor's NativeCallback decodes them.
-Effects DecodeEffects(uint8_t* base, uint32_t ring, uint32_t words) {
-  Effects out;
-  for (uint32_t i = 1; i <= words;) {
-    const uint32_t header = U32(base, ring + i * 4);
-    switch (header >> 30) {
-      case 0: {
-        const uint32_t first = header & 0x7FFF, n = ((header >> 16) & 0x3FFF) + 1;
-        const bool one = (header >> 15) & 1;
-        for (uint32_t j = 0; j < n && i + 1 + j <= words; ++j) {
-          out.push_back({one ? first : first + j, U32(base, ring + (i + 1 + j) * 4)});
-        }
-        i += 1 + n;
-        break;
-      }
-      case 1:
-        i += 3;
-        break;
-      case 2:
-        i += 1;
-        break;
-      default: {
-        const uint32_t opcode = (header >> 8) & 0x7F, n = ((header >> 16) & 0x3FFF) + 1;
-        if (opcode == 0x54 && i + 1 <= words) out.push_back({kEffectInterrupt, U32(base, ring + (i + 1) * 4)});
-        i += 1 + n;
-        break;
-      }
-    }
-  }
-  return out;
-}
-
 void PushEffects(List& list, const Effects& effects) {
   list.words.push_back(kOpEffects | (uint32_t(effects.size()) << 8));
   for (const auto& [reg, value] : effects) {
@@ -1694,14 +1639,6 @@ void PushEffects(List& list, const Effects& effects) {
     list.words.push_back(value);
   }
   g_counts.effect_records.fetch_add(1, std::memory_order_relaxed);
-}
-
-std::string EffectsText(const Effects& effects) {
-  std::string out;
-  for (const auto& [reg, value] : effects) {
-    out += reg == kEffectInterrupt ? fmt::format(" int:{:X}", value) : fmt::format(" {:X}={:X}", reg, value);
-  }
-  return out.empty() ? std::string(" (none)") : out;
 }
 
 // D3D::CDevice::SetFence(device, ring) (sub_82278528): two EVENT_WRITE_SHDs
@@ -1723,43 +1660,26 @@ void SetFence(PPCContext& ctx, uint8_t* base) {
 }
 
 // D3D::CDevice::AddCallsToPrimaryBuffer(device, calls, count) (sub_82210408):
-// the doorbell. Each call is (size, address) and becomes an INDIRECT_BUFFER in
-// the primary ring; everything recorded so far goes with these segments, named
-// in the list so the command processor knows which list is which segment.
-// Whether the next content carries its sync records is decided here.
-bool AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t* base) {
+// the doorbell. Each call is (size, address), an INDIRECT_BUFFER in the primary
+// ring; everything recorded so far is published as a list that carries what the
+// GPU would have written back, and the worker is woken to run it. The ring is
+// not written: the original is skipped for the device that draws and swaps.
+bool AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t*) {
   if (GetMode() != Mode::kNative) return false;
-  const uint32_t calls = ctx.r4.u32, count = ctx.r5.u32;
   std::lock_guard lock(g_front.mutex);
-  // A segment recorded with its sync records is one the command processor would not walk
-  // either, so for it the IB packet (and the write pointer it moves) need not exist.
-  const bool carried = g_front.sync_recording;
   if (g_front.main_device && ctx.r3.u32 != g_front.main_device) g_foreign_doorbells.fetch_add(1, std::memory_order_relaxed);
-  List& list = *g_front.immediate;
-  list.words.push_back(kOpSegments | (std::min(count, 0xFFFFu) << 8));
-  list.words.push_back(g_front.sync_recording ? 1u : 0u);
-  for (uint32_t i = 0; i < std::min(count, 0xFFFFu); ++i) {
-    list.words.push_back(U32(base, calls + i * 8 + 4) & 0x1FFFFFFFu);
-  }
   g_counts.doorbells.fetch_add(1, std::memory_order_relaxed);
   if (g_front.sync_recording) g_counts.native_doorbells.fetch_add(1, std::memory_order_relaxed);
+  const bool carried = g_front.sync_recording;
   Publish();
-  const bool was = g_front.sync_recording;
-  g_front.sync_recording = SyncWanted();
-  if (g_front.sync_recording != was) {
-    REXLOG_INFO("Renut: native sync {} at doorbell {} (swap {})", g_front.sync_recording ? "on" : "off",
-                g_counts.doorbells.load(std::memory_order_relaxed), g_front.swaps_seen);
-  }
-  const bool skip = carried && g_pm4_doorbell.load(std::memory_order_relaxed) == 1 &&
-                    ctx.r3.u32 == g_front.main_device && !g_sync_fallback.load(std::memory_order_relaxed);
+  const bool skip = carried && ctx.r3.u32 == g_front.main_device;
   if (skip) g_counts.doorbells_skipped.fetch_add(1, std::memory_order_relaxed);
   return skip;
 }
 
 // D3D InsertCallback(device, ring, flags, function, context) (sub_822052C8):
 // scratch register writes naming the callback, waits for the CPU and the
-// interrupt that runs it, as PM4 at `ring`; the packets it wrote go into the
-// list as they are.
+// interrupt that runs it, as PM4 at `ring`; the list carries their effects.
 bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, ring = ctx.r4.u32;
   const uint32_t flags = ctx.r5.u32, function = ctx.r6.u32, context = ctx.r7.u32;
@@ -1773,24 +1693,7 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   List& list = Current(dev);
   const uint32_t words = (end - ring) / 4;
   g_counts.callbacks.fetch_add(1, std::memory_order_relaxed);
-  const int mode = g_pm4_callbacks.load(std::memory_order_relaxed);
-  if (mode >= 1) {
-    const Effects want = CallbackEffects(flags, function, context);
-    if (mode == 2) {
-      const Effects got = DecodeEffects(base, ring, words);
-      g_counts.effects_checked.fetch_add(1, std::memory_order_relaxed);
-      if (got != want && g_counts.effect_mismatches.fetch_add(1, std::memory_order_relaxed) < 3) {
-        g_first_mismatch += fmt::format("   mismatch: flags {:08X} function {:08X} context {:08X}\n      words:{}\n"
-                                        "      args :{}\n",
-                                        flags, function, context, EffectsText(got), EffectsText(want));
-      }
-    } else {
-      PushEffects(list, want);
-      return true;
-    }
-  }
-  list.words.push_back(kOpCallback | (words << 8));
-  for (uint32_t i = 1; i <= words; ++i) list.words.push_back(U32(base, ring + i * 4));
+  PushEffects(list, CallbackEffects(flags, function, context));
   return true;
 }
 
@@ -1816,13 +1719,7 @@ bool SynchronizeToPresentationInterval(PPCContext& ctx, uint8_t* base) {
   const bool wait = !immediate && block;
   if (wait) {
     List& list = Current(dev);
-    if (g_pm4_callbacks.load(std::memory_order_relaxed) == 1) {
-      PushEffects(list, {{kRegScratch1, 1}});  // the present interval, written back
-    } else {
-      list.words.push_back(kOpCallback | (2u << 8));
-      list.words.push_back(0x00000579u);  // type 0: SCRATCH_REG1
-      list.words.push_back(1);
-    }
+    PushEffects(list, {{kRegScratch1, 1}});  // the present interval, written back
   }
   lock.unlock();
   __imp__sub_8228A748(ctx, base);
@@ -1877,9 +1774,8 @@ void CheckWait(PPCContext& ctx, uint8_t* base) {
   const uint32_t issued = U32(base, dev + 10908) - 2;
   const uint32_t position = (U32(base, dev + 13244) & 3) | U32(base, dev + 13240);
   REXLOG_WARN("Renut: native sync: a wait (kind {}) stood still 1.5 s with every list run: fence {:X} of {:X}, "
-              "position {:X} of {:X}; completing it and walking the ring again",
+              "position {:X} of {:X}; completing it",
               U32(base, blocker + 4), done, issued, U32(base, block + 4), position);
-  g_sync_fallback.store(true, std::memory_order_relaxed);
   S32(base, block + 4, position);
   S32(base, block, issued);
 }
@@ -1952,7 +1848,7 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
     case kD3D_SynchronizeToPresentationInterval:
       return SynchronizeToPresentationInterval(ctx, base);
     case kD3D_CBlocker_Check:
-      if (REXCVAR_GET(renut_native_sync)) CheckWait(ctx, base);
+      CheckWait(ctx, base);
       return false;
     default:
       return false;
@@ -1973,10 +1869,9 @@ void RingBufferParameters(PPCContext& ctx, uint32_t dev, uint8_t* base) {
   std::lock_guard lock(g_front.mutex);
   PushEffects(Current(dev), {{kRegScratchAddr, Phys(block)}, {kRegScratchUmsk, 0x00020037u}});
   // The only device that sets a ring up is the one that draws and swaps, so from here its
-  // doorbells are the main ones; and the lists carry their sync records from the first doorbell
-  // when the boot is native (renut_native_sync_after_swaps = 0).
+  // doorbells are the main ones; and the lists carry their sync records from the first doorbell.
   if (!g_front.main_device) g_front.main_device = dev;
-  if (!g_front.sync_recording && SyncWanted()) {
+  if (!g_front.sync_recording) {
     g_front.sync_recording = true;
     REXLOG_INFO("Renut: native sync on from the device's first act (swap {})", g_front.swaps_seen);
   }
@@ -2022,30 +1917,6 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
       std::fclose(file);
     }
   }
-  if (frame % 30 == 0) {
-    // The PM4-less switches (see g_pm4_callbacks), read again every 30 frames.
-    std::string dir;
-    {
-      std::lock_guard lock(g_report_mutex);
-      dir = g_report_path;
-    }
-    dir = dir.substr(0, dir.rfind('/') + 1);
-    auto read_switch = [&](const char* name, std::atomic<int>& target, int fallback, int top) {
-      int value = fallback;
-      if (FILE* file = std::fopen((dir + name).c_str(), "r")) {
-        int parsed = 0;
-        if (std::fscanf(file, "%d", &parsed) == 1) value = std::clamp(parsed, 0, top);
-        std::fclose(file);
-      }
-      if (target.exchange(value, std::memory_order_relaxed) != value) {
-        REXLOG_INFO("Renut: {} = {}", name, value);
-      }
-    };
-    if (!dir.empty()) {
-      read_switch("renut-pm4-callbacks", g_pm4_callbacks, 1, 2);
-      read_switch("renut-pm4-doorbell", g_pm4_doorbell, 1, 1);
-    }
-  }
   if (frame < last_frame + 300) return;
   const double f = double(frame - last_frame);
   auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
@@ -2064,10 +1935,10 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
       c(g_counts.no_scratch));
   out += fmt::format(
       "== sync (total): {} doorbells ({} with native sync), fences {}, presents {}, callbacks {}, lists {} "
-      "published / {} run, stuck waits {}{}; BeginIndexedVertices {}\n",
+      "published / {} run, stuck waits {}; BeginIndexedVertices {}\n",
       c(g_counts.doorbells), c(g_counts.native_doorbells), c(g_counts.fences), c(g_counts.presents),
       c(g_counts.callbacks), c(g_counts.lists_published), c(g_counts.lists_executed), c(g_counts.stuck_waits),
-      g_sync_fallback.load() ? " (fell back to the ring)" : "", c(g_counts.indexed_up));
+      c(g_counts.indexed_up));
   {
     const uint64_t clip = g_foreign_clip.load(std::memory_order_relaxed);
     out += fmt::format(
@@ -2083,19 +1954,10 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t ring_draws_dropped, u
     }
     out += "\n";
   }
-  {
-    std::string mismatch;
-    {
-      std::lock_guard lock(g_front.mutex);
-      mismatch = g_first_mismatch;
-    }
-    out += fmt::format(
-        "== pm4less: callbacks mode {} ({} checked against their words, {} mismatches, {} structured records), "
-        "doorbell mode {} ({} of {} doorbells without a ring packet), worker runs {}\n{}",
-        g_pm4_callbacks.load(), c(g_counts.effects_checked), c(g_counts.effect_mismatches),
-        c(g_counts.effect_records), g_pm4_doorbell.load(), c(g_counts.doorbells_skipped), c(g_counts.doorbells),
-        c(g_counts.worker_runs), mismatch);
-  }
+  out += fmt::format("== sync records: {} structured effect records, {} of {} doorbells without a ring packet, "
+                     "worker runs {}\n",
+                     c(g_counts.effect_records), c(g_counts.doorbells_skipped), c(g_counts.doorbells),
+                     c(g_counts.worker_runs));
   if (executor) out += executor();
   last_frame = frame;
   last_draws = draws;

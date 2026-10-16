@@ -12,10 +12,9 @@
 // draw itself becomes a record. Command buffers get a list of their own,
 // which a run appends to the list being recorded. Render targets are the
 // bound D3DSurfaces, resolves copy into the D3DTexture they name, vertex and
-// index buffers are kept per object. With renut_native_sync the lists also
-// carry what the GPU writes back for the CPU (fences, the swap history,
-// callbacks), and the command processor does not walk the game's segments;
-// the ring is left with the doorbell and its read pointer. The report goes to
+// index buffers are kept per object. The lists also carry what the GPU writes
+// back for the CPU (fences, the swap history, callbacks); nothing walks the
+// game's command segments and the ring is not read. The report goes to
 // files/native-d3d.txt.
 #include <atomic>
 #include <cstdint>
@@ -63,13 +62,6 @@ enum Op : uint32_t {
   // GPU stamps with its vblank counter around the swap (GPU addresses, 0 for none):
   // VdSwap, native sync
   kOpPresent = 14,
-  // [op | count << 8] the PM4 InsertCallback wrote: scratch register writes, waits
-  // for the CPU (not needed on the host) and the interrupt, native sync
-  kOpCallback = 15,
-  // [op | count << 8] flags, then the GPU addresses of the segments the ring is
-  // handed with this list (AddCallsToPrimaryBuffer). Flag 1: the list holds their
-  // fences, swaps and callbacks, and the command processor does not walk them
-  kOpSegments = 16,
   // [op | mask << 8] for each stream in the mask (bits 0-17), its vertex buffer's
   // GPU address and size in bytes (0, 0 for none): the vertex fetch constants
   // 95 - stream sent just before
@@ -82,7 +74,7 @@ enum Op : uint32_t {
   kOpWaitMemory = 19,
   // [op | count << 8] then count pairs (register, value): what a callback or the swap's pacing
   // does to the GPU's registers, in order, without PM4 words. A register of 0xFFFFFFFF is the
-  // interrupt, its value the mask of CPUs. Native sync with renut-pm4-callbacks 1
+  // interrupt, its value the mask of CPUs. Native sync
   kOpEffects = 20,
 };
 constexpr uint32_t kResolveWords = 30, kClearWords = 18;
@@ -129,7 +121,7 @@ void NoteListExecuted();
 // Native sync: the command processor is running lists or presenting (a wait
 // meanwhile is no sign of a missing record).
 void SetExecutorBusy(bool busy);
-// Ring-less runs (files/renut-pm4-doorbell 1): the doorbell writes nothing to the ring, so a
+// The doorbell writes nothing to the ring, so a
 // publish wakes the command processor's worker, which then runs the lists itself.
 void SetWake(std::function<void()> wake);
 bool WorkPending();
