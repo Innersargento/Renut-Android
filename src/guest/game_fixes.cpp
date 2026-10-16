@@ -2,7 +2,13 @@
 // are weak symbols, so a strong definition here replaces them at link time.
 
 #include "guest_address.h"
+#include <algorithm>
 #include <atomic>
+#include <set>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <cstdint>
 #include <cstring>
 
@@ -309,4 +315,102 @@ REX_HOOK_RAW(sub_8265AB70) {
     REXLOG_WARN("Renut: GPU fence wait exceeded the D3D hang timeout ({}x); still waiting", n);
   }
   ctx.r3.u64 = 0;
+}
+
+// Pipeline prediction, UnleashedRecomp's method: when a model's render data
+// loads, every pipeline it will draw with is built before its scene may start.
+// A model's render data is a "rendergraph" file (it starts with that name). Its
+// draws are 32-byte records (sub_823A9C38: +8 and +12 point at references whose
+// first word is the vertex and pixel shader object), reached from the model
+// through 8 passes of 16-byte groups; the file registers its vertex shaders in
+// the GPU fixup table at +252 (sub_82B67318: +12 the references, +20 how many).
+// sub_82B673D0 (r4 the file) runs that fixup once the file is loaded and
+// relocated; the records lie between the file and the table, so the scan below
+// finds them all (checked on the boot and the title: every record drawn later
+// had been found). The engine's draws bind no vertex declaration, so the vertex
+// shader runs as its binding 0 holds it - the microcode Plume sees.
+namespace {
+
+// Direct3D's view of physical memory (native_d3d.cpp's Phys).
+uint32_t Physical(uint32_t address) { return (address & 0x1FFFFFFF) + (((address >> 20) + 0x200) & 0x1000); }
+
+}  // namespace
+
+extern "C" void __imp__sub_82B673D0(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_82B673D0) {
+  const uint32_t file = ctx.r4.u32;
+  __imp__sub_82B673D0(ctx, base);
+  const uint32_t table = GuestWord(base, file + 252);
+  if (!table || table <= file || table - file > (32u << 20)) return;
+  auto inside = [&](uint32_t address) { return address >= file && address < table; };
+  std::vector<uint32_t> objects;
+  const uint32_t count = GuestWord(base, table + 20), references = GuestWord(base, table + 12);
+  for (uint32_t i = 0; i < count && i < 65536; ++i) objects.push_back(GuestWord(base, GuestWord(base, references + i * 4)));
+  std::sort(objects.begin(), objects.end());
+  // The records, by address.
+  std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> records;
+  for (uint32_t at = file; at + 32 <= table; at += 4) {
+    const uint32_t vs_ref = GuestWord(base, at + 8);
+    if (!inside(vs_ref)) continue;
+    const uint32_t vs = GuestWord(base, vs_ref);
+    if (!std::binary_search(objects.begin(), objects.end(), vs)) continue;
+    const uint32_t ps_ref = GuestWord(base, at + 12);
+    records.emplace(at, std::make_pair(vs, inside(ps_ref) ? GuestWord(base, ps_ref) : 0));
+  }
+  if (records.empty()) return;
+  // Which pass draws each record: passes 1 and 2 run with alpha testing on
+  // (pass 1 as alpha to coverage, sub_823A9730 -> sub_823A7F40; pass 2 measured:
+  // 42 of the 46 alpha-tested programs left unpredicted were its), and alpha
+  // test makes a program of its own in Plume. Groups are 16 bytes (+8 how many
+  // records, +12 the first); a pass table is 8 {groups, how many}.
+  std::unordered_set<uint32_t> groups;
+  for (uint32_t at = file; at + 16 <= table; at += 4) {
+    const uint32_t n = GuestWord(base, at + 8);
+    if (n && n < 65536 && records.count(GuestWord(base, at + 12))) groups.insert(at);
+  }
+  std::set<std::tuple<uint32_t, uint32_t, bool>> pairs;
+  std::unordered_set<uint32_t> reached;
+  for (uint32_t at = file; at + 64 <= table; at += 4) {
+    bool valid = true, any = false;
+    for (uint32_t pass = 0; pass < 8 && valid; ++pass) {
+      const uint32_t first = GuestWord(base, at + pass * 8), n = GuestWord(base, at + pass * 8 + 4);
+      if (!n) continue;
+      valid = n < 4096 && groups.count(first);
+      any = true;
+    }
+    if (!valid || !any) continue;
+    for (uint32_t pass = 0; pass < 8; ++pass) {
+      const uint32_t first = GuestWord(base, at + pass * 8), n = GuestWord(base, at + pass * 8 + 4);
+      for (uint32_t g = 0; g < n; ++g) {
+        const uint32_t group = first + g * 16;
+        const uint32_t record_count = GuestWord(base, group + 8), record = GuestWord(base, group + 12);
+        for (uint32_t r = 0; r < record_count && r < 65536; ++r) {
+          auto found = records.find(record + r * 32);
+          if (found == records.end()) continue;
+          reached.insert(found->first);
+          pairs.emplace(found->second.first, found->second.second, pass == 1 || pass == 2);
+        }
+      }
+    }
+  }
+  // Records no pass table was found for: the plain variant.
+  for (const auto& [at, pair] : records) {
+    if (!reached.count(at)) pairs.emplace(pair.first, pair.second, false);
+  }
+  std::vector<renut::PlumeShaderPair> predicted;
+  for (const auto& [vs, ps, alpha] : pairs) {
+    renut::PlumeShaderPair pair;
+    // Vertex shader binding 0, and the pixel shader's microcode (native_d3d.cpp).
+    const uint32_t vs_info = GuestWord(base, vs + 112 * 8) + vs;
+    pair.vs_address = Physical(GuestWord(base, vs_info + 872) + GuestWord(base, vs + 32));
+    pair.vs_dwords = GuestWord(base, vs_info + 876) >> 2;
+    if (ps) {
+      const uint32_t ps_info = GuestWord(base, ps + 64) + ps;
+      pair.ps_address = Physical(GuestWord(base, ps_info + 40) + GuestWord(base, ps + 24));
+      pair.ps_dwords = GuestWord(base, ps_info + 44) >> 2;
+    }
+    pair.alpha_test = alpha && ps;
+    if (pair.vs_dwords && pair.vs_dwords < 65536 && pair.ps_dwords < 65536) predicted.push_back(pair);
+  }
+  if (!predicted.empty()) renut::PlumePredictPipelines(std::move(predicted));
 }

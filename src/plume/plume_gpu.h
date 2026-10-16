@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace rex::system {
 class KernelState;
@@ -51,5 +52,16 @@ void PlumeSceneRequested(uint32_t scene, uint32_t asset, uint32_t ref);
 bool PlumeSceneReady();
 // The loading screen let go of the scene; `held` if it waited for pipelines.
 void PlumeSceneOpened(bool held);
+
+// A model's shader pairs, read from its render data as it loads (game_fixes.cpp):
+// the physical address and length of each shader's microcode, ps_dwords 0 for a
+// draw without a pixel shader. Plume builds the program each pair needs, ahead
+// of its first draw; while a scene loads its loading screen waits for them, as
+// for the recorded ones. Any thread.
+struct PlumeShaderPair {
+  uint32_t vs_address = 0, vs_dwords = 0, ps_address = 0, ps_dwords = 0;
+  bool alpha_test = false;  // drawn in the alpha-to-coverage pass
+};
+void PlumePredictPipelines(std::vector<PlumeShaderPair> pairs);
 
 }  // namespace renut
