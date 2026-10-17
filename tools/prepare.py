@@ -545,7 +545,7 @@ def stage_codegen(args):
         elif helper.exists():
             helper.unlink()
     fix_generated(GENERATED / "android")
-    if re.search(r"(?m)^non_argument_as_local\s*=\s*true", (ROOT / "config" / "renut_funcs.toml").read_text(encoding="utf-8")):
+    if re.search(r"(?m)^non_(argument|volatile)_as_local\s*=\s*true", (ROOT / "config" / "renut_funcs.toml").read_text(encoding="utf-8")):
         sys.path.insert(0, str(ROOT / "tools"))
         import codegen_handoff
         codegen_handoff.main(GENERATED / "android")

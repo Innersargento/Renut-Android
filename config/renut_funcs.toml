@@ -1,24 +1,27 @@
 setjmp_address = 0x82BB5EF0
 longjmp_address = 0x82BB59B0
 
-# Codegen flags UnleashedRecomp ships. All but non_volatile_as_local are on; each was turned on alone over the
-# previous ones on the PC build (16/10) and the title ran to frame 7,000+ with a correct picture.
-#   non_argument_as_local turns r0, r2, r11, r12, f0 and v32-v63 into locals, but the game passes some of them across
-#     calls (r12 into the save/restore helpers, __chkstk and the SEH handlers, r11 into 15 functions, r11/v60 out of
-#     9): tools/codegen_handoff.py, run by `prepare.py codegen` when this flag is on, writes those hand-offs through
-#     ctx. Without it the game hangs at the 3D title (two job threads park in debugHookCall).
-#   non_volatile_as_local needs share_registers on 2,133 functions (config/renut_share_registers.toml, not
-#     included) and the save/restore helpers put back in them (tools/fix_shared_helpers.py); with both the game
-#     still loops on failed heap allocations (tried before the hand-off pass existed).
+# Codegen flags UnleashedRecomp ships. All are on but reserved_as_local (left off by choice: on the PC it made no
+# measurable difference). Each was added alone on the PC build (16-17/10); the title runs with a correct picture.
+# The game breaks the calling convention the flags assume, so tools/codegen_handoff.py (run by `prepare.py codegen`
+# when non_argument_as_local or non_volatile_as_local is on) works out from the generated code where a register
+# value crosses a call and writes it through ctx:
+#   non_argument_as_local: r12 into the save/restore helpers, __chkstk and the SEH handlers, r11 into 15
+#     functions, r11/v60 out of 9. Without the hand-offs the game hangs at the 3D title.
+#   non_volatile_as_local: the Xbox compiler's whole-program allocation passes values in non-volatiles (r19-r31,
+#     v21, v31 out of a few functions; v65-v77, v123, v126 into thousands), so v14-v31 and v64-v127 stay in ctx
+#     (their save/restore helpers called again), r14-r31 and f14-f31 are local with hand-offs, the SEH funclets
+#     that keep registers in ctx get their save/restore back, and setjmp snapshots the locals. Without the
+#     output hand-offs the title draws only the sky.
 # `prepare.py codegen` deletes generated/android/*.cpp first: the generator skips files it finds unchanged.
 skip_lr = true
 skip_msr = true
 ctr_as_local = true
 xer_as_local = true
-reserved_as_local = true
+reserved_as_local = false
 cr_as_local = true
 non_argument_as_local = true
-non_volatile_as_local = false
+non_volatile_as_local = true
 
 [functions]
 0x82B100E8 = {}
