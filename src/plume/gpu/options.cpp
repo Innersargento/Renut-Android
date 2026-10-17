@@ -23,15 +23,15 @@ REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
     .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_plume_hiz, 2, "reNut/Plume",
                      "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
-                     "lies wholly outside the view frustum or the scissor (exact; files/plume-hiz overrides)");
+                     "lies wholly outside the view frustum or the scissor");
 REXCVAR_DEFINE_BOOL(renut_plume_shader_cache, true, "reNut/Plume",
                     "Remember across frames which shader lives at a guest address and length, trusting it "
                     "until the guest writes there (write-watched), instead of hashing the microcode of "
-                    "every shader a frame uses again (files/plume-shadercache overrides)");
+                    "every shader a frame uses again");
 REXCVAR_DEFINE_BOOL(renut_plume_key_reuse, true, "reNut/Plume",
                     "Key a draw's pipeline by one hash of its vertex shader's fetch table, kept on the "
                     "shader, instead of laying every specialization constant of the table into the key "
-                    "each draw (files/plume-keyreuse overrides)");
+                    "each draw");
 REXCVAR_DEFINE_INT32(renut_plume_fetch_spec, 1, "reNut/Plume",
                      "Give each vertex shader's live vertex fetch table to the driver as specialization "
                      "constants, so that the format switches of its fetch sites fold away: 0 off, 1 on")
@@ -56,10 +56,16 @@ REXCVAR_DEFINE_BOOL(renut_plume_no_shadows, false, "reNut/Plume",
 REXCVAR_DEFINE_BOOL(renut_plume_no_bloom, false, "reNut/Plume",
                     "Make the bloom's bright pass write black, so the blur chain and the final blend add "
                     "no glow.");
-REXCVAR_DEFINE_BOOL(renut_plume_memexport_readback, false, "reNut/Plume",
-                    "Copy shader exports back to guest memory (experimental; may overwrite reused memory).");
-REXCVAR_DEFINE_BOOL(renut_plume_memexport_fast, true, "reNut/Plume",
-                    "Batch Plume memexport readback across frames; off waits for the current frame.");
+REXCVAR_DEFINE_INT32(renut_plume_water_tess_percent, 100, "reNut/Plume",
+                     "Percent of the game's tessellation level the water grid uses (100 = as the game sets it).")
+    .range(10, 100);
+REXCVAR_DEFINE_INT32(renut_plume_shadow_min_indices, 0, "reNut/Plume",
+                     "Shadow casters (depth-only draws into a shadow map) with fewer indices than this are "
+                     "dropped; 0 keeps them all.")
+    .range(0, 1000000);
+REXCVAR_DEFINE_INT32(renut_plume_fence_sleep_us, 250, "reNut/Plume",
+                     "Microseconds the fence wait sleeps once the GPU is clearly not moving; 0 is the busy wait.")
+    .range(0, 20000);
 REXCVAR_DEFINE_INT32(renut_plume_low_memory, -1, "reNut/Plume",
                      "Keep less on the GPU for a device with little RAM: -1 decides from the device (under 6 GB), "
                      "0 off, 1 on.");
@@ -69,13 +75,12 @@ REXCVAR_DEFINE_INT32(renut_plume_texture_max_dim, 0, "reNut/Plume",
 REXCVAR_DEFINE_INT32(renut_plume_bc_textures, 1, "reNut/Plume",
                      "Upload the guest's DXT1/2/3/4/5, DXT5A and DXN 2D textures as the BC1-BC5 blocks they "
                      "already are (a quarter to an eighth of the RGBA8 the decoder makes, no CPU decode) on a GPU "
-                     "that samples BC (Adreno): 0 off, 1 on. Live: files/plume-bc.")
+                     "that samples BC (Adreno): 0 off, 1 on.")
     .range(0, 1);
 REXCVAR_DEFINE_INT32(renut_plume_texture_quality, 0, "reNut/Plume",
                      "Texture quality: 0 full, 1 half, 2 quarter. A 2D texture the game samples with mip "
                      "filtering (the world; the interface and fonts are read from the base level alone and "
-                     "stay sharp) drops its top one or two mips, never below 64 px. Live: "
-                     "files/plume-texquality.")
+                     "stay sharp) drops its top one or two mips, never below 64 px. Live:")
     .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_plume_shadow_quality, 0, "reNut/Plume",
                      "Shadow map resolution: 0 full, 1 three quarters, 2 half (a side of the dynamic maps; "

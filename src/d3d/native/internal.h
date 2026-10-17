@@ -140,7 +140,7 @@ inline thread_local uint32_t t_function = 0;  // the Direct3D function this thre
 // nothing, go into the immediate list; the report names them. On the console
 // they go into that device's own ring, so what they set (the window scissor
 // above all: SetSurfaceClip writes it straight into the ring) never reaches
-// the swapping device's draws. <files>/native-d3d-foreign: 0 as they come,
+// the swapping device's draws. The renut_native_d3d_foreign_mode cvar: 0 as they come,
 // 1 each device's window scissor put back before its calls (default), 2
 // dropped.
 inline std::array<std::atomic<uint64_t>, renut::d3d::kFunctionCount> g_foreign{};

@@ -17,9 +17,12 @@
 #include <string>
 #include <thread>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
 #include <rex/system/xthread.h>
+
+REXCVAR_DECLARE(int32_t, renut_plume_fence_sleep_us);
 
 namespace renut::d3d {
 namespace {
@@ -38,11 +41,9 @@ uint8_t GuestU8(const uint8_t* base, uint32_t address) {
   return *reinterpret_cast<const volatile uint8_t*>(GuestPtr(base, address));
 }
 
-// How long the fence wait sleeps once it is clear the GPU is not moving. Read
-// from <files>/plume-spin so a session can A/B it without a rebuild; 0 restores
-// the busy wait. The wait it covers is ~100 ms, so this costs at most a quarter
-// of a percent of it in latency.
-constexpr uint32_t kDefaultSleepMicroseconds = 250;
+// How long the fence wait sleeps once it is clear the GPU is not moving: the
+// renut_plume_fence_sleep_us cvar, 0 restoring the busy wait. The wait it covers is
+// ~100 ms, so this costs at most a quarter of a percent of it in latency.
 constexpr uint32_t kMaxSleepMicroseconds = 20000;
 // Passes without GPU progress before the first sleep, at roughly 90 million
 // polls a second: a few microseconds of spinning, so a wait short enough to end
@@ -51,40 +52,9 @@ constexpr uint32_t kSpinBeforeSleep = 256;
 
 std::atomic<bool> in_background{false};
 constexpr uint32_t kBackgroundSleepMicroseconds = 20000;
-std::mutex files_mutex;
-std::string files_directory;
-std::atomic<uint32_t> blocker_sleep_us{kDefaultSleepMicroseconds};
-std::atomic<uint64_t> blocker_calls{0};
-std::atomic<int64_t> next_reread_ns{0};
 
-// Neither the clock nor the file may be touched on every call, so a counter
-// gates the clock and the clock gates the file.
 uint32_t BlockerSleepMicroseconds() {
-  if ((blocker_calls.fetch_add(1, std::memory_order_relaxed) & 0xFFFF) == 0) {
-    const int64_t now =
-        std::chrono::steady_clock::now().time_since_epoch() / std::chrono::nanoseconds(1);
-    int64_t due = next_reread_ns.load(std::memory_order_relaxed);
-    if (now >= due &&
-        next_reread_ns.compare_exchange_strong(due, now + 2'000'000'000, std::memory_order_relaxed)) {
-      uint32_t value = kDefaultSleepMicroseconds;
-      std::string path;
-      {
-        std::lock_guard lock(files_mutex);
-        if (!files_directory.empty()) path = files_directory + "/plume-spin";
-      }
-      if (!path.empty()) {
-        if (FILE* file = std::fopen(path.c_str(), "r")) {
-          if (std::fscanf(file, "%u", &value) != 1) value = kDefaultSleepMicroseconds;
-          std::fclose(file);
-        }
-      }
-      value = std::min(value, kMaxSleepMicroseconds);
-      if (value != blocker_sleep_us.exchange(value, std::memory_order_relaxed)) {
-        REXLOG_INFO("Renut: Plume fence wait sleeps {} us", value);
-      }
-    }
-  }
-  return blocker_sleep_us.load(std::memory_order_relaxed);
+  return uint32_t(std::clamp(REXCVAR_GET(renut_plume_fence_sleep_us), 0, int32_t(kMaxSleepMicroseconds)));
 }
 
 float LoadBEFloat(const uint8_t* p) {
@@ -166,11 +136,6 @@ bool BlockerCheck(PPCContext& ctx, uint8_t* base) {
 }  // namespace
 
 void SetBackground(bool background) { in_background.store(background, std::memory_order_relaxed); }
-
-void SetRuntimeFilesDirectory(std::string directory) {
-  std::lock_guard lock(files_mutex);
-  files_directory = std::move(directory);
-}
 
 void RegisterPlumeHandlers() {
   SetHandler(kD3DDevice_Clear, Clear);

@@ -107,10 +107,11 @@ REXCVAR_DECLARE(int32_t, renut_plume_fetch_spec);
 REXCVAR_DECLARE(int32_t, renut_plume_depth_strip);
 REXCVAR_DECLARE(int32_t, renut_plume_rel_constants);
 REXCVAR_DECLARE(int32_t, renut_plume_adaptive_patches);
+REXCVAR_DECLARE(int32_t, renut_plume_water_tess_percent);
+REXCVAR_DECLARE(int32_t, renut_plume_shadow_min_indices);
+REXCVAR_DECLARE(int32_t, renut_plume_fence_sleep_us);
 REXCVAR_DECLARE(bool, renut_plume_no_shadows);
 REXCVAR_DECLARE(bool, renut_plume_no_bloom);
-REXCVAR_DECLARE(bool, renut_plume_memexport_readback);
-REXCVAR_DECLARE(bool, renut_plume_memexport_fast);
 REXCVAR_DECLARE(int32_t, renut_plume_low_memory);
 REXCVAR_DECLARE(int32_t, renut_plume_texture_max_dim);
 REXCVAR_DECLARE(int32_t, renut_plume_bc_textures);
@@ -141,8 +142,6 @@ constexpr uint32_t kPushBytes = 128;
 
 // Where microcode without a recompiled shader is saved (SetPlumeMissDumpDirectory).
 inline std::string g_miss_dump_directory;
-inline bool g_dedupe_descriptors = false;  // files/plume-dedupe-desc (see SetTexture2D)
-inline bool g_validate_windows = false;    // files/plume-validate (see ValidateRange)
 
 // The game's own VdSwap count, which is what the on-screen counter shows. Plume
 // presents more often than the game swaps, so the two rates have to be read

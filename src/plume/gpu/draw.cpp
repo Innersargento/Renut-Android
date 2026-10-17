@@ -263,13 +263,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     Resolved* found = FindResolved(fetch.base_address << 12);
     if (found && found->descriptor) {
       Resolved& r = *found;
-      if (backend.swap.snap_shader_ && !backend.swap.snap_taken_ && !r.depth && r.texture && ps && ps->entry->hash == backend.swap.snap_shader_ &&
-          !backend.miss_dump_directory_.empty() &&
-          access((backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/')) + "/plume-snap-dump").c_str(),
-                 F_OK) == 0) {
-        backend.resolve.SnapshotResolved(r);
-        backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
-      }
       if (backend.swap.depth_dump_ps_ && !backend.swap.depth_dump_ && r.depth && !r.alias && r.texture && ps &&
           ps->entry->hash == backend.swap.depth_dump_ps_) {
         const uint32_t bytes = r.format == RenderFormat::R32G32_FLOAT ? 8 : 4;

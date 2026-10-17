@@ -247,11 +247,6 @@ void SetPlumeMissDumpDirectory(const std::string& directory) {
   g_miss_dump_directory = directory;
 }
 
-void ArmPlumeMemoryTrace(const std::string& root) {
-  g_dedupe_descriptors = access((root + "/plume-dedupe-desc").c_str(), F_OK) == 0;
-  g_validate_windows = access((root + "/plume-validate").c_str(), F_OK) == 0;
-}
-
 void PlumeSceneRequested(uint32_t scene, uint32_t asset, uint32_t ref) {
   PrecompileState& p = g_precompile;
   p.scene.store(scene, std::memory_order_relaxed);

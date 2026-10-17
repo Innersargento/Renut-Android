@@ -67,6 +67,9 @@ bool PlumeConditionalRenderingSupported();
 
 class PlumeRenderer {
  public:
+  // Whether this machine can run the renderer at all (a Vulkan loader to open), asked
+  // before Start so the app can say so instead of failing half-way through setup.
+  static bool IsAvailable();
   // Uses the Vulkan loader already opened for the session.
   static bool Start(PlumeWindow* window, std::string* error);
   static void Stop();

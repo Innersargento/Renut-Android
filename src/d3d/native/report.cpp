@@ -1,6 +1,10 @@
 // The report written to files/native-d3d.txt.
 #include "internal.h"
 
+REXCVAR_DEFINE_INT32(renut_native_d3d_foreign_mode, 1, "reNut/D3D",
+                     "How the native Direct3D front end treats immediate calls on a device other than the main one: 0, 1 or 2.")
+    .range(0, 2);
+
 namespace renut::native_d3d {
 
 // The report.
@@ -13,21 +17,11 @@ std::string g_report_path;
 void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
                   const std::function<std::string()>& executor) {
   static uint64_t last_frame = 0, last_draws = 0;
-  if (frame % 30 == 0) {
-    // The live switch for other devices' immediate calls.
-    std::string path;
-    {
-      std::lock_guard lock(g_report_mutex);
-      path = g_report_path;
-    }
-    path = path.substr(0, path.rfind('/')) + "/native-d3d-foreign";
-    if (FILE* file = std::fopen(path.c_str(), "r")) {
-      int mode = 1;
-      if (std::fscanf(file, "%d", &mode) == 1 && mode >= 0 && mode <= 2 &&
-          mode != g_foreign_mode.exchange(mode, std::memory_order_relaxed)) {
-        REXLOG_INFO("Renut: native Direct3D: other devices' immediate calls in mode {}", mode);
-      }
-      std::fclose(file);
+  {
+    // Other devices' immediate calls: the cvar, read every frame.
+    const int mode = std::clamp(REXCVAR_GET(renut_native_d3d_foreign_mode), 0, 2);
+    if (mode != g_foreign_mode.exchange(mode, std::memory_order_relaxed)) {
+      REXLOG_INFO("Renut: native Direct3D: other devices' immediate calls in mode {}", mode);
     }
   }
   if (frame < last_frame + 300) return;

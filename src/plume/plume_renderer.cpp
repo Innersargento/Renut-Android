@@ -438,9 +438,24 @@ void VulkanLayerDeviceCreated(bool buffer_device_address);
 PlumeRenderer::PlumeRenderer() : state_(std::make_unique<State>()) {}
 PlumeRenderer::~PlumeRenderer() = default;
 
+bool PlumeRenderer::IsAvailable() {
+#if defined(__ANDROID__)
+  return renutXenosVulkanSymbol("vkGetInstanceProcAddr") != nullptr;
+#else
+  HMODULE loader = LoadLibraryA("vulkan-1.dll");
+  return loader && GetProcAddress(loader, "vkGetInstanceProcAddr");
+#endif
+}
+
 bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
   std::lock_guard lock(instance_mutex);
   if (instance) return true;
+  if (!IsAvailable()) {
+    const char* why = "Plume: nenhum carregador Vulkan neste sistema.";
+    if (error) *error = why;
+    REXLOG_ERROR("Renut: {}", why);
+    return false;
+  }
   try {
 #if defined(__ANDROID__)
     auto entry = reinterpret_cast<PFN_vkGetInstanceProcAddr>(

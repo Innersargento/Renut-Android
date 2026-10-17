@@ -28,7 +28,6 @@ bool PlumeActive();
 void SetHandler(Function function, Handler handler);
 void SetShaderDumpDirectory(std::string directory);
 // The runtime's files directory, where plume_d3d.cpp reads plume-spin.
-void SetRuntimeFilesDirectory(std::string directory);
 // While the app is in the background the game's fence wait polls slowly, so a
 // paused game does not keep waking a core (plume_d3d.cpp).
 void SetBackground(bool background);

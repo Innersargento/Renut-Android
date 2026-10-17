@@ -219,11 +219,6 @@ bool GpuBackend::SetupContext() {
               draw.lookup_here_ ? fmt::format("cache lookups at the draw up to {} ms a frame", draw.lookup_budget_us_ / 1000)
                            : std::string("no cache lookups at the draw"),
               REXCVAR_GET(renut_plume_bool_spec) ? "specialized" : "read from the shared block");
-  draw.validate_windows_ = g_validate_windows;
-  dedupe_descriptors_ = g_dedupe_descriptors;
-  if (dedupe_descriptors_) REXLOG_INFO("Renut: Plume 2D descriptors are written once per texture (plume-dedupe-desc)");
-  swap.writeback_ = REXCVAR_GET(renut_plume_memexport_readback);
-  swap.writeback_fast_ = REXCVAR_GET(renut_plume_memexport_fast);
   targets.BeginFrame();
   REXLOG_INFO("Renut: Plume GPU backend ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);

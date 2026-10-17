@@ -35,11 +35,6 @@ void PlumeGpuEnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
 // here (first 32), to extend the capture.
 void SetPlumeMissDumpDirectory(const std::string& directory);
 
-// Debug: with <root>/plume-memtrace present, Plume logs every memory block, buffer and
-// image it makes or frees (with device addresses) and writes it to <root>/plume-mem.txt
-// when the device is lost. Call before PlumeRenderer::Start so the first blocks are seen.
-void ArmPlumeMemoryTrace(const std::string& root);
-
 // The loading-screen hold, UnleashedRecomp's method with the pipelines built
 // ahead at start from <files>/plume-recipes.bin (game_fixes.cpp drives it).
 // The game asked for a scene: the pipelines drawn from now on are tagged with

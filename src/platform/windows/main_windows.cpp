@@ -242,11 +242,20 @@ int main(int argc, char** argv) {
     config.tool_mode = false;
 
     renut::d3d::SetShaderDumpDirectory((data_dir / "shader-dump").string());
-    renut::d3d::SetRuntimeFilesDirectory(data_dir.string());
     renut::native_d3d::SetFilesDirectory(data_dir.string());
-    renut::ArmPlumeMemoryTrace(data_dir.string());
 
+    // Plume's life cycle, as the SDK documents a graphics backend's: ask whether it is
+    // available, set it up and check the status, shut it down in reverse order. The guard
+    // does the last on every way out of this scope, including a failed setup.
+    struct PlumeGuard {
+      ~PlumeGuard() {
+        renut::StopPlumeGpu();
+        renut::PlumeRenderer::Stop();
+      }
+    } plume_guard;
     Note("Iniciando o Plume...");
+    if (!renut::PlumeRenderer::IsAvailable())
+      throw std::runtime_error("Plume indisponível: este sistema não tem um carregador Vulkan (vulkan-1.dll).");
     std::string plume_error;
     if (!renut::PlumeRenderer::Start(reinterpret_cast<renut::PlumeWindow*>(window), &plume_error))
       throw std::runtime_error(plume_error);
@@ -265,7 +274,7 @@ int main(int argc, char** argv) {
     auto status = runtime.Setup(PPCImageConfig, std::move(config));
     if (status != X_STATUS_SUCCESS) throw std::runtime_error("Setup falhou: " + std::to_string(status));
     if (!renut::StartPlumeGpu(runtime.function_dispatcher(), runtime.kernel_state()))
-      throw std::runtime_error("Backend gráfico indisponível.");
+      throw std::runtime_error("O Plume não conseguiu iniciar a GPU hospedada.");
     Note("GPU do Plume hospedada pelo app (o Runtime não tem sistema gráfico).");
     Note("Runtime inicializado.");
     status = runtime.LoadXexImage("game:\\default.xex");
@@ -322,10 +331,8 @@ int main(int argc, char** argv) {
     runtime.kernel_state()->TerminateTitle();
     renut::StopPlumeGpu();
     runtime.Shutdown();
-    if (auto* plume = renut::PlumeRenderer::Get()) {
-      Note(plume->report());
-      renut::PlumeRenderer::Stop();
-    }
+    if (auto* plume = renut::PlumeRenderer::Get()) Note(plume->report());
+    renut::PlumeRenderer::Stop();
     DestroyWindow(window);
   } catch (const std::exception& error) {
     Note(std::string("Falha: ") + error.what());
