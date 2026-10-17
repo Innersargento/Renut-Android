@@ -530,6 +530,10 @@ def stage_codegen(args):
         fail("gerador de código ausente. Rode o passo 'deps'.")
     helper = GENERATED / "rexglue.cmake"
     saved = helper.read_bytes() if helper.is_file() else None
+    # The generator skips a file it finds unchanged, which would keep the post-processing below
+    # from a previous run (or the output of other flags) in place.
+    for old in (GENERATED / "android").glob("*.cpp"):
+        old.unlink()
     try:
         run([binary, "--log-level", "info", "codegen", "renut_android_manifest.toml"], cwd=ROOT, log="codegen.log")
         # SDK 0.10 also overwrites the root helper regardless of the output directory.
@@ -541,6 +545,10 @@ def stage_codegen(args):
         elif helper.exists():
             helper.unlink()
     fix_generated(GENERATED / "android")
+    if re.search(r"(?m)^non_argument_as_local\s*=\s*true", (ROOT / "config" / "renut_funcs.toml").read_text(encoding="utf-8")):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import codegen_handoff
+        codegen_handoff.main(GENERATED / "android")
     say("   C++ gerado em generated/android")
 
 

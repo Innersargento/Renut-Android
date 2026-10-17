@@ -1,23 +1,23 @@
 setjmp_address = 0x82BB5EF0
 longjmp_address = 0x82BB59B0
 
-# Codegen flags UnleashedRecomp ships. Three are on: skip_lr, skip_msr and cr_as_local (a bisection on the PC build,
-# 16/10, counting the window title's frame number: all three together run, 169 FPS at the title). The rest hang the
-# game at its 3D title - two job threads (sub_823DFE68, made in gameMain) park in debugHookCall because
-# sub_82240400(thread id) returns non-zero:
-#   ctr_as_local + xer_as_local + reserved_as_local  hang as a group (not bisected inside it)
-#   non_argument_as_local                            hangs alone
-#   non_volatile_as_local                            needs share_registers on 2,133 functions
-#     (config/renut_share_registers.toml, not included) and the save/restore helpers put back in them
-#     (tools/fix_shared_helpers.py); with both the game still loops on failed heap allocations.
-# Delete generated/android/*.cpp before regenerating: the generator skips files it finds unchanged.
+# Codegen flags UnleashedRecomp ships. All but non_volatile_as_local are on; each was turned on alone over the
+# previous ones on the PC build (16/10) and the title ran to frame 7,000+ with a correct picture.
+#   non_argument_as_local turns r0, r2, r11, r12, f0 and v32-v63 into locals, but the game passes some of them across
+#     calls (r12 into the save/restore helpers, __chkstk and the SEH handlers, r11 into 15 functions, r11/v60 out of
+#     9): tools/codegen_handoff.py, run by `prepare.py codegen` when this flag is on, writes those hand-offs through
+#     ctx. Without it the game hangs at the 3D title (two job threads park in debugHookCall).
+#   non_volatile_as_local needs share_registers on 2,133 functions (config/renut_share_registers.toml, not
+#     included) and the save/restore helpers put back in them (tools/fix_shared_helpers.py); with both the game
+#     still loops on failed heap allocations (tried before the hand-off pass existed).
+# `prepare.py codegen` deletes generated/android/*.cpp first: the generator skips files it finds unchanged.
 skip_lr = true
 skip_msr = true
-ctr_as_local = false
-xer_as_local = false
-reserved_as_local = false
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
 cr_as_local = true
-non_argument_as_local = false
+non_argument_as_local = true
 non_volatile_as_local = false
 
 [functions]
