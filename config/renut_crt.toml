@@ -5,6 +5,8 @@
 #     0x8223FD48, 0x82240200, 0x82717428): all-or-nothing, it needs the ReXCRT heap started after the
 #     XEX loads (rex::kernel::crt::InitHeap) and the rexcrt_heap_enable cvar, and it moves every
 #     allocation of the game into a 256 MB o1heap;
+#   - wcscmp, wcsncmp, wcschr: the SDK reads the guest's big-endian UTF-16 as host int16, so the sign of the result
+#     is wrong and wcschr never finds a character (tried 18/10 with the geb project's list);
 #   - the file group (CreateFileA 0x82715378, ReadFile 0x827156E0, WriteFile 0x82715E50, ...): handle
 #     based and tied to the kernel's XFile objects, not measured.
 # Addresses are this build's (default.xex of the European disc); each was checked to be a function start
@@ -34,3 +36,5 @@ _stricmp = 0x82BB6220  # case-insensitive compare, 73 call sites
 
 # wide string: a lhz loop returning the count of halfwords (144 call sites)
 wcslen = 0x82BB1798
+wcsstr = 0x82BB3508  # compares halfwords for equality only, so the guest's big-endian text is fine
+wcsncpy = 0x82BB4068  # copies halfwords as they are
