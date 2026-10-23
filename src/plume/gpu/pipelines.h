@@ -60,9 +60,21 @@ struct Pipelines {
   // [0] and the first without [1]; and counts for the log.
   RenderGraphicsPipelineDesc predict_desc_[2];
   bool predict_desc_set_[2] = {};
-  uint64_t predict_added_ = 0, predict_known_ = 0, predict_unknown_ = 0;
+  uint64_t predict_added_ = 0, predict_known_ = 0, predict_unknown_ = 0, predict_exact_ = 0, predict_raised_ = 0;
   std::unordered_set<uint64_t> drawn_programs_;
-  void PredictPipelines();
+  // Turns the queued shader pairs into recipe groups, a few milliseconds at a
+  // time; false when it could not make any (no draw yet to borrow a state from).
+  bool PredictPipelines();
+  // The render states each engine pass (1-8) draws model records with
+  // (PassState), as many as it has views; read from the file at start and
+  // learned from the draws stamped with their pass (IssueDraw, at a new
+  // pipeline). The prediction builds each record of a pass with the most used
+  // few of its pass, as real pipelines the draws take as they take the listed
+  // ones. Command thread, but for the read at start.
+  std::array<std::vector<PassState>, 9> pass_states_;
+  void LearnPassState(uint8_t pass, const Recipe& recipe);
+  // Recipes the prediction made whole, so a model loaded again adds none.
+  std::unordered_set<uint64_t> predicted_recipes_;
   // The pipeline built ahead for this recipe, if there is one; a recipe that
   // is not in the file yet is written to it. `key` is the draw's pipeline key.
   std::unique_ptr<RenderPipeline> TakeRecipe(Recipe& recipe, uint64_t key);

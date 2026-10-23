@@ -83,6 +83,15 @@ enum DrawFlags : uint32_t {
   kDrawPredicated = 1,    // obeys the bin mask, as every Direct3D draw packet does
   kDrawScreenExtent = 2,  // took Direct3D's screen extent path (not reproduced)
 };
+// Bits 4-7 of a draw's flags: the engine pass (1-8, 0 for none) the draw was
+// made in, from EnginePass().
+constexpr uint32_t kDrawPassShift = 4;
+
+// The engine pass (1-8) the calling thread is drawing a model's records in, 0
+// outside one: set around sub_823A9908 (guest/game_fixes.cpp), stamped on the
+// draws recorded meanwhile. Their pipelines teach Plume each pass's render
+// state, which pipeline prediction then builds the passes' records with.
+uint8_t& EnginePass();
 
 struct List {
   std::vector<uint32_t> words;

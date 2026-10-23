@@ -249,6 +249,10 @@ void GpuBackend::RunWorkerLoop() {
       worked = true;
     }
     if (service_hardware_ && service_hardware_()) worked = true;
+    // Predicted pipelines of models that loaded: while a scene start holds its
+    // loading screen the game draws nothing (game_fixes.cpp, sub_822BBE58), and
+    // the hold waits for these to be queued.
+    if (g_predict.queued.load(std::memory_order_relaxed) && pipelines.PredictPipelines()) worked = true;
     if (worked) {
       idle = 0;
       continue;

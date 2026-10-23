@@ -1608,6 +1608,9 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       }
       recipe.slots = input_slots;
       recipe.constants = spec_constants;
+      if (backend.lists.draw_pass_ && !patch_list && !rect_list && !point_list) {
+        backend.pipelines.LearnPassState(backend.lists.draw_pass_, recipe);
+      }
       pipeline = backend.pipelines.TakeRecipe(recipe, key);
       if (pipeline) {
         ++backend.stats_.pipelines;

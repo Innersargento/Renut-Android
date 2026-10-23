@@ -56,6 +56,11 @@ void PlumeSceneOpened(bool held);
 struct PlumeShaderPair {
   uint32_t vs_address = 0, vs_dwords = 0, ps_address = 0, ps_dwords = 0;
   bool alpha_test = false;  // drawn in the alpha-to-coverage pass
+  // The engine passes (bit p for pass p, 0-7) whose tables reach the record:
+  // with the render states each pass is known to draw with (learned from the
+  // draws stamped with native_d3d::EnginePass), its pipelines are predicted
+  // whole, not only their programs. 0 when no pass table was found.
+  uint8_t passes = 0;
 };
 void PlumePredictPipelines(std::vector<PlumeShaderPair> pairs);
 

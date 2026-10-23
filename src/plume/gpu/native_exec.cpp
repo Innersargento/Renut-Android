@@ -43,8 +43,10 @@ void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, ui
   const auto viz = backend.register_file_->Get<reg::PA_SC_VIZ_QUERY>();
   if (viz.viz_query_ena && viz.kill_pix_post_hi_z) return;
   ++native_draws_;
+  draw_pass_ = uint8_t((flags >> native_d3d::kDrawPassShift) & 0xF);
   backend.draw.IssueDraw(draw.prim_type, draw.num_indices, indexed ? &info : nullptr,
             xenos::IsMajorModeExplicit(draw.major_mode, draw.prim_type));
+  draw_pass_ = 0;
 }
 
 bool Lists::RunNative(uint32_t until) {

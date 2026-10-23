@@ -39,6 +39,8 @@ struct Lists {
   std::vector<NativeFrame> native_stack_;
   std::deque<std::shared_ptr<const native_d3d::List>> native_queue_;
   uint64_t native_draws_ = 0, native_bad_ = 0;
+  // The engine pass of the draw being issued (native_d3d::kDrawPassShift).
+  uint8_t draw_pass_ = 0;
 };
 
 }  // namespace renut::gpu

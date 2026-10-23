@@ -281,6 +281,11 @@ bool ClearNative(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+uint8_t& EnginePass() {
+  thread_local uint8_t pass = 0;
+  return pass;
+}
+
 uint32_t ResolveScratch() {
   static uint32_t block = 0;
   if (!block) {

@@ -4,7 +4,9 @@
 #include "guest_address.h"
 #include <algorithm>
 #include <atomic>
-#include <set>
+#include <chrono>
+#include <map>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -18,6 +20,7 @@
 #include <rex/ppc/func.h>
 #include <rex/hook.h>
 
+#include "d3d/native_d3d.h"
 #include "plume/frame_pacing.h"
 #include "plume/plume_gpu.h"
 
@@ -140,6 +143,8 @@ REX_HOOK_RAW(sub_82535F20) {
 namespace {
 
 thread_local uint32_t pending_scene_ref = 0;
+// A scene was asked for since the boot (sub_822BC0D8).
+std::atomic<bool> scene_asked_since_boot{false};
 
 uint32_t GuestWord(uint8_t* base, uint32_t address) {
   if (!address) return 0;
@@ -165,13 +170,14 @@ REX_HOOK_RAW(sub_822BC0D8) {
   uint32_t scene = asset * 0x9E3779B1u ^ ref;
   if (!scene) scene = 1;
   renut::PlumeSceneRequested(scene, asset, ref);
+  scene_asked_since_boot = true;
   __imp__sub_822BC0D8(ctx, base);
 }
 
 // The loading screen stays up until the new scene's pipelines are built. A
 // scene's per-frame update (sub_8229B330, r3 the scene) starts it when the
 // scene is loaded (+16 state 2) and not started yet (+52): it waits there while
-// an intro is pending (the word @ 0x82FAC650 nonzero, the sequence @ 0x82FAC654
+// an intro is pending (the byte @ 0x82FAC650 nonzero, the sequence @ 0x82FAC654
 // not finished - the Rare logo at boot), then starts the scene, releases the
 // loading screen it held (sub_822BBE58) and sets +52. Until the scene's
 // pipelines are built, reNut keeps it waiting at that point - the analog of
@@ -179,15 +185,20 @@ REX_HOOK_RAW(sub_822BC0D8) {
 // it shows while loading (the logo, the closed puzzle between worlds), exactly
 // as on a slow disc: with an intro the sequence's state query reports it not
 // finished; without one the update sees the scene as started for that call and
-// returns before starting it. Holding the release instead froze the picture:
-// once the scene starts, the game draws nothing until the opening transition.
+// returns before starting it. What the start itself loads is waited for where
+// it lets go of the loading screen (sub_822BBE58 below).
 namespace {
 
-constexpr uint32_t kIntro = 0x82FAC650;  // +0 the intro, +4 its sequence
+// The intro pending: a byte (sub_8229B330 tests byte_82FAC650; the bytes after
+// it are other flags, so reading it as a word took them for an intro and let
+// the scene start under the hold). Its sequence is the word at +4.
+constexpr uint32_t kIntro = 0x82FAC650;
 constexpr uint32_t kSequenceFinished = 4;
 
 thread_local bool in_scene_start = false;
 bool pipeline_hold = false;  // the game's main thread only
+// Inside an update that may start the scene (the free path below).
+thread_local bool in_scene_update = false;
 
 void StoreGuestWord(uint8_t* base, uint32_t address, uint32_t value) {
   value = __builtin_bswap32(value);
@@ -199,18 +210,26 @@ void StoreGuestWord(uint8_t* base, uint32_t address, uint32_t value) {
 extern "C" void __imp__sub_8229B330(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(sub_8229B330) {
   const uint32_t scene = ctx.r3.u32;
-  // The update applies queued state changes first, so a scene seen loading on
-  // entry may reach state 2 and start within this call.
-  if (GuestWord(base, scene + 52) != 0 || renut::PlumeSceneReady()) {
-    const bool starting = GuestWord(base, scene + 52) == 0;
+  if (GuestWord(base, scene + 52) != 0) {
     __imp__sub_8229B330(ctx, base);
-    if (starting && GuestWord(base, scene + 52)) {
+    return;
+  }
+  // Not started. The update applies the queued state changes first, and a
+  // scene object reused for the next scene goes from 0 to loaded (2) and would
+  // start within one call: the load itself - its models, whose pipelines are
+  // predicted as they load - happens inside it. So the scene may start only in
+  // a call it enters loaded, once its pipelines are built.
+  if (GuestWord(base, scene + 16) == 2 && renut::PlumeSceneReady()) {
+    in_scene_update = true;
+    __imp__sub_8229B330(ctx, base);
+    in_scene_update = false;
+    if (GuestWord(base, scene + 52)) {
       renut::PlumeSceneOpened(pipeline_hold);
       pipeline_hold = false;
     }
     return;
   }
-  if (GuestWord(base, kIntro)) {
+  if (*renut::GuestPtr(base, kIntro)) {
     in_scene_start = true;
     __imp__sub_8229B330(ctx, base);
     in_scene_start = false;
@@ -226,6 +245,51 @@ REX_HOOK_RAW(sub_8229B330) {
     pipeline_hold = true;
     REXLOG_INFO("Renut: scene {:08X} loaded; its loading screen held for its pipelines", scene);
   }
+}
+
+// The start itself builds the world (sub_823C5408): most of a level's models
+// load inside it, after the scene was let go above, and their pipelines are
+// predicted only then. So the start is held once more where it lets go of the
+// loading screen (sub_822BBE58, r4 1: the scene's hold on it), until those are
+// built: the game's thread waits here as it did for the load itself. The
+// picture stands still meanwhile - the loading screen is drawn by this same
+// thread, between frames; leaving the release for a later frame instead made
+// the game wait for it and never come back. Not at the boot, whose logo the
+// starting scene draws itself. The GPU backend turns the predictions into
+// pipelines meanwhile from its own loop, with no frame to wait for.
+extern "C" void __imp__sub_822BBE58(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_822BBE58) {
+  if (in_scene_update && ctx.r4.u32 != 0 && scene_asked_since_boot.load()) {
+    const auto start = std::chrono::steady_clock::now();
+    uint32_t polls = 0;
+    while (!renut::PlumeSceneReady()) {
+      ++polls;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (polls) {
+      REXLOG_INFO("Renut: scene start held its loading screen {} ms more for the pipelines of the models it loaded",
+                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                      .count());
+    }
+  }
+  __imp__sub_822BBE58(ctx, base);
+}
+
+// The engine pass a model's records are drawn in. sub_823A9908 (r3 the
+// renderer, r4 the model, r5 the pass 0-7) draws the records of one pass of a
+// model (sub_823A9A58 -> sub_823A9C38 for each); sub_823A9730 picks the passes
+// of a scene phase and sets the render state they draw with around them (pass
+// 1 with alpha to coverage, sub_823A7F40), so every record of a pass draws with
+// the pass's state. The draws made inside are stamped with it (native_d3d.h,
+// EnginePass), and their pipelines teach Plume each pass's states, which the
+// prediction below builds the passes' records with.
+extern "C" void __imp__sub_823A9908(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_823A9908) {
+  uint8_t& pass = renut::native_d3d::EnginePass();
+  const uint8_t outer = pass;
+  pass = ctx.r5.u32 < 8 ? uint8_t(ctx.r5.u32 + 1) : 0;
+  __imp__sub_823A9908(ctx, base);
+  pass = outer;
 }
 
 // The intro sequence's state, asked by the scene start above.
@@ -347,29 +411,33 @@ REX_HOOK_RAW(sub_82B673D0) {
   const uint32_t count = GuestWord(base, table + 20), references = GuestWord(base, table + 12);
   for (uint32_t i = 0; i < count && i < 65536; ++i) objects.push_back(GuestWord(base, GuestWord(base, references + i * 4)));
   std::sort(objects.begin(), objects.end());
-  // The records, by address.
-  std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> records;
+  // The records, by address: their shader pair and the passes found to draw them.
+  struct Record {
+    uint32_t vs = 0, ps = 0;
+    uint8_t passes = 0;
+  };
+  std::unordered_map<uint32_t, Record> records;
   for (uint32_t at = file; at + 32 <= table; at += 4) {
     const uint32_t vs_ref = GuestWord(base, at + 8);
     if (!inside(vs_ref)) continue;
     const uint32_t vs = GuestWord(base, vs_ref);
     if (!std::binary_search(objects.begin(), objects.end(), vs)) continue;
     const uint32_t ps_ref = GuestWord(base, at + 12);
-    records.emplace(at, std::make_pair(vs, inside(ps_ref) ? GuestWord(base, ps_ref) : 0));
+    records.emplace(at, Record{vs, inside(ps_ref) ? GuestWord(base, ps_ref) : 0, 0});
   }
   if (records.empty()) return;
-  // Which pass draws each record: passes 1 and 2 run with alpha testing on
+  // Which passes draw each record. Passes 1 and 2 run with alpha testing on
   // (pass 1 as alpha to coverage, sub_823A9730 -> sub_823A7F40; pass 2 measured:
   // 42 of the 46 alpha-tested programs left unpredicted were its), and alpha
-  // test makes a program of its own in Plume. Groups are 16 bytes (+8 how many
-  // records, +12 the first); a pass table is 8 {groups, how many}.
+  // test makes a program of its own in Plume; with the render states each pass
+  // is known to draw with, the record's pipelines are predicted whole. Groups
+  // are 16 bytes (+8 how many records, +12 the first); a pass table is 8
+  // {groups, how many}.
   std::unordered_set<uint32_t> groups;
   for (uint32_t at = file; at + 16 <= table; at += 4) {
     const uint32_t n = GuestWord(base, at + 8);
     if (n && n < 65536 && records.count(GuestWord(base, at + 12))) groups.insert(at);
   }
-  std::set<std::tuple<uint32_t, uint32_t, bool>> pairs;
-  std::unordered_set<uint32_t> reached;
   for (uint32_t at = file; at + 64 <= table; at += 4) {
     bool valid = true, any = false;
     for (uint32_t pass = 0; pass < 8 && valid; ++pass) {
@@ -386,20 +454,26 @@ REX_HOOK_RAW(sub_82B673D0) {
         const uint32_t record_count = GuestWord(base, group + 8), record = GuestWord(base, group + 12);
         for (uint32_t r = 0; r < record_count && r < 65536; ++r) {
           auto found = records.find(record + r * 32);
-          if (found == records.end()) continue;
-          reached.insert(found->first);
-          pairs.emplace(found->second.first, found->second.second, pass == 1 || pass == 2);
+          if (found != records.end()) found->second.passes |= uint8_t(1u << pass);
         }
       }
     }
   }
-  // Records no pass table was found for: the plain variant.
-  for (const auto& [at, pair] : records) {
-    if (!reached.count(at)) pairs.emplace(pair.first, pair.second, false);
+  // One pair per shader pair and alpha variant (passes 1 and 2 test alpha); a
+  // record no pass table was found for is the plain one.
+  constexpr uint8_t kAlphaPasses = 0x06;
+  std::map<std::tuple<uint32_t, uint32_t, bool>, uint8_t> pairs;
+  for (const auto& [at, record] : records) {
+    if (record.passes & kAlphaPasses) pairs[{record.vs, record.ps, true}] |= record.passes & kAlphaPasses;
+    if ((record.passes & ~kAlphaPasses) || !record.passes) {
+      pairs[{record.vs, record.ps, false}] |= record.passes & ~kAlphaPasses;
+    }
   }
   std::vector<renut::PlumeShaderPair> predicted;
-  for (const auto& [vs, ps, alpha] : pairs) {
+  for (const auto& [shaders, passes] : pairs) {
+    const auto& [vs, ps, alpha] = shaders;
     renut::PlumeShaderPair pair;
+    pair.passes = passes;
     // Vertex shader binding 0, and the pixel shader's microcode (d3d/native/flush.cpp).
     const uint32_t vs_info = GuestWord(base, vs + 112 * 8) + vs;
     pair.vs_address = Physical(GuestWord(base, vs_info + 872) + GuestWord(base, vs + 32));

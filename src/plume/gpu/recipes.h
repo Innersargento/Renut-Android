@@ -170,6 +170,24 @@ inline uint64_t SceneTagKey(uint64_t recipe, uint32_t scene) {
   return key;
 }
 
+// The render state an engine pass draws a model's records with
+// (native_d3d::EnginePass): a recipe without its shaders, vertex inputs and
+// the constants those make - `vs` holds the pass (1-8), `ps` whether the state
+// is drawn with a pixel shader, and the constants only the alpha test bit of
+// constant 0 and the user clip planes (3). The engine sets these per pass, not
+// per record (sub_823A9730 picks the passes of a scene phase; a record sets
+// only constants, textures, shaders and its geometry - sub_823A9C38), so the
+// states seen in a pass are the states every record of the pass draws with,
+// one per view it is drawn into. In the file, a record whose size has this bit
+// set is one of these.
+constexpr uint32_t kRecipePassBit = 0x40000000u;
+constexpr size_t kMaxPassStates = 32, kPredictedStatesPerPass = 8;
+struct PassState {
+  Recipe state;
+  std::string bytes;  // VisitRecipe of `state`, what two states are compared by
+  uint64_t uses = 0;  // new pipelines of the run drawn with it: prediction takes the most used
+};
+
 // The precompilation, shared by its threads and the loading-screen hold
 // (PlumeSceneRequested / PlumeSceneReady, driven by game_fixes.cpp). A group is
 // the recipes of one program; a scene's groups are those its pipelines are in.
@@ -213,6 +231,8 @@ struct PrecompileState {
   std::deque<std::vector<uint32_t>> groups;
   std::vector<uint8_t> warm_only;
   std::unordered_set<uint64_t> programs;
+  // The group each listed or predicted program was first put in.
+  std::unordered_map<uint64_t, uint32_t> group_of_program;
   uint32_t busy = 0;
   std::chrono::steady_clock::time_point batch_start;
   uint32_t batch_failed = 0;
@@ -235,6 +255,19 @@ struct PrecompileState {
       batch_failed = 0;
     }
     return g;
+  }
+
+  // Under mutex: the scene being loaded waits for group `g` too, which goes to
+  // the front of the queue. False when it is built already or waited for.
+  bool WaitInScene(uint32_t g) {
+    if (state[g] == kDone || std::find(scene_missing.begin(), scene_missing.end(), g) != scene_missing.end()) {
+      return false;
+    }
+    scene_missing.push_back(g);
+    scene_total += group_size[g];
+    scene_left += group_size[g];
+    if (state[g] == kPending) urgent.push_front(g);
+    return true;
   }
 
   // Under mutex. What a scene being loaded asks for (urgent) - its recorded

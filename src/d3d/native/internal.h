@@ -217,7 +217,7 @@ class Builder {
               uint32_t serial) {
     const size_t at = list_.words.size();
     uint32_t* p = Grow(6);
-    p[0] = kOpDraw | (flags << 8);
+    p[0] = kOpDraw | ((flags | (uint32_t(EnginePass()) << kDrawPassShift)) << 8);
     p[1] = viz;
     p[2] = initiator;
     p[3] = dma_base;

@@ -199,11 +199,13 @@ void Pipelines::StartRecipes() {
     }
     return bytes;
   };
-  // Records are a 32-bit size and a recipe's bytes, or a scene tag (the size
-  // with kRecipeTagBit). One cut short by the app being killed mid-write ends
-  // the list and is cut off the file.
+  // Records are a 32-bit size and a recipe's bytes, a scene tag (the size
+  // with kRecipeTagBit) or an engine pass's render state (kRecipePassBit). One
+  // cut short by the app being killed mid-write ends the list and is cut off
+  // the file.
   auto recipes = std::make_shared<std::vector<std::pair<uint64_t, Recipe>>>();
   std::vector<std::pair<uint64_t, uint32_t>> tags;
+  size_t pass_states = 0;
   RecipeHeader header;
   // Returns where the good records end, 0 for a file that is not a list.
   auto parse = [&](const std::vector<uint8_t>& bytes) -> size_t {
@@ -213,7 +215,7 @@ void Pipelines::StartRecipes() {
       uint32_t size = 0;
       std::memcpy(&size, bytes.data() + good_end, sizeof(size));
       const uint8_t* at = bytes.data() + good_end + sizeof(size);
-      const uint32_t length = size & ~kRecipeTagBit;
+      const uint32_t length = size & ~(kRecipeTagBit | kRecipePassBit);
       if (size_t(bytes.data() + bytes.size() - at) < length) break;
       if (size & kRecipeTagBit) {
         if (length != kRecipeTagSize) break;
@@ -222,6 +224,19 @@ void Pipelines::StartRecipes() {
         std::memcpy(&recipe, at, sizeof(recipe));
         std::memcpy(&scene, at + sizeof(recipe), sizeof(scene));
         if (scene_tags_.insert(SceneTagKey(recipe, scene)).second) tags.emplace_back(recipe, scene);
+      } else if (size & kRecipePassBit) {
+        PassState learned;
+        RecipeReader reader{at, at + length};
+        if (VisitRecipe(reader, learned.state) && learned.state.vs >= 1 && learned.state.vs <= 8) {
+          learned.bytes.assign(reinterpret_cast<const char*>(at), length);
+          std::vector<PassState>& states = pass_states_[learned.state.vs];
+          const bool known = std::any_of(states.begin(), states.end(),
+                                         [&](const PassState& s) { return s.bytes == learned.bytes; });
+          if (!known && states.size() < kMaxPassStates) {
+            states.push_back(std::move(learned));
+            ++pass_states;
+          }
+        }
       } else {
         Recipe recipe;
         RecipeReader reader{at, at + length};
@@ -284,6 +299,7 @@ void Pipelines::StartRecipes() {
     p.state.clear();
     p.group_size.clear();
     p.programs.clear();
+    p.group_of_program.clear();
     p.urgent.clear();
     p.background.clear();
     p.busy = 0;
@@ -292,8 +308,9 @@ void Pipelines::StartRecipes() {
     p.total = 0;
     p.running = false;
     for (size_t g = 0; g < grouped.size(); ++g) {
-      p.AddGroup(std::move(grouped[g]), false);
+      const uint32_t added = p.AddGroup(std::move(grouped[g]), false);
       p.programs.insert(program_of_group[g]);
+      p.group_of_program.emplace(program_of_group[g], added);
     }
     for (const auto& [recipe, scene] : tags) {
       auto group = group_of_recipe.find(recipe);
@@ -309,9 +326,9 @@ void Pipelines::StartRecipes() {
   stop_precompile_ = false;
   const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
   const uint32_t count = std::clamp(cores * 2 / 3, 2u, 6u);
-  REXLOG_INFO("Renut: Plume knows {} pipelines ({} programs, {} tags over {} scenes) from {}; each scene's are "
-              "built while it loads, on {} threads",
-              recipes->size(), p.groups.size(), tags.size(), p.scene_groups.size(), path, count);
+  REXLOG_INFO("Renut: Plume knows {} pipelines ({} programs, {} tags over {} scenes, {} engine pass states) from {}; "
+              "each scene's are built while it loads, on {} threads",
+              recipes->size(), p.groups.size(), tags.size(), p.scene_groups.size(), pass_states, path, count);
   recipes->clear();
   p.predicting = true;
   // The threads stay for the whole run: predicted programs (PredictPipelines)
@@ -427,34 +444,82 @@ void Pipelines::StopRecipes() {
   recorded_recipes_.clear();
   scene_tags_.clear();
   recipe_of_.clear();
+  for (auto& states : pass_states_) states.clear();
+  predicted_recipes_.clear();
   if (recipe_file_) std::fclose(recipe_file_);
   recipe_file_ = nullptr;
 }
 
+// An engine pass's render state, learned from a draw of the pass that made a
+// new pipeline (IssueDraw): kept per pass, counted, and written to the file the
+// first time it is seen.
+void Pipelines::LearnPassState(uint8_t pass, const Recipe& recipe) {
+  if (pass < 1 || pass > 8) return;
+  PassState learned;
+  Recipe& s = learned.state;
+  s.vs = pass;
+  s.ps = recipe.ps ? 1 : 0;
+  s.desc = recipe.desc;
+  s.desc.pipelineLayout = nullptr;
+  s.desc.vertexShader = s.desc.geometryShader = s.desc.pixelShader = nullptr;
+  s.desc.inputElements = nullptr;
+  s.desc.inputElementsCount = 0;
+  s.desc.inputSlots = nullptr;
+  s.desc.inputSlotsCount = 0;
+  s.desc.specConstants = nullptr;
+  s.desc.specConstantsCount = 0;
+  for (const RenderSpecConstant& c : recipe.constants) {
+    if (c.index == 0) s.constants.emplace_back(0, c.value & SPEC_CONSTANT_ALPHA_TEST);
+    if (c.index == 3) s.constants.emplace_back(3, c.value);
+  }
+  RecipeWriter writer{learned.bytes};
+  VisitRecipe(writer, s);
+  std::vector<PassState>& states = pass_states_[pass];
+  for (PassState& known : states) {
+    if (known.bytes == learned.bytes) {
+      ++known.uses;
+      return;
+    }
+  }
+  if (states.size() >= kMaxPassStates) return;
+  learned.uses = 1;
+  WriteRecord(kRecipePassBit | uint32_t(learned.bytes.size()), learned.bytes.data());
+  REXLOG_INFO("Renut: Plume engine pass {} draws with a new render state ({} targets, depth {}{}, {} pixel shader); "
+              "{} known for it",
+              pass - 1, s.desc.renderTargetCount, s.desc.depthEnabled ? "on" : "off",
+              s.desc.depthWriteEnabled ? " written" : "", s.ps ? "with a" : "without a", states.size() + 1);
+  states.push_back(std::move(learned));
+}
+
 // Pipeline prediction (PlumePredictPipelines): the shader pairs of the models
-// that loaded, each turned into the recipe a draw of it would make - the same
-// vertex inputs and specialization constants IssueDraw works out - with a fixed
-// state borrowed from a real draw. The driver's cache is keyed by the program
-// (shaders and specialization), not that state, so the pipeline the draw makes
-// later finds its program built. Runs on the command thread, a few
+// that loaded, each turned into the recipes a draw of it would make - the same
+// vertex inputs and specialization constants IssueDraw works out. A record's
+// whole pipelines come from the render states its passes are known to draw
+// with (PassState), built as real pipelines the draws take as they take the
+// listed ones. A pair with no pass state known yet gets its program alone, with
+// a fixed state borrowed from a real draw: the driver's cache is keyed by the
+// program (shaders and specialization), not that state, so the pipeline the
+// draw makes later finds its program built. Runs on the command thread, a few
 // milliseconds at a time.
-void Pipelines::PredictPipelines() {
+bool Pipelines::PredictPipelines() {
+  const bool any_state = std::any_of(pass_states_.begin(), pass_states_.end(),
+                                     [](const std::vector<PassState>& states) { return !states.empty(); });
+  if (!predict_desc_set_[0] && !any_state) return false;  // nothing to build them with yet
   std::vector<PlumeShaderPair> pairs;
   {
     std::lock_guard lock(g_predict.mutex);
     pairs.swap(g_predict.pairs);
   }
-  if (pairs.empty()) return;
+  if (pairs.empty()) return false;
   PrecompileState& p = g_precompile;
   const auto start = std::chrono::steady_clock::now();
-  uint32_t added = 0, known = 0, unknown = 0;
+  uint32_t added = 0, known = 0, unknown = 0, exact = 0, raised = 0;
   size_t i = 0;
   for (; i < pairs.size(); ++i) {
     if (i && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(8)) break;
     const PlumeShaderPair& pair = pairs[i];
     const int form_kind = pair.ps_dwords ? 0 : 1;
-    if (!predict_desc_set_[form_kind]) {
-      if (!predict_desc_set_[0]) break;  // no draw yet: later
+    if (!predict_desc_set_[form_kind] && predict_desc_set_[0]) {
       predict_desc_[1] = predict_desc_[0];
       predict_desc_[1].renderTargetCount = 0;
       predict_desc_set_[1] = true;
@@ -478,11 +543,11 @@ void Pipelines::PredictPipelines() {
     }
     if (!vs->elements_decoded) DecodeLiveElements(*vs);
 
-    Recipe recipe;
-    recipe.vs = vs->entry->hash;
-    recipe.ps = ps ? ps->entry->hash : 0;
-    recipe.desc = predict_desc_[form_kind];
-    // Vertex inputs, as IssueDraw lays them out (every stream taken as bound).
+    // What the shaders make of a recipe: the vertex inputs, as IssueDraw lays
+    // them out (every stream taken as bound), and the constants that follow.
+    Recipe shaders;
+    shaders.vs = vs->entry->hash;
+    shaders.ps = ps ? ps->entry->hash : 0;
     std::array<bool, 17> slot_used{};
     uint32_t input_remap[RENUT_INPUT_REMAP_COUNT] = {};
     uint32_t packed_inputs = 0, int_inputs = 0;
@@ -501,16 +566,16 @@ void Pipelines::PredictPipelines() {
                                 : RenderFormat::UNKNOWN;
       if (!element || format == RenderFormat::UNKNOWN || !element->stride || element->slot >= slot_used.size() ||
           (slot_used[element->slot] &&
-           std::find_if(recipe.slots.begin(), recipe.slots.end(), [&](const RenderInputSlot& s) {
+           std::find_if(shaders.slots.begin(), shaders.slots.end(), [&](const RenderInputSlot& s) {
              return s.index == element->slot && s.stride != element->stride;
-           }) != recipe.slots.end())) {
-        recipe.elements.emplace_back("TEXCOORD", location, location,
-                                     integer ? RenderFormat::R32G32B32A32_UINT : RenderFormat::R32G32B32A32_FLOAT,
-                                     kZeroBinding, 0);
+           }) != shaders.slots.end())) {
+        shaders.elements.emplace_back("TEXCOORD", location, location,
+                                      integer ? RenderFormat::R32G32B32A32_UINT : RenderFormat::R32G32B32A32_FLOAT,
+                                      kZeroBinding, 0);
         zero_used = true;
         continue;
       }
-      recipe.elements.emplace_back("TEXCOORD", location, location, format, element->slot, element->offset);
+      shaders.elements.emplace_back("TEXCOORD", location, location, format, element->slot, element->offset);
       switch (decode) {
         case InputDecode::kInteger: int_inputs |= 1u << location; break;
         case InputDecode::kPacked1010102: packed_inputs |= 1u << location; break;
@@ -521,60 +586,127 @@ void Pipelines::PredictPipelines() {
       }
       if (!slot_used[element->slot]) {
         slot_used[element->slot] = true;
-        recipe.slots.emplace_back(element->slot, element->stride);
+        shaders.slots.emplace_back(element->slot, element->stride);
       }
       if (location < RENUT_INPUT_REMAP_COUNT) input_remap[location] = element->remap;
     }
-    if (zero_used) recipe.slots.emplace_back(kZeroBinding, 0);
-    // Specialization constants in IssueDraw's order: alpha test as the pass
-    // draws it, no user clip planes, the boolean registers at 0.
-    recipe.constants.emplace_back(0, (pair.alpha_test && ps ? SPEC_CONSTANT_ALPHA_TEST : 0u) |
-                                         (r11g11b10_normals ? SPEC_CONSTANT_R11G11B10_NORMAL : 0u));
-    if (packed_inputs) recipe.constants.emplace_back(1, packed_inputs);
-    if (int_inputs) recipe.constants.emplace_back(2, int_inputs);
-    for (uint32_t l = 0; l < RENUT_SPEC_INPUT_REMAP_LOCATIONS; ++l) {
-      if (input_remap[l]) recipe.constants.emplace_back(RENUT_SPEC_INPUT_REMAP_BASE + l, input_remap[l]);
-    }
+    if (zero_used) shaders.slots.emplace_back(kZeroBinding, 0);
     const bool fetch_spec = backend.swap.fetch_spec_mode_ && vs->compiled->fetch_spec_module;
-    if (fetch_spec) {
-      for (const auto& [slot, entry] : vs->live_fetches) {
-        for (uint32_t word = 0; word < 4; ++word) {
-          if (entry[word]) recipe.constants.emplace_back(kFetchSpecBase + slot * 4 + word, entry[word]);
-        }
-      }
-    }
-    if (backend.draw.rel_constants_mode_ && backend.draw.rel_constants_mode_ < 10 &&
-        (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_REL_CONSTANTS)) {
-      recipe.constants.emplace_back(RENUT_SPEC_REL_CONSTANTS, backend.draw.rel_constants_mode_);
-    }
     const bool depth = backend.swap.depth_strip_mode_ && !ps &&
                        (fetch_spec ? vs->compiled->depth_fetch_spec_module : vs->compiled->depth_module);
-    recipe.form = depth ? (fetch_spec ? kRecipeDepthFetchSpec : kRecipeDepth)
-                        : (fetch_spec ? kRecipeFetchSpec : kRecipeModule);
-    std::string bytes;
-    RecipeWriter writer{bytes};
-    VisitRecipe(writer, recipe);
-    const uint64_t key = XXH3_64bits(bytes.data(), bytes.size());
-    const uint64_t program = RecipeProgram(recipe);
+    shaders.form = depth ? (fetch_spec ? kRecipeDepthFetchSpec : kRecipeDepth)
+                         : (fetch_spec ? kRecipeFetchSpec : kRecipeModule);
+    // Specialization constants in IssueDraw's order, with the alpha test and
+    // the user clip planes as the state draws them; the boolean registers at 0.
+    auto make = [&](const RenderGraphicsPipelineDesc& desc, uint32_t alpha, uint32_t clip_planes) {
+      Recipe recipe = shaders;
+      recipe.desc = desc;
+      recipe.constants.emplace_back(0, (ps ? alpha : 0u) | (r11g11b10_normals ? SPEC_CONSTANT_R11G11B10_NORMAL : 0u));
+      if (packed_inputs) recipe.constants.emplace_back(1, packed_inputs);
+      if (int_inputs) recipe.constants.emplace_back(2, int_inputs);
+      if (clip_planes) recipe.constants.emplace_back(3, clip_planes);
+      for (uint32_t l = 0; l < RENUT_SPEC_INPUT_REMAP_LOCATIONS; ++l) {
+        if (input_remap[l]) recipe.constants.emplace_back(RENUT_SPEC_INPUT_REMAP_BASE + l, input_remap[l]);
+      }
+      if (fetch_spec) {
+        for (const auto& [slot, entry] : vs->live_fetches) {
+          for (uint32_t word = 0; word < 4; ++word) {
+            if (entry[word]) recipe.constants.emplace_back(kFetchSpecBase + slot * 4 + word, entry[word]);
+          }
+        }
+      }
+      if (backend.draw.rel_constants_mode_ && backend.draw.rel_constants_mode_ < 10 &&
+          (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_REL_CONSTANTS)) {
+        recipe.constants.emplace_back(RENUT_SPEC_REL_CONSTANTS, backend.draw.rel_constants_mode_);
+      }
+      return recipe;
+    };
+    auto key_of = [](Recipe& recipe) {
+      std::string bytes;
+      RecipeWriter writer{bytes};
+      VisitRecipe(writer, recipe);
+      return XXH3_64bits(bytes.data(), bytes.size());
+    };
+
+    // The record's whole pipelines: one for each pass that draws it and each
+    // render state that pass is known to draw with, the most used first. Those
+    // the file lists or an earlier prediction made are left out; one group per
+    // program.
+    std::map<uint64_t, std::vector<std::pair<uint64_t, Recipe>>> whole;
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      if (!(pair.passes & (1u << bit))) continue;
+      std::vector<const PassState*> matching;
+      for (const PassState& state : pass_states_[bit + 1]) {
+        if ((state.state.ps != 0) == (ps != nullptr)) matching.push_back(&state);
+      }
+      std::stable_sort(matching.begin(), matching.end(),
+                       [](const PassState* a, const PassState* b) { return a->uses > b->uses; });
+      if (matching.size() > kPredictedStatesPerPass) matching.resize(kPredictedStatesPerPass);
+      for (const PassState* state : matching) {
+        uint32_t alpha = 0, clip_planes = 0;
+        for (const RenderSpecConstant& c : state->state.constants) {
+          if (c.index == 0) alpha = c.value;
+          if (c.index == 3) clip_planes = c.value;
+        }
+        Recipe recipe = make(state->state.desc, alpha, clip_planes);
+        const uint64_t key = key_of(recipe);
+        if (recorded_recipes_.count(key) || !predicted_recipes_.insert(key).second) continue;
+        whole[RecipeProgram(recipe)].emplace_back(key, std::move(recipe));
+      }
+    }
+    // A pair that no pass state reaches: its program alone, with the borrowed state.
+    Recipe borrowed;
+    uint64_t borrowed_program = 0;
+    if (whole.empty()) {
+      if (!predict_desc_set_[form_kind]) break;  // no draw yet: later
+      borrowed = make(predict_desc_[form_kind], pair.alpha_test ? SPEC_CONSTANT_ALPHA_TEST : 0u, 0);
+      borrowed_program = RecipeProgram(borrowed);
+    }
+
     std::lock_guard lock(p.mutex);
-    if (!p.programs.insert(program).second) {
-      ++known;
+    // A program the file lists: its recorded pipelines are what the model's
+    // draws will ask for, but untagged for this scene (its first visit) they
+    // would only be built once the game had drawn without them. While a scene
+    // loads its screen waits for them as for its own.
+    auto raise = [&](uint64_t program) {
+      auto listed = p.group_of_program.find(program);
+      if (p.loading && listed != p.group_of_program.end() && p.WaitInScene(listed->second)) ++raised;
+    };
+    auto queue = [&](uint32_t g) {
+      // While a scene loads its screen waits for these too, and they go first;
+      // during play they are left to the one thread that works then.
+      if (!p.loading) {
+        p.background.push_back(g);
+      } else {
+        p.WaitInScene(g);
+      }
+    };
+    if (whole.empty()) {
+      if (!p.programs.insert(borrowed_program).second) {
+        ++known;
+        raise(borrowed_program);
+        continue;
+      }
+      std::vector<std::pair<uint64_t, Recipe>> group;
+      group.emplace_back(key_of(borrowed), std::move(borrowed));
+      const uint32_t g = p.AddGroup(std::move(group), true);
+      p.group_of_program.emplace(borrowed_program, g);
+      queue(g);
+      ++added;
       continue;
     }
-    std::vector<std::pair<uint64_t, Recipe>> group;
-    group.emplace_back(key, std::move(recipe));
-    const uint32_t g = p.AddGroup(std::move(group), true);
-    // While a scene loads its screen waits for these too, and they go first;
-    // during play they are left to the one thread that works then.
-    if (!p.loading) {
-      p.background.push_back(g);
-    } else {
-      p.urgent.push_front(g);
-      p.scene_missing.push_back(g);
-      ++p.scene_total;
-      ++p.scene_left;
+    for (auto& [program, recipes] : whole) {
+      if (p.programs.insert(program).second) {
+        ++added;
+      } else {
+        ++known;
+        raise(program);
+      }
+      exact += uint32_t(recipes.size());
+      const uint32_t g = p.AddGroup(std::move(recipes), false);
+      p.group_of_program.try_emplace(program, g);
+      queue(g);
     }
-    ++added;
   }
   const size_t done = i;
   if (done < pairs.size()) {
@@ -582,16 +714,20 @@ void Pipelines::PredictPipelines() {
     g_predict.pairs.insert(g_predict.pairs.begin(), pairs.begin() + done, pairs.end());
   }
   g_predict.queued.fetch_sub(uint32_t(done), std::memory_order_relaxed);
-  if (added) p.changed.notify_all();
+  if (added || exact || raised) p.changed.notify_all();
   predict_added_ += added;
   predict_known_ += known;
   predict_unknown_ += unknown;
-  if (done && (added || unknown)) {
-    REXLOG_INFO("Renut: Plume predicted {} new programs from {} shader pairs ({} already known, {} without a "
-                "recompiled shader); {} new, {} known so far; draws so far used {} programs, {} built ahead",
-                added, done, known, unknown, predict_added_, predict_known_, p.draw_programs.load(),
-                p.draw_programs_ahead.load());
+  predict_exact_ += exact;
+  predict_raised_ += raised;
+  if (done && (added || unknown || raised)) {
+    REXLOG_INFO("Renut: Plume predicted {} new programs from {} shader pairs ({} already known, of which {} listed "
+                "ones the loading scene now waits for; {} without a recompiled shader; {} whole pipelines from pass "
+                "states); {} new, {} known, {} whole so far; draws so far used {} programs, {} built ahead",
+                added, done, known, raised, unknown, exact, predict_added_, predict_known_, predict_exact_,
+                p.draw_programs.load(), p.draw_programs_ahead.load());
   }
+  return done != 0;
 }
 
 // Flushed at once: a game closed by swiping it away never runs the shutdown
@@ -599,7 +735,7 @@ void Pipelines::PredictPipelines() {
 void Pipelines::WriteRecord(uint32_t size, const void* data) {
   if (!recipe_file_) return;
   std::fwrite(&size, sizeof(size), 1, recipe_file_);
-  std::fwrite(data, 1, size & ~kRecipeTagBit, recipe_file_);
+  std::fwrite(data, 1, size & ~(kRecipeTagBit | kRecipePassBit), recipe_file_);
   std::fflush(recipe_file_);
 }
 
