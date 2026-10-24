@@ -16,17 +16,10 @@ import java.util.*;
 import java.util.zip.*;
 
 public final class MainActivity extends androidx.activity.ComponentActivity {
-    private static final int DRIVER=12, EXPORT=13, SAVE_IMPORT=14, SAVE_EXPORT=15, PHOTO_EXPORT=16;
-    private final int ink=Color.rgb(226,237,235), muted=Color.rgb(158,182,181);
-    private TextView status, library, driver, fpsCounter, oneUiFix, tuDebug, ir3Debug, savesSummary;
-    private LinearLayout savesList;
-    private ProgressBar progress;
-    private Button cancel;
+    private static final int DRIVER=12, SAVE_IMPORT=14, SAVE_EXPORT=15, PHOTO_EXPORT=16;
+    private volatile String status="";
     private volatile Thread worker;
     private long lastProgress;
-    private String report="";
-    private final ArrayList<Button> actions=new ArrayList<>();
-    private final Map<String,Runnable> uiActions=new LinkedHashMap<>();
 
     @Override protected void attachBaseContext(android.content.Context base) {
         super.attachBaseContext(Language.attach(base));
@@ -45,94 +38,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         BundledDriver.sync(this,getPreferences(0));  // unpacks the Turnip that ships in the APK and makes it the default on Adreno
         getWindow().setStatusBarColor(Color.rgb(16,10,6));
         getWindow().setNavigationBarColor(Color.rgb(16,10,6));
-        LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(Color.rgb(16,10,6));setContentView(root);
-        FrameLayout pages=new FrameLayout(this);root.addView(pages,new LinearLayout.LayoutParams(-1,0,1));
-        ScrollView savesPage=new ScrollView(this);pages.addView(savesPage);
-        LinearLayout savesBody=new LinearLayout(this);savesBody.setOrientation(LinearLayout.VERTICAL);savesBody.setPadding(dp(24),dp(28),dp(24),dp(28));savesBody.setBackgroundColor(Color.rgb(16,10,6));savesPage.addView(savesBody);
-        savesBody.addView(text("RENUT  /  SAVES",13,Color.rgb(103,223,174)));
-        TextView savesTitle=text("Seus saves",34,ink);savesTitle.setTypeface(null,Typeface.BOLD);savesBody.addView(savesTitle);
-        LinearLayout saveCard=card(savesBody,"ARQUIVOS DO JOGO");
-        savesSummary=text("Procurando saves…",15,ink);saveCard.addView(savesSummary);
-        savesList=new LinearLayout(this);savesList.setOrientation(LinearLayout.VERTICAL);saveCard.addView(savesList);
-        button(saveCard,"Exportar saves (.zip)",()->{
-            Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("application/zip").addCategory(Intent.CATEGORY_OPENABLE);
-            i.putExtra(Intent.EXTRA_TITLE,"renut-saves.zip");startActivityForResult(i,SAVE_EXPORT);
-        });
-        button(saveCard,"Importar saves (.zip)",()->{
-            Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("application/zip").addCategory(Intent.CATEGORY_OPENABLE);
-            startActivityForResult(i,SAVE_IMPORT);
-        });
-        ScrollView scroll=new ScrollView(this);pages.addView(scroll);scroll.setVisibility(View.GONE);
-        LinearLayout body=new LinearLayout(this); body.setOrientation(LinearLayout.VERTICAL); body.setPadding(dp(24),dp(28),dp(24),dp(28));
-        body.setBackgroundColor(Color.rgb(16,10,6)); scroll.addView(body);
-        body.setOnApplyWindowInsetsListener((v,insets)->{
-            v.setPadding(dp(24),dp(28)+insets.getSystemWindowInsetTop(),dp(24),dp(28)+insets.getSystemWindowInsetBottom()); return insets;
-        });
-        body.addView(text("RENUT  /  ANDROID",13,Color.rgb(103,223,174)));
-        TextView title=text("Uma nova casa\npara a aventura.",34,ink); title.setTypeface(null,Typeface.BOLD); body.addView(title);
-        body.addView(text("Prévia de desenvolvimento · 0.4\nImporte seus arquivos e teste a inicialização do Banjo com gráficos nativos Vulkan. Compatibilidade e desempenho estão em desenvolvimento.",15,muted));
-        LinearLayout game=card(body,"01   SEU JOGO");
-        library=text("Nenhum arquivo importado",16,ink); game.addView(library);
-        CheckBox showControls=new CheckBox(this);
-        showControls.setText("Mostrar controles na tela");
-        showControls.setTextColor(ink);
-        showControls.setChecked(getPreferences(0).getBoolean("showControls",true));
-        showControls.setOnCheckedChangeListener((view,checked)->
-            getPreferences(0).edit().putBoolean("showControls",checked).apply());
-        game.addView(showControls);
-        CheckBox autoStart=new CheckBox(this);
-        autoStart.setText("Iniciar direto no jogo");
-        autoStart.setTextColor(ink);
-        autoStart.setChecked(getPreferences(0).getBoolean("autoStart",false));
-        autoStart.setOnCheckedChangeListener((view,checked)->
-            getPreferences(0).edit().putBoolean("autoStart",checked).apply());
-        game.addView(autoStart);
-        button(game,"Configurar controle externo",()->startActivity(new Intent(this,ControllerSettingsActivity.class)));
-        button(game,"Iniciar Banjo (experimental)",()->startGame());
-        button(game,"Validar runtime ARM64",()->startActivity(new Intent(this,RuntimeActivity.class)));
-        button(game,"Testar runtime com Plume",()->{
-            Intent i=new Intent(this,RuntimeActivity.class).putExtra("graphics",true);
-            i.putExtra("driverDir",getPreferences(0).getString("driverDir",""));
-            i.putExtra("driverLib",getPreferences(0).getString("driverLib",""));startActivity(i);
-        });
-        LinearLayout graphics=card(body,"02   GRÁFICOS");
-        driver=text("Driver do sistema",16,ink); graphics.addView(driver);
-        button(graphics,"Importar driver Adreno (.zip)",()->pick(DRIVER));
-        button(graphics,"Usar driver do sistema",()->{getPreferences(0).edit().remove("driverDir").remove("driverLib").putBoolean(BundledDriver.PREF_CHOSEN,true).apply(); refresh();});
-        button(graphics,"Apagar cache de shaders",()->new AlertDialog.Builder(this)
-            .setTitle(Language.s(R.string.shader_cache_title))
-            .setMessage(Language.s(R.string.shader_cache_message))
-            .setNegativeButton(Language.s(R.string.common_cancel),null)
-            .setPositiveButton(Language.s(R.string.common_delete),(dialog,which)->clearShaderCache())
-            .show());
-        fpsCounter=text("",16,ink); graphics.addView(fpsCounter);
-        button(graphics,"Ativar/desativar contador de FPS",()->{
-            getPreferences(0).edit().putBoolean("fps",!getPreferences(0).getBoolean("fps",false)).apply(); refresh();
-        });
-        oneUiFix=text("",16,ink); graphics.addView(oneUiFix);
-        button(graphics,"Ativar/desativar One UI fix",()->{
-            getPreferences(0).edit().putBoolean("oneui",!getPreferences(0).getBoolean("oneui",true)).apply(); refresh();
-        });
-        graphics.addView(text("Pede ao Turnip a dica de flag UBWC do processador de texturas (FD_DEV_FEATURES). Sem ela, amostrar uma imagem comprimida que a GPU acabou de escrever devolve dado velho: a tela pisca preta e os quadros saem em blocos. Não tem efeito no driver do sistema.",13,muted));
-        tuDebug=text("",16,ink); graphics.addView(tuDebug);
-        graphics.addView(text("Depuração do Turnip. \"perf\" registra no logcat por que cada render pass foi para GMEM ou sysmem; \"sysmem\" e \"gmem\" forçam um dos modos. Só para medição. Não tem efeito no driver do sistema.",13,muted));
-        ir3Debug=text("",16,ink); graphics.addView(ir3Debug);
-        graphics.addView(text("Opções do compilador de shaders do Turnip. \"nopreamble\" é o mais rápido, mas faz placas penduradas piscarem entre dois tons; \"noearlypreamble\", \"nouboopt\" e \"nodescprefetch\" servem para medir. Cada combinação tem seu próprio cache de shaders. Não tem efeito no driver do sistema.",13,muted));
-        LinearLayout diagnostics=card(body,"03   ATIVIDADE");
-        status=text("Pronto para começar.",14,ink); diagnostics.addView(status);
-        progress=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal); progress.setVisibility(View.GONE); diagnostics.addView(progress);
-        cancel=new Button(this); cancel.setText("Cancelar importação"); cancel.setVisibility(View.GONE);
-        cancel.setOnClickListener(v->{Thread t=worker;if(t!=null)t.interrupt();}); diagnostics.addView(cancel);
-        button(diagnostics,"Exportar diagnóstico",()->{
-            Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain").addCategory(Intent.CATEGORY_OPENABLE);
-            i.putExtra(Intent.EXTRA_TITLE,"renut-diagnostico.txt");startActivityForResult(i,EXPORT);
-        });
-        LinearLayout nav=new LinearLayout(this);nav.setPadding(dp(16),dp(8),dp(16),dp(8));root.addView(nav);
-        Button savesTab=new Button(this);savesTab.setText("▣  Saves");savesTab.setAllCaps(false);
-        Button settingsTab=new Button(this);settingsTab.setText("⚙  Configurações");settingsTab.setAllCaps(false);
-        nav.addView(savesTab,new LinearLayout.LayoutParams(0,dp(52),1));nav.addView(settingsTab,new LinearLayout.LayoutParams(0,dp(52),1));
-        savesTab.setOnClickListener(v->{savesPage.setVisibility(View.VISIBLE);scroll.setVisibility(View.GONE);refreshSaves();});
-        settingsTab.setOnClickListener(v->{savesPage.setVisibility(View.GONE);scroll.setVisibility(View.VISIBLE);});
         refresh();
         ComposeScreens.showMain(this);
         // Only on a fresh launch of the launcher: leaving the game (back, or "Sair para o
@@ -177,26 +82,28 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     private void toast(String message){
         runOnUiThread(()->Toast.makeText(this,message,Toast.LENGTH_LONG).show());
     }
-    private int dp(int n){return (int)(getResources().getDisplayMetrics().density*n);}
-    private TextView text(String value,int size,int color){TextView t=new TextView(this);t.setText(value);t.setTextSize(size);t.setTextColor(color);t.setPadding(0,dp(7),0,dp(9));return t;}
-    private LinearLayout card(LinearLayout parent,String label){
-        LinearLayout box=new LinearLayout(this);box.setOrientation(LinearLayout.VERTICAL);box.setPadding(dp(18),dp(14),dp(18),dp(14));
-        GradientDrawable bg=new GradientDrawable();bg.setColor(Color.rgb(30,20,12));bg.setCornerRadius(dp(18));box.setBackground(bg);
-        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);lp.topMargin=dp(18);parent.addView(box,lp);
-        box.addView(text(label,12,Color.rgb(103,223,174)));return box;
+    public void uiExportSaves(){
+        if(worker!=null)return;
+        Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("application/zip").addCategory(Intent.CATEGORY_OPENABLE);
+        i.putExtra(Intent.EXTRA_TITLE,"renut-saves.zip");startActivityForResult(i,SAVE_EXPORT);
     }
-    private void button(LinearLayout box,String name,Runnable action){
-        Button b=new Button(this);b.setText(name);b.setAllCaps(false);b.setTextColor(ink);
-        b.setOnClickListener(v->action.run());box.addView(b,new LinearLayout.LayoutParams(-1,dp(54)));actions.add(b);
-        uiActions.put(name,action);
+    public void uiImportSaves(){
+        if(worker!=null)return;
+        startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("application/zip").addCategory(Intent.CATEGORY_OPENABLE),SAVE_IMPORT);
     }
-    public void uiAction(String name){Runnable action=uiActions.get(name);if(action!=null&&worker==null)action.run();}
+    public void uiPickDriver(){if(worker==null)pick(DRIVER);}
+    public void uiOpenControllerSettings(){if(worker==null)startActivity(new Intent(this,ControllerSettingsActivity.class));}
+    public void uiConfirmClearShaderCache(){
+        if(worker!=null)return;
+        new AlertDialog.Builder(this)
+            .setTitle(Language.s(R.string.shader_cache_title))
+            .setMessage(Language.s(R.string.shader_cache_message))
+            .setNegativeButton(Language.s(R.string.common_cancel),null)
+            .setPositiveButton(Language.s(R.string.common_delete),(dialog,which)->clearShaderCache())
+            .show();
+    }
     public boolean uiBusy(){return worker!=null;}
-    public boolean uiCanCancel(){return worker!=null&&cancel.getVisibility()==View.VISIBLE;}
-    public void uiCancelImport(){Thread t=worker;if(t!=null&&uiCanCancel())t.interrupt();}
-    public String uiLibrary(){return library.getText().toString();}
-    public String uiStatus(){return status.getText().toString();}
-    public String uiDriver(){return driver.getText().toString();}
+    public String uiStatus(){return status;}
     private String systemDriver(){return Language.s(R.string.driver_system);}
     /** Drivers kept on the device: {dir, lib, name}. The one in use is mirrored in driverDir/driverLib. */
     private java.util.List<JSONObject> storedDrivers(){
@@ -292,10 +199,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         try{GameFiles.removeTree(new File(dir));}catch(IOException e){toast(Language.s(R.string.driver_remove_failed,e.getMessage()));}
         refresh();
     }
-    public String uiFps(){return fpsCounter.getText().toString();}
-    public String uiOneUi(){return oneUiFix.getText().toString();}
-    public String uiTu(){return tuDebug.getText().toString();}
-    public String uiIr3(){return ir3Debug.getText().toString();}
     public boolean uiAutoStart(){return getPreferences(0).getBoolean("autoStart",false);}
     public void uiSetAutoStart(boolean value){getPreferences(0).edit().putBoolean("autoStart",value).apply();}
     public boolean uiShowControls(){return getPreferences(0).getBoolean("showControls",true);}
@@ -330,15 +233,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     }
     public java.util.List<String> uiSaves()throws IOException{return SaveArchive.list(new File(getFilesDir(),"runtime-user"));}
     private void pick(int code){startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE),code);}
-    private void refreshSaves(){
-        if(savesList==null)return;
-        savesList.removeAllViews();
-        try{
-            java.util.List<String> entries=SaveArchive.list(new File(getFilesDir(),"runtime-user"));
-            savesSummary.setText(entries.isEmpty()?"Nenhum save encontrado neste aparelho.":entries.size()+" arquivo(s) de save encontrado(s).");
-            for(String name:entries)savesList.addView(text(name,13,muted));
-        }catch(IOException e){savesSummary.setText("Não foi possível ler os saves: "+e.getMessage());}
-    }
     private void clearShaderCache(){
         File root=getFilesDir();
         try{
@@ -349,25 +243,11 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             toast(Language.s(removed?R.string.shader_cache_cleared:R.string.shader_cache_none));
         }catch(IOException e){toast(Language.s(R.string.shader_cache_failed,e.getMessage()));}
     }
-    @Override protected void onResume(){super.onResume();refresh();refreshSaves();}
+    @Override protected void onResume(){super.onResume();refresh();}
+    /** Shows the last runtime report as the status while no import is running. */
     private void refresh(){
-        if(library==null)return;
-        File active=new File(getFilesDir(),"active-game.txt");
-        try{
-            String name=new String(Files.readAllBytes(active.toPath()),java.nio.charset.StandardCharsets.UTF_8).trim();
-            File folder=new File(getFilesDir(),name);
-            boolean full=new File(folder,"Bundle").isDirectory();
-            library.setText("Banjo-Kazooie: Nuts & Bolts\n"+(full?"assets presentes":"XEX identificado; importe a ISO para obter os assets")+"\nInicialização experimental disponível");
-        }catch(IOException e){library.setText("Nenhum arquivo importado");}
-        driver.setText(uiDriverSelected());
-        fpsCounter.setText(getPreferences(0).getBoolean("fps",false)?"Contador de FPS: ativado":"Contador de FPS: desativado");
-        oneUiFix.setText(getPreferences(0).getBoolean("oneui",true)?"One UI fix: ativado":"One UI fix: desativado");
-        String debug=getPreferences(0).getString("tuDebug","");
-        tuDebug.setText("TU_DEBUG: "+(debug.isEmpty()?"desativado":debug));
-        String ir3=getPreferences(0).getString("ir3Debug","");
-        ir3Debug.setText("IR3_SHADER_DEBUG: "+(ir3.isEmpty()?"desativado":ir3));
         File runtimeReport=new File(getFilesDir(),"runtime-report.txt");
-        try{if(runtimeReport.isFile()&&worker==null)status.setText(new String(Files.readAllBytes(runtimeReport.toPath()),java.nio.charset.StandardCharsets.UTF_8));}catch(IOException ignored){}
+        try{if(runtimeReport.isFile()&&worker==null)status=new String(Files.readAllBytes(runtimeReport.toPath()),java.nio.charset.StandardCharsets.UTF_8);}catch(IOException ignored){}
     }
     @Override protected void onActivityResult(int request,int result,Intent data){
         super.onActivityResult(request,result,data);
@@ -386,7 +266,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         }
         if(request==PHOTO_EXPORT){
             if(worker!=null)return;
-            for(Button b:actions)b.setEnabled(false);
             worker=new Thread(()->{
                 try{
                     int count;
@@ -397,21 +276,11 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
                     if(count==0)try{getContentResolver().delete(uri,null,null);}catch(Exception ignored){}
                     runOnUiThread(()->Toast.makeText(this,Language.s(count>0?R.string.photos_exported:R.string.photos_export_none),Toast.LENGTH_LONG).show());
                 }catch(Exception e){runOnUiThread(()->new AlertDialog.Builder(this).setTitle(Language.s(R.string.saves_failed_title)).setMessage(e.getMessage()).setPositiveButton(Language.s(R.string.common_ok),null).show());}
-                finally{runOnUiThread(()->{worker=null;for(Button b:actions)b.setEnabled(true);});}
+                finally{runOnUiThread(()->{worker=null;});}
             },"renut-photos");worker.start();
             return;
         }
-        if(request==EXPORT){
-            try(OutputStream out=getContentResolver().openOutputStream(uri)){
-                if(out==null)throw new IOException(Language.s(R.string.unavailable_dest));
-                String text="Aparelho: "+Build.MANUFACTURER+" "+Build.MODEL+"\nAndroid: "+Build.VERSION.RELEASE+"\nABI: "+Arrays.toString(Build.SUPPORTED_ABIS)+"\n"+report;
-                File runtimeReport=new File(getFilesDir(),"runtime-report.txt");
-                if(runtimeReport.isFile())text+="\n\n"+new String(Files.readAllBytes(runtimeReport.toPath()),java.nio.charset.StandardCharsets.UTF_8);
-                out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            }catch(IOException e){status.setText(e.getMessage());}return;
-        }
         if(worker!=null||request!=DRIVER)return;
-        for(Button b:actions)b.setEnabled(false);cancel.setVisibility(View.VISIBLE);progress.setVisibility(View.VISIBLE);progress.setIndeterminate(true);
         worker=new Thread(()->{
             File stage=new File(getFilesDir(),"import-"+UUID.randomUUID());
             boolean committed=false;
@@ -422,12 +291,11 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
             }catch(Exception e){toast(Language.s(R.string.driver_import_failed,String.valueOf(e.getMessage())));}
             finally{
                 if(!committed)try{GameFiles.removeTree(stage);}catch(IOException ignored){}
-                runOnUiThread(()->{worker=null;cancel.setVisibility(View.GONE);progress.setVisibility(View.GONE);for(Button b:actions)b.setEnabled(true);refresh();});
+                runOnUiThread(()->{worker=null;refresh();});
             }
         },"renut-import");worker.start();
     }
     private void transferSaves(Uri uri,boolean importing){
-        for(Button b:actions)b.setEnabled(false);
         worker=new Thread(()->{
             try{
                 File saveRoot=new File(getFilesDir(),"runtime-user");
@@ -444,13 +312,13 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
                 }
                 runOnUiThread(()->Toast.makeText(this,Language.s(importing?R.string.saves_imported:R.string.saves_exported),Toast.LENGTH_LONG).show());
             }catch(Exception e){runOnUiThread(()->new AlertDialog.Builder(this).setTitle(Language.s(R.string.saves_failed_title)).setMessage(e.getMessage()).setPositiveButton(Language.s(R.string.common_ok),null).show());}
-            finally{runOnUiThread(()->{worker=null;for(Button b:actions)b.setEnabled(true);refreshSaves();});}
+            finally{runOnUiThread(()->{worker=null;});}
         },"renut-saves");worker.start();
     }
     private void update(String message,long done,long total)throws IOException{
         if(Thread.currentThread().isInterrupted())throw new InterruptedIOException(Language.s(R.string.import_cancelled));
         long now=SystemClock.elapsedRealtime();if(now-lastProgress<250)return;lastProgress=now;
-        runOnUiThread(()->{status.setText(message);progress.setIndeterminate(total==0);if(total>0)progress.setProgress((int)(done*100/total));});
+        status=message;
     }
     private void importDriver(Uri source,File stage)throws Exception{
         long total=0;int files=0;Set<String> names=new HashSet<>();

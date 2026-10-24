@@ -346,8 +346,8 @@ private val NAV_ENTRIES = listOf(
         }
         item {
             Panel(stringResource(R.string.saves_panel_transfer)) {
-                ActionButton(stringResource(R.string.saves_export), !activity.uiBusy()) { activity.uiAction("Exportar saves (.zip)") }
-                ActionButton(stringResource(R.string.saves_import), !activity.uiBusy(), outlined = true) { activity.uiAction("Importar saves (.zip)") }
+                ActionButton(stringResource(R.string.saves_export), !activity.uiBusy()) { activity.uiExportSaves() }
+                ActionButton(stringResource(R.string.saves_import), !activity.uiBusy(), outlined = true) { activity.uiImportSaves() }
                 Text(stringResource(R.string.saves_import_note), color = Muted, fontSize = 12.sp)
             }
         }
@@ -757,7 +757,7 @@ private val SKIN_LABELS = listOf(
             Panel(stringResource(R.string.settings_controls)) {
                 ToggleRow(stringResource(R.string.settings_show_controls), controlsEnabled, !busy) { activity.uiSetShowControls(it) }
                 ActionButton(stringResource(R.string.layouts_manage), !busy, outlined = true) { activity.uiOpenLayoutEditor() }
-                ActionButton(stringResource(R.string.settings_external), !busy, outlined = true) { activity.uiAction("Configurar controle externo") }
+                ActionButton(stringResource(R.string.settings_external), !busy, outlined = true) { activity.uiOpenControllerSettings() }
             }
         }
         item {
@@ -769,7 +769,7 @@ private val SKIN_LABELS = listOf(
                         Icon(Icons.Default.Delete, stringResource(R.string.settings_driver_delete), tint = if (busy) Muted else Accent)
                     }
                 }
-                ActionButton(stringResource(R.string.settings_driver_import), !busy, outlined = true) { activity.uiAction("Importar driver Adreno (.zip)") }
+                ActionButton(stringResource(R.string.settings_driver_import), !busy, outlined = true) { activity.uiPickDriver() }
                 if (busy) Text(activity.uiStatus(), color = Muted, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
                 if (turnip) {
                     ToggleRow("One UI fix", oneUiEnabled, !busy) { activity.uiSetOneUi(it) }
@@ -778,7 +778,7 @@ private val SKIN_LABELS = listOf(
                 } else {
                     Text(stringResource(R.string.settings_turnip_note), color = Muted, fontSize = 12.sp)
                 }
-                ActionButton(stringResource(R.string.settings_clear_shaders), !busy, outlined = true) { activity.uiAction("Apagar cache de shaders") }
+                ActionButton(stringResource(R.string.settings_clear_shaders), !busy, outlined = true) { activity.uiConfirmClearShaderCache() }
             }
         }
         item {
