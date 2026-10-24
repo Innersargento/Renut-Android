@@ -61,23 +61,20 @@ git submodule update --init --recursive
    `vkQueueSubmit`/`vkWaitForFences` (perda do dispositivo). Cópia
    textura→buffer e os comandos de estado dinâmico saem direto no command
    buffer do Plume.
-5. **Ajustes de compilação** (só `windows/CMakeLists.txt`, nunca nos fontes do
-   SDK): o SDK vira biblioteca estática dentro do `.exe` (as exportações do
-   kernel têm o prefixo `__imp_`, que o linker COFF lê como DLL), os symlinks do
-   `mspack` são resolvidos para os alvos reais, o `git` fica escondido do SDK
-   (ele lê a versão das tags do repositório) e um cabeçalho é incluído à força
-   num arquivo do driver XInput.
+5. **Ajustes de compilação** (só `android/native/CMakeLists.txt` e os
+   cabeçalhos de `src/platform/shims/`, nunca nos fontes do SDK): os
+   cabeçalhos são incluídos à força em arquivos do SDK e do Plume, e a abertura
+   do `libvulkan` do Plume é redirecionada na compilação do arquivo.
 
 ## Estado por plataforma
 
-- **Windows (PC): feito.** `windows/` compila e roda contra os dois submódulos
-  intactos: logo da Rare, abertura e tela-título (renderização conferida por
-  captura da própria janela), ~2.100 quadros em 65 s sem queda.
+- **Windows: abandonado.** O build de PC (`windows/`) existiu até 23/10/2026 e
+  foi removido; o estado está no tag `archive/candidate-v1-pre-android`.
 - **Android: compila e roda contra os dois submódulos intactos** (13/10/2026).
   `android/native/CMakeLists.txt` aponta para `thirdparty/rexglue-sdk` e o
   Plume é compilado de `thirdparty/plume`; o que não é
   SDK nem Plume (libadrenotools, libucontext) está em `thirdparty/`. O que o Android precisa a mais
-  vem de `src/platform/android/shims/` (cabeçalhos incluídos à força em arquivos do
+  vem de `src/platform/shims/` (cabeçalhos incluídos à força em arquivos do
   SDK), de `kernel_overrides.*` e do áudio próprio (`renut_audio.cpp`). Chega à
   tela-título; o que ainda falta está na tabela abaixo.
 
@@ -117,7 +114,7 @@ git submodule update --init --recursive
 | Rastreio de memória, mapeamento persistente, sem compressão | **Descartados** (eram ferramentas de investigação) |
 | Carregador Vulkan do app Android (driver embutido) | A fazer (Android): a abertura do `libvulkan` do Plume é redirecionada na compilação do arquivo, sem editá-lo |
 
-## Áudio do Android (`src/platform/android/renut_audio.cpp`)
+## Áudio do Android (`src/platform/renut_audio.cpp`)
 
 O backend SDL do SDK e o laço de trabalho do `AudioSystem` do SDK não são
 usados no Android. O reNut registra o seu próprio `AudioSystem` em

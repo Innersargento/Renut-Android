@@ -11,7 +11,7 @@ then gradle -PrenutPgo=use -PrenutPgoProfile=out/pgo/renut.profdata.
 import glob, os, subprocess, sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 OUT = ROOT / "out" / "pgo"
 SDK = Path(os.environ.get("ANDROID_HOME") or r"C:\Users\Sidney-PC\AppData\Local\Android\Sdk")
 ADB = os.environ.get("ADB") or str(SDK / "platform-tools" / "adb.exe")

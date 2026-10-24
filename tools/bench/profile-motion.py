@@ -7,9 +7,9 @@ CPU time of every thread of the game process and the core it last ran on. Then
 a simpleperf record of the whole process, reported by thread and by function
 (the guest's recompiled functions are `sub_XXXXXXXX` symbols).
 
-    python tools/profile-motion.py --label parked --seconds 25
-    python tools/profile-motion.py --label driving --seconds 25
-    python tools/profile-motion.py --compare parked driving
+    python tools/bench/profile-motion.py --label parked --seconds 25
+    python tools/bench/profile-motion.py --label driving --seconds 25
+    python tools/bench/profile-motion.py --compare parked driving
 
 Needs the game in the foreground. Output in out/profile-motion/<label>/.
 The symbols come from --symdir (an unstripped librenut_runtime.so that matches
@@ -19,7 +19,7 @@ import argparse, collections, glob, json, os, re, subprocess, sys, time
 
 ADB = os.environ.get("ADB") or r"C:\Users\Sidney-PC\AppData\Local\Android\Sdk\platform-tools\adb.exe"
 PKG = "org.renut.android"
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, "out", "profile-motion")
 K = "/sys/class/kgsl/kgsl-3d0"
 

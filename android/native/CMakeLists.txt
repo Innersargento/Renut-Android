@@ -6,10 +6,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 get_filename_component(RENUT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 # The code reNut itself writes: src/, shared with the Windows build (windows/CMakeLists.txt).
 set(RENUT_SRC "${RENUT_ROOT}/src")
-set(RENUT_ANDROID "${RENUT_SRC}/platform/android")
+set(RENUT_ANDROID "${RENUT_SRC}/platform")
 # The SDK is the git submodule thirdparty/rexglue-sdk (tag v0.10.0) exactly as
 # released: nothing under thirdparty/ is edited, patched or copied. What Android
-# needs on top of it is under src/ (platform/android/shims/, guest/kernel_overrides.*,
+# needs on top of it is under src/ (platform/shims/, guest/kernel_overrides.*,
 # the audio output) or arrives as compile options below.
 set(REXGLUE_ROOT "${RENUT_ROOT}/thirdparty/rexglue-sdk")
 set(PROJECT_SOURCE_DIR "${REXGLUE_ROOT}")
@@ -38,7 +38,7 @@ add_link_options(-flto=thin -Wl,--thinlto-jobs=all
 # runtime), driven by -DRENUT_PGO=gen|use (gradle: -PrenutPgo=gen|use):
 #   gen  instruments those two targets; the profile is written on nativeStop and
 #        nativeBackground (runtime_jni.cpp) to files/renut-%m.profraw.
-#   use  RENUT_PGO_PROFILE is the merged .profdata (tools/pgo.py merge).
+#   use  RENUT_PGO_PROFILE is the merged .profdata (tools/bench/pgo.py merge).
 set(RENUT_PGO "" CACHE STRING "PGO mode: gen, use or empty")
 set(RENUT_PGO_PROFILE "" CACHE FILEPATH "merged .profdata for RENUT_PGO=use")
 function(renut_pgo_target target)
@@ -54,7 +54,7 @@ function(renut_pgo_target target)
     endif()
 endfunction()
 # libc++ in the NDK lacks clock_time_conversion/clock_cast, which the SDK's chrono.h
-# builds on (platform/android/shims/android_chrono.h).
+# builds on (platform/shims/android_chrono.h).
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${RENUT_ANDROID}/shims/android_chrono.h>")
 include("${REXGLUE_ROOT}/cmake/rex_pch.cmake")
 set(REXGLUE_DERIVED_MAJOR 0)
@@ -119,12 +119,12 @@ set_property(TARGET rexcore PROPERTY INTERFACE_LINK_LIBRARIES "${CORE_INTERFACE}
 set_source_files_properties("${REXGLUE_ROOT}/src/core/fiber_posix.cpp"
     TARGET_DIRECTORY rexcore PROPERTIES
     COMPILE_OPTIONS "-include;${RENUT_ANDROID}/shims/android_ucontext.h")
-# The same for what the core files assume of glibc (platform/android/shims/android_core.h).
+# The same for what the core files assume of glibc (platform/shims/android_core.h).
 set_source_files_properties("${REXGLUE_ROOT}/src/core/memory_posix.cpp"
     "${REXGLUE_ROOT}/src/core/threading_posix.cpp"
     TARGET_DIRECTORY rexcore PROPERTIES
     COMPILE_OPTIONS "-include;${RENUT_ANDROID}/shims/android_core.h")
-# QueryProtect is interposed by src/platform/android/query_protect.cpp, which only works
+# QueryProtect is interposed by src/platform/query_protect.cpp, which only works
 # while the SDK's own callers reach it through the PLT. ThinLTO imported it into them and
 # bound the calls directly (the movies' MMIO fault path went back to parsing
 # /proc/self/maps per fault: slow video), so its file stays a plain native object.
@@ -154,7 +154,7 @@ file(READ "${REXGLUE_ROOT}/src/ui/CMakeLists.txt" UI_CMAKE)
 string(FIND "${UI_CMAKE}" "# Platform-specific dependencies" UI_END)
 string(SUBSTRING "${UI_CMAKE}" 0 ${UI_END} UI_CMAKE)
 string(REPLACE "surface_gnulinux.cpp" "" UI_CMAKE "${UI_CMAKE}")
-# The window is GameWindow (platform/android/android_game_window.h), a rex::ui::Window over the
+# The window is GameWindow (platform/android_game_window.h), a rex::ui::Window over the
 # Android surface (and GameContext its app context); the SDK's SDL window includes
 # Xlib unconditionally.
 string(REGEX REPLACE "[ ]+window_sdl[.]cpp" "" UI_CMAKE "${UI_CMAKE}")
@@ -219,10 +219,10 @@ set(RENUT_RUNTIME_SOURCES
     plume/gpu/targets.cpp plume/gpu/textures.cpp plume/plume_textures.cpp plume/shader_cache_blob.S
     vendor/smolv/smolv.cpp
     # Android only
-    platform/android/runtime_jni.cpp platform/android/achievements_bridge.cpp
-    platform/android/text_input_bridge.cpp platform/android/adpf.cpp platform/android/vulkan_entry.cpp
-    platform/android/renut_audio.cpp platform/android/xam_users.cpp platform/android/query_protect.cpp
-    platform/android/hardware_concurrency.cpp)
+    platform/runtime_jni.cpp platform/achievements_bridge.cpp
+    platform/text_input_bridge.cpp platform/adpf.cpp platform/vulkan_entry.cpp
+    platform/renut_audio.cpp platform/xam_users.cpp platform/query_protect.cpp
+    platform/hardware_concurrency.cpp)
 list(TRANSFORM RENUT_RUNTIME_SOURCES PREPEND "${RENUT_SRC}/")
 add_library(renut_runtime SHARED ${RENUT_RUNTIME_SOURCES}
     "${RENUT_SHADERS}/shader_cache.cpp" $<TARGET_OBJECTS:renut_guest>)

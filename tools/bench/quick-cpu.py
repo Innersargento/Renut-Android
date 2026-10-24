@@ -7,8 +7,8 @@ each window, next to the frame rate and the GPU clock and busy share. Use it
 for a change that is a CPU cost (a cache, a hash), where Mcycles/frame of the
 GPU does not move.
 
-    python tools/quick-cpu.py --file plume-shadercache --states 1,0
-    python tools/quick-cpu.py --file plume-keyreuse --states 1,0 --rounds 3
+    python tools/bench/quick-cpu.py --file plume-shadercache --states 1,0
+    python tools/bench/quick-cpu.py --file plume-keyreuse --states 1,0 --rounds 3
 
 States are flipped in A B B A A B ... order. Needs the game in the foreground
 on a scene that stands still (or a steady loop); the file is put back after.

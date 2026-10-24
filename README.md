@@ -1,125 +1,62 @@
+# reNut para Android
 
+Banjo-Kazooie: Nuts & Bolts no Android (ARM64), por **recompilação estática**: o
+executável do Xbox 360 é traduzido para C++ e compilado para o aparelho, e o
+Direct3D do jogo é desenhado por um renderizador próprio sobre Vulkan. Este
+repositório é só o app Android.
 
-<img width="1920" height="1080" alt="renut logo" src="https://github.com/user-attachments/assets/273bee28-755f-4494-920f-9333af72091e" />
+Este projeto vem do [reNut](https://github.com/masterspike52/reNut) de
+masterspike52 (a recompilação para PC) e usa o
+[RexGlue SDK](https://github.com/rexglue/rexglue-sdk).
 
+> **O repositório não traz nada do jogo.** Você precisa da sua própria cópia
+> (a edição **europeia**: o app confere o SHA-256 do `default.xex`) e a importa no
+> app. O código gerado e os shaders saem do seu jogo, ficam na sua máquina e nunca
+> entram no Git.
 
+## O que tem aqui
 
+| Pasta | O quê |
+|---|---|
+| `android/` | o app (Gradle, Kotlin/Java) e o `native/CMakeLists.txt` da biblioteca nativa |
+| `src/` | o código nativo: `guest/` (o jogo e o kernel emulado), `d3d/` (Direct3D do jogo), `plume/` (o renderizador), `platform/` (JNI, áudio, toque) |
+| `config/` | a configuração do codegen: funções, ganchos e a CRT do jogo |
+| `thirdparty/` | RexGlue SDK e Plume (submódulos, sem alteração) e as ferramentas de build (`thirdparty/README.md`) |
+| `tools/` | `prepare.py` (o build de ponta a ponta), `shaders/`, `i18n/`, `bench/` (medição no aparelho), `test/` |
+| `docs/` | como compilar, as dependências e as medições de desempenho (`docs/performance/`) |
 
-Originally created with <a href="https://github.com/rexglue/rexglue-sdk">Rexglue-SDK</a>
+## Como compilar
 
-**Dependencies:** RexGlue (`v0.10.0`) and Plume are git submodules under `thirdparty/` and are used unmodified; see [docs/DEPENDENCIAS.md](docs/DEPENDENCIAS.md).
+```bash
+python tools/prepare.py doctor                 # confere a máquina
+python tools/prepare.py all --game "<ISO ou pasta do jogo>"
+python tools/prepare.py apk                    # ou abra android/ no Android Studio
+```
 
-**Building for Android (Windows or Linux):** see [docs/BUILD.md](docs/BUILD.md) (`python tools/prepare.py all --game <your ISO>`, then Android Studio).
+O passo a passo, os pré-requisitos e os problemas conhecidos estão em
+[docs/BUILD.md](docs/BUILD.md). As dependências e o que mudamos nelas estão em
+[docs/DEPENDENCIAS.md](docs/DEPENDENCIAS.md).
 
-**Layout:** the code reNut writes is in [src/](src/README.md) and is shared by the Windows build ([windows/](windows/README.md), the PC build with the Plume renderer) and the Android build ([android/](android/README.md)). Existing desktop instructions below remain separate.
+## Medir desempenho
 
+`tools/bench/` tem os scripts que medem no aparelho conectado por `adb`
+(FPS, CPU das threads de GPU, A/B de uma opção). As medições feitas e o que
+delas saiu estão em [docs/performance/](docs/performance/).
 
+## Créditos
 
-DISCORD
---------------------------------------------
-We have a discord, please join and direct any questions there. Myself or someone else will happily answer them.
+- **reNut** (masterspike52), a recompilação do jogo para PC de que este
+  projeto parte, e quem a ajudou: SolarCookies (ganchos), ValcomDrifty (logo),
+  OlieGamerTV (documentação do jogo), XephyrCraft e os testadores.
+- **RexGlue SDK**, a base da recompilação.
+- **Plume** (renderbag), a camada de renderização sobre Vulkan.
+- **XenosRecomp** (hedge-dev), o conversor de shaders do Xbox 360, na versão do reNut.
+- **libadrenotools** e **liblinkernsbypass** (bylaws), que carregam o driver
+  Turnip empacotado; **libucontext** (kaniini), as fibras do código recompilado.
+- As licenças das bibliotecas embarcadas no app estão em
+  `android/app/src/main/assets/licenses/`.
 
-https://discord.gg/D5Bz2ZsHdY
+## Licença
 
-
-
-Credits
-------------------------------------------------
-<a href="https://github.com/rexglue/rexglue-sdk">Rexglue team</a> for creating Rexglue-SDK
-<br>
-the Rexglue SDK discord for helping with any info they have
-<br>
-SolarCookies for midasm hooks and future use of CRT functions and the reNut Launcher
-<br>
-ValcomDrifty for the renut logo
-<br>
-OlieGamerTV for the information and documentations made for nuts and bolts specifically
-<br>
-.
-<br>
-.
-<br>
-.
-<br>
-.
-<br>
-.
-<br>
-.
-<br>
-you, the player?
-<br>
-.
-
-
-Requirements
-----------------------------------------------
-the US version of Banjo-Kazooie: Nuts and Bolts (do not get the update, the recomp doesn't use it)
-
-How to play on Linux
-----------------------------------------------
-1. Download Goopie Launcher from https://goopie.xyz/#/downloads
-2. run goopie launcher
-3. find banjo-kazooie: nuts and bolts in goopie launcher and click select game
-4. select your iso for banjo-kazooie nuts and bolts, this will extract the contents to the default location for goopie (you can change it in goopie's settings)
-5. click install (this should install the latest release which comes with the game, the dll's needed, and renut.toml)
-6. click play when the game opens itll open a gui for setting your paths, you dont have to worry about it just click continue. it was placed there for me so when i deleted builds to rebuild i didnt have to run a command line.
-
-or you can do the following.
-
-- go to <a href=https://github.com/masterspike52/reNut/releases>releases</a> and download the appimage file from the latest release
-- open the appimage file by double clicking it.
-
-- when opening the appimage you will be met with a dialog box for dumping your iso's assets, selecting yes will let you select your iso for Banjo-Kazooie: Nuts and Bolts (US Version) with extract-iso.
-- if you already have your iso's assets dumped you can click no and use the in game gui that appears to set your assets folder. the dialog will only show up once
-
-How to play on Windows
---------------------------------------------
-1. download <a href="https://github.com/etonedemid/NutStaller">NutStaller</a>
-2. open NutStaller and select Do Everything which will do things like extract your assets and download the game to your selected directory
-
-    Alternatives are
-   - use goopie
-   - download directly from releases
-   
-
-Where everything is in Linux
---------------------------------
-- renut.toml and renut.cfg will be located in home/.config/renut/ they are written and read from here because appimages are weird about reading external stuff and renut.cfg will be specific to your locations for game_data_root and such
-- saves are located wherever you choose to set the save location in the gui (by default its home/.local/shared/renut/)
-- amd users currently cannot run the linux port (its being worked on right now) if you use a nvidia card you should be fine
-
-
-copy and paste the following into renut.toml
-------------------------------------------------------
-- log_level = "off"
-- fullscreen = false
-- disable_shadows = true
-- disable_cao = true
-- disable_msaa = true
-- disable_motion_blur = true
-- target_refreshRate = 1
-- frame_cap = "Display"
-- sync_shader_compile = false
-- mnk_controls = true
-- gpu_plugin = "xenos"
-- gpu_allow_invalid_fetch_constants = true
-- native_2x_msaa = false
-- readback_memexport = false
-- readback_memexport_fast = false
-
-How to use the texture replacement
--------------------------------------------
-- enable dump_textures under Nuts&Bolts > Graphics
-- Go to the area you wanna replace the texture for
-- find the texture in textures > dump next to your exe
-- open the texture in a program like Gimp
-- Place the new texture on the old one as a new layer and erase the old texture
-- save the texture as the same name as the old texture keeping the .dds extension
-- in your toml insert replace_textures = true
-- in your toml also insert texture_packs = "location of texture pack" i.e. if i have a texture pack on my D drive i would use texture_packs = "D:/folder name of texture pack"
-- if you have multiple packs you insert it like so  texture_packs = "D:/folder name of texture pack;C:/name of folder with other texture pack"
-
-NOTICE
---------------------
-you will not have access to the texture replacement stuff due to rexglue-ostentation not working on linux at this time, you will however still have access to the extra menu for the cvars, it'll just show up as the unused town map icon.
+Este repositório ainda não declara uma licença para o código do reNut Android.
+Defina uma antes de publicá-lo, respeitando as licenças dos projetos acima.

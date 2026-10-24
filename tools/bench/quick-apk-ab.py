@@ -7,7 +7,7 @@ title to run steadily, lets it settle, and measures a window: frames presented (
 CPU the runtime process spent per frame - all threads, the guest main thread and the command thread - from
 /proc/<pid>/task/*/schedstat, next to the frame rate and the GPU clock and busy share.
 
-    python tools/quick-apk-ab.py out/ab/base.apk out/ab/new.apk --rounds 3
+    python tools/bench/quick-apk-ab.py out/ab/base.apk out/ab/new.apk --rounds 3
 
 Runs go in A B B A A B ... order. The phone has to be unlocked and left alone; installing closes the game.
 """

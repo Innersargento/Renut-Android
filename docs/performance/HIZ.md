@@ -2,7 +2,7 @@
 
 Implementado em 14/10/2026 (`src/plume/hiz_model.{h,cpp}` e `src/plume/gpu/hiz.cpp`).
 Chave: o cvar `renut_plume_hiz` (lido a cada quadro; em builds de depuração dá
-para trocá-lo com o jogo aberto, ver `docs/DESEMPENHO-2026-10-17.md`).
+para trocá-lo com o jogo aberto, ver `docs/performance/DESEMPENHO-2026-10-17.md`).
 
 | Modo | O que faz |
 | --- | --- |
@@ -75,7 +75,7 @@ isso uma caixa de frustum não corta.
 
 ## Oclusão: por que não (17/10/2026)
 
-O censo de desenhos sem amostras (`docs/DESEMPENHO-2026-10-17.md`) mostrou no
+O censo de desenhos sem amostras (`docs/performance/DESEMPENHO-2026-10-17.md`) mostrou no
 Showdown ~2.050 desenhos de cor por quadro (61%) que não deixam nenhum pixel, dos
 quais ~1.260 por estarem escondidos por profundidade. Foi o motivo para tentar de
 novo a oclusão. O que se aprendeu:

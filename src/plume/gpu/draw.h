@@ -81,14 +81,14 @@ struct Draw {
   // reads (a0, aL) are served - 0 by the four blocks, 1 by the whole file as one
   // block, 2 by the same block declared too large for the driver to promote
   // into the constant file. Part of the pipeline key through spec constant 12.
-  // Default 2: measured on identical frames (tools/quick-ab.py --interleave) mode
+  // Default 2: measured on identical frames (tools/bench/quick-ab.py --interleave) mode
   // 1 costs +8% on the 108 vertex shaders that read by a0/aL, mode 2 -27%, and a
-  // frame costs 22% fewer GPU cycles in the heavy plaza (tools/quick-fps.py).
+  // frame costs 22% fewer GPU cycles in the heavy plaza (tools/bench/quick-fps.py).
   uint32_t rel_constants_mode_ = 0;
   // Modes 11 and 12 alternate between mode 0 and mode 1 or 2 from one draw of a
   // shader to the next, and mark the alternate's vertex shader hash in the pair
   // profile (bit 60 and 61 xored in), so a single capture holds both variants
-  // of the same draws: tools/quick-ab.py --interleave.
+  // of the same draws: tools/bench/quick-ab.py --interleave.
   uint32_t rel_toggle_[256] = {};
   // Where the whole vertex file was last placed in the ring, and what it held.
   uint64_t vs_all_offset_ = UINT64_MAX;

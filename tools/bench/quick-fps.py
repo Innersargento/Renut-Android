@@ -10,8 +10,8 @@ its busy share once a second, and prints per window and per state
 which does not move with the clock the governor picks (a frame is clock-bound),
 unlike the frame time. Needs the game in the foreground on a steady scene.
 
-    python tools/quick-fps.py --cvar renut_plume_hiz --states 2,3
-    python tools/quick-fps.py --cvar renut_plume_hiz --states 2,3 --restore 2
+    python tools/bench/quick-fps.py --cvar renut_plume_hiz --states 2,3
+    python tools/bench/quick-fps.py --cvar renut_plume_hiz --states 2,3 --restore 2
 
 --cvar sets a cvar live through the debug build's broadcast receiver
 (RuntimeActivity.registerCvarReceiver); the Plume switches are cvars read every

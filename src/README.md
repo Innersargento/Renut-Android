@@ -1,11 +1,11 @@
 # src/ — o código do reNut
 
-Tudo o que o reNut escreve fica aqui, e **o build do PC e o do Android compilam
-exatamente estes arquivos**. O que é de uma plataforma só fica em
-`platform/<plataforma>/`; o resto é comum.
+Tudo o que o reNut escreve fica aqui, e o build do APK (`android/native`) compila
+estes arquivos. O reNut é só Android: o que toca o sistema (JNI, janela, áudio,
+toque) fica em `platform/`.
 
-Os dois builds definem `src/` como raiz de includes: um arquivo inclui outro
-pelo caminho a partir daqui (`#include "d3d/d3d_layer.h"`).
+O build define `src/` como raiz de includes: um arquivo inclui outro pelo
+caminho a partir daqui (`#include "d3d/d3d_layer.h"`).
 
 ```
 src/
@@ -13,9 +13,7 @@ src/
 ├── d3d/        Direct3D do XDK: interceptação e front end nativo
 ├── plume/      Renderizador nativo sobre Plume/Vulkan e seus shaders
 ├── vendor/     Código de terceiros copiado inteiro (smol-v)
-├── platform/
-│   ├── android/  JNI, entrada por toque, áudio AAudio, janela, ADPF, conquistas
-│   └── windows/  main (janela Win32), carregador Vulkan, canário de pilha
+└── platform/   Android: JNI, entrada por toque, áudio AAudio, janela, ADPF, conquistas
 ```
 
 ## guest/
@@ -93,5 +91,4 @@ O processador de comandos do Plume, dividido por assunto. Tudo em `renut::gpu`; 
 ## Onde ficam os scripts de build
 
 - `android/native/CMakeLists.txt` — biblioteca nativa do APK (chamado por `android/app`).
-- `windows/CMakeLists.txt` — `renut_plume.exe`.
 - `generated/` — saída local do codegen e dos shaders (fora do Git).

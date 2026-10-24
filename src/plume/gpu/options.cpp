@@ -23,7 +23,7 @@ REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
     .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_plume_hiz, 2, "reNut/Plume",
                      "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
-                     "lies wholly outside the view frustum, the scissor or an enabled user clip plane (docs/HIZ.md)");
+                     "lies wholly outside the view frustum, the scissor or an enabled user clip plane (docs/performance/HIZ.md)");
 REXCVAR_DEFINE_INT32(renut_plume_skip, 0, "reNut/Plume",
                      "Debug: the plume-skip bits (see the skip_mask_ tests in src/plume/gpu), e.g. 1024 no depth test, "
                      "131072 no culling, 4096 no alpha to mask. Other bits also turn off Hi-Z and the draw windows. "

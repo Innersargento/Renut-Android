@@ -44,7 +44,7 @@ adb shell am broadcast -a org.renut.android.SET_CVAR -p org.renut.android --es n
 pela permissão `DUMP`, que o shell do adb tem e app nenhum consegue) chama
 `rex::cvar::SetFlagByName`. `result=1` na resposta = aceito.
 
-`tools/quick-fps.py --cvar <nome> --states a,b` usa esse canal (o `--file` antigo
+`tools/bench/quick-fps.py --cvar <nome> --states a,b` usa esse canal (o `--file` antigo
 ficou para o que ainda lê arquivo) e passou a mostrar a CPU por quadro das threads
 "GPU Commands" e "PlumeRecord" (lidas via `run-as` do processo
 `org.renut.android:runtime`).
@@ -90,7 +90,7 @@ lá só 40% dos zeros são profundidade, e 58% dos tiles têm céu.
   antiga nunca a testava; com isso entendido, ela ficou exata, mas não paga: o
   Turnip cobra ~5.500 ciclos de GPU por desenho sob renderização condicional, mais
   que o desenho. Os modos 3, 4 e 5 foram retirados. Detalhes e números em
-  `docs/HIZ.md`, seção "Oclusão: por que não".
+  `docs/performance/HIZ.md`, seção "Oclusão: por que não".
 
 ## 5. O que pesa na GPU no Showdown
 

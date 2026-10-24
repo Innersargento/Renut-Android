@@ -25,7 +25,7 @@
 #include "d3d/native_d3d.h"
 #include "plume/plume_gpu.h"
 #if defined(__ANDROID__)
-#include "platform/android/renut_audio.h"
+#include "platform/renut_audio.h"
 #endif
 
 // The SDK's X_STATUS_* macros are written with the unqualified type.

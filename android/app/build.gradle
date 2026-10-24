@@ -16,7 +16,7 @@ android {
         versionName '0.4.0-xenos-experimental'
         ndk { abiFilters 'arm64-v8a' }
         // -PrenutPgo=gen builds the instrumented APK; -PrenutPgo=use -PrenutPgoProfile=<.profdata>
-        // builds with the merged profile (tools/pgo.py).
+        // builds with the merged profile (tools/bench/pgo.py).
         def pgoArgs = []
         if (project.hasProperty('renutPgo')) {
             pgoArgs << "-DRENUT_PGO=${project.property('renutPgo')}".toString()

@@ -9,8 +9,8 @@ state. A screenshot per state is compared with the first one to show the image
 did not change. A whole run is about a minute per state and needs no frame-rate
 windows: the per-pair profile is repeatable to a few percent.
 
-    tools/quick-ab.py                      # plume-relconst 0,1,2,0
-    tools/quick-ab.py --file plume-fetchspec --modes 0,1,0 --top 12
+    tools/bench/quick-ab.py                      # plume-relconst 0,1,2,0
+    tools/bench/quick-ab.py --file plume-fetchspec --modes 0,1,0 --top 12
 
 The scene must stand still while it runs (park the player in Showdown Town).
 adb comes from ADB, or the default SDK location.
@@ -19,7 +19,7 @@ import argparse, glob, io, os, re, subprocess, sys, time
 
 ADB = os.environ.get("ADB") or r"C:\Users\Sidney-PC\AppData\Local\Android\Sdk\platform-tools\adb.exe"
 PKG = "org.renut.android"
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 HLSL = os.path.join(ROOT, "generated", "shaders", "hlsl")
 
 

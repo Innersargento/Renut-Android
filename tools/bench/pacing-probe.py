@@ -7,8 +7,8 @@ the game's layer (`dumpsys SurfaceFlinger --latency`): the time every frame
 reached the screen and when its GPU work was ready, and samples the display's
 active mode once a second (a variable-refresh panel may switch under the game).
 
-    python tools/pacing-probe.py --seconds 40
-    python tools/pacing-probe.py --seconds 40 --label capped
+    python tools/bench/pacing-probe.py --seconds 40
+    python tools/bench/pacing-probe.py --seconds 40 --label capped
 
 Prints the present intervals in display periods, how far the frame was ready
 before its vsync, the display modes seen and the worst stretches. Needs the game
@@ -17,7 +17,7 @@ in the foreground on a steady scene. Raw rows go to out/pacing-probe/<label>.csv
 import argparse, collections, os, re, statistics, subprocess, sys, time
 
 ADB = os.environ.get("ADB") or r"C:\Users\Sidney-PC\AppData\Local\Android\Sdk\platform-tools\adb.exe"
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, "out", "pacing-probe")
 PENDING = 9223372036854775807
 
