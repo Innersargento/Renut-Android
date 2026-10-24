@@ -101,6 +101,7 @@ REXCVAR_DECLARE(int32_t, renut_plume_pipeline_lookup_ms);
 REXCVAR_DECLARE(int32_t, renut_plume_bool_spec);
 REXCVAR_DECLARE(int32_t, renut_plume_defer_draws);
 REXCVAR_DECLARE(int32_t, renut_plume_hiz);
+REXCVAR_DECLARE(bool, renut_plume_stack_wrap);
 REXCVAR_DECLARE(bool, renut_plume_shader_cache);
 REXCVAR_DECLARE(bool, renut_plume_key_reuse);
 REXCVAR_DECLARE(int32_t, renut_plume_fetch_spec);

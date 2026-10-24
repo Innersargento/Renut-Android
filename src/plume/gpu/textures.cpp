@@ -334,14 +334,18 @@ void Textures::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
 // linear" and the X axis's wrap mode, which cost the textures their sharpness
 // at grazing angles and addressed Y and Z with a mode meant for X.
 //
-// One exception: a stacked texture's Z picks a slice of an array, and the guest
-// clamps a layer to the ends of the stack whatever the mode reads.
+// A stacked texture's Z picks a slice of an array and follows the fetch
+// constant's mode like any other axis: the water's runs far past the end of its
+// stack with the clock and relies on repeating. With renut_plume_stack_wrap off
+// the layer is clamped to the ends of the stack whatever the mode reads (the
+// old behaviour, which leaves the water still).
 uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  const bool stack_wrap = fetch.stacked && REXCVAR_GET(renut_plume_stack_wrap);
   const uint32_t key = uint32_t(fetch.mag_filter) | (uint32_t(fetch.min_filter) << 2) |
                        (uint32_t(fetch.mip_filter) << 4) | (uint32_t(fetch.aniso_filter) << 6) |
                        (uint32_t(fetch.clamp_x) << 9) | (uint32_t(fetch.clamp_y) << 12) |
                        (uint32_t(fetch.clamp_z) << 15) | (uint32_t(fetch.stacked) << 18) |
-                       ((uint32_t(fetch.lod_bias) & 0x3FF) << 19);
+                       ((uint32_t(fetch.lod_bias) & 0x3FF) << 19) | (stack_wrap ? 1u << 30 : 0u);
   // The fallback is the old behaviour: linear everywhere, no anisotropy, and
   // every axis wrapped, for comparing a capture against.
   if (backend.skip_mask_ & 524288) return kSamplerDefault;
@@ -380,7 +384,8 @@ uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   if (fetch.mip_filter == xenos::TextureFilter::kBaseMap) desc.maxLOD = 0.0f;
   desc.addressU = address(fetch.clamp_x);
   desc.addressV = address(fetch.clamp_y);
-  desc.addressW = fetch.stacked ? RenderTextureAddressMode::CLAMP : address(fetch.clamp_z);
+  // The stack's Z is a layer index (normalised): the water's runs far past the end and repeats.
+  desc.addressW = fetch.stacked && !stack_wrap ? RenderTextureAddressMode::CLAMP : address(fetch.clamp_z);
   // The bias has five fractional bits.
   desc.mipLODBias = float(fetch.lod_bias) / 32.0f;
   if (fetch.aniso_filter != xenos::AnisoFilter::kDisabled &&

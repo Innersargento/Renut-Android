@@ -24,6 +24,11 @@ REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
 REXCVAR_DEFINE_INT32(renut_plume_hiz, 2, "reNut/Plume",
                      "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
                      "lies wholly outside the view frustum or the scissor");
+REXCVAR_DEFINE_BOOL(renut_plume_stack_wrap, true, "reNut/Plume",
+                    "Address a stacked texture's layers as its fetch constant says (repeat, mirror, clamp) instead of "
+                    "always clamping them to the ends of the stack. The water walks a 12-layer stack in time with a "
+                    "coordinate far past the stack's end and relies on the layer index repeating; clamped, it sat on "
+                    "the last layer and the waves stood still. Followed live.");
 REXCVAR_DEFINE_BOOL(renut_plume_shader_cache, true, "reNut/Plume",
                     "Remember across frames which shader lives at a guest address and length, trusting it "
                     "until the guest writes there (write-watched), instead of hashing the microcode of "
