@@ -10,6 +10,7 @@
 #include "draw.h"
 #include "recorder.h"
 #include "hiz.h"
+#include "census.h"
 #include "resolve.h"
 #include "patches.h"
 #include "swap.h"
@@ -126,6 +127,7 @@ class GpuBackend final {
   Draw draw{*this};
   Recorder recorder{*this};
   HiZ hiz{*this};
+  Census census{*this};
   Resolve resolve{*this};
   Patches patches{*this};
   Swap swap{*this};
@@ -288,7 +290,7 @@ inline RenderCommandList* Recorder::L() {
 inline bool Recorder::OnRecorder() const { return std::this_thread::get_id() == rec_thread_id_; }
 
 inline bool Recorder::RecActive() const {
-    return backend.swap.rec_enabled_ && backend.report.hiz_mode_ < 3 && !backend.targets.pair_capture_ && !backend.draw.sync_draws_ && sync_every_ <= 1 && !backend.draw.trace_;
+    return backend.swap.rec_enabled_ && !backend.targets.pair_capture_ && !backend.draw.sync_draws_ && sync_every_ <= 1 && !backend.draw.trace_;
   }
 
 inline std::shared_ptr<PipelineJob> Pipelines::TakeUrgentJob() {

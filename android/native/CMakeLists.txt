@@ -212,7 +212,7 @@ set(RENUT_RUNTIME_SOURCES
     d3d/d3d_layer.cpp d3d/plume_d3d.cpp
     d3d/native/lists.cpp d3d/native/flush.cpp d3d/native/draws.cpp d3d/native/commands.cpp d3d/native/sync.cpp d3d/native/entry.cpp d3d/native/report.cpp
     plume/plume_renderer.cpp plume/hiz_model.cpp
-    plume/gpu/context.cpp plume/gpu/draw.cpp plume/gpu/draw_util.cpp plume/gpu/xenos/interpreter.cpp plume/gpu/xenos/register_file.cpp plume/gpu/xenos/registers.cpp plume/gpu/xenos/shader.cpp plume/gpu/xenos/translator.cpp plume/gpu/xenos/translator_disasm.cpp plume/gpu/xenos/ucode.cpp plume/gpu/hiz.cpp plume/gpu/host.cpp
+    plume/gpu/context.cpp plume/gpu/draw.cpp plume/gpu/draw_util.cpp plume/gpu/xenos/interpreter.cpp plume/gpu/xenos/register_file.cpp plume/gpu/xenos/registers.cpp plume/gpu/xenos/shader.cpp plume/gpu/xenos/translator.cpp plume/gpu/xenos/translator_disasm.cpp plume/gpu/xenos/ucode.cpp plume/gpu/hiz.cpp plume/gpu/census.cpp plume/gpu/host.cpp
     plume/gpu/native_exec.cpp plume/gpu/options.cpp plume/gpu/patches.cpp plume/gpu/pipeline_cache.cpp
     plume/gpu/profiling.cpp plume/gpu/recorder.cpp plume/gpu/report.cpp plume/gpu/resolve.cpp
     plume/gpu/shaders.cpp plume/gpu/streams.cpp plume/gpu/support.cpp plume/gpu/swap.cpp

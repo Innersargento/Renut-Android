@@ -23,7 +23,14 @@ REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
     .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_plume_hiz, 2, "reNut/Plume",
                      "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
-                     "lies wholly outside the view frustum or the scissor");
+                     "lies wholly outside the view frustum, the scissor or an enabled user clip plane (docs/HIZ.md)");
+REXCVAR_DEFINE_INT32(renut_plume_skip, 0, "reNut/Plume",
+                     "Debug: the plume-skip bits (see the skip_mask_ tests in src/plume/gpu), e.g. 1024 no depth test, "
+                     "131072 no culling, 4096 no alpha to mask. Other bits also turn off Hi-Z and the draw windows. "
+                     "Followed live.");
+REXCVAR_DEFINE_BOOL(renut_plume_zero_census, false, "reNut/Plume",
+                    "Debug: run every draw inside an occlusion query and sum the draws that leave no sample by their "
+                    "state, into <files>/plume-zero-census.txt every 300 frames and when turned off. Followed live.");
 REXCVAR_DEFINE_BOOL(renut_plume_stack_wrap, true, "reNut/Plume",
                     "Address a stacked texture's layers as its fetch constant says (repeat, mirror, clamp) instead of "
                     "always clamping them to the ends of the stack. The water walks a 12-layer stack in time with a "

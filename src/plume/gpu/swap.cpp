@@ -227,9 +227,9 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     }
     key_reuse_ = key_reuse;
 
-    const int hiz = std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 4);
+    const int hiz = std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2);
     if (uint32_t(hiz) != backend.report.hiz_mode_) {
-      REXLOG_INFO("Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor, 3 + occlusion, 4 + occlusion of depth-only draws)", hiz);
+      REXLOG_INFO("Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor/clip plane)", hiz);
     }
     backend.report.hiz_mode_ = uint32_t(hiz);
 

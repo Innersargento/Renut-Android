@@ -132,20 +132,8 @@ bool GpuBackend::SetupContext() {
   for (auto& list : lists_) list = queue_->createCommandList();
   targets.list_ = lists_[0].get();
   swap.defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
-  hiz.hiz_cond_ = PlumeConditionalRenderingSupported();
-  hiz.hiz_force_ = getenv("RENUT_HIZ_FORCE") != nullptr;
-  hiz.hiz_verify_ = getenv("RENUT_HIZ_VERIFY") != nullptr;
-  hiz.hiz_debug_ = getenv("RENUT_HIZ_DEBUG") != nullptr;
-  if (hiz.hiz_verify_) {
-    VkQueryPoolCreateInfo query_info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    query_info.queryType = VK_QUERY_TYPE_OCCLUSION;
-    query_info.queryCount = kHizMaxQueries * kPlumeFramesInFlight;
-    if (vkCreateQueryPool(static_cast<VulkanDevice*>(device_)->vk, &query_info, nullptr, &hiz.hiz_query_pool_) !=
-        VK_SUCCESS) {
-      hiz.hiz_query_pool_ = VK_NULL_HANDLE;
-    }
-  }
-  report.hiz_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 4));
+  report.hiz_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2));
+  census.Init();
   swap.fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
   swap.depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
   draw.rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
@@ -279,6 +267,7 @@ void GpuBackend::ShutdownContext() {
   }
   // Frames may still be running; nothing below may be freed under them.
   if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForAllSlots();
+  census.Shutdown();
   pipelines.pipelines_.clear();
   draw.standins_.clear();
   draw.pipeline_memo_.Clear();
@@ -332,7 +321,6 @@ void GpuBackend::ShutdownContext() {
       patch_modules_[i] = VK_NULL_HANDLE;
     }
     if (patches.patch_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, patches.patch_layout_, nullptr);
-    hiz.HizDestroy();
     patches.patch_layout_ = VK_NULL_HANDLE;
     for (auto& buffer : patches.patch_out_) buffer.reset();
     resolve.stencil_staging_.reset();

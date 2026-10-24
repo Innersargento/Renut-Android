@@ -293,17 +293,8 @@ namespace renut::gpu {
     // The device address and size of each of the 17 streams the shaders read by address.
     uint64_t stream_addr[17] = {};
     uint32_t stream_size[17] = {};
-    // Hi-Z (see HizFlushWindow): the depth target this draw can be tested
-    // against, its image when the packet was made, the box's rectangle (target
-    // pixels) and nearest depth, the draw's identity from frame to frame, and,
-    // once tested, where its answer is in the slot's predicate buffer.
-    Target* hiz_depth = nullptr;
-    const RenderTexture* hiz_texture = nullptr;
-    float hiz_rect[4] = {};
-    float hiz_z = 0.f;
-    uint64_t hiz_key = 0;
-    uint32_t hiz_pred_offset = UINT32_MAX;
-    uint32_t hiz_query = UINT32_MAX;
+    // renut_plume_zero_census: the draw's occlusion query.
+    uint32_t census_query = UINT32_MAX;
   };
 
   // The draws recorded last, for the report a lost device prints (see
@@ -349,8 +340,6 @@ namespace renut::gpu {
 
   inline constexpr size_t kMaxDeferred = 384;
 
-  inline constexpr size_t kMaxDeferredHiz = 1536;
-
   struct HizModelEntry {
     std::shared_ptr<renut::hiz::Model> model;
     bool validated = false;
@@ -385,40 +374,6 @@ namespace renut::gpu {
     uint32_t generation = 0;
   };
 
-  // What HizCullDraw learned about the draw it did not drop, for the occlusion
-  // test: the screen rectangle (guest pixels) and nearest depth of its box.
-  struct HizTest {
-    bool valid = false;
-    float rect[4] = {};
-    float z = 0.f;
-    uint64_t key = 0;
-  };
-
-  // the device has conditional rendering
-  inline constexpr uint32_t kHizMaxRecords = 16384;
-
-  inline constexpr uint32_t kHizMaxQueries = 4096;
-
-  struct HizRecord {
-    uint64_t key;
-    float rect[4];
-    float z;
-    bool held;
-    uint64_t vs = 0, ps = 0;
-  };
-
-  struct HizPending {
-    uint64_t key;
-    bool held;
-    uint32_t query;  // occlusion query of the verification run, or UINT32_MAX
-    uint64_t vs = 0, ps = 0;
-  };
-
-  struct HizHistory {
-    bool hidden = false;
-    uint64_t frame = 0;
-  };
-
   // ---- Recording thread (files/plume-recthread) ----
   // The draws of a frame are decoded on this thread (IssueDraw makes a packet
   // out of the guest's state) and recorded on another: EmitDraw's Vulkan calls,
@@ -438,7 +393,7 @@ namespace renut::gpu {
   // What EmitDraw counts: written by the recorder, folded into stats_ at the
   // report (after a sync).
   struct RecStats {
-    uint64_t drawn = 0, pipeline_binds = 0, predicated = 0, passes = 0;
+    uint64_t drawn = 0, pipeline_binds = 0, passes = 0;
   };
 
   struct RecWorker {

@@ -3,6 +3,11 @@
 
 namespace renut::gpu {
 
+// plume-skip bits that only change a draw's own state (no depth test, no culling,
+// no alpha to mask, no timestamps): they keep Hi-Z and the draw windows, so the
+// zero-sample census can be compared with them on and off.
+constexpr uint32_t kStateOnlySkipBits = 1024 | 131072 | 4096 | 67108864;
+
 bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool) {
   struct InDraw {
@@ -144,8 +149,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // dropped draw would have fetched are fetched by the draws that remain: only
   // mesh draws (triangles through a vertex model) are ever dropped, never the
   // full-screen passes that read the scene's copies.
-  hiz_test_.valid = false;
-  if (backend.report.hiz_mode_ && !trace_ && !backend.skip_mask_ && !backend.recorder.bind_skip_ && !sync_draws_ && !patch_list && !rect_list &&
+  if (backend.report.hiz_mode_ && !trace_ && !(backend.skip_mask_ & ~kStateOnlySkipBits) && !backend.recorder.bind_skip_ && !sync_draws_ && !patch_list && !rect_list &&
       !point_list && vs->compiled && (!debug_shader_ || (vs->entry->hash != debug_shader_ &&
                                                           (!ps || ps->entry->hash != debug_shader_)))) {
     // One call in 16 is timed (the clock reads are a cost of their own).
@@ -2043,7 +2047,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // order.
   bool defer = false;
   uint64_t window_signature = 0;
-  if (backend.swap.defer_mode_ && !sync_draws_ && !trace_ && !backend.skip_mask_ && !backend.recorder.bind_skip_ && !debug_draw && !patch_list &&
+  if (backend.swap.defer_mode_ && !sync_draws_ && !trace_ && !(backend.skip_mask_ & ~kStateOnlySkipBits) && !backend.recorder.bind_skip_ && !debug_draw && !patch_list &&
       !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && depth_write) {
     const xenos::CompareFunction zf = depth_control.zfunc;
     const bool strict = zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual ||
@@ -2069,31 +2073,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // a bias too, and do not care.
     const bool biased = raster.poly_offset_front_enable || raster.poly_offset_back_enable;
     defer = strict && stencil_ok && (!color_pass || (backend.swap.defer_mode_ >= 2 && opaque && !biased));
-    // Hi-Z: tested against the depth the pass holds when the window closes. Not
-    // biased draws (the bias moves their depth), and only the "closer wins"
-    // functions, whose fragments pass when they are nearer.
-    if (backend.report.hiz_mode_ >= 3 && hiz_test_.valid) {
-      // Where the boxed draws go: not deferred, biased, other depth function, no depth.
-      ++backend.stats_.hiz_boxed_draws;
-      if (!defer) ++backend.stats_.hiz_why_not[0];
-      else if (biased) ++backend.stats_.hiz_why_not[1];
-      else if (!(zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual)) ++backend.stats_.hiz_why_not[2];
-      else if (!depth || !depth->texture) ++backend.stats_.hiz_why_not[3];
-    }
-    if (defer && backend.report.hiz_mode_ >= 3 && backend.hiz.hiz_cond_ && hiz_test_.valid && !biased && depth && depth->texture &&
-        (zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual) &&
-        (color_pass || backend.report.hiz_mode_ >= 4)) {
-      const float fraction = float(depth->scale) / 4.f;
-      pk.hiz_depth = depth;
-      pk.hiz_texture = depth->texture.get();
-      pk.hiz_rect[0] = std::clamp(hiz_test_.rect[0] * fraction, 0.f, float(depth->width));
-      pk.hiz_rect[1] = std::clamp(hiz_test_.rect[1] * fraction, 0.f, float(depth->height));
-      pk.hiz_rect[2] = std::clamp(hiz_test_.rect[2] * fraction, 0.f, float(depth->width));
-      pk.hiz_rect[3] = std::clamp(hiz_test_.rect[3] * fraction, 0.f, float(depth->height));
-      pk.hiz_z = hiz_test_.z;
-      pk.hiz_key = hiz_test_.key ^ (pk.ps_hash * 0xC2B2AE3D27D4EB4Full);
-      if (pk.hiz_rect[2] < pk.hiz_rect[0] || pk.hiz_rect[3] < pk.hiz_rect[1]) pk.hiz_depth = nullptr;
-    }
     if (defer) {
       HashCombine(window_signature, framebuffer);
       HashCombine(window_signature, color_mask);
@@ -2102,6 +2081,37 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       HashCombine(window_signature, uint32_t(edram_mode));
     }
   }
+  if (backend.census.active_ && pk.kind != DrawPacket::Kind::kNone) {
+    CensusSignature sig;
+    sig.vs = pk.vs_hash;
+    sig.ps = pk.ps_hash;
+    sig.depth_control = depth_control.value;
+    sig.stencil = stencil_ref_mask.value;
+    sig.stencil_bf = regs[XE_GPU_REG_RB_STENCILREFMASK_BF];
+    sig.raster = raster.value;
+    sig.color_control = color_control.value;
+    const float census_alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
+    std::memcpy(&sig.alpha_ref, &census_alpha_ref, 4);
+    sig.clip = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
+    sig.color_mask = color_mask;
+    sig.viewport_w = uint32_t(std::fabs(viewport.width));
+    sig.viewport_h = uint32_t(std::fabs(viewport.height));
+    sig.scissor_w = uint32_t(scissor_rect.right - scissor_rect.left);
+    sig.scissor_h = uint32_t(scissor_rect.bottom - scissor_rect.top);
+    sig.prim = uint32_t(prim_type);
+    sig.kind = uint32_t(pk.kind);
+    sig.count_log2 = pk.count ? 32 - uint32_t(__builtin_clz(pk.count)) : 0;
+    bool any_blend = false;
+    for (uint32_t i = 0; i < color_count; ++i) any_blend = any_blend || blends[i].blendEnabled;
+    sig.flags = (color_pass ? Census::kColorPass : 0) | (alpha_test ? Census::kAlphaTest : 0) |
+                (alpha_to_mask ? Census::kAlphaToMask : 0) | (stencil_enabled ? Census::kStencil : 0) |
+                (depth_enabled ? Census::kDepth : 0) | (depth_write ? Census::kDepthWrite : 0) |
+                (any_blend ? Census::kBlend : 0) |
+                ((raster.poly_offset_front_enable || raster.poly_offset_back_enable) ? Census::kBias : 0) |
+                ((vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) ? Census::kMemExport : 0) |
+                (defer ? Census::kDeferred : 0);
+    pk.census_query = backend.census.Assign(sig);
+  }
   if (defer) {
     if (!backend.recorder.deferred_.empty() && deferred_signature_ != window_signature) backend.recorder.FlushDeferred(1);
     deferred_signature_ = window_signature;
@@ -2109,12 +2119,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     deferred_slots_.insert(deferred_slots_.end(), draw_slots_.begin(), draw_slots_.end());
     backend.recorder.deferred_.push_back(pk);
     ++backend.stats_.deferred_draws;
-    if (backend.recorder.deferred_.size() >= (backend.report.hiz_mode_ >= 3 ? kMaxDeferredHiz : kMaxDeferred)) backend.recorder.FlushDeferred(2);
+    if (backend.recorder.deferred_.size() >= kMaxDeferred) backend.recorder.FlushDeferred(2);
     return true;
   }
   backend.recorder.FlushDeferred(3);
-  if (backend.recorder.RecActive()) backend.recorder.RecQueue(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
-  else backend.recorder.EmitDraw(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
+  backend.recorder.Submit(pk, draw_slots_.data(), uint32_t(draw_slots_.size()));
   return true;
 }
 

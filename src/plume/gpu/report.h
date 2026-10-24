@@ -28,9 +28,6 @@ struct Reporting {
   std::unordered_map<uint64_t, uint64_t> hiz_clip_states_;
   std::unordered_map<uint64_t, uint64_t> hiz_nomodel_draws_;
   std::unordered_map<uint64_t, uint32_t> hiz_nomodel_why_;
-  // Verification runs: the shader pairs of the held draws that put out no
-  // samples although the test could not call them hidden, with their counts.
-  std::unordered_map<uint64_t, std::array<uint64_t, 3>> hiz_zero_pairs_;
   RecStats rec_stats_;
   uint64_t reported_silent_frames_ = 0;
 };

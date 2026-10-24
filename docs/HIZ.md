@@ -1,18 +1,20 @@
 # Hi-Z: o que o renderizador deixa de desenhar
 
-Implementado em 14/10/2026 (`src/plume/hiz_model.{h,cpp}`, a parte "Hi-Z" de
-`src/plume/gpu/hiz.cpp`, `src/plume/shaders/hiz_*.comp`). Chave de teste:
-`files/plume-hiz` (relida a cada 30 quadros) ou o cvar `renut_plume_hiz`.
+Implementado em 14/10/2026 (`src/plume/hiz_model.{h,cpp}` e `src/plume/gpu/hiz.cpp`).
+Chave: o cvar `renut_plume_hiz` (lido a cada quadro; em builds de depuração dá
+para trocá-lo com o jogo aberto, ver `docs/DESEMPENHO-2026-10-17.md`).
 
 | Modo | O que faz |
 | --- | --- |
 | 0 | desligado |
 | 1 | só conta o que poderia ser descartado |
-| 2 (padrão) | descarta desenhos cuja caixa está toda fora do frustum ou do scissor |
-| 3 | + oclusão pela profundidade que o passe já desenhou (desenhos de cor); **experimental, ver abaixo** |
-| 4 | + oclusão dos desenhos só de profundidade (sombras); os com bias ficam de fora |
+| 2 (padrão) | descarta desenhos cuja caixa está toda fora do frustum, do scissor ou de um plano de recorte do usuário |
 
 Tudo é exato: um desenho só some quando nada dele pode chegar ao alvo.
+
+Os modos 3, 4 e 5 (oclusão pela profundidade, na GPU) foram **retirados em
+17/10/2026**: medidos no celular, sempre custaram mais do que pouparam. O porquê
+está em "Oclusão: por que não" abaixo; não tente de novo sem ler.
 
 ## Como funciona
 
@@ -21,69 +23,27 @@ Tudo é exato: um desenho só some quando nada dele pode chegar ao alvo.
    clip tem que ser uma função afim de um elemento do vértice, com coeficientes
    que são expressões das constantes. Skinning, endereçamento por a0/aL, laços,
    predicação e comparações na posição invalidam o modelo (o desenho nunca é
-   cortado). Na primeira vez, dois vértices reais passam pelo interpretador do
-   SDK e têm que dar o mesmo resultado.
+   cortado). Na primeira vez, dois vértices reais passam pelo interpretador e
+   têm que dar o mesmo resultado.
 2. **Caixa** do elemento sobre os vértices que o desenho lê, em cache e
    invalidada por escrita do jogo (mesma vigilância dos streams guardados, mais
    uma amostra de conteúdo).
-3. **Frustum/scissor** (modo 2): os 8 (ou 16) cantos da caixa pelas constantes do
-   desenho; todos fora de um mesmo plano → o desenho cai antes de custar stream,
-   constantes ou pipeline.
-4. **Oclusão** (modo 3/4), dentro de uma janela de desenhos reordenáveis
-   (`FlushDeferred`): os desenhos que o último teste achou escondidos ficam para
-   o fim da janela; o resto é gravado normalmente. Depois o passe é fechado, a
-   profundidade é copiada, reduzida a uma pirâmide (blocos de 8 a 128 px, o valor
-   mais distante) e cada desenho com caixa é testado na GPU (retângulo + a
-   profundidade mais próxima da caixa). Os segurados são gravados por último, cada
-   um dentro de `VK_EXT_conditional_rendering` com a própria resposta. Nada chega
-   com um quadro de atraso e nada pode estar errado por um quadro.
-   O custo de um teste (quebra de passe + cópia + 6 dispatches) só é pago onde há
-   desenho segurado; "aprendizado" em até 3 janelas por quadro, a cada 8 quadros,
-   e a cada 120 se menos de 2% das respostas forem "escondido".
+3. **Frustum/scissor/plano de recorte** (modo 2): a faixa de cada plano sobre a
+   caixa, pelas constantes do desenho; a caixa toda do lado de fora de um mesmo
+   plano → o desenho cai antes de custar stream, constantes ou pipeline.
+   Os planos de recorte do usuário (`PA_CL_UCP_n`, ligados em `PA_CL_CLIP_CNTL`)
+   entram desde 17/10: o shader guarda o que tem `dot(posição de clip, plano) >= 0`
+   em todo plano ligado, então uma caixa inteira com distância < 0 a um deles não
+   desenha nada. É o pass de reflexo em 1/4 de resolução (320x180) do jogo.
+   Contador `clip_plane=` em `files/plume-hiz.txt`: ~14 desenhos de cor por quadro
+   no Showdown.
 
 ## O que se mediu (PC, cena do título, 300 quadros)
 
 * colorido: 26% dos desenhos fora do frustum; 44% sem modelo (skinned etc.).
 * só profundidade: 62% fora do frustum.
-* oclusão: com todos os candidatos forçados (RENUT_HIZ_FORCE) e conferidos por
-  consultas de oclusão (RENUT_HIZ_VERIFY): 0 violações em ~40 mil desenhos, e a
-  imagem sai igual. Mas quase nenhum é respondido como escondido: ~99,8% dos
-  desenhos sem amostras estão sobre profundidade ainda no plano distante quando a
-  janela fecha, ou seja, não estão escondidos por profundidade (o jogo desenha
-  muita coisa que não deixa um pixel por outros motivos). Os pares de shader mais
-  frequentes saem na linha "Hi-Z draws with no samples" do log (só com VERIFY).
-
-## Depuração
-
-Variáveis de ambiente (PC): `RENUT_HIZ_FORCE=1` segura todos os candidatos;
-`RENUT_HIZ_VERIFY=1` roda os segurados sem predicado, dentro de consultas, e conta
-violações; `RENUT_HIZ_DEBUG=1` despeja o nível 0 da pirâmide de algumas janelas.
-No Windows o arquivo de modo fica em `<dados>/plume-miss/plume-hiz`.
-
-## Limites conhecidos
-
-* Janelas são curtas (~13 desenhos, ~4 com caixa): o teste vê a profundidade do
-  passe até ali, não a final.
-* Desenhos skinned, instanciados pelo motor (c133) e com bias não têm caixa.
-* A extensão `VK_EXT_conditional_rendering` é pedida na criação do dispositivo
-  (`plume_renderer.cpp`); sem ela o modo 3 não faz nada.
 
 ## Medido no celular (Showdown Town, câmera parada, 14/10/2026)
-
-Por quadro (média de 4 janelas de 300 quadros alternadas 0/2/3):
-
-* Desenhos por quadro ~6.100 (3.600 de cor, 2.500 só de profundidade).
-* Modo 2 descarta ~930 por quadro (15%): 448 de cor (12,5%) e 478 só de
-  profundidade (19%); `drawn` cai de ~1.83 M para ~1.55 M por 300 quadros.
-* GPU: 14,99 Mcycles/quadro desligado, 14,00 no modo 2 (-6,6%).
-* Modo 3: 0 desenhos respondidos como escondidos em ~3.600 testes, e -4 FPS
-  (20,8 contra 24,7): cada teste é uma quebra de passe e uma cópia de profundidade
-  da tela inteira. Por isso o padrão ficou em 2; o modo 3/4 existe para
-  experimento e o aprendizado se espaça (a cada 600 quadros) quando nada é achado.
-* A thread do backend de GPU está perto de 100% (cp_cpu ~14 s por 300 quadros),
-  então descartar desenhos poupa GPU mas o FPS não sobe na mesma proporção.
-
-## Medido de novo, com o corte barateado (celular, Showdown, câmera parada, 6 rodadas 0/2)
 
 * 5.630 draws por quadro; o modo 2 descarta 779 (13,8%): 275 de cor e 504 só de
   profundidade. Pipeline binds por quadro 2.308 -> 2.015.
@@ -91,30 +51,62 @@ Por quadro (média de 4 janelas de 300 quadros alternadas 0/2/3):
   do corte (~2,5 ms por quadro, amostrado).
 * GPU: 12,32 -> 11,82 Mcycles por quadro (-4,0%).
 * FPS: 37,3 -> 41,9 (+12%), com o modo 2 à frente em todos os 6 pares.
-* A medição anterior (antes de indexar as caixas por bloco e de trocar os 8 cantos
-  por teste de planos) tinha dado FPS igual: o corte custava o que poupava. O
-  clock estava mais alto desta vez (500-550 MHz contra ~350), então os números
-  absolutos não são comparáveis entre as duas medições, só os pares dentro de cada
-  uma.
 
-## Por que um draw não tem modelo (PC, cena do título, por 300 quadros, cor)
+## Por que um draw não tem modelo
 
-`files/plume-hiz.txt` agora traz `nm_color=` e `nm_depth=` (10 causas, na ordem
-da enum `renut::hiz::Why` a partir de 1: controle, laço, predicado, sem fetch,
+`files/plume-hiz.txt` traz `nm_color=` e `nm_depth=` (10 causas, na ordem da enum
+`renut::hiz::Why` a partir de 1: controle, laço, predicado, sem fetch,
 instanciado, skinned, relativo, outro elemento, índice de vértice, não linear) e
 o log lista os shaders sem modelo mais frequentes.
 
-* **Predicado** (~70-136 mil de ~320-375 mil draws de cor; 3-30 mil de ~80-100 mil de
-  profundidade): os shaders skinned. O predicado vem do peso do osso
-  (`p0 = r0.y != 0`) e as matrizes de osso vêm do stream 10 por índice de
-  vértice, então a posição não é afim em constantes. Exigiria análise por
-  intervalos e leitura da paleta; o custo por draw (alguns µs) passa do que um
-  corte poupa (~5 µs), então não foi feito.
-* **Instanciado** (a0 calculado do vertex id, constantes c133+): 21-32 mil de cor.
-  Esses shaders também fazem balanço com `sin()`, ou seja, não são afins.
-* **Não linear**: era 12-38 mil; quase tudo era `max(a, a)` escalar (o mov do
-  montador) que o executor não reconhecia. Corrigido: 0 agora, e os draws de cor
-  com caixa subiram de ~190 mil para ~210-229 mil por janela.
+* **Predicado**: os shaders skinned. O predicado vem do peso do osso
+  (`p0 = r0.y != 0`) e as matrizes de osso vêm por índice de vértice, então a
+  posição não é afim em constantes. No Showdown: ~710 draws de cor e ~600 de
+  sombra por quadro.
+* **Instanciado** (a0 calculado do vertex id, constantes c133+, balanço com
+  `sin()`): ~1.020 de cor e ~600 de sombra por quadro no Showdown.
+* **Não linear**: era quase tudo `max(a, a)` escalar (o mov do montador);
+  corrigido em 14/10.
+
+Caixas para esses dois casos foram pesadas em 17/10 e **adiadas**: o censo
+(abaixo) mostra que, dos desenhos sem amostras dessas famílias, no máximo ~250
+por quadro estão fora da tela; o resto está escondido atrás de outra coisa, e
+isso uma caixa de frustum não corta.
+
+## Oclusão: por que não (17/10/2026)
+
+O censo de desenhos sem amostras (`docs/DESEMPENHO-2026-10-17.md`) mostrou no
+Showdown ~2.050 desenhos de cor por quadro (61%) que não deixam nenhum pixel, dos
+quais ~1.260 por estarem escondidos por profundidade. Foi o motivo para tentar de
+novo a oclusão. O que se aprendeu:
+
+* **A passada de cor do jogo usa profundidade invertida** (`GEQUAL`, limpa em 0,
+  valores 0..0,003). O teste original só aceitava `LESS/LEQUAL`, e as janelas dos
+  mapas de sombra gastavam o orçamento de 12 testes por quadro: a passada de cor
+  nunca tinha sido testada. A conclusão de 14/10 ("não estão escondidos por
+  profundidade") estava errada por isso.
+* Com o suporte a `GEQUAL` (pirâmide de 1 - profundidade) o teste ficou exato
+  (0 violações em dezenas de milhares de desenhos verificados) e, testando todas
+  as janelas, acha ~380 desenhos escondidos por quadro no Showdown. Mas:
+  * **por janela** (modo 3): cada teste é uma quebra de passada, uma cópia de
+    profundidade e uma pirâmide, para uma janela de ~13 desenhos. Testando tudo:
+    FPS 43 -> 27. No ritmo normal (aprendizado): FPS 41,0 -> 37,5, GPU +1,9%, ~63
+    desenhos poupados por quadro. O modo 3 também desligava a thread de gravação
+    (`RecActive`), o que custava ~9% sozinho; isso foi corrigido antes da medida
+    acima.
+  * **por segmento** (modo 5: um teste por trecho de profundidade, segurando os
+    desenhos do trecho): FPS 48,3 -> 32,3, GPU +40%, **0 escondidos**. A passada
+    principal é um trecho só, que começa logo depois do clear: a profundidade do
+    começo está vazia, e tudo o que esconde algo é desenhado dentro da passada.
+* **No Turnip (Adreno 740), cada desenho sob `VK_EXT_conditional_rendering`
+  custa ~5.500 ciclos de GPU**, mais que o dobro do próprio desenho (~2.300).
+  Qualquer esquema exato precisa segurar o desenho sob predicado até a resposta,
+  então nenhum pode pagar neste driver. O que sobraria seria a leitura da resposta
+  na CPU, um quadro depois: não é exato (objetos podem aparecer com atraso), o que
+  a regra do projeto exclui.
+
+O código dos modos 3-5, os shaders `hiz_*.comp` e o pedido da extensão de
+renderização condicional saíram junto.
 
 ## Perfil da thread de comandos (simpleperf, Showdown, câmera parada, 20/10)
 

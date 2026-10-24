@@ -118,9 +118,8 @@ void Targets::BeginFrame() {
                                       .count());
   backend.profiling.ReadTimestamps(backend.slot_);
   backend.profiling.ReadPairTimestamps(backend.slot_);
-  backend.hiz.HizReadResults(backend.slot_);
-  backend.hiz.hiz_tests_frame_ = backend.hiz.hiz_tests_remembered_ = 0;
-  backend.hiz.hiz_learn_left_ = 3;
+  backend.census.BeginSlot(backend.slot_);
+  backend.skip_mask_ = uint32_t(REXCVAR_GET(renut_plume_skip));
   backend.streams.ApplyWritebacks(backend.slot_);
   list_ = backend.lists_[backend.slot_].get();
   slice_base_ = slice_origin_ + uint64_t(backend.slot_) * backend.upload_slice_size_;
@@ -169,6 +168,7 @@ void Targets::BeginFrame() {
                         backend.slot_ * kMaxTimestamps, kMaxTimestamps);
     backend.profiling.WriteTimestamp();
   }
+  backend.census.ResetSlot(backend.slot_);
   pair_capture_ = false;
   backend.profiling.pair_used_ = 0;
   backend.profiling.pair_marks_[backend.slot_].clear();

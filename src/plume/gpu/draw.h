@@ -101,7 +101,6 @@ struct Draw {
   std::vector<DeferredSlot> deferred_slots_, flushing_slots_, draw_slots_;
   uint64_t deferred_signature_ = 0;
   bool in_issue_draw_ = false;
-  HizTest hiz_test_;
   uint32_t hiz_timer_phase_ = 0;
   LookupMemo<std::unique_ptr<RenderPipeline>, 13> pipeline_memo_;
   // Lookups at the draw (renut_plume_pipeline_lookup_ms): whether they are

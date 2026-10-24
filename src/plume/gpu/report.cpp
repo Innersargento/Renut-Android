@@ -70,7 +70,6 @@ void Reporting::Report() {
   backend.recorder.SyncRecorder();
   backend.stats_.drawn += rec_stats_.drawn;
   backend.stats_.pipeline_binds += rec_stats_.pipeline_binds;
-  backend.stats_.hiz_predicated_draws += rec_stats_.predicated;
   backend.stats_.passes += rec_stats_.passes;
   rec_stats_ = {};
   REXLOG_INFO(
@@ -153,35 +152,6 @@ void Reporting::Report() {
     }
     REXLOG_INFO("{}", line);
     hiz_clip_states_.clear();
-  }
-  if (hiz_mode_ >= 3) {
-    REXLOG_INFO(
-        "Renut: Plume Hi-Z occlusion: {} windows tested ({} failed), {} draws tested, {} held back, of which {} "
-        "answered hidden and {} visible; {} answered ({} hidden in all); {} draws run under conditional rendering; "
-        "history {} keys | boxed draws {} (not deferred {}, biased {}, other depth func {}, no depth {}); windows {} "
-        "(not tested {} holding {} draws); learning every {} frames; verified {} held draws: {} violations, {} "
-        "visible answers with no samples ({} of them over depth still at the far plane)",
-        backend.stats_.hiz_windows_tested, backend.stats_.hiz_test_failed, backend.stats_.hiz_records, backend.stats_.hiz_held,
-        backend.stats_.hiz_held_skipped, backend.stats_.hiz_held_visible, backend.stats_.hiz_answered, backend.stats_.hiz_occluded,
-        backend.stats_.hiz_predicated_draws, backend.hiz.hiz_history_.size(), backend.stats_.hiz_boxed_draws, backend.stats_.hiz_why_not[0],
-        backend.stats_.hiz_why_not[1], backend.stats_.hiz_why_not[2], backend.stats_.hiz_why_not[3], backend.stats_.hiz_windows_all,
-        backend.stats_.hiz_small_windows, backend.stats_.hiz_small_draws, backend.hiz.hiz_learn_period_, backend.stats_.hiz_verified,
-        backend.stats_.hiz_violations, backend.stats_.hiz_missed_hidden, backend.stats_.hiz_missed_empty);
-  }
-  if (!hiz_zero_pairs_.empty()) {
-    std::vector<std::array<uint64_t, 3>> ranked;
-    uint64_t total = 0;
-    for (const auto& [key, entry] : hiz_zero_pairs_) {
-      ranked.push_back(entry);
-      total += entry[0];
-    }
-    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a[0] > b[0]; });
-    std::string line = fmt::format("Renut: Plume Hi-Z draws with no samples that the test could not call hidden ({}):", total);
-    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 8); ++i) {
-      line += fmt::format(" [vs {:016X} ps {:016X} x{}]", ranked[i][1], ranked[i][2], ranked[i][0]);
-    }
-    REXLOG_INFO("{}", line);
-    hiz_zero_pairs_.clear();
   }
   if (backend.bc_supported_ && backend.swap.bc_mode_) {
     REXLOG_INFO("Renut: Plume BC textures: {} of the {} 2D uploads were blocks, not decoded pixels",
@@ -271,24 +241,24 @@ void Reporting::Report() {
     if (FILE* out = std::fopen(path.c_str(), "a")) {
       std::fprintf(out,
                    "mode=%u swaps=%llu draws=%llu drawn=%llu dropped=%llu color_seen=%llu color_boxed=%llu "
-                   "color_frustum=%llu depth_seen=%llu depth_boxed=%llu depth_frustum=%llu windows_tested=%llu "
-                   "tested=%llu held=%llu answered=%llu hidden=%llu predicated=%llu test_failed=%llu cp_cpu_ms=%llu "
-                   "cull_ms=%llu model_ms=%llu box_ms=%llu eval_ms=%llu memo_hits=%llu pipeline_binds=%llu nm_color=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu nm_depth=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu skipped=%llu,%llu skip=%d tests_ms=%llu\n",
+                   "color_frustum=%llu depth_seen=%llu depth_boxed=%llu depth_frustum=%llu cp_cpu_ms=%llu "
+                   "cull_ms=%llu model_ms=%llu box_ms=%llu eval_ms=%llu memo_hits=%llu pipeline_binds=%llu "
+                   "nm_color=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu "
+                   "nm_depth=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu skipped=%llu,%llu skip=%d "
+                   "clip_plane=%llu,%llu\n",
                    hiz_mode_, (unsigned long long)backend.swaps_, (unsigned long long)backend.stats_.draws,
                    (unsigned long long)backend.stats_.drawn, (unsigned long long)backend.stats_.hiz_culled_total,
                    (unsigned long long)backend.stats_.hiz_seen[1], (unsigned long long)backend.stats_.hiz_eligible[1],
                    (unsigned long long)backend.stats_.hiz_frustum[1], (unsigned long long)backend.stats_.hiz_seen[0],
                    (unsigned long long)backend.stats_.hiz_eligible[0], (unsigned long long)backend.stats_.hiz_frustum[0],
-                   (unsigned long long)backend.stats_.hiz_windows_tested, (unsigned long long)backend.stats_.hiz_records,
-                   (unsigned long long)backend.stats_.hiz_held, (unsigned long long)backend.stats_.hiz_answered,
-                   (unsigned long long)backend.stats_.hiz_occluded, (unsigned long long)backend.stats_.hiz_predicated_draws,
-                   (unsigned long long)backend.stats_.hiz_test_failed, (unsigned long long)(backend.stats_.cp_cpu_us / 1000),
+                   (unsigned long long)(backend.stats_.cp_cpu_us / 1000),
                    (unsigned long long)(backend.stats_.hiz_cull_ns / 1000000), (unsigned long long)(backend.stats_.hiz_stage_ns[0] / 1000000),
                    (unsigned long long)(backend.stats_.hiz_stage_ns[1] / 1000000), (unsigned long long)(backend.stats_.hiz_stage_ns[2] / 1000000),
                    (unsigned long long)backend.stats_.stream_memo_hits, (unsigned long long)backend.stats_.pipeline_binds,
-                   (unsigned long long)backend.stats_.hiz_why_model[1][1], (unsigned long long)backend.stats_.hiz_why_model[1][2], (unsigned long long)backend.stats_.hiz_why_model[1][3], (unsigned long long)backend.stats_.hiz_why_model[1][4], (unsigned long long)backend.stats_.hiz_why_model[1][5], (unsigned long long)backend.stats_.hiz_why_model[1][6], (unsigned long long)backend.stats_.hiz_why_model[1][7], (unsigned long long)backend.stats_.hiz_why_model[1][8], (unsigned long long)backend.stats_.hiz_why_model[1][9], (unsigned long long)backend.stats_.hiz_why_model[1][10], (unsigned long long)backend.stats_.hiz_why_model[0][1], (unsigned long long)backend.stats_.hiz_why_model[0][2], (unsigned long long)backend.stats_.hiz_why_model[0][3], (unsigned long long)backend.stats_.hiz_why_model[0][4], (unsigned long long)backend.stats_.hiz_why_model[0][5], (unsigned long long)backend.stats_.hiz_why_model[0][6], (unsigned long long)backend.stats_.hiz_why_model[0][7], (unsigned long long)backend.stats_.hiz_why_model[0][8], (unsigned long long)backend.stats_.hiz_why_model[0][9], (unsigned long long)backend.stats_.hiz_why_model[0][10],
+                   (unsigned long long)backend.stats_.hiz_why_model[1][1], (unsigned long long)backend.stats_.hiz_why_model[1][2], (unsigned long long)backend.stats_.hiz_why_model[1][3], (unsigned long long)backend.stats_.hiz_why_model[1][4], (unsigned long long)backend.stats_.hiz_why_model[1][5], (unsigned long long)backend.stats_.hiz_why_model[1][6], (unsigned long long)backend.stats_.hiz_why_model[1][7], (unsigned long long)backend.stats_.hiz_why_model[1][8], (unsigned long long)backend.stats_.hiz_why_model[1][9], (unsigned long long)backend.stats_.hiz_why_model[1][10],
+                   (unsigned long long)backend.stats_.hiz_why_model[0][1], (unsigned long long)backend.stats_.hiz_why_model[0][2], (unsigned long long)backend.stats_.hiz_why_model[0][3], (unsigned long long)backend.stats_.hiz_why_model[0][4], (unsigned long long)backend.stats_.hiz_why_model[0][5], (unsigned long long)backend.stats_.hiz_why_model[0][6], (unsigned long long)backend.stats_.hiz_why_model[0][7], (unsigned long long)backend.stats_.hiz_why_model[0][8], (unsigned long long)backend.stats_.hiz_why_model[0][9], (unsigned long long)backend.stats_.hiz_why_model[0][10],
                    (unsigned long long)backend.stats_.hiz_skipped[1], (unsigned long long)backend.stats_.hiz_skipped[0], backend.swap.hiz_skip_ ? 1 : 0,
-                   (unsigned long long)(backend.stats_.hiz_stage_ns[3] / 1000000));
+                   (unsigned long long)backend.stats_.hiz_clip_plane[1], (unsigned long long)backend.stats_.hiz_clip_plane[0]);
       std::fclose(out);
     }
   }

@@ -63,6 +63,8 @@ struct Recorder {
   // cvars renut_plume_no_shadows / _no_bloom
   void FlushDeferred(uint32_t reason = 0);
   void EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count);
+  // A draw ready to record: queued for the recording thread, or recorded here.
+  void Submit(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count);
   // The command list, after recording any draws that are waiting.
   RenderCommandList* L();
   std::mutex rec_mutex_;

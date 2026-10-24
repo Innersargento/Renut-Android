@@ -157,6 +157,7 @@ add_executable(renut_plume_exe
     "${RENUT_SRC}/plume/gpu/xenos/translator_disasm.cpp"
     "${RENUT_SRC}/plume/gpu/xenos/ucode.cpp"
     "${RENUT_SRC}/plume/gpu/hiz.cpp"
+    "${RENUT_SRC}/plume/gpu/census.cpp"
     "${RENUT_SRC}/plume/gpu/host.cpp"
     "${RENUT_SRC}/plume/gpu/native_exec.cpp"
     "${RENUT_SRC}/plume/gpu/options.cpp"

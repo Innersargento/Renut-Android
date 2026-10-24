@@ -180,26 +180,16 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
       bound.offset = view.buffer.offset;
     }
   }
-  // A draw the Hi-Z test answered for runs only where the answer is non-zero.
-  const bool predicated = pk.hiz_pred_offset != UINT32_MAX && backend.hiz.hiz_pred_[backend.slot_] != nullptr &&
-                          pk.kind != DrawPacket::Kind::kNone;
-  VkCommandBuffer predicate_cb = VK_NULL_HANDLE;
-  const bool queried = pk.hiz_query != UINT32_MAX && backend.hiz.hiz_query_pool_ != VK_NULL_HANDLE &&
-                       pk.kind != DrawPacket::Kind::kNone;
-  if (queried) {
+  // renut_plume_zero_census: the draw runs inside its occlusion query.
+  const bool counted = pk.census_query != UINT32_MAX && pk.kind != DrawPacket::Kind::kNone;
+  VkCommandBuffer census_cb = VK_NULL_HANDLE;
+  if (counted) {
     auto* vulkan = static_cast<VulkanCommandList*>(L());
     vulkan->checkActiveRenderPass();
-    predicate_cb = vulkan->vk;
-    vkCmdBeginQuery(predicate_cb, backend.hiz.hiz_query_pool_, pk.hiz_query, 0);
-  }
-  if (predicated) {
-    auto* vulkan = static_cast<VulkanCommandList*>(L());
-    vulkan->checkActiveRenderPass();
-    predicate_cb = vulkan->vk;
-    VkConditionalRenderingBeginInfoEXT info = {VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
-    info.buffer = static_cast<VulkanBuffer*>(backend.hiz.hiz_pred_[backend.slot_].get())->vk;
-    info.offset = pk.hiz_pred_offset;
-    vkCmdBeginConditionalRenderingEXT(predicate_cb, &info);
+    census_cb = vulkan->vk;
+    vkCmdBeginQuery(census_cb, backend.census.pool_, pk.census_query, 0);
+    const auto& marks = backend.targets.pass_marks_[backend.slot_];
+    backend.census.positions_[backend.slot_][pk.census_query % Census::kQueries] = marks.empty() ? 0 : marks.back().draws;
   }
   switch (pk.kind) {
     case DrawPacket::Kind::kNone: break;
@@ -221,11 +211,7 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
     }
     case DrawPacket::Kind::kPlain: L()->drawInstanced(pk.count, 1, pk.first, 0); break;
   }
-  if (predicated) {
-    vkCmdEndConditionalRenderingEXT(predicate_cb);
-    ++backend.report.rec_stats_.predicated;
-  }
-  if (queried) vkCmdEndQuery(predicate_cb, backend.hiz.hiz_query_pool_, pk.hiz_query);
+  if (counted) vkCmdEndQuery(census_cb, backend.census.pool_, pk.census_query);
   if (pair_stamped) backend.profiling.PairStamp();
   ++backend.report.rec_stats_.drawn;
   if (!backend.targets.pass_marks_[backend.slot_].empty()) ++backend.targets.pass_marks_[backend.slot_].back().draws;
@@ -437,6 +423,11 @@ void Recorder::SyncAfterDraw(const DrawPacket& pk) {
 // Records the draws that are waiting, grouped by pipeline. The groups keep the
 // order in which each pipeline first appeared and the draws keep their order
 // inside a group, so a window whose draws share one pipeline is untouched.
+void Recorder::Submit(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count) {
+  if (RecActive()) RecQueue(pk, slots, slot_count);
+  else EmitDraw(pk, slots, slot_count);
+}
+
 void Recorder::FlushDeferred(uint32_t reason) {
   if (deferred_.empty()) return;
   ++backend.stats_.flush_windows[reason & 7];
@@ -475,13 +466,9 @@ void Recorder::FlushDeferred(uint32_t reason) {
   ++backend.stats_.defer_windows;
   backend.stats_.defer_binds_before += before;
   backend.stats_.defer_binds_after += after;
-  if (!backend.hiz.HizFlushWindow(n)) {
-    const bool async = RecActive();
-    for (size_t i = 0; i < n; ++i) {
-      const DrawPacket& pk = flushing_[defer_order_[i]];
-      if (async) RecQueue(pk, backend.draw.flushing_slots_.data() + pk.first_slot, pk.slot_count);
-      else EmitDraw(pk, backend.draw.flushing_slots_.data() + pk.first_slot, pk.slot_count);
-    }
+  for (size_t i = 0; i < n; ++i) {
+    const DrawPacket& pk = flushing_[defer_order_[i]];
+    Submit(pk, backend.draw.flushing_slots_.data() + pk.first_slot, pk.slot_count);
   }
   flushing_.clear();
   backend.draw.flushing_slots_.clear();

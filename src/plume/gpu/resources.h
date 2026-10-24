@@ -203,21 +203,19 @@ struct Stats {
   // and the ones whose box lay wholly outside the frustum or the scissor.
   uint64_t hiz_seen[2] = {}, hiz_eligible[2] = {}, hiz_no_model[2] = {}, hiz_no_box[2] = {};
   uint64_t hiz_frustum[2] = {}, hiz_scissor[2] = {}, hiz_skipped[2] = {};
+  // Of hiz_frustum: boxes wholly below an enabled user clip plane.
+  uint64_t hiz_clip_plane[2] = {};
   uint64_t hiz_boxes_made = 0, hiz_box_us = 0, hiz_box_hits = 0, hiz_models = 0, hiz_models_valid = 0,
            hiz_model_rejected = 0, hiz_model_us = 0;
   uint64_t hiz_culled_total = 0;
   // Windows closed, and the draws they held, by reason: 0 elsewhere, 1 state change, 2 full, 3 an immediate
   // draw, 4 something the draw itself needed (a texture, a barrier).
   uint64_t flush_windows[8] = {}, flush_draws[8] = {};
-  uint64_t hiz_boxed_draws = 0, hiz_why_not[4] = {}, hiz_small_windows = 0, hiz_small_draws = 0, hiz_windows_all = 0;
   uint64_t hiz_cull_ns = 0;
   uint64_t stream_memo_hits = 0;
   uint64_t hiz_stage_ns[4] = {};  // model lookup, box lookup, constants evaluation, plane/scissor tests (sampled, scaled)
   // Draws with no model by why (renut::hiz::Why), depth-only [0] and colour [1].
   uint64_t hiz_why_model[2][12] = {};
-  uint64_t hiz_verified = 0, hiz_violations = 0, hiz_missed_hidden = 0, hiz_missed_empty = 0;
-  uint64_t hiz_windows_tested = 0, hiz_records = 0, hiz_held = 0, hiz_test_failed = 0, hiz_answered = 0,
-           hiz_occluded = 0, hiz_held_skipped = 0, hiz_held_visible = 0, hiz_predicated_draws = 0;
   // Why a draw was not considered: no indices, primitive, memory export, clip/viewport state, constant base.
   uint64_t hiz_why[5] = {};
 };
