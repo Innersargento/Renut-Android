@@ -208,7 +208,7 @@ set_source_files_properties("${RENUT_SRC}/plume/shader_cache_blob.S" PROPERTIES
     OBJECT_DEPENDS "${RENUT_SHADERS}/shader_spirv.smolv")
 set(RENUT_RUNTIME_SOURCES
     # Shared with the Windows build
-    guest/game_fixes.cpp guest/cheats.cpp guest/kernel_overrides.cpp guest/host_support.cpp
+    guest/game_fixes.cpp guest/frame_fixes.cpp guest/cheats.cpp guest/kernel_overrides.cpp guest/host_support.cpp
     d3d/d3d_layer.cpp d3d/plume_d3d.cpp
     d3d/native/lists.cpp d3d/native/flush.cpp d3d/native/draws.cpp d3d/native/commands.cpp d3d/native/sync.cpp d3d/native/entry.cpp d3d/native/report.cpp
     plume/plume_renderer.cpp plume/hiz_model.cpp

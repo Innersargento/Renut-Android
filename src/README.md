@@ -21,6 +21,7 @@ src/
 | Arquivo | O que faz |
 |---|---|
 | `kernel_overrides.{cpp,inc,cmake}` | Exportações do kernel que o reNut assume (`VdSwap`...). O `.inc` lista; o `.cmake` renomeia as chamadas na compilação do jogo |
+| `frame_fixes.cpp` | O jogo acima de 30 FPS: passos inteiros da física e o limite de 30 FPS no arcade do Klungo e no Saucer of Peril (`renut_physics_whole_steps`) |
 | `game_fixes.cpp` | Substituições específicas do jogo: definições fortes que trocam funções recompiladas (símbolos fracos) |
 | `cheats.cpp` | Ganchos de cheat que o código gerado chama em endereços fixos (`config/renut_android_hooks.toml`), ligados por cvar |
 | `host_support.{h,cpp}` | Pausa do jogador e contadores compartilhados entre renderizador e contador de quadros |

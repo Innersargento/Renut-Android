@@ -81,3 +81,17 @@ address = 0x823F4720
 name = "renut_cheat_super_punch"
 registers = ["f1", "r3"]
 after_instruction = false
+
+# Klungo's arcade runs its games' logic once per frame, so they play too fast above 30 fps: the end of its
+# constructor and of its destructor start and stop holding the game at 30 (guest/frame_fixes.cpp).
+[[midasm_hook]]
+address = 0x8246E7A8
+name = "renut_klungo_arcade_begin"
+registers = []
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x8246F62C
+name = "renut_klungo_arcade_end"
+registers = []
+after_instruction = false

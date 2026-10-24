@@ -12,7 +12,8 @@
 //             does not queue (Mailbox, or Immediate): see PresentVsync().
 //
 // The target comes from the renut_fps_target cvar at start and from the sidebar
-// while playing (nativeSetFpsTarget), and is only ever read through here.
+// while playing (nativeSetFpsTarget), and is only ever read through here (Target(), which
+// answers 30 while a hold is on; UserTarget() is the player's own).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -40,8 +41,31 @@ inline int Sanitize(int fps) {
   return std::clamp(fps, kMinFps, kMaxFps);
 }
 
-inline int Target() { return TargetCell().load(std::memory_order_relaxed); }
+// What the player asked for.
+inline int UserTarget() { return TargetCell().load(std::memory_order_relaxed); }
 inline void SetTarget(int fps) { TargetCell().store(Sanitize(fps), std::memory_order_relaxed); }
+
+// Parts of the game whose logic runs once a frame, so that above 30 FPS they play too fast or never
+// end: Klungo's arcade and The Saucer of Peril Returns (guest/frame_fixes.cpp). While one runs the
+// game is held to its own 30 FPS whatever the player asked for; the target comes back after.
+enum HoldReason : uint32_t { kHoldKlungoArcade = 1, kHoldSaucerOfPeril = 2 };
+
+inline std::atomic<uint32_t>& HoldCell() {
+  static std::atomic<uint32_t> hold{0};
+  return hold;
+}
+// Returns whether the hold changed.
+inline bool SetHold(uint32_t reason, bool on) {
+  const uint32_t before = on ? HoldCell().fetch_or(reason, std::memory_order_relaxed)
+                             : HoldCell().fetch_and(~reason, std::memory_order_relaxed);
+  return ((before & reason) != 0) != on;
+}
+
+// The target every part that paces or presents follows: the player's, or 30 while a hold is on.
+inline int Target() {
+  const int target = UserTarget();
+  return target != kOriginalFps && HoldCell().load(std::memory_order_relaxed) ? kOriginalFps : target;
+}
 
 // Takes the target from the renut_fps_target cvar (game_fixes.cpp), once the
 // configuration has been loaded.
