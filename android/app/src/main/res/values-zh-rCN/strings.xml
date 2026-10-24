@@ -71,6 +71,7 @@
     <string name="cheat_no_notes_spent">音符不会被消耗</string>
     <string name="cheat_vehicles_anywhere">可在任意地点更换和组装载具</string>
     <string name="cheat_extended_build_range">更大的组装区域（Mumbo\'s Motors）</string>
+    <string name="cheat_super_punch">超强攻击</string>
     <string name="cheats_skin">班卓的外观</string>
     <string name="skin_default">普通</string>
     <string name="skin_robot">机器人</string>

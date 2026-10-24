@@ -25,6 +25,8 @@ REXCVAR_DEFINE_BOOL(renut_cheat_vehicles_anywhere, false, "reNut/Cheats",
                     "Change and build vehicles from the pause menu outside Showdown Town");
 REXCVAR_DEFINE_BOOL(renut_cheat_extended_build_range, false, "reNut/Cheats",
                     "A larger area to build in at Mumbo's Motors");
+REXCVAR_DEFINE_BOOL(renut_cheat_super_punch, false, "reNut/Cheats",
+                    "Hits on anything but Banjo do enormous damage");
 REXCVAR_DEFINE_STRING(renut_cheat_banjo_skin, "default", "reNut/Cheats", "Banjo's outfit")
     .allowed({"default", "robot", "tuxedo"});
 
@@ -36,6 +38,24 @@ namespace {
 // that does not hold the expected name is left alone instead of spawning garbage.
 constexpr uint32_t kRobotBanjoActor = 0x8216B690;
 constexpr uint32_t kTuxedoBanjoActor = 0x8216B6A4;
+
+// Damage multiplier of the super punch.
+constexpr double kSuperPunchFactor = 1000.0;
+// Type byte of a health component's owner actor.
+constexpr uint32_t kOwnerTypeOffset = 0xBE0;
+constexpr int kBanjoOwnerType = 2;
+
+int GuestByte(uint32_t address) {
+  auto* runtime = rex::Runtime::instance();
+  const uint8_t* bytes = runtime ? runtime->virtual_membase() : nullptr;
+  return bytes ? bytes[address] : -1;
+}
+
+uint32_t GuestWord(uint32_t address) {
+  uint32_t value = 0;
+  for (int i = 0; i < 4; ++i) value = value << 8 | static_cast<uint32_t>(GuestByte(address + i));
+  return value;
+}
 
 bool GuestStringIs(uint32_t address, const char* expected) {
   auto* runtime = rex::Runtime::instance();
@@ -61,6 +81,7 @@ std::string renutCheatsSummary() {
   add(REXCVAR_GET(renut_cheat_no_notes_spent), "notas");
   add(REXCVAR_GET(renut_cheat_vehicles_anywhere), "veículos em qualquer lugar");
   add(REXCVAR_GET(renut_cheat_extended_build_range), "área de montagem");
+  add(REXCVAR_GET(renut_cheat_super_punch), "golpe forte");
   add(REXCVAR_GET(renut_cheat_banjo_skin) != "default", ("visual " + REXCVAR_GET(renut_cheat_banjo_skin)).c_str());
   return list.empty() ? "ligados, nenhum selecionado" : list;
 }
@@ -87,6 +108,16 @@ void renut_cheat_vehicles_anywhere(PPCRegister& r23, PPCRegister& r26) {
 
 bool renut_cheat_extended_build_range() {
   return RENUT_CHEAT_ON(renut_cheat_extended_build_range);
+}
+
+// Entry of sub_823F4720: f1 is the damage about to be subtracted from the component in r3.
+// The component's owner (+0x30) has a type byte at +0xBE0; 2 is Banjo (it took damage in the
+// logs, objects and enemies were 4), who is left alone.
+void renut_cheat_super_punch(PPCRegister& f1, PPCRegister& r3) {
+  if (!r3.u32 || !RENUT_CHEAT_ON(renut_cheat_super_punch)) return;
+  const uint32_t owner = GuestWord(r3.u32 + 0x30);
+  if (owner && GuestByte(owner + kOwnerTypeOffset) == kBanjoOwnerType) return;
+  f1.f64 *= kSuperPunchFactor;
 }
 
 // True keeps the game's own choice of actor; false jumps past it with the

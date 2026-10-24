@@ -72,3 +72,12 @@ name = "renut_cheat_banjo_skin"
 registers = ["r3", "r5"]
 after_instruction = true
 jump_address_on_false = 0x8251CABC
+
+# Super punch: sub_823F4720(f1 = damage, r3 = health component) is the generic
+# "subtract health" entry every hit goes through. The hook multiplies f1 unless the
+# component's owner is Banjo (type byte 2 at owner+0xBE0, owner = component+0x30).
+[[midasm_hook]]
+address = 0x823F4720
+name = "renut_cheat_super_punch"
+registers = ["f1", "r3"]
+after_instruction = false

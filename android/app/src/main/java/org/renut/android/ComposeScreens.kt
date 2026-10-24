@@ -580,7 +580,8 @@ private val CHEAT_LABELS = listOf(
     "renut_cheat_no_timer" to R.string.cheat_no_timer,
     "renut_cheat_no_notes_spent" to R.string.cheat_no_notes_spent,
     "renut_cheat_vehicles_anywhere" to R.string.cheat_vehicles_anywhere,
-    "renut_cheat_extended_build_range" to R.string.cheat_extended_build_range)
+    "renut_cheat_extended_build_range" to R.string.cheat_extended_build_range,
+    "renut_cheat_super_punch" to R.string.cheat_super_punch)
 private val SKIN_LABELS = listOf(
     "default" to R.string.skin_default, "robot" to R.string.skin_robot, "tuxedo" to R.string.skin_tuxedo)
 

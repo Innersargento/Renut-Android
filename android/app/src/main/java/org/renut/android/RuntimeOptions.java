@@ -17,7 +17,7 @@ final class RuntimeOptions {
     static final String[] CHEAT_FLAGS = {
         "renut_cheat_infinite_health", "renut_cheat_infinite_fuel_ammo", "renut_cheat_infinite_parts",
         "renut_cheat_no_timer", "renut_cheat_no_notes_spent", "renut_cheat_vehicles_anywhere",
-        "renut_cheat_extended_build_range"};
+        "renut_cheat_extended_build_range", "renut_cheat_super_punch"};
     static final String CHEAT_SKIN = "renut_cheat_banjo_skin";
     static final String[] SKINS = {"default", "robot", "tuxedo"};
     /** 0 full, 1 half, 2 quarter: how far the world's textures are reduced (plume/gpu). */

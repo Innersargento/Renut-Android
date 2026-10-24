@@ -119,6 +119,7 @@ add("cheat_vehicles_anywhere", "Trocar e montar veículo em qualquer lugar", "Sw
     "可在任意地点更换和组装载具", "Cambiar y montar vehículo en cualquier lugar")
 add("cheat_extended_build_range", "Área de montagem maior (Mumbo's Motors)", "Larger build area (Mumbo's Motors)",
     "更大的组装区域（Mumbo's Motors）", "Área de montaje mayor (Mumbo's Motors)")
+add("cheat_super_punch", "Golpe super forte", "Super strong hits", "超强攻击", "Golpes superfuertes")
 add("cheats_skin", "Visual do Banjo", "Banjo's look", "班卓的外观", "Aspecto de Banjo")
 add("skin_default", "Normal", "Normal", "普通", "Normal")
 add("skin_robot", "Robô", "Robot", "机器人", "Robot")
