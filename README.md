@@ -1,62 +1,69 @@
-# reNut para Android
+# reNut for Android
 
-Banjo-Kazooie: Nuts & Bolts no Android (ARM64), por **recompilação estática**: o
-executável do Xbox 360 é traduzido para C++ e compilado para o aparelho, e o
-Direct3D do jogo é desenhado por um renderizador próprio sobre Vulkan. Este
-repositório é só o app Android.
+Banjo-Kazooie: Nuts & Bolts on Android (ARM64), through **static recompilation**:
+the Xbox 360 executable is translated to C++ and compiled for the device, and the
+game's Direct3D is drawn by a renderer of our own on top of Vulkan. This
+repository is only the Android app.
 
-Este projeto vem do [reNut](https://github.com/masterspike52/reNut) de
-masterspike52 (a recompilação para PC) e usa o
+This project comes from [reNut](https://github.com/masterspike52/reNut) by
+masterspike52 (the recompilation for PC) and uses the
 [RexGlue SDK](https://github.com/rexglue/rexglue-sdk).
 
-> **O repositório não traz nada do jogo.** Você precisa da sua própria cópia
-> (a edição **europeia**: o app confere o SHA-256 do `default.xex`) e a importa no
-> app. O código gerado e os shaders saem do seu jogo, ficam na sua máquina e nunca
-> entram no Git.
+> **Special thanks to [masterspike52](https://github.com/masterspike52) and the
+> [reNut](https://github.com/masterspike52/reNut) project.** Without their
+> recompilation of the game, its hooks and its documentation, none of this would
+> exist.
 
-## O que tem aqui
+> **The repository contains nothing of the game.** You need your own copy (the
+> **European** edition: the app checks the SHA-256 of `default.xex`) and import it
+> in the app. The generated code and the shaders come out of your game, stay on
+> your machine and never enter Git.
 
-| Pasta | O quê |
+## What is here
+
+| Folder | What |
 |---|---|
-| `android/` | o app (Gradle, Kotlin/Java) e o `native/CMakeLists.txt` da biblioteca nativa |
-| `src/` | o código nativo: `guest/` (o jogo e o kernel emulado), `d3d/` (Direct3D do jogo), `plume/` (o renderizador), `platform/` (JNI, áudio, toque) |
-| `config/` | a configuração do codegen: funções, ganchos e a CRT do jogo |
-| `thirdparty/` | RexGlue SDK e Plume (submódulos, sem alteração) e as ferramentas de build (`thirdparty/README.md`) |
-| `tools/` | `prepare.py` (o build de ponta a ponta), `shaders/`, `i18n/`, `bench/` (medição no aparelho), `test/` |
-| `docs/` | como compilar, as dependências e as medições de desempenho (`docs/performance/`) |
+| `android/` | the app (Gradle, Kotlin/Java) and the native library's `native/CMakeLists.txt` |
+| `src/` | the native code: `guest/` (the game and the emulated kernel), `d3d/` (the game's Direct3D), `plume/` (the renderer), `platform/` (JNI, audio, touch) |
+| `config/` | the codegen configuration: functions, hooks and the game's CRT |
+| `thirdparty/` | RexGlue SDK and Plume (submodules, unmodified) and the build tools (`thirdparty/README.md`) |
+| `tools/` | `prepare.py` (the end-to-end build), `shaders/`, `i18n/`, `bench/` (measuring on the device), `test/` |
+| `docs/` | how to build, the dependencies and the performance measurements (`docs/performance/`) |
 
-## Como compilar
+## How to build
 
 ```bash
-python tools/prepare.py doctor                 # confere a máquina
-python tools/prepare.py all --game "<ISO ou pasta do jogo>"
-python tools/prepare.py apk                    # ou abra android/ no Android Studio
+python tools/prepare.py doctor                 # checks the machine
+python tools/prepare.py all --game "<ISO or game folder>"
+python tools/prepare.py apk                    # or open android/ in Android Studio
 ```
 
-O passo a passo, os pré-requisitos e os problemas conhecidos estão em
-[docs/BUILD.md](docs/BUILD.md). As dependências e o que mudamos nelas estão em
-[docs/DEPENDENCIAS.md](docs/DEPENDENCIAS.md).
+The step by step, the prerequisites and the known problems are in
+[docs/BUILD.md](docs/BUILD.md). The dependencies and what we changed in them are
+in [docs/DEPENDENCIAS.md](docs/DEPENDENCIAS.md). (These two documents are in
+Portuguese.)
 
-## Medir desempenho
+## Measuring performance
 
-`tools/bench/` tem os scripts que medem no aparelho conectado por `adb`
-(FPS, CPU das threads de GPU, A/B de uma opção). As medições feitas e o que
-delas saiu estão em [docs/performance/](docs/performance/).
+`tools/bench/` has the scripts that measure on a device connected through `adb`
+(FPS, CPU of the GPU threads, A/B of an option). The measurements made and what
+came out of them are in [docs/performance/](docs/performance/).
 
-## Créditos
+## Credits
 
-- **reNut** (masterspike52), a recompilação do jogo para PC de que este
-  projeto parte, e quem a ajudou: SolarCookies (ganchos), ValcomDrifty (logo),
-  OlieGamerTV (documentação do jogo), XephyrCraft e os testadores.
-- **RexGlue SDK**, a base da recompilação.
-- **Plume** (renderbag), a camada de renderização sobre Vulkan.
-- **XenosRecomp** (hedge-dev), o conversor de shaders do Xbox 360, na versão do reNut.
-- **libadrenotools** e **liblinkernsbypass** (bylaws), que carregam o driver
-  Turnip empacotado; **libucontext** (kaniini), as fibras do código recompilado.
-- As licenças das bibliotecas embarcadas no app estão em
+- **[reNut](https://github.com/masterspike52/reNut)** (masterspike52), the
+  recompilation of the game for PC this project starts from, and those who helped
+  it: SolarCookies (hooks), ValcomDrifty (logo), OlieGamerTV (game
+  documentation), XephyrCraft and the testers.
+- **RexGlue SDK**, the base of the recompilation.
+- **Plume** (renderbag), the rendering layer on top of Vulkan.
+- **XenosRecomp** (hedge-dev), the Xbox 360 shader converter, in reNut's version.
+- **libadrenotools** and **liblinkernsbypass** (bylaws), which load the bundled
+  Turnip driver; **libucontext** (kaniini), the fibers of the recompiled code.
+- The licenses of the libraries embedded in the app are in
   `android/app/src/main/assets/licenses/`.
 
-## Licença
+## License
 
-Este repositório ainda não declara uma licença para o código do reNut Android.
-Defina uma antes de publicá-lo, respeitando as licenças dos projetos acima.
+This repository does not declare a license yet for the reNut Android code. Set
+one before publishing it, respecting the licenses of the projects above.
