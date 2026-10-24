@@ -207,6 +207,15 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeS
   renut::pacing::SetTarget(fps);
   renut::adpf::SetTargetFps(renut::pacing::Target());
 }
+// Debug builds' live cvar setter (RuntimeActivity.registerCvarReceiver).
+extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nativeSetCvar(JNIEnv* env,jclass,jstring name,jstring value) {
+  const char* n=env->GetStringUTFChars(name,nullptr);
+  const char* v=env->GetStringUTFChars(value,nullptr);
+  const bool set=rex::cvar::SetFlagByName(n,v);
+  env->ReleaseStringUTFChars(name,n);
+  env->ReleaseStringUTFChars(value,v);
+  return set;
+}
 extern "C" uint64_t renut_guest_swap_count();
 extern "C" JNIEXPORT jlong JNICALL Java_org_renut_android_RuntimeActivity_nativeFrameCount(JNIEnv*,jclass) {
   return jlong(renut_guest_swap_count());

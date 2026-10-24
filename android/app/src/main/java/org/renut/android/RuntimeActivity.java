@@ -55,6 +55,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native long nativeRumble();
     private static native void nativeSetFpsTarget(int fps);
     private static native long nativeFrameCount();
+    private static native boolean nativeSetCvar(String name,String value);
     private static native void nativeTextInputResult(String text,boolean cancelled);
     private TextView fps, temp;
     private ThermalReader thermal;
@@ -102,9 +103,34 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         super.finish();
         Transitions.fadeClose(this);
     }
+    /**
+     * Debug builds only: sets a cvar while the game runs, for measurements without reopening it.
+     * {@code adb shell am broadcast -a org.renut.android.SET_CVAR -p org.renut.android --es name renut_plume_hiz --es value 3}
+     * Guarded by the DUMP permission, which the adb shell holds and an app cannot get.
+     */
+    private android.content.BroadcastReceiver cvarReceiver;
+    private void registerCvarReceiver(){
+        if((getApplicationInfo().flags&android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE)==0)return;
+        cvarReceiver=new android.content.BroadcastReceiver(){
+            @Override public void onReceive(android.content.Context context,Intent intent){
+                String name=intent.getStringExtra("name"),value=intent.getStringExtra("value");
+                if(name==null||value==null)return;
+                boolean set=nativeSetCvar(name,value);
+                android.util.Log.i("renut-cvar",name+" = "+value+(set?"":" (unknown cvar)"));
+                setResultCode(set?1:0);
+            }
+        };
+        android.content.IntentFilter filter=new android.content.IntentFilter("org.renut.android.SET_CVAR");
+        if(android.os.Build.VERSION.SDK_INT>=33){
+            registerReceiver(cvarReceiver,filter,android.Manifest.permission.DUMP,null,RECEIVER_EXPORTED);
+        }else{
+            registerReceiver(cvarReceiver,filter,android.Manifest.permission.DUMP,null);
+        }
+    }
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         Transitions.fadeOpen(this);
+        registerCvarReceiver();
         launch=getIntent().getBooleanExtra("launch",false);
         if(launch){
             fpsTarget=RuntimeOptions.fpsTarget(this);
@@ -489,5 +515,5 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     // Leaving the screen no longer ends the game; only closing it does (onDestroy).
     @Override protected void onPause(){clearControllers();super.onPause();if(!launch){stop();finish();}}
     @Override protected void onResume(){super.onResume();if(launch){setupControllers();applyHudLayout();}}
-    @Override protected void onDestroy(){if(rumble!=null)rumble.stop();if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
+    @Override protected void onDestroy(){if(cvarReceiver!=null){unregisterReceiver(cvarReceiver);cvarReceiver=null;}if(rumble!=null)rumble.stop();if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
 }
