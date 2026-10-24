@@ -96,7 +96,6 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 // (the SDL driver in rexglue).
 extern "C" uint64_t renut_audio_silent_frames();
 
-REXCVAR_DECLARE(bool, renut_plume_async_pipelines);
 REXCVAR_DECLARE(int32_t, renut_plume_pipeline_lookup_ms);
 REXCVAR_DECLARE(int32_t, renut_plume_bool_spec);
 REXCVAR_DECLARE(int32_t, renut_plume_defer_draws);
@@ -116,7 +115,6 @@ REXCVAR_DECLARE(int32_t, renut_plume_water_tess_percent);
 REXCVAR_DECLARE(int32_t, renut_plume_shadow_min_indices);
 REXCVAR_DECLARE(int32_t, renut_plume_fence_sleep_us);
 REXCVAR_DECLARE(bool, renut_plume_no_shadows);
-REXCVAR_DECLARE(bool, renut_plume_no_bloom);
 REXCVAR_DECLARE(int32_t, renut_plume_low_memory);
 REXCVAR_DECLARE(int32_t, renut_plume_texture_max_dim);
 REXCVAR_DECLARE(int32_t, renut_plume_bc_textures);

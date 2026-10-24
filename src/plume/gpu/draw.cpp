@@ -1354,13 +1354,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       b.blendEnabled = false;
       b.renderTargetWriteMask = 0xF;
     }
-    // renut_plume_no_bloom: the bright pass (scene * its alpha + glow) writes
-    // black, so every blur after it and the final add are black too.
-    if (backend.no_bloom_ && ps && ps->entry->hash == 0x1B958C7DC860BBBEull && IsBlendable(colors[i]->format)) {
-      b.blendEnabled = true;
-      b.srcBlend = b.dstBlend = b.srcBlendAlpha = b.dstBlendAlpha = RenderBlend::ZERO;
-      b.blendOp = b.blendOpAlpha = RenderBlendOperation::ADD;
-    }
   }
   // Blend constants (RB_BLEND_RED..ALPHA) are dynamic state, set per draw, in
   // the pipelines whose factors use them. Plume left them at zero, so the
@@ -1654,8 +1647,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     // Exporting shaders feed later draws and sometimes the guest CPU. Never
     // skip those draws merely because their first pipeline is still compiling.
-    if (!pipeline && REXCVAR_GET(renut_plume_async_pipelines) &&
-        !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
+    if (!pipeline && !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
       // A draw whose pipeline is still compiling is drawn with a ready sibling
       // (same shaders, targets, blending and vertex layout; other boolean
       // registers) when there is one. Dropping it instead left holes in the

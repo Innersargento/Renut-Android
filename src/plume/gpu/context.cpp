@@ -138,7 +138,6 @@ bool GpuBackend::SetupContext() {
   swap.depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
   draw.rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
   no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
-  no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
   swap.adaptive_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1));
   if (no_shadows_) swap.shadow_min_indices_ = UINT32_MAX;
   recorder.fence_ = device_->createCommandFence();
@@ -202,8 +201,7 @@ bool GpuBackend::SetupContext() {
   }
   draw.lookup_budget_us_ = uint64_t(REXCVAR_GET(renut_plume_pipeline_lookup_ms)) * 1000;
   draw.lookup_here_ = draw.lookup_budget_us_ && PlumePipelineLookupSupported();
-  REXLOG_INFO("Renut: Plume pipelines: {} compile, {}, boolean registers {}",
-              REXCVAR_GET(renut_plume_async_pipelines) ? "async" : "sync",
+  REXLOG_INFO("Renut: Plume pipelines: async compile, {}, boolean registers {}",
               draw.lookup_here_ ? fmt::format("cache lookups at the draw up to {} ms a frame", draw.lookup_budget_us_ / 1000)
                            : std::string("no cache lookups at the draw"),
               REXCVAR_GET(renut_plume_bool_spec) ? "specialized" : "read from the shared block");

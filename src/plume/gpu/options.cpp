@@ -1,10 +1,6 @@
 // The renut_plume_* cvars of the Plume GPU. Declared in internal.h.
 #include "internal.h"
 
-REXCVAR_DEFINE_BOOL(renut_plume_async_pipelines, true, "reNut/Plume",
-                    "Compile new Plume graphics pipelines on workers; until one is ready its draw is drawn "
-                    "with a sibling pipeline or skipped. Pipelines the driver already has are taken at the "
-                    "draw. Draws that export to memory always wait for theirs.");
 REXCVAR_DEFINE_INT32(renut_plume_pipeline_lookup_ms, 4, "reNut/Plume",
                      "Milliseconds per frame the command thread may spend asking the driver's cache for "
                      "new pipelines it already has, so their draws appear at once; past it they go to the "
@@ -76,9 +72,6 @@ REXCVAR_DEFINE_BOOL(renut_plume_decal_log, false, "reNut/Plume",
 REXCVAR_DEFINE_BOOL(renut_plume_no_shadows, false, "reNut/Plume",
                     "Drop the shadow casters (depth-only draws into the shadow maps): the scene is drawn "
                     "without shadows.");
-REXCVAR_DEFINE_BOOL(renut_plume_no_bloom, false, "reNut/Plume",
-                    "Make the bloom's bright pass write black, so the blur chain and the final blend add "
-                    "no glow.");
 REXCVAR_DEFINE_INT32(renut_plume_water_tess_percent, 100, "reNut/Plume",
                      "Percent of the game's tessellation level the water grid uses (100 = as the game sets it).")
     .range(10, 100);

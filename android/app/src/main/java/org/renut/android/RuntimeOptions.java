@@ -63,8 +63,7 @@ final class RuntimeOptions {
     }
 
     private static final Set<String> BOOLEANS = new java.util.HashSet<>(java.util.Arrays.asList(
-        "renut_plume_async_pipelines", LEGACY_UNCAP_FPS, "renut_plume_no_shadows", "renut_plume_no_bloom",
-        "renut_adpf", CHEATS));
+        LEGACY_UNCAP_FPS, "renut_plume_no_shadows", "renut_adpf", CHEATS));
     static {
         BOOLEANS.addAll(java.util.Arrays.asList(CHEAT_FLAGS));
     }

@@ -60,7 +60,7 @@ struct Recorder {
   std::vector<DrawPacket> deferred_, flushing_;
   std::vector<uint32_t> defer_order_, defer_group_start_;
   std::unordered_map<const RenderPipeline*, uint32_t> defer_groups_;
-  // cvars renut_plume_no_shadows / _no_bloom
+  // cvar renut_plume_no_shadows
   void FlushDeferred(uint32_t reason = 0);
   void EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_t slot_count);
   // A draw ready to record: queued for the recording thread, or recorded here.

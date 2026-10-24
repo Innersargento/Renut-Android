@@ -119,9 +119,7 @@
     <string name="settings_runtime">Opciones del runtime</string>
     <string name="settings_runtime_note">Se aplican en el próximo inicio del juego.</string>
     <string name="settings_log_level">Nivel de registro</string>
-    <string name="settings_async">Compilación asíncrona de shaders y pipelines</string>
     <string name="settings_no_shadows">Quitar sombras</string>
-    <string name="settings_no_bloom">Quitar bloom</string>
     <string name="settings_adpf">Rendimiento sostenido (ADPF)</string>
     <string name="settings_texture_quality">Calidad de texturas</string>
     <string name="texture_quality_full">Completa</string>

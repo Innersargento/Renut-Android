@@ -108,7 +108,7 @@ class GpuBackend final {
   // frame a pair was first recorded
   std::atomic<bool> device_watch_stop_{false};
   WatchThread device_watch_{device_watch_stop_};
-  bool no_shadows_ = false, no_bloom_ = false;
+  bool no_shadows_ = false;
   bool dedupe_descriptors_ = false;
   std::array<ResolvedLookup, kResolvedLookupSize> resolved_lookup_{};
   uint64_t resolved_lookup_serial_ = 1;

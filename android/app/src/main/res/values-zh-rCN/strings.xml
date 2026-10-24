@@ -119,9 +119,7 @@
     <string name="settings_runtime">运行时选项</string>
     <string name="settings_runtime_note">将在下次启动游戏时生效。</string>
     <string name="settings_log_level">日志级别</string>
-    <string name="settings_async">异步编译着色器和管线</string>
     <string name="settings_no_shadows">移除阴影</string>
-    <string name="settings_no_bloom">移除泛光</string>
     <string name="settings_adpf">持续性能 (ADPF)</string>
     <string name="settings_texture_quality">纹理质量</string>
     <string name="texture_quality_full">完整</string>

@@ -704,9 +704,7 @@ private val SKIN_LABELS = listOf(
     val ir3Mode = activity.uiIr3Mode()
     val turnip = remember(driver) { activity.uiDriverIsTurnip() }
     val logLevel = activity.uiRuntimeOption("log_level", "info")
-    val shaderAsync = activity.uiRuntimeOption("renut_plume_async_pipelines", "true") == "true"
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
-    val noBloom = activity.uiRuntimeOption("renut_plume_no_bloom", "false") == "true"
     val sustained = activity.uiRuntimeOption("renut_adpf", "true") == "true"
     val textureLevels = listOf(stringResource(R.string.texture_quality_full), stringResource(R.string.texture_quality_half),
         stringResource(R.string.texture_quality_quarter))
@@ -788,9 +786,6 @@ private val SKIN_LABELS = listOf(
                     listOf("trace", "debug", "info", "warn", "error", "critical", "off")) {
                     activity.uiSetRuntimeOption("log_level", it)
                 }
-                ToggleRow(stringResource(R.string.settings_async), shaderAsync, !busy) {
-                    activity.uiSetRuntimeOption("renut_plume_async_pipelines", it.toString())
-                }
                 SingleChoiceSelector(stringResource(R.string.settings_texture_quality), textureLevels[textureQuality],
                     textureLevels, !busy) { choice ->
                     val level = textureLevels.indexOf(choice).coerceAtLeast(0)
@@ -814,9 +809,6 @@ private val SKIN_LABELS = listOf(
                 }
                 ToggleRow(stringResource(R.string.settings_adpf), sustained, !busy) {
                     activity.uiSetRuntimeOption("renut_adpf", it.toString())
-                }
-                ToggleRow(stringResource(R.string.settings_no_bloom), noBloom, !busy) {
-                    activity.uiSetRuntimeOption("renut_plume_no_bloom", it.toString())
                 }
             }
         }

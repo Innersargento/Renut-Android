@@ -195,10 +195,7 @@ add("settings_runtime", "Opções do runtime", "Runtime options", "运行时选�
 add("settings_runtime_note", "Aplicadas na próxima inicialização do jogo.", "Applied the next time the game starts.",
     "将在下次启动游戏时生效。", "Se aplican en el próximo inicio del juego.")
 add("settings_log_level", "Nível do log", "Log level", "日志级别", "Nivel de registro")
-add("settings_async", "Compilação assíncrona de shaders e pipelines", "Asynchronous shader and pipeline compilation",
-    "异步编译着色器和管线", "Compilación asíncrona de shaders y pipelines")
 add("settings_no_shadows", "Remover sombras", "Remove shadows", "移除阴影", "Quitar sombras")
-add("settings_no_bloom", "Remover bloom", "Remove bloom", "移除泛光", "Quitar bloom")
 add("settings_adpf", "Desempenho sustentado (ADPF)", "Sustained performance (ADPF)", "持续性能 (ADPF)",
     "Rendimiento sostenido (ADPF)")
 add("settings_texture_quality", "Qualidade das texturas", "Texture quality", "纹理质量", "Calidad de texturas")
