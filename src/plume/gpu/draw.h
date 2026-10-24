@@ -101,6 +101,9 @@ struct Draw {
   std::vector<DeferredSlot> deferred_slots_, flushing_slots_, draw_slots_;
   uint64_t deferred_signature_ = 0;
   bool in_issue_draw_ = false;
+  // renut_plume_decal_log: the states of polygon-offset draws already logged.
+  std::unordered_set<uint64_t> bias_log_seen_;
+  uint64_t bias_log_draws_ = 0, bias_log_applied_ = 0, bias_log_next_ = 0;
   uint32_t hiz_timer_phase_ = 0;
   LookupMemo<std::unique_ptr<RenderPipeline>, 13> pipeline_memo_;
   // Lookups at the draw (renut_plume_pipeline_lookup_ms): whether they are

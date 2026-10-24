@@ -103,6 +103,8 @@ REXCVAR_DECLARE(int32_t, renut_plume_defer_draws);
 REXCVAR_DECLARE(int32_t, renut_plume_hiz);
 REXCVAR_DECLARE(bool, renut_plume_zero_census);
 REXCVAR_DECLARE(bool, renut_plume_stack_wrap);
+REXCVAR_DECLARE(int32_t, renut_plume_poly_offset_percent);
+REXCVAR_DECLARE(bool, renut_plume_decal_log);
 REXCVAR_DECLARE(int32_t, renut_plume_skip);
 REXCVAR_DECLARE(bool, renut_plume_shader_cache);
 REXCVAR_DECLARE(bool, renut_plume_key_reuse);

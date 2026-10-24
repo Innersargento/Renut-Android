@@ -210,6 +210,13 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     }
     defer_mode_ = uint32_t(defer);
 
+    const int poly_offset = std::clamp(REXCVAR_GET(renut_plume_poly_offset_percent), 0, 1600);
+    if ((poly_offset != 0) != poly_offset_ || poly_offset * 0.01f != poly_offset_scale_) {
+      REXLOG_INFO("Renut: Plume polygon offset {} x{}", poly_offset ? "on" : "off", poly_offset * 0.01f);
+    }
+    poly_offset_ = poly_offset != 0;
+    poly_offset_scale_ = poly_offset * 0.01f;
+
     const bool shader_cache = REXCVAR_GET(renut_plume_shader_cache);
     if (shader_cache != shader_cache_) {
       REXLOG_INFO("Renut: Plume shader cache {}", shader_cache ? "on" : "off");

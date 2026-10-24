@@ -62,6 +62,17 @@ REXCVAR_DEFINE_INT32(renut_plume_adaptive_patches, 1, "reNut/Plume",
                      "each edge, a patch off screen being one triangle, instead of every patch at the draw's "
                      "highest level: 0 off, 1 on")
     .range(0, 1);
+REXCVAR_DEFINE_INT32(renut_plume_poly_offset_percent, 1600, "reNut/Plume",
+                     "The game's polygon offset (PA_SU_POLY_OFFSET_*), as a percent of what it asks (0 = off). "
+                     "Ground decals - the tire marks and skid marks of a vehicle, footprints - lie on the "
+                     "terrain and ask to be pulled toward the camera; without it they fight the surface under "
+                     "them for depth and flicker (the pier). 100 is the offset as the game gives it, which left the pier's "
+                     "marks flickering; 1600 stopped it (tested on the device, 24/10). Followed live.")
+    .range(0, 1600);
+REXCVAR_DEFINE_BOOL(renut_plume_decal_log, false, "reNut/Plume",
+                    "Debug: log each distinct state of the draws that ask for a polygon offset (shaders, depth "
+                    "function, the offset asked and the bias given to Vulkan) and a count every 300 frames. "
+                    "Followed live.");
 REXCVAR_DEFINE_BOOL(renut_plume_no_shadows, false, "reNut/Plume",
                     "Drop the shadow casters (depth-only draws into the shadow maps): the scene is drawn "
                     "without shadows.");

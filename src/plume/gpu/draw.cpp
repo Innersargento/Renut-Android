@@ -1477,6 +1477,37 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // keep their keys. The reference and masks are dynamic: the game changes
   // them from draw to draw, and keying on them made thousands of pipelines.
   if (stencil_enabled) key_bytes.Put(uint32_t(depth_control.value & 0xFFFFFF81u));
+  if (REXCVAR_GET(renut_plume_decal_log) && (raster.poly_offset_front_enable || raster.poly_offset_back_enable ||
+                                              raster.poly_offset_para_enable)) {
+    // Every draw that asks for a polygon offset (ground decals, shadow maps):
+    // each distinct state once, with the raw register values and what Vulkan got,
+    // and a count of them every 300 frames.
+    float log_slope = 0.0f, log_offset = 0.0f;
+    draw_util::GetPreferredFacePolygonOffset(regs, polygonal, log_slope, log_offset);
+    ++bias_log_draws_;
+    if (depth_bias != 0 || depth_slope != 0.0f) ++bias_log_applied_;
+    uint64_t sig = 0;
+    HashCombine(sig, vs->entry->hash);
+    HashCombine(sig, ps ? ps->entry->hash : 0);
+    HashCombine(sig, uint32_t(depth_control.value));
+    HashCombine(sig, raster.value);
+    HashCombine(sig, uint32_t(depth_bias));
+    HashCombine(sig, uint32_t(blends[0].blendEnabled));
+    if (bias_log_seen_.insert(sig).second) {
+      REXLOG_INFO(
+          "Renut: Plume offset draw vs={:016X} ps={:016X} prim={} indices={} zfunc={} (0 never 1 less 2 equal 3 lequal 4 greater 5 notequal 6 gequal 7 always) zwrite={} depth={} blend={} "
+          "alpha_test={} colors={} cull={} slope={:g} offset={:g} -> bias={} slope={:g} (poly offset {} x{})",
+          vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type), index_count, uint32_t(depth_control.zfunc),
+          depth_write, depth_enabled, blends[0].blendEnabled, alpha_test, color_count, uint32_t(cull), log_slope,
+          log_offset, depth_bias, depth_slope, backend.swap.poly_offset_ ? "on" : "off",
+          backend.swap.poly_offset_scale_);
+    }
+    if (backend.swaps_ >= bias_log_next_) {
+      bias_log_next_ = backend.swaps_ + 300;
+      REXLOG_INFO("Renut: Plume offset draws so far: {} asked, {} with a non-zero bias, {} distinct states",
+                  bias_log_draws_, bias_log_applied_, bias_log_seen_.size());
+    }
+  }
   // Likewise only biased draws add bytes.
   if (depth_bias != 0 || depth_slope != 0.0f) {
     key_bytes.Put(depth_bias);

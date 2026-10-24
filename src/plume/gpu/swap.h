@@ -81,10 +81,10 @@ struct Swap {
   // The game's polygon offset (PA_SU_POLY_OFFSET_*): ground decals - footprints,
   // the tread blocks and skid marks a vehicle leaves - are quads lying on the
   // terrain and ask to be pulled a little toward the camera. Applying it made
-  // no visible difference to those marks (measured 04/10, scales 1 and 16), and
-  // other scenes were not looked at, so it is off unless
-  // <files>/plume-polyoffset "<on> [scale]" turns it on.
-  bool poly_offset_ = false;
+  // no visible difference to those marks on open ground (measured 04/10, scales
+  // 1 and 16), but on flat planks like the pier's they fight the surface and
+  // flicker. Set each frame from renut_plume_poly_offset_percent (0 = off).
+  bool poly_offset_ = true;
   float poly_offset_scale_ = 1.0f;
   // Debug: <files>/plume-depth-dump holds a pixel shader hash (hex). The first
   // depth resolve one of its draws samples is read back, as the shader sees it,
