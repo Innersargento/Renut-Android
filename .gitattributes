@@ -7,4 +7,3 @@ android/gradlew text eol=lf
 thirdparty/XenosRecomp/** -text
 thirdparty/libucontext/** -text
 thirdparty/libadrenotools/** -text
-thirdparty/rexglue-codegen/** -text

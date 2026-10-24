@@ -99,7 +99,7 @@ e pula o que já está pronto):
 
 | Etapa | O que faz | Tempo aproximado |
 | --- | --- | --- |
-| `deps` | inicializa os submódulos (RexGlue e Plume, sem patches), confere as ferramentas de `thirdparty/` (libadrenotools, libucontext, o conversor de shaders com o patch já aplicado e o gerador de código do Windows) e compila o conversor de shaders | 10–25 min (download de ~1,3 GB + compilação) |
+| `deps` | inicializa os submódulos (RexGlue e Plume, sem patches), confere as ferramentas de `thirdparty/` (libadrenotools, libucontext, o conversor de shaders com o patch já aplicado), baixa o gerador de código da sua plataforma (uma vez, em `external/`, com o sha256 conferido) e compila o conversor de shaders | 10–25 min (download de ~1,3 GB + compilação) |
 | `game` | extrai o ISO e confere o `default.xex` | 2–5 min |
 | `codegen` | recompila o executável do Xbox 360 para C++ (`generated/android`) | segundos |
 | `shaders` | extrai e descomprime os shaders do jogo e converte tudo para SPIR-V (`generated/shaders`) | ~20 min (a conversão usa em grande parte um único núcleo) |
@@ -255,8 +255,7 @@ container nem existe para a lista apontar.
 
 Outras opções do script: `prepare.py <etapa>` roda uma etapa só
 (`deps`, `game`, `codegen`, `shaders`, `dumps`, `apk`); `RENUT_EXTERNAL=<pasta>`
-muda onde o gerador de código de outra plataforma é baixado (no Windows x64 ele já
-está em `thirdparty/rexglue-codegen`); `XENOS_RECOMP_WORK=<pasta>` muda onde o
+muda onde o gerador de código é baixado (padrão `external/`); `XENOS_RECOMP_WORK=<pasta>` muda onde o
 conversor de shaders é compilado (padrão `~/.cache/renut-shader-tool`).
 
 ## 6. Como funciona (resumo)
@@ -264,8 +263,8 @@ conversor de shaders é compilado (padrão `~/.cache/renut-shader-tool`).
 - **Dependências fixas:** o RexGlue (tag `v0.10.0`) e o Plume são submódulos em
   `thirdparty/`, usados como foram publicados — o reNut não os altera nem aplica
   patches (veja `docs/DEPENDENCIAS.md`). `deps` inicializa os submódulos; o resto
-  (libadrenotools, libucontext, o conversor de shaders com o patch já aplicado, o
-  gerador de código do Windows) já está em `thirdparty/` (veja
+  (libadrenotools, libucontext, o conversor de shaders com o patch já aplicado) já
+  está em `thirdparty/` (veja
   `thirdparty/README.md`), então nada é baixado nem corrigido por patch na hora.
 - **Código do jogo:** o gerador do RexGlue traduz o PowerPC do `default.xex`
   para C++ (`generated/android`), que o NDK compila para ARM64.

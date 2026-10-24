@@ -1,7 +1,8 @@
 # thirdparty/
 
 O que o reNut usa de terceiros. Tudo o que o build precisa está aqui ou nos
-submódulos: `prepare.py deps` não baixa nem aplica patch de nada.
+submódulos; o `prepare.py deps` não aplica patch de nada e só baixa o gerador de
+código (última seção).
 
 | Pasta | O que é | Como entra | Alterado? |
 | --- | --- | --- | --- |
@@ -10,10 +11,9 @@ submódulos: `prepare.py deps` não baixa nem aplica patch de nada.
 | `XenosRecomp` | conversor de shaders do Xbox 360 para HLSL/SPIR-V | cópia | **sim**: o patch do reNut já está aplicado |
 | `libadrenotools` | carrega o driver Turnip empacotado no app (Android) | cópia | não |
 | `libucontext` | fibras para o código recompilado (Android, ARM64) | cópia | não |
-| `rexglue-codegen` | `rexglue.exe`, o gerador de código do SDK, para Windows x64 | cópia do binário publicado | não |
 
 Os dois submódulos continuam intactos (`git submodule status` não mostra
-diferença). As quatro cópias não têm `.git`: a origem, a revisão e o que foi
+diferença). As três cópias não têm `.git`: a origem, a revisão e o que foi
 mudado estão abaixo e, para o `XenosRecomp`, em `XenosRecomp/RENUT.md`.
 
 ## XenosRecomp
@@ -42,11 +42,10 @@ Cópias sem alteração, sem `.git` e sem os arquivos de CI:
 - `libucontext`: <https://github.com/kaniini/libucontext>, `49e671dd52ff`.
   Licença ISC (`LICENSE`).
 
-## rexglue-codegen
+## O gerador de código (fora do repositório)
 
-`win-amd64/bin/rexglue.exe`, do pacote `rexglue-sdk-0.10.0-win-amd64.zip`
-publicado em <https://github.com/rexglue/rexglue-sdk/releases/tag/v0.10.0>
-(sha256 do pacote em `tools/prepare.py`; sha256 deste arquivo:
-`04014C2E5EEF3C40BDDC490D413E910E5BA98D81AA3DA1C1F5D43DD29728EE3A`). Só o
-executável do gerador, sem as bibliotecas do pacote. Em Linux e macOS o
-`prepare.py` ainda baixa o pacote da plataforma, com o sha256 conferido.
+O `rexglue`, o gerador de código do SDK, **não está aqui**: o passo `deps` baixa
+o pacote da sua plataforma de
+<https://github.com/rexglue/rexglue-sdk/releases/tag/v0.10.0> para `external/`
+(ignorado pelo Git), confere o sha256 (a tabela está em `tools/prepare.py`) e só
+baixa uma vez.

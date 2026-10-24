@@ -46,8 +46,9 @@ XEX_PACKAGE = "org.renut.android"
 
 # RexGlue and Plume are git submodules of this repository (thirdparty/rexglue-sdk, thirdparty/plume),
 # used as released and never patched. Everything else the build needs is in thirdparty/ already, with
-# the project's changes applied: libucontext, libadrenotools, XenosRecomp (the shader tool) and the
-# Windows code generator. See thirdparty/README.md.
+# the project's changes applied: libucontext, libadrenotools and XenosRecomp (the shader tool).
+# See thirdparty/README.md. The code generator is not in the repository: ensure_host_sdk downloads the
+# release for this platform to external/ (sha256 checked) the first time.
 
 # The code generator, from the SDK release the sources are pinned to (sha256 as published by GitHub).
 HOST_SDK_VERSION = "0.10.0"
@@ -312,11 +313,9 @@ def git(*args, cwd=None, log="deps.log"):
 
 def host_sdk_binary():
     exe = "rexglue.exe" if IS_WINDOWS else "rexglue"
-    # thirdparty/rexglue-codegen/<platform>/bin holds the binaries that are in the repository; any other
-    # platform's is downloaded to external/ once.
-    for base in (THIRDPARTY / "rexglue-codegen", EXT / ("rexglue-host-" + HOST_SDK_VERSION)):
-        for candidate in base.glob("*/bin/" + exe):
-            return candidate
+    base = EXT / ("rexglue-host-" + HOST_SDK_VERSION)
+    for candidate in base.glob("*/bin/" + exe):
+        return candidate
     return None
 
 
