@@ -18,6 +18,6 @@ target_include_directories(renut_plume PUBLIC "${PLUME_ROOT}"
 # renut_vulkan_dlopen (android_vulkan_loader.cpp), which answers with the
 # session's loader and falls back to dlopen. The file itself is not edited.
 target_compile_definitions(renut_plume PRIVATE NDEBUG dlopen=renut_vulkan_dlopen)
-add_subdirectory("${RENUT_ROOT}/external/libadrenotools" adrenotools)
+add_subdirectory("${RENUT_ROOT}/thirdparty/libadrenotools" adrenotools)
 
 add_subdirectory("${RENUT_ROOT}/android/native" native)

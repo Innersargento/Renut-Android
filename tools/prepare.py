@@ -4,7 +4,7 @@ leaves the app itself to Android Studio / Gradle.
 
     python tools/prepare.py doctor                 what is missing on this machine
     python tools/prepare.py all --game <iso|dir|default.xex>
-    python tools/prepare.py deps                   submodules (RexGlue, Plume), adrenotools, shader tool (pinned revisions)
+    python tools/prepare.py deps                   submodules (RexGlue, Plume) and the shader tool (the rest is in thirdparty/)
     python tools/prepare.py game --game <...>      checks the executable and installs assets/default.xex
     python tools/prepare.py codegen                recompiles the executable to C++ (generated/android)
     python tools/prepare.py shaders [--dumps DIR]  recompiles the shaders to SPIR-V (generated/shaders)
@@ -32,6 +32,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
+THIRDPARTY = ROOT / "thirdparty"
+# Only where a code generator for another platform is downloaded to (external/ is ignored by git).
 EXT = Path(os.environ.get("RENUT_EXTERNAL") or ROOT / "external")
 OUT = ROOT / "out" / "prepare"
 LOGS = OUT / "logs"
@@ -42,13 +44,10 @@ IS_WINDOWS = os.name == "nt"
 XEX_SHA256 = "d57b15b73490ca8334fb2fc7a53e0b21936a187731fa4f891273f4feaf38d3bc"
 XEX_PACKAGE = "org.renut.android"
 
-# name -> (url, pinned commit, submodule paths or None for "all, recursively", patch to apply)
-# RexGlue and Plume are not here: they are git submodules of this repository
-# (thirdparty/rexglue-sdk, thirdparty/plume), used as released and never patched.
-DEPENDENCIES = {
-    "libucontext": ("https://github.com/kaniini/libucontext.git", "49e671dd52ff6791295d8161ad3b6da7dc5f6f9d", [], None),
-    "libadrenotools": ("https://github.com/bylaws/libadrenotools.git", "8fae8ce254dfc1344527e05301e43f37dea2df80", None, None),
-}
+# RexGlue and Plume are git submodules of this repository (thirdparty/rexglue-sdk, thirdparty/plume),
+# used as released and never patched. Everything else the build needs is in thirdparty/ already, with
+# the project's changes applied: libucontext, libadrenotools, XenosRecomp (the shader tool) and the
+# Windows code generator. See thirdparty/README.md.
 
 # The code generator, from the SDK release the sources are pinned to (sha256 as published by GitHub).
 HOST_SDK_VERSION = "0.10.0"
@@ -311,43 +310,13 @@ def git(*args, cwd=None, log="deps.log"):
     return run(["git", "-c", "core.longpaths=true", *args], cwd=cwd, log=log)
 
 
-def apply_patch(repo, patch):
-    """Applies the patch unless it is already there; refuses to touch a tree that has diverged."""
-    patch = str(ROOT / patch)
-    if run(["git", "-C", repo, "apply", "--reverse", "--check", patch], log="deps.log", check=False) == 0:
-        say("   patch já aplicado: %s" % Path(patch).name)
-        return
-    if run(["git", "-C", repo, "apply", "--check", patch], log="deps.log", check=False) != 0:
-        fail("o patch %s não se aplica a %s (alterações locais?). Nada foi sobrescrito." % (Path(patch).name, repo))
-    git("-C", repo, "apply", patch)
-    say("   patch aplicado: %s" % Path(patch).name)
-
-
-def ensure_dependency(name):
-    url, commit, submodules, patch = DEPENDENCIES[name]
-    path = EXT / name
-    if not (path / ".git").exists():
-        say("   clonando %s" % name)
-        git("-c", "core.autocrlf=false", "clone", "--no-checkout", url, str(path))
-        git("-C", str(path), "config", "core.longpaths", "true")
-        git("-C", str(path), "checkout", "--detach", commit)
-    code, head = capture(["git", "-C", path, "rev-parse", "HEAD"])
-    if head != commit:
-        fail("%s está em %s, mas o projeto fixa %s. Suas alterações foram preservadas; revise manualmente." % (path, head[:12], commit[:12]))
-    if submodules is None:
-        git("-C", str(path), "submodule", "update", "--init", "--recursive")
-    elif submodules:
-        git("-C", str(path), "submodule", "update", "--init", "--depth", "1", "--", *submodules)
-    if patch:
-        apply_patch(str(path), patch)
-    say("   %s @ %s" % (name, commit[:10]))
-
-
 def host_sdk_binary():
     exe = "rexglue.exe" if IS_WINDOWS else "rexglue"
-    base = EXT / ("rexglue-host-" + HOST_SDK_VERSION)
-    for candidate in base.glob("*/bin/" + exe):
-        return candidate
+    # thirdparty/rexglue-codegen/<platform>/bin holds the binaries that are in the repository; any other
+    # platform's is downloaded to external/ once.
+    for base in (THIRDPARTY / "rexglue-codegen", EXT / ("rexglue-host-" + HOST_SDK_VERSION)):
+        for candidate in base.glob("*/bin/" + exe):
+            return candidate
     return None
 
 
@@ -375,12 +344,13 @@ def ensure_host_sdk():
 
 
 def stage_deps(args):
-    step("Dependências (revisões fixas e patches do projeto)")
-    EXT.mkdir(exist_ok=True)
+    step("Dependências (submódulos e ferramentas de thirdparty/)")
     say("   RexGlue e Plume: submódulos de thirdparty/ (sem patches)")
     git("-C", str(ROOT), "submodule", "update", "--init", "--recursive")
-    for name in DEPENDENCIES:
-        ensure_dependency(name)
+    for name in ("libucontext", "libadrenotools", "XenosRecomp"):
+        if not (THIRDPARTY / name).is_dir():
+            fail("thirdparty/%s não está no repositório (clone incompleto?)." % name)
+        say("   %s: thirdparty/%s" % (name, name))
     ensure_host_sdk()
     if args.skip_shader_tool:
         return
@@ -389,14 +359,14 @@ def stage_deps(args):
     missing = missing_shader_tools()
     if missing:
         fail("faltam ferramentas no Linux/WSL: %s\n  sudo apt install -y git clang cmake ninja-build spirv-tools" % ", ".join(missing))
-    say("   preparando o conversor de shaders (clona e compila na primeira vez; vários minutos)")
+    say("   preparando o conversor de shaders (thirdparty/XenosRecomp; compila na primeira vez, vários minutos)")
     script = to_linux_path(TOOLS / "shaders" / "recompile_shaders.sh")
     linux_bash("%s bash %s --prepare-only" % (shader_work_env(), shlex.quote(script)), log="shader-tool.log")
 
 
 def shader_work_env():
     work = os.environ.get("XENOS_RECOMP_WORK")
-    return "XENOS_RECOMP_WORK=%s" % (shlex.quote(work) if work else "$HOME/.cache/renut-xenosrecomp")
+    return "XENOS_RECOMP_WORK=%s" % (shlex.quote(work) if work else "$HOME/.cache/renut-shader-tool")
 
 
 # ---- stage: game ---------------------------------------------------------------------------------

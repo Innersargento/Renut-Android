@@ -79,7 +79,7 @@ add_subdirectory("${DEPS}/spdlog" spdlog)
 set(XXHASH_BUILD_XXHSUM OFF CACHE BOOL "" FORCE)
 add_subdirectory("${DEPS}/xxHash/cmake_unofficial" xxhash)
 add_subdirectory("${DEPS}/utfcpp" utfcpp)
-set(UCONTEXT "${RENUT_ROOT}/external/libucontext")
+set(UCONTEXT "${RENUT_ROOT}/thirdparty/libucontext")
 add_library(renut_ucontext STATIC "${UCONTEXT}/arch/aarch64/getcontext.S"
     "${UCONTEXT}/arch/aarch64/setcontext.S" "${UCONTEXT}/arch/aarch64/swapcontext.S"
     "${UCONTEXT}/arch/aarch64/makecontext.c" "${UCONTEXT}/arch/aarch64/trampoline.c")

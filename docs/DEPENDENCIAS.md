@@ -1,7 +1,10 @@
 # Dependências: RexGlue e Plume sem alterações
 
 O reNut usa dois projetos de terceiros que **não são nossos e não são
-alterados aqui**:
+alterados aqui**. As ferramentas de build (libadrenotools, libucontext, o
+conversor de shaders XenosRecomp e o gerador de código) ficam em `thirdparty/`
+como cópias, e a única com alterações nossas é o XenosRecomp, que já vem com o
+patch aplicado: `thirdparty/README.md` diz de onde cada uma veio.
 
 | Projeto | Onde | Revisão |
 | --- | --- | --- |
@@ -10,8 +13,9 @@ alterados aqui**:
 
 Regras:
 
-- Nada em `thirdparty/` é editado, corrigido por patch ou copiado para dentro do
-  reNut. `git submodule status` mostra as revisões; qualquer diferença é erro.
+- Nada nos **submódulos** de `thirdparty/` (`rexglue-sdk`, `plume`) é editado,
+  corrigido por patch ou copiado para dentro do reNut. `git submodule status`
+  mostra as revisões; qualquer diferença é erro.
 - O que o reNut precisa a mais deles fica **no código do reNut**
   (`src/`), usando o que o SDK e o Plume já expõem.
 - Correções que valem para todo mundo (e não só para o reNut) devem ir para o
@@ -71,8 +75,8 @@ git submodule update --init --recursive
   captura da própria janela), ~2.100 quadros em 65 s sem queda.
 - **Android: compila e roda contra os dois submódulos intactos** (13/10/2026).
   `android/native/CMakeLists.txt` aponta para `thirdparty/rexglue-sdk` e o
-  Plume é compilado de `thirdparty/plume`; `external/` só guarda o que não é
-  SDK nem Plume (libadrenotools, libucontext). O que o Android precisa a mais
+  Plume é compilado de `thirdparty/plume`; o que não é
+  SDK nem Plume (libadrenotools, libucontext) está em `thirdparty/`. O que o Android precisa a mais
   vem de `src/platform/android/shims/` (cabeçalhos incluídos à força em arquivos do
   SDK), de `kernel_overrides.*` e do áudio próprio (`renut_audio.cpp`). Chega à
   tela-título; o que ainda falta está na tabela abaixo.

@@ -1,3 +1,10 @@
 *.sh text eol=lf
 *.patch text eol=lf
 android/gradlew text eol=lf
+
+# Tools copied into thirdparty/ are kept byte for byte: no end-of-line conversion on checkout (the shader
+# tool writes shader_common.h into the HLSL it generates, and the assembly files of libucontext must stay LF).
+thirdparty/XenosRecomp/** -text
+thirdparty/libucontext/** -text
+thirdparty/libadrenotools/** -text
+thirdparty/rexglue-codegen/** -text
