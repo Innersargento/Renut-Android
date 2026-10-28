@@ -9,7 +9,7 @@ Instalar JDK 17 ou 21, SDK Android plataforma 35, NDK 29.0.14206865 e CMake Andr
 Na raiz do repositório:
 
 ```powershell
-python tools/prepare.py all --game <seu jogo>   # dependências, código gerado e shaders (docs/BUILD.md)
+python tools/prepare.py all --game <seu jogo>   # dependências, código gerado e shaders
 # Crie android/local.properties com sdk.dir apontando para seu SDK.
 ./tools/build-android.ps1 -JavaHome 'C:/Program Files/Java/jdk-17'
 ```

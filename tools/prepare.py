@@ -12,7 +12,7 @@ leaves the app itself to Android Studio / Gradle.
     python tools/prepare.py apk                    optional: runs Gradle assembleDebug
 
 Nothing derived from the game leaves this machine and none of it is committed:
-generated/, assets/ and out/ are ignored by git. See docs/BUILD.md.
+generated/, assets/ and out/ are ignored by git.
 """
 import argparse
 import hashlib
@@ -295,7 +295,7 @@ def stage_doctor(args):
     sdk = find_android_sdk()
     row(sdk is not None, "Android SDK (%s)" % (sdk or "não encontrado"),
         "instale o Android Studio e abra-o uma vez; ele baixa o SDK. Sem o Studio: ferramentas de linha de comando "
-        "do Android (veja docs/BUILD.md). O Gradle baixa NDK 29 e CMake 3.22 sozinho")
+        "do Android. O Gradle baixa NDK 29 e CMake 3.22 sozinho")
     if sdk:
         row(os.path.isfile(os.path.join(sdk, "licenses", "android-sdk-license")), "licenças do Android SDK aceitas",
             "yes | %s --licenses" % os.path.join(sdk, "cmdline-tools", "latest", "bin", "sdkmanager"))

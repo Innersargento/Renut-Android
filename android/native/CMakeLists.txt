@@ -34,25 +34,6 @@ add_compile_definitions(NDEBUG)
 add_compile_options(-flto=thin)
 add_link_options(-flto=thin -Wl,--thinlto-jobs=all
     "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
-# Profile-guided optimization of the code that matters (the recompiled guest and the
-# runtime), driven by -DRENUT_PGO=gen|use (gradle: -PrenutPgo=gen|use):
-#   gen  instruments those two targets; the profile is written on nativeStop and
-#        nativeBackground (runtime_jni.cpp) to files/renut-%m.profraw.
-#   use  RENUT_PGO_PROFILE is the merged .profdata (tools/bench/pgo.py merge).
-set(RENUT_PGO "" CACHE STRING "PGO mode: gen, use or empty")
-set(RENUT_PGO_PROFILE "" CACHE FILEPATH "merged .profdata for RENUT_PGO=use")
-function(renut_pgo_target target)
-    if(RENUT_PGO STREQUAL "gen")
-        target_compile_options(${target} PRIVATE -fprofile-generate)
-        target_compile_definitions(${target} PRIVATE RENUT_PGO_GEN=1)
-    elseif(RENUT_PGO STREQUAL "use")
-        if(NOT EXISTS "${RENUT_PGO_PROFILE}")
-            message(FATAL_ERROR "RENUT_PGO=use needs RENUT_PGO_PROFILE (merged .profdata): '${RENUT_PGO_PROFILE}'")
-        endif()
-        target_compile_options(${target} PRIVATE "-fprofile-use=${RENUT_PGO_PROFILE}"
-            -Wno-profile-instr-unprofiled -Wno-profile-instr-missing -Wno-backend-plugin)
-    endif()
-endfunction()
 # libc++ in the NDK lacks clock_time_conversion/clock_cast, which the SDK's chrono.h
 # builds on (platform/shims/android_chrono.h).
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${RENUT_ANDROID}/shims/android_chrono.h>")
@@ -181,7 +162,6 @@ renut_kernel_overrides(renut_guest)
 # The recompiled game is the hot path: a profile of the boot stall put ~90% of
 # CPU inside two guest functions, so this target's level matters most.
 target_compile_options(renut_guest PRIVATE -O3 -g0 -Wno-unused-variable -Wno-unused-label)
-renut_pgo_target(renut_guest)
 # The vector tables behind every lvx/stvx byte swap, copied verbatim out of the
 # SDK as read-only data (renut_simd_fast.h explains why). Taken from the header
 # rather than retyped, so an SDK update cannot leave a stale copy behind.
@@ -239,7 +219,3 @@ target_link_libraries(renut_runtime PRIVATE rexruntime renut_plume adrenotools
 # their place (the strong overrides in game_fixes.cpp are settled at link time),
 # so bind them locally and the calls become plain branches.
 target_link_options(renut_runtime PRIVATE -Wl,-Bsymbolic-functions)
-renut_pgo_target(renut_runtime)
-if(RENUT_PGO STREQUAL "gen")
-    target_link_options(renut_runtime PRIVATE -fprofile-generate)
-endif()

@@ -15,17 +15,8 @@ android {
         versionCode 5
         versionName '0.5.0'
         ndk { abiFilters 'arm64-v8a' }
-        // -PrenutPgo=gen builds the instrumented APK; -PrenutPgo=use -PrenutPgoProfile=<.profdata>
-        // builds with the merged profile (tools/bench/pgo.py).
-        def pgoArgs = []
-        if (project.hasProperty('renutPgo')) {
-            pgoArgs << "-DRENUT_PGO=${project.property('renutPgo')}".toString()
-            if (project.hasProperty('renutPgoProfile'))
-                pgoArgs << "-DRENUT_PGO_PROFILE=${project.property('renutPgoProfile')}".toString()
-        }
         externalNativeBuild { cmake {
             arguments '-DANDROID_STL=c++_shared', '-DCMAKE_JOB_POOLS=compile_pool=4', '-DCMAKE_JOB_POOL_COMPILE=compile_pool'
-            pgoArgs.each { arguments it }
         } }
     }
     externalNativeBuild {
@@ -39,7 +30,23 @@ android {
     buildFeatures { compose true }
     sourceSets.main.java.srcDir '../../thirdparty/rexglue-sdk/thirdparty/sdl3/android-project/app/src/main/java'
     packaging { jniLibs { useLegacyPackaging true } }
-    buildTypes { release { minifyEnabled false } }
+    // The release key is read from android/keystore.properties (not in Git: storeFile, storePassword,
+    // keyAlias, keyPassword). Without that file the release APK comes out unsigned.
+    def keystoreFile = rootProject.file('keystore.properties')
+    if (keystoreFile.isFile()) {
+        def keys = new Properties()
+        keystoreFile.withInputStream { keys.load(it) }
+        signingConfigs { release {
+            storeFile file(keys['storeFile'])
+            storePassword keys['storePassword']
+            keyAlias keys['keyAlias']
+            keyPassword keys['keyPassword']
+        } }
+    }
+    buildTypes { release {
+        minifyEnabled false
+        if (keystoreFile.isFile()) signingConfig signingConfigs.release
+    } }
 }
 
 dependencies {

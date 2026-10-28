@@ -8,3 +8,6 @@
 /android/**/build/
 /android/**/.cxx/
 __pycache__/
+/android/keystore.properties
+*.jks
+*.keystore
