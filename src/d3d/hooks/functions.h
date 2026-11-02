@@ -212,11 +212,11 @@ X(sub_82655DD8, D3DVolumeTexture_GetVolumeLevel)
 X(sub_82656178, D3DVolume_GetDesc)
 X(sub_826561C0, D3DVolume_LockBox)
 X(sub_82661C38, D3D_AllocateEdramMemory)
-X(sub_82210AB0, D3D_CDevice_KickOff)  // publishes the immediate list
-X(sub_822106C8, D3D_CDevice_KickOffSegment)  // publishes the immediate list
+X(sub_82210AB0, D3D_CDevice_KickOff)  // stubbed: issues the fence (SetFence), publishes the list, rewinds the ring
+X(sub_822106C8, D3D_CDevice_KickOffSegment)  // stubbed like KickOff
 X(sub_82223270, D3D_SetSurfaceClip)  // records the window scissor, which Direct3D writes straight into the ring
 X(sub_8264DCD0, D3D_CBlocker_Check)  // native-sync watchdog and the Plume handler's polling sleep; called tens of millions of times a second, so it is not counted
-X(sub_82278528, D3D_CDevice_SetFence)  // records the fence write (kOpFence); the original still runs, its packets are never read
+X(sub_82278528, D3D_CDevice_SetFence)  // stubbed: records the fence write (kOpFence), which the backend completes in order; no packets (the original only for command buffers)
 X(sub_82210408, D3D_CDevice_AddCallsToPrimaryBuffer)  // the doorbell: publishes the list with the segments the ring is handed
 X(sub_822052C8, D3D_InsertCallback)  // the callback's register writes and interrupt are recorded (kOpCallback)
 X(sub_8228A748, D3D_SynchronizeToPresentationInterval)  // the present-interval wait is recorded (kOpCallback + kOpWaitMemory)
@@ -278,5 +278,5 @@ X(sub_826597C8, D3D_InitializeApiState)
 X(sub_82207680, D3D_GetSubresourceLayout)
 X(sub_82222F20, D3D_SetViewport)
 X(sub_821EF4E8, D3D_NotifyPresented)
-X(sub_82289F08, D3D_CaptureRing)
+X(sub_82289F08, D3D_CaptureRing)  // stubbed: there is no ring to capture
 X(sub_821ED560, D3D_SwapNotify)

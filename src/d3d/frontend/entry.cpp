@@ -52,14 +52,24 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       Swap(ctx);
       return false;
     case kD3D_CDevice_KickOff:
-    case kD3D_CDevice_KickOffSegment: {
-      std::lock_guard lock(g_front.mutex);
-      Publish();
-      return false;
-    }
+    case kD3D_CDevice_KickOffSegment:
+      return KickOff(ctx, base);
+    case kD3DDevice_SetRingBufferParameters:
+      SetRingBufferParameters(ctx, base);
+      return true;
+    case kD3D_CDevice_BeginRingAlloc:
+      return BeginRingAlloc(ctx, base);
+    case kD3D_RingAllocate:
+      return RingAllocate(ctx, base);
+    case kD3D_CDevice_StartNewSegment:
+      return StartNewSegment(ctx, base);
+    case kD3D_CaptureRing:
+      // CDevice::CaptureRing(device, ...) (sub_82289F08): retrains the EDRAM and asks the kernel to
+      // capture the ring, a loop that reserves ring space each pass. There is no ring to capture.
+      ctx.r3.u64 = 1;
+      return true;
     case kD3D_CDevice_SetFence:
-      SetFence(ctx, base);
-      return false;
+      return SetFence(ctx, base);
     case kD3D_CDevice_AddCallsToPrimaryBuffer:
       return AddCallsToPrimaryBuffer(ctx, base);
     case kD3D_InsertCallback:
@@ -74,13 +84,13 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
   }
 }
 
-// D3DDevice_SetRingBufferParameters(device, ...) (sub_82657508), the device's first act: it
-// writes the first segment, whose type-0 packets set up the GPU backend. The one the CPU
-// depends on is the scratch register writeback: SCRATCH_ADDR names the block (device + 10900,
-// which SynchronizeToPresentationInterval waits on at +4) and SCRATCH_UMSK (0x20037) which
-// registers are written back to it. Every later scratch write the lists carry (callbacks, the
-// present interval) lands where this says, so it is a record of its own, ahead of the first
-// doorbell, whether or not that segment is walked.
+// The device's first act, D3DDevice_SetRingBufferParameters(device, ...) (sub_82657508), stubbed
+// (SetRingBufferParameters, sync.cpp): after it the scratch writeback block (device + 10900, which
+// SynchronizeToPresentationInterval waits on at +4) exists. The scratch registers the original's
+// GPU set-up packets pointed at it are recorded here: SCRATCH_ADDR names the block and
+// SCRATCH_UMSK (0x20037) which registers are written back to it. Every later scratch write the
+// lists carry (callbacks, the present interval) lands where this says, so it is a record of its
+// own, ahead of the first doorbell.
 void RingBufferParameters(PPCContext& ctx, uint32_t dev, uint8_t* base) {
   if (ctx.r3.u32 != 0 || !dev) return;  // not S_OK
   const uint32_t block = U32(base, dev + 10900);

@@ -67,6 +67,8 @@
 // Guest functions the front end calls, as the Direct3D it replaces does.
 extern "C" {
 REX_FUNC(sub_82210AB0);  // KickOff: more ring space
+REX_FUNC(sub_82265B90);  // XMemAlloc
+REX_FUNC(sub_82278528);  // CDevice::SetFence
 void __imp__sub_822052C8(PPCContext& __restrict, uint8_t*);  // InsertCallback, the original
 void __imp__sub_8228A748(PPCContext& __restrict, uint8_t*);  // SynchronizeToPresentationInterval
 // True while this guest thread is inside Photo Mode's capture routine
@@ -546,11 +548,21 @@ Effects CallbackEffects(uint32_t flags, uint32_t function, uint32_t context);
 
 void PushEffects(List& list, const Effects& effects);
 
-// D3D::CDevice::SetFence(device, ring) (sub_82278528): two EVENT_WRITE_SHDs
-// into the writeback block at +10896, the ring position (+14920 low bits |
-// the write pointer) to +4 and the fence (+10908, which then moves on by 2)
-// to +0. The original still runs: its packets are never read.
-void SetFence(PPCContext& ctx, uint8_t* base);
+// D3D::CDevice::SetFence(device, ring) (sub_82278528): the fence is recorded for the backend to
+// complete (kOpFence: the ring position to the writeback block's +4, the fence to +0) and the tag
+// moves on by 2; the original's ten packet words are not written. False (the original runs) for a
+// device recording a command buffer, one with no completion word, and before the first act.
+bool SetFence(PPCContext& ctx, uint8_t* base);
+// The ring set-up and its allocators, which give the recompiled code the sink and the data scratch
+// instead of the ring the original allocates.
+void SetRingBufferParameters(PPCContext& ctx, uint8_t* base);
+bool BeginRingAlloc(PPCContext& ctx, uint8_t* base);
+bool RingAllocate(PPCContext& ctx, uint8_t* base);
+bool StartNewSegment(PPCContext& ctx, uint8_t* base);
+// CDevice::KickOff (sub_82210AB0) and KickOffSegment (sub_822106C8): publish the list, issue
+// the fence and point the device's ring at a scratch block nothing reads. KickOff returns the ring.
+bool KickOff(PPCContext& ctx, uint8_t* base);
+
 
 // D3D::CDevice::AddCallsToPrimaryBuffer(device, calls, count) (sub_82210408):
 // the doorbell. Each call is (size, address), an INDIRECT_BUFFER in the primary

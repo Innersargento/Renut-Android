@@ -52,15 +52,6 @@ class PlumeGpu {
     interrupt_callback_data_ = user_data;
     REXLOG_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
   }
-  // The ring the game's Direct3D sets up. It carries nothing the lists do not: a write pointer
-  // that moves is taken as consumed and the read pointer written back, which is all Direct3D
-  // looks at (to know there is room).
-  void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
-    ring_.read_index = 0;
-    ring_.base = ptr;
-    ring_.size = uint32_t(1) << (size_log2 + 3);
-  }
-  void EnableReadPointerWriteBack(uint32_t ptr, uint32_t) { ring_.writeback = ptr; }
 
  private:
   // Runs the guest's interrupt callback on the calling thread, as the console's
@@ -81,10 +72,6 @@ class PlumeGpu {
     const uint32_t write_index = ring_.write_index.load();
     if (write_index == 0xBAADF00D || ring_.read_index == write_index) return false;
     ring_.read_index = write_index;
-    if (ring_.writeback) {
-      const uint32_t big = __builtin_bswap32(ring_.read_index);
-      std::memcpy(memory_->TranslatePhysical<uint8_t*>(ring_.writeback), &big, 4);
-    }
     return true;
   }
 
@@ -188,10 +175,10 @@ class PlumeGpu {
   rex::runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
   rex::system::KernelState* kernel_state_ = nullptr;
   std::unique_ptr<GpuBackend> backend_;
+  // The write pointer a device that still rings the doorbell moves (CP_RB_WPTR). The ring has no
+  // contents: a pointer that moves is only work for the worker.
   struct Ring {
-    uint32_t base = 0, size = 0;
     uint32_t read_index = 0;  // the worker's thread only
-    uint32_t writeback = 0;   // where the read pointer is written back
     std::atomic<uint32_t> write_index{0};
   } ring_;
   uint32_t interrupt_callback_ = 0;
@@ -231,14 +218,6 @@ bool PlumeGpuHosted() { return g_hosted_gpu != nullptr; }
 
 void PlumeGpuSetInterruptCallback(uint32_t callback, uint32_t user_data) {
   if (g_hosted_gpu) g_hosted_gpu->SetInterruptCallback(callback, user_data);
-}
-
-void PlumeGpuInitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
-  if (g_hosted_gpu) g_hosted_gpu->InitializeRingBuffer(ptr, size_log2);
-}
-
-void PlumeGpuEnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
-  if (g_hosted_gpu) g_hosted_gpu->EnableReadPointerWriteBack(ptr, block_size_log2);
 }
 
 void SetPlumeMissDumpDirectory(const std::string& directory) {

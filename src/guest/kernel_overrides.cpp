@@ -45,8 +45,8 @@ uint32_t LoadBE32(const uint8_t* p) {
 
 // VdSwap(buffer, fetch, unk2, unk3, unk4, frontbuffer, format, color space,
 // width, height): the game's present. With native sync the frame goes into the
-// swapping device's list, and the ring gets 64 words of no-ops where the swap
-// packet would have been. The rest is the SDK's.
+// swapping device's list and the buffer is left as it is: the ring is a stub that
+// nothing reads, so no swap packet is needed. The rest is the SDK's.
 extern "C" void renut_imp_VdSwap(PPCContext& __restrict ctx, uint8_t* base) {
   const uint32_t buffer_address = ctx.r3.u32;
   const uint32_t fetch_address = ctx.r4.u32;
@@ -63,37 +63,20 @@ extern "C" void renut_imp_VdSwap(PPCContext& __restrict ctx, uint8_t* base) {
     const uint32_t width = LoadBE32(renut::GuestPtr(base, width_address));
     const uint32_t height = LoadBE32(renut::GuestPtr(base, height_address));
     if (physical != UINT32_MAX && renut::native_d3d::RecordPresent(physical, width, height)) {
-      uint8_t* words = renut::GuestPtr(base, buffer_address);
-      for (uint32_t i = 0; i < 64; ++i) {
-        // A type-2 packet (a no-op), big-endian.
-        words[i * 4 + 0] = 0x80;
-        words[i * 4 + 1] = 0;
-        words[i * 4 + 2] = 0;
-        words[i * 4 + 3] = 0;
-      }
       return;
     }
   }
   __imp__VdSwap(ctx, base);
 }
 
-// The video exports the SDK routes to its graphics system (xboxkrnl_video.cpp:
-// the interrupt callback, the ring buffer and its read pointer write-back). The
-// Runtime has none, since the app hosts the GPU (plume_gpu.h): these are the
-// app's, and the SDK's own functions are not reached.
+// The video export the SDK routes to its graphics system (xboxkrnl_video.cpp:
+// the interrupt callback). The Runtime has none, since the app hosts the GPU
+// (plume_gpu.h): this is the app's, and the SDK's own function is not reached.
+// (The ring buffer exports are not overridden: the ring is a stub, and the only code that
+// called them, D3DDevice_SetRingBufferParameters, no longer runs.)
 // (callback, user data)
 extern "C" void renut_imp_VdSetGraphicsInterruptCallback(PPCContext& __restrict ctx, uint8_t*) {
   renut::PlumeGpuSetInterruptCallback(ctx.r3.u32, ctx.r4.u32);
-}
-
-// (physical address, log2 of the size)
-extern "C" void renut_imp_VdInitializeRingBuffer(PPCContext& __restrict ctx, uint8_t*) {
-  renut::PlumeGpuInitializeRingBuffer(ctx.r3.u32, ctx.r4.u32);
-}
-
-// (address, log2 of the block size)
-extern "C" void renut_imp_VdEnableRingBufferRPtrWriteBack(PPCContext& __restrict ctx, uint8_t*) {
-  renut::PlumeGpuEnableReadPointerWriteBack(ctx.r3.u32, ctx.r4.u32);
 }
 
 #if defined(__ANDROID__)

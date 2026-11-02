@@ -20,15 +20,13 @@ namespace renut {
 // The GPU, hosted by the app: the Runtime is set up with no graphics system
 // (the SDK's native-rendering boundary) and the app starts this after
 // Runtime::Setup (it needs PlumeRenderer::Start to have succeeded) and stops it
-// before Runtime::Shutdown. The Vd exports the SDK would have routed to its
-// graphics system (interrupt callback, ring buffer, read pointer write-back)
-// are overridden in kernel_overrides.cpp and land in the functions below.
+// before Runtime::Shutdown. The Vd export the SDK would have routed to its
+// graphics system (the interrupt callback) is overridden in kernel_overrides.cpp
+// and lands in the function below.
 bool StartPlumeGpu(rex::runtime::FunctionDispatcher* dispatcher, rex::system::KernelState* kernel);
 void StopPlumeGpu();
 bool PlumeGpuHosted();
 void PlumeGpuSetInterruptCallback(uint32_t callback, uint32_t user_data);
-void PlumeGpuInitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
-void PlumeGpuEnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
 
 // Microcode the GPU backend meets without a recompiled shader is saved
 // here (first 32), to extend the capture.

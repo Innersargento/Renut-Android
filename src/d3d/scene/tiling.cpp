@@ -1,8 +1,7 @@
 // BeginTiling, EndTiling, RunCommandBuffer and AllocateEdramMemory, natively (see tiling.h).
 //
 // Offsets are this release's, read off the retail disassembly (not through Layout()).
-// The ring writes are kept as the original makes them: a device recording a command buffer
-// chains the segments its kicks make, and RunCommandBuffer walks that chain.
+// Neither writes the ring or builds the tile lists the GPU would replay per tile.
 #include "d3d/scene/tiling.h"
 
 #include <bit>
@@ -21,14 +20,11 @@ REX_FUNC(sub_822811A0);  // D3DDevice_ClearF
 REX_FUNC(sub_8222AA18);  // D3DDevice_SetPredication
 REX_FUNC(sub_822899D0);  // D3DDevice_SetRenderState_HiZWriteEnable
 REX_FUNC(sub_8222D6C8);  // D3DDevice_Resolve
-REX_FUNC(sub_821FB688);  // D3DDevice_InsertCallback
 REX_FUNC(sub_826572C8);  // CDevice::QueueIndirectBuffers
+REX_FUNC(sub_82210138);  // D3D::EndTilingLists
 __attribute__((weak)) void sub_82222F20(PPCContext& __restrict, uint8_t*);  // the viewport from floats
 __attribute__((weak)) void sub_8220F610(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8220F800(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_821F7C18(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82287D38(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82210138(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_8222D0E8(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_8222BF10(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_8226AAB8(PPCContext& __restrict, uint8_t*);
@@ -48,7 +44,6 @@ __attribute__((weak)) void sub_82661AF0(PPCContext& __restrict, uint8_t*);  // m
 namespace renut::d3d::port {
 namespace {
 
-constexpr u32 kRing = 0x30, kRingGuarantee = 0x38;
 constexpr u32 kViewportDefault = 0x820018DC, kScissorDefault = 0x82001190;
 constexpr u32 kOutOfMemoryHresult = 0x8007000E;
 
@@ -106,7 +101,7 @@ void RestoreViewport(const GuestFrame& f, u32 dev, u32 saved) {
 // --- BeginTiling ----------------------------------------------------------------
 
 bool HaveBegin() {
-  return sub_82222F20 && sub_8220F610 && sub_8220F800 && sub_821F7C18 && sub_82287D38;
+  return sub_82222F20 && sub_8220F610 && sub_82287D38;
 }
 
 // D3DDevice_BeginTiling(device, flags, count, tile rects, clear colour [vector])
@@ -191,20 +186,8 @@ bool BeginTiling(PPCContext& ctx, uint8_t* base) {
   SetTiledBit(d, tiled);
   f.Call(sub_8220F610, {dev});
 
-  u32 slot = d.W(0x3440);
-  if (slot + 4 > d.W(0x3444))
-    slot = f.Call(sub_8220F800, {dev + 0x3438});
-  f.Put(slot, 0x86000000u);
-  d.SetW(0x3440, slot + 4);
-  u32 ring = d.W(kRing);
-  if (ring > d.W(kRingGuarantee))
-    ring = Kick(f, dev);
-  f.Put(ring + 4, 0xC0004600u);
-  f.Put(ring + 8, 0x19);
-  ring += 8;
-  d.SetW(kRing, ring);
-  if (const u32 next = f.Call(sub_821F7C18, {dev, 0x46}))
-    d.SetW(kRing, next);
+  // (The original also writes a packet into the ring and reserves room for the per-tile
+  // packets; the ring is a stub nothing reads.)
   f.Call(sub_82222EA0, {dev, kViewportDefault});
   f.Call(sub_82287D38, {dev, 1});
   return true;
@@ -213,14 +196,16 @@ bool BeginTiling(PPCContext& ctx, uint8_t* base) {
 // --- EndTiling --------------------------------------------------------------------
 
 bool HaveEnd() {
-  return sub_8220F800 && sub_82210138 && sub_82287D38;
-}
-
-u32 TileGpu(u32 address) {
-  return address ? GuestGpu(address) - 0x40000000u : 0;
+  return sub_82287D38;
 }
 
 // HRESULT D3DDevice_EndTiling(device, flags, ?, destination texture, clear colour)
+//
+// Each tile's rect is resolved from the full-size target on the host, so what the original leaves
+// for the GPU to replay per tile is left out, as in reNut: the tile list's closing records, the
+// indirect ranges and the WorkerDpc callback that replays the list. What stays is the resolves,
+// the predication and render state around them, the kick, the device's flags and the fence that
+// covers the pass (EndTilingLists).
 bool EndTiling(PPCContext& ctx, uint8_t* base) {
   if (!HaveEnd())
     return false;
@@ -230,7 +215,6 @@ bool EndTiling(PPCContext& ctx, uint8_t* base) {
     return false;
   const u32 dev = d.va, texture = ctx.r6.u32, color = ctx.r7.u32;
   const float default_depth = std::bit_cast<float>(f.Get(0x82000D0C));
-  u32 callback_type = 0;
 
   if (texture && d.W(0x31CC) > 0) {
     for (u32 i = 0; i < d.W(0x31CC); ++i) {
@@ -260,53 +244,30 @@ bool EndTiling(PPCContext& ctx, uint8_t* base) {
   }
   f.Call(sub_8222AA18, {dev, 0});
   f.Call(sub_822899D0, {dev, 2});
-  callback_type = 0x01000000u << d.W(0x2C38);
-  if (const u32 mask = d.W(0x3384) & 0x3F000000u)
-    callback_type = mask;
 
-  if (d.W(0x31CC) == 1) {
-    Kick(f, dev);
-  } else {
-    const u32 list = dev + 0x3438;
+  if (d.W(0x31CC) != 1) {
+    // Around the WorkerDpc callback.
     f.Call(sub_8222AA18, {dev, 0x80000000u});
-    const u32 context = TileGpu(d.W(0x3438));
-    f.Call(sub_821FB688, {dev, callback_type, 0x82662FE0, context});
     f.Call(sub_8222AA18, {dev, 0});
-    Kick(f, dev);
-    u32 slot = f.Get(list + 8);
-    if (slot + 8 > f.Get(list + 0xC))
-      slot = f.Call(sub_8220F800, {list});
-    f.Put(slot + 4, 0x80000000u);
-    f.Put(slot, 0x88000000u);
-    d.SetW(0x3440, slot + 8);
-    slot = f.Get(list + 8);
-    if (slot + 0xC > f.Get(list + 0xC))
-      slot = f.Call(sub_8220F800, {list});
-    f.Put(slot, 0x89000000u);
-    f.Put(slot + 4, TileGpu(d.W(0x33C0)));
-    f.Put(slot + 8, TileGpu(d.W(0x3424)));
-    d.SetW(0x3440, slot + 0xC);
   }
-  u32 slot = d.W(0x3440);
-  if (slot + 4 > d.W(0x3444))
-    slot = f.Call(sub_8220F800, {dev + 0x3438});
-  f.Put(slot, 0x87000000u);
-  const u8 flags3 = d.B(0x2ABF) & 0xCF;
-  const u8 flags = d.B(0x2ABC) & 0xDF;
-  d.SetW(0x3440, slot + 4);
+  Kick(f, dev);
+
   d.SetW(0x31B4, 0);
   d.SetW(0x31AC, 0);
-  d.SetB(0x2ABC, flags);
-  d.SetB(0x2ABF, flags3);
+  d.SetB(0x2ABC, d.B(0x2ABC) & 0xDF);
+  d.SetB(0x2ABF, d.B(0x2ABF) & 0xCF);
   const u32 tiled = TiledBit(d);
   d.SetW(0x31A8, 0);
   d.SetW(0x31A4, 0xFFFFFFFFu);
   d.SetW(0x2AB4, 0);
   d.SetW(0x2AB8, 0);
   SetTiledBit(d, tiled);
-  const u32 failed = f.Call(sub_82210138, {dev, d.W(0x31CC), callback_type});
+
+  // sub_82210138: the pass is over and its fence goes out, unless the device's command memory
+  // ran out (EndCommandBuffer marks a device so until the next Begin).
+  const bool failed = f.Call(sub_82210138, {dev, d.W(0x31CC), 0}) != 0;
   f.Call(sub_82222EA0, {dev, kViewportDefault});
-  if (failed != 0) {
+  if (failed) {
     f.Call(sub_82287D38, {dev, 0});
     ctx.r3.u64 = kOutOfMemoryHresult;
   } else {

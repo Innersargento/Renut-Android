@@ -218,7 +218,7 @@ bool DrawIndexedVerticesUP(PPCContext& ctx, uint8_t* base) {
 
 // --- Memory export ---------------------------------------------------------
 
-constexpr u32 kRing = 0x30, kRingGuarantee = 0x38, kExportDepth = 0x34C0, kExportDone = 0x34C4,
+constexpr u32 kExportDepth = 0x34C0, kExportDone = 0x34C4,
               kExportKind = 0x34C8;
 
 // The guest address D3D's export packets name for a resource: its base address (for a
@@ -236,19 +236,13 @@ u32 ExportBase(const Frame& f, u32 resource) {
   }
 }
 
-// Room for the ring to take `words` more.
-u32 RingRoom(const Frame& f, Device d) {
-  u32 ring = d.W(kRing);
-  if (ring > d.W(kRingGuarantee))
-    ring = f.Kick(d.va);
-  return ring;
-}
-
 bool HaveExport() {
   return sub_82654FD8 && sub_82655130 && sub_82657A20 && sub_82207680 && sub_8226BA20;
 }
 
-// D3DDevice_BeginExport(device, index, resource, kind)
+// D3DDevice_BeginExport(device, index, resource, kind). The original also writes the export's
+// registers into the ring; the ring is a stub nothing reads, so only the device's state is kept:
+// the export base, the dirty bit, and the settle (which marks the registers dirty).
 bool BeginExport(PPCContext& ctx, uint8_t* base) {
   if (!HaveExport())
     return false;
@@ -257,38 +251,19 @@ bool BeginExport(PPCContext& ctx, uint8_t* base) {
   if (!d)
     return false;
   const u32 index = ctx.r4.u32, resource = ctx.r5.u32, kind = ctx.r6.u32;
-  u32 ring = RingRoom(f, d);
   f.Put(d.va + (index + 0xA26) * 4, GpuOf(ExportBase(f, resource)));
   d.SetQ(0x10, d.Q(0x10) | ((u64(1) << 63) >> ((index + 0xC) & 0x7F)));
-  f.Put(ring + 4, 0x5C8);
-  f.Put(ring + 8, 0x20000);
-  ring += 8;
-  if (d.W(kExportDepth) == 0) {
-    bool settle = false;
-    if (kind == 0xA) {
-      f.Put(ring + 4, 0xC0004600);
-      f.Put(ring + 8, 0xF);
-      ring += 8;
-      settle = true;
-    } else if (d.W(kExportDone) == 0) {
-      settle = true;
-    }
-    if (settle) {
-      d.SetW(kRing, ring);
-      f.Call(sub_82654FD8, {d.va});
-      ring = d.W(kRing);
-      if (ring > d.W(kRingGuarantee))
-        ring = f.Kick(d.va);
-    }
-  }
-  d.SetW(kRing, ring);
+  if (d.W(kExportDepth) == 0 && (kind == 0xA || d.W(kExportDone) == 0))
+    f.Call(sub_82654FD8, {d.va});
   d.SetW(kExportKind, kind & 3);
   d.SetW(kExportDone, 0);
   d.SetW(kExportDepth, d.W(kExportDepth) + 1);
   return true;
 }
 
-// D3DDevice_EndExport(device, index, resource, kind)
+// D3DDevice_EndExport(device, index, resource, kind). As BeginExport, without the ring packets:
+// the resource gets the current fence (or goes on the list of resources the buffer being
+// recorded names), its range is invalidated, and the settle runs.
 bool EndExport(PPCContext& ctx, uint8_t* base) {
   if (!HaveExport())
     return false;
@@ -298,11 +273,6 @@ bool EndExport(PPCContext& ctx, uint8_t* base) {
     return false;
   const u32 index = ctx.r4.u32, resource = ctx.r5.u32, kind = ctx.r6.u32;
   f.Put(d.va + (index + 0xA26) * 4, 0);
-  u32 ring = RingRoom(f, d);
-  f.Put(ring + 4, index + 0x2006);
-  f.Put(ring + 8, 0);
-  ring += 8;
-  d.SetW(kRing, ring);
   if (const u32 fence = d.W(0x2A9C)) {
     f.Put(resource + 8, fence);
     f.Put(resource + 12, fence);
@@ -338,27 +308,12 @@ bool EndExport(PPCContext& ctx, uint8_t* base) {
 
   const u32 depth = d.W(kExportDepth) - 1;
   d.SetW(kExportDepth, depth);
-  ring = RingRoom(f, d);
-  f.Put(ring + 4, 0xC0004600);
-  f.Put(ring + 8, 6);
-  ring += 8;
-  d.SetW(kRing, ring);
   if (depth == 0 && kind != 1) {
-    if (ring > d.W(kRingGuarantee))
-      ring = f.Kick(d.va);
-    f.Put(ring + 4, 0x5C8);
-    f.Put(ring + 8, 0x20000);
-    ring += 8;
-    d.SetW(kRing, ring);
     if (kind != 2)
       f.Call(sub_82655130, {d.va});
   } else {
     f.Call(sub_82654FD8, {d.va});
   }
-  ring = d.W(kRing);
-  if (ring > d.W(kRingGuarantee))
-    ring = f.Kick(d.va);
-  d.SetW(kRing, ring);
   d.SetW(kExportDone, (d.W(kExportDepth) == 0 && kind == 1) ? 1 : 0);
   return true;
 }
@@ -436,27 +391,15 @@ bool Clear(PPCContext& ctx, uint8_t* base) {
 }
 
 // D3D::SetSurfaceClip(device, x1, y1, x2, y2) [0x82223270]: one window-scissor packet in the
-// ring (kicking first when the ring is past its guarantee). Not a no-op even though nobody
-// reads the ring: a device recording a command buffer chains the segments the kick makes
-// into the buffer, and RunCommandBuffer walks that chain. While tiling it writes a packet
-// per tile, which stays the recompiled game's.
+// ring, which is all the original does, so outside tiling nothing is left. While tiling it
+// writes a packet per tile, which stays the recompiled game's.
 bool SetSurfaceClip(PPCContext& ctx, uint8_t* base) {
-  Frame f(ctx, base, 0xB0);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
     return false;
-  if (TilingBound(d))
-    return false;
-  const u32 x1 = ctx.r4.u32, y1 = ctx.r5.u32, x2 = ctx.r6.u32, y2 = ctx.r7.u32;
-  u32 ring = d.W(0x30);
-  if (ring > d.W(0x38))
-    ring = f.Kick(d.va);
-  f.Put(ring + 4, 0x22080);
-  f.Put(ring + 8, 0);
-  f.Put(ring + 12, ((y1 & 0x3FFF) << 16) | (x1 & 0x3FFF));
-  f.Put(ring + 16, ((y2 & 0x3FFF) << 16) | (x2 & 0x3FFF));
-  d.SetW(0x30, ring + 16);
-  return true;
+  // While tiling it writes a packet per tile, and a device recording a command buffer chains the
+  // segments its kicks make: both stay the original's.
+  return !TilingBound(d) && !d.W(off::CommandBuffer);
 }
 
 }  // namespace

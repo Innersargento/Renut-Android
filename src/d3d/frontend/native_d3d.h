@@ -138,6 +138,11 @@ uint32_t MainDevice();
 bool ExecutorIdle();
 void TakeWorkPending();
 
+// The block the stubbed ring points at, and its size: memory the recompiled code may write
+// packets into and nothing reads. 0 when it could not be allocated.
+constexpr uint32_t kRingSinkSize = 4u << 20;
+uint32_t RingSinkAddress();
+
 // Fence waits sleep instead of polling. The GPU backend calls NotifyFenceCompleted
 // after it writes a fence word; a waiter reads FenceEpoch() before it tests the fence
 // and hands that value to FenceWait, which returns once the epoch has moved or after

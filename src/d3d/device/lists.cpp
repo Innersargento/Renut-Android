@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "d3d/frontend/native_d3d.h"
 #include "d3d/hooks/layer.h"
 #include "d3d/device/guest_frame.h"
 #include "d3d/device/internal.h"
@@ -55,46 +56,14 @@ __attribute__((weak)) void sub_82D0824C(PPCContext& __restrict, uint8_t*);  // u
 namespace renut::d3d::port {
 namespace {
 
-// The address the GPU reads a list word at: D3D's GPU address less the 0x40000000 window.
-u32 ListGpu(u32 address) { return GuestGpu(address) - 0x40000000u; }
-
-// A list is { u32 head; u32* link; u32* cursor; u32 end; CDevice* device; }.
+// A tile list is { u32 head; u32* link; u32* cursor; u32 end; CDevice* device; }.
 constexpr u32 kListHead = 0, kListLink = 4, kListCursor = 8, kListEnd = 0xC, kListDevice = 0x10;
-constexpr u32 kListWords = 0x420;  // the allocation a list segment asks BeginRingAlloc for
 
-constexpr u32 kSideBuffer = 0x4158;
-
-// sub_8220F800(list): the segment that the list is full gets linked to a fresh one.
-u32 GrowList(const GuestFrame& f, u32 list) {
-  if (const u32 link = f.Get(list + kListLink))
-    f.Put(link, ListGpu(f.Get(list + kListCursor)));
-  const u32 device = f.Get(list + kListDevice);
-  const u32 segment = f.Call(sub_8222D240, {device, kListWords, 0x80});
-  u32 start;
-  if (!segment) {
-    start = f.Get(device + kSideBuffer);
-    f.Put(list + kListHead, 0);
-  } else {
-    start = segment;
-    f.Put(segment, ListGpu(segment + 4));
-    if (const u32 cursor = f.Get(list + kListCursor))
-      f.Put(cursor, ListGpu(segment));
-    else
-      f.Put(list + kListHead, segment);
-    // (the original flushes the segment's cache lines here: the host has no separate cache)
-  }
-  f.Put(list + kListLink, start);
-  f.Put(list + kListCursor, start + 4);
-  f.Put(list + kListEnd, start + 0x107C);
-  return start + 4;
-}
-
-
-
-
-
-// sub_8220F610(device): a kick, then the tiling and indirect lists start afresh and the
-// tile rectangles go into the first of them.
+// sub_8220F610(device): a kick, then the tiling and indirect lists start afresh. The tile lists
+// are what the GPU replays per tile, which the host does not, so they hold nothing here: each
+// is an empty list whose cursor sits in the ring's scratch block, where anything the recompiled
+// code still puts in it goes nowhere. What stays is the device's record of the pass (the ring it
+// had, and the position it is waiting for).
 bool StartTilingLists(PPCContext& ctx, uint8_t* base) {
   GuestFrame f(ctx, base, 0x70);
   Device d = DeviceAt(base, ctx.r3.u32);
@@ -110,31 +79,14 @@ bool StartTilingLists(PPCContext& ctx, uint8_t* base) {
   const u32 position = d.W(0x33BC) + 1;
   d.SetW(0x33B0, d.W(0x33B8));
   d.SetW(0x33B4, position);
-  for (u32 i = 0; i < 5; ++i)
-    d.SetW(0x344C + 4 * i, d.W(0x3438 + 4 * i));
+  const u32 sink = renut::native_d3d::RingSinkAddress();
   for (const u32 list : {0x3438u, 0x33C0u, 0x3424u, 0x33D4u, 0x33E8u, 0x33FCu, 0x3410u}) {
     d.SetW(list + kListDevice, d.va);
     d.SetW(list + kListLink, 0);
-    d.SetW(list + kListCursor, 0);
-    d.SetW(list + kListEnd, 0);
+    d.SetW(list + kListCursor, sink);
+    d.SetW(list + kListEnd, sink ? sink + renut::native_d3d::kRingSinkSize : 0);
     d.SetW(list + kListHead, 0);
-    GrowList(f, d.va + list);
   }
-  u32 packet = d.W(0x3440);
-  if (packet + 0xFC > d.W(0x3444))
-    packet = GrowList(f, d.va + 0x3438);
-  f.Put(packet, 0x80000000u);
-  f.Put(packet + 4, d.W(0x3384));
-  const u32 count = d.W(0x31CC);
-  f.Put(packet + 8, count);
-  const u32 x0 = d.W(0x32C0), y0 = d.W(0x32C4);
-  for (u32 i = 0; i < count; ++i) {
-    f.Put(packet + 0xC + 16 * i, d.W(0x31D0 + 16 * i) - x0);
-    f.Put(packet + 0x10 + 16 * i, d.W(0x31D4 + 16 * i) - y0);
-    f.Put(packet + 0x14 + 16 * i, d.W(0x31D8 + 16 * i) - x0);
-    f.Put(packet + 0x18 + 16 * i, d.W(0x31DC + 16 * i) - y0);
-  }
-  d.SetW(0x3440, packet + 0xFC);
   return true;
 }
 
@@ -165,62 +117,22 @@ void StampFences(const GuestFrame& f, u32 fence, u32 list, u32 mask) {
 
 
 
-// The ring pointer with room for the packet that follows: kicked first when it is past
-// its guarantee (the KickOff's result is the new pointer).
-u32 RingForPacket(const GuestFrame& f, Device d) {
-  u32 ring = d.W(0x30);
-  if (ring > d.W(0x38))
-    ring = f.Call(sub_82210AB0, {d.va});
-  return ring;
-}
-
-
 // sub_8229A260(device, format): the packet that tells the display the front buffer's
-// format (0x28280136 being the one that changes two of its registers).
-bool FrontBufferFormatPacket(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0x70);
-  Device d = DeviceAt(base, ctx.r3.u32);
-  if (!d)
-    return false;
-  u32 ring = RingForPacket(f, d);
-  const bool special = ctx.r4.u32 == 0x28280136u;
-  for (const u32 word : {0xC0022100u, 0x1841u, 0xFFFFF8FFu, special ? 0x100u : 0u, 0x1930u, special ? 3u : 0u}) {
-    ring += 4;
-    f.Put(ring, word);
-  }
-  d.SetW(0x30, ring);
-  return true;
-}
+// format. The ring is a stub (nothing reads it), so no packet is written.
+bool FrontBufferFormatPacket(PPCContext&, uint8_t*) { return true; }
 
-// D3D::ResetAllState(device, skip predication) [0x82287D38]: the predication registers
-// back to their device values (unless skipped), the window scissor again, the screen
-// extent mode, and every dirty mask set so the next draw writes all state.
+// D3D::ResetAllState(device, skip predication) [0x82287D38]: the window scissor again and every
+// dirty mask set so the next draw writes all state. (The original also writes the predication
+// registers and the screen extent mode into the ring.)
 bool ResetAllState(PPCContext& ctx, uint8_t* base) {
   GuestFrame f(ctx, base, 0x60);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
     return false;
-  if (ctx.r4.u32 == 0) {
-    u32 ring = RingForPacket(f, d);
-    for (const u32 word : {0xC0006000u, d.W(0x31A4), 0xC0006200u, 0xFFFFFFFFu, 0xC0006100u, d.W(0x31A8),
-                           0xC0006300u, 0u}) {
-      ring += 4;
-      f.Put(ring, word);
-    }
-    d.SetW(0x30, ring);
-  }
   const auto sext15 = [](u32 value) { return u32(i32(value << 17) >> 17); };
   const u32 top_left = d.W(0x28C4), bottom_right = d.W(0x28C8);
   f.Call(sub_82223270, {d.va, sext15(top_left), sext15(top_left >> 16), sext15(bottom_right),
                         sext15(bottom_right >> 16)});
-  const u32 mode = d.W(0x2AA4);
-  u32 ring = RingForPacket(f, d);
-  d.SetW(0x2AA4, mode);
-  for (const u32 word : {0x5C8u, 0x20000u, 0xF01u, d.W(0x2AA4)}) {
-    ring += 4;
-    f.Put(ring, word);
-  }
-  d.SetW(0x30, ring);
   for (u32 word = 0; word < 5; ++word)
     d.SetPending(word, ~u64(0));
   return true;
@@ -260,25 +172,9 @@ bool SetupTileExtent(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-// A ring that grows by whole words: `put` writes the next one after the pointer.
-struct RingWriter {
-  const GuestFrame& f;
-  u32 ring;
-  void put(u32 word) {
-    ring += 4;
-    f.Put(ring, word);
-  }
-  // A block of the executable's own data copied into the ring.
-  void copy(u32 source, u32 bytes) {
-    std::memcpy(f.G(ring + 4), f.G(source), bytes);
-    ring += bytes;
-  }
-};
-
-// sub_82654FD8(device): the packets that start an export (BeginExport's settle): the
-// shared-memory export registers, a block of the executable's register writes, a fence
-// event, and the dirty bits those registers leave. Skipped while the executable's debug
-// word at 0x82FAD204 is set.
+// sub_82654FD8(device): BeginExport's settle. The original writes the export registers into
+// the ring; here only the dirty bits those registers leave remain. Skipped while the
+// executable's debug word at 0x82FAD204 is set.
 bool ExportBegin(PPCContext& ctx, uint8_t* base) {
   GuestFrame f(ctx, base, 0x70);
   Device d = DeviceAt(base, ctx.r3.u32);
@@ -286,21 +182,13 @@ bool ExportBegin(PPCContext& ctx, uint8_t* base) {
     return false;
   if (f.Get(0x82FAD204) != 0)
     return true;
-  RingWriter w{f, RingForPacket(f, d)};
-  for (const u32 word : {0x00022100u, 0xFu, 0xEu, 0x10u, 0xC0003B00u, 0x100u, 0xC0102B00u, 0u, 0xFu})
-    w.put(word);
-  w.copy(0x82121B34, 0x3C);
-  for (const u32 word : {0x00012180u, 0x07000000u, 0u, 0x2208u, 4u, 0xC0003600u, 0x00010081u})
-    w.put(word);
   d.SetQ(0x10, d.Q(0x10) | 0x80000 | Bit(41) | Bit(40) | Bit(39) | 8);
-  d.SetW(0x30, w.ring);
   return true;
 }
 
-// sub_82655130(device): the end of an export (EndExport's settle): the resolve registers
-// back to the executable's defaults, written as one long packet block, then a fence
-// event, with every state group the registers touch marked dirty and the window clip
-// set again.
+// sub_82655130(device): EndExport's settle: every state group the export registers touch marked
+// dirty and the window clip set again. (The original also writes the registers back to the
+// executable's defaults into the ring.)
 bool ExportEnd(PPCContext& ctx, uint8_t* base) {
   GuestFrame f(ctx, base, 0xF0);
   Device d = DeviceAt(base, ctx.r3.u32);
@@ -308,27 +196,6 @@ bool ExportEnd(PPCContext& ctx, uint8_t* base) {
     return false;
   if (f.Get(0x82FAD208) != 0)
     return true;
-  RingWriter w{f, RingForPacket(f, d)};
-  for (const u32 word : {0xC0003B00u, 0x300u, 0xC0192B00u, 0u, 0x18u})
-    w.put(word);
-  w.copy(0x82123E08, 0x60);
-  d.SetW(0x30, w.ring);
-  w.ring = RingForPacket(f, d);
-  for (const u32 word : {0xC00A2B00u, 1u, 9u})
-    w.put(word);
-  w.copy(0x8211E96C, 0x24);
-  d.SetW(0x30, w.ring);
-  w.ring = RingForPacket(f, d);
-  for (const u32 word : {0x00012180u, 0x10000001u, 0u, 0x00022100u, 0x0000FFFFu, 0u, 0u, 0x2293u, 0u,
-                         0x00022204u, 0x00010000u, 0x00010000u, 0x300u, 0x2312u, 0x0000FFFFu, 0x200Du, 0u,
-                         0x2200u, 0u, 0x2203u, 0u, 0x2208u, 4u, 0x2104u, 0u, 0x2280u, 0x00080008u, 0x2302u,
-                         4u, 0x00022080u, 0u, 0u, 0x00100010u})
-    w.put(word);
-  d.SetW(0x30, w.ring);
-  w.ring = RingForPacket(f, d);
-  w.put(0xC0003600u);
-  w.put(0x00200081u);
-  d.SetW(0x30, w.ring);
   d.SetQ(0x10, d.Q(0x10) | Bit(41) | Bit(40) | Bit(39) | 0x80 | 0x40 | 0x20 | Bit(44) | 0x80000 | 0x100000 |
                    0x800 | 0x100 | 8 | Bit(37));
   d.SetQ(0x18, d.Q(0x18) | Bit(35) | Bit(54));
@@ -363,25 +230,19 @@ bool MarkEdramBits(PPCContext& ctx, uint8_t* base) {
 }
 
 
-// sub_82210138(device, ?, callback type): the end of a tiled pass: the lists the pass built
-// (the tile list, the indirect ranges and the fence) go to the GPU through the primary
-// buffer, behind an InsertCallback that tells the CPU. A device that ran out of memory
-// gets its ring back instead and returns 1.
+// sub_82210138(device, ?, callback type): the end of a tiled pass. The original hands the pass's
+// lists (the tile list, the indirect ranges and the fence) to the GPU through the primary buffer,
+// behind an InsertCallback that tells the CPU; the host resolves each tile as it goes, so what is
+// left is the pass being over and its fence. A device that ran out of memory gets its ring back
+// instead and returns 1.
 bool EndTilingLists(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0xA0);
+  GuestFrame f(ctx, base, 0x70);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
     return false;
-  const u32 callback_type = ctx.r5.u32;
-  if (!(d.B(0x2ABD) & 0x20))
-    f.Call(sub_822108B8, {d.va, f.sp + 0x54, f.sp + 0x50});
-  const u32 block_a = f.Call(sub_8222D240, {d.va, 0x94, 0x20});   // r28
-  const u32 block_b = f.Call(sub_8222D240, {d.va, 0xA, 0x20});    // r30
-  u32 block_c = f.Call(sub_8222D240, {d.va, 0xC, 4});             // r29
-  const bool out_of_memory = (d.B(0x2ABD) >> 5) & 1;
   d.SetW(0x33B0, 0);
   d.SetW(0x33B4, 0);
-  if (out_of_memory) {
+  if ((d.B(0x2ABD) >> 5) & 1) {
     d.SetW(0x30, d.W(0x3460));
     d.SetW(0x34, d.W(0x3464));
     d.SetW(0x3A50, d.W(0x3468));
@@ -393,288 +254,31 @@ bool EndTilingLists(PPCContext& ctx, uint8_t* base) {
     ctx.r3.u64 = 1;
     return true;
   }
-  const u32 tile_list = d.va + 0x3438;  // r25
-  for (const u32 list : {0x3438u, 0x33C0u, 0x3424u, 0x33D4u, 0x33E8u, 0x33FCu, 0x3410u})
-    f.Call(sub_8220F408, {d.va + list});
-  u32 context = 0;
-  if (const u32 head = d.W(0x3438))
-    context = GuestGpu(head) - 0x40000000u;
-  const u32 inserted = f.Call(sub_822052C8, {d.va, block_a - 4, callback_type | 1, 0x82662FE0, context}) + 4;  // r27
-  const u32 fenced = f.Call(sub_82278528, {d.va, block_b - 4}) + 4;                                              // r26
-  const u32 words = f.Get(f.sp + 0x50);
-  if (words != 0)
-    block_c = f.Call(sub_822105F0, {d.va, block_c, f.Get(f.sp + 0x54), words, 0, d.va + 0x344C});
-  if (d.W(0x541C) != 0 || !(d.B(0x2ABD) & 2))
-    block_c = f.Call(sub_822105F0, {d.va, block_c, GuestGpu(block_a), u32(i32(inserted - block_a) >> 2), 1,
-                                    d.va + 0x344C});
-  f.Call(sub_822105F0, {d.va, block_c, GuestGpu(block_b), u32(i32(fenced - block_b) >> 2), 0, tile_list});
+  f.Call(sub_82278528, {d.va, d.W(0x30)});
   ctx.r3.u64 = 0;
   return true;
 }
 
 // --- Register packets ---------------------------------------------------------
+//
+// The emitters below write the dirty registers as packets into the ring in the original. The ring
+// is a stub nothing reads (the front end flushes from the device's shadow), so they write nothing:
+// the shadow is already up to date and the caller clears the dirty bits.
 
-// sub_821E2940(device, ring, register, data, count, per): `count` words of register data as
-// type-0 packets, in pieces of whole records of `per` words that fit under the ring's end
-// (kicking for room when none does). Returns the ring pointer.
-u32 AppendRegisters(const GuestFrame& f, Device d, u32 ring, u32 reg, u32 data, u32 count, u32 per) {
-  for (;;) {
-    const i32 fit = (i32(d.W(0x34) - ring) >> 2) - 1;
-    if (per && fit / i32(per) > 0) {
-      u32 words = u32(fit / i32(per)) * per;
-      if (words >= count)
-        words = count;
-      count -= words;
-      ring += 4;
-      f.Put(ring, ((words - 1) << 16) | reg);
-      for (u32 i = 0; i < words; ++i) {
-        data += 4;
-        ring += 4;
-        f.Put(ring, f.Get(data));
-      }
-      reg += words;
-    }
-    if (count == 0)
-      return ring;
-    d.SetW(0x30, ring);
-    f.Call(sub_82210AB0, {d.va});
-    ring = d.W(0x30);
-  }
-}
-
-
-// How one of the dirty-register emitters lays its runs out: a bit of the mask is `words`
-// words of register data, `stride` registers apart, and a run that fits is written in the
-// ring directly after the alignment the emitter wants.
-struct RunStyle {
-  u32 words;   // words of data (and registers) a mask bit stands for
-  u32 stride;  // registers a bit advances
-  u32 per;     // the record size AppendRegisters keeps whole
-  u32 extra;   // words of room beyond the data a run needs to be written directly
-  enum Align { kNone, kVector, kPad8 } align;
-};
-
-// The emitters' common body (0x8222CB90, 0x8222D0E8, 0x8222AB88, 0x8220E2B0): the set bits
-// of `mask`, most significant first, as runs of registers starting at `reg`, their data
-// read from `data`. Returns the ring pointer.
-u32 EmitRuns(const GuestFrame& f, Device d, u32 ring, u64 mask, u32 reg, u32 data, const RunStyle& style) {
-  u32 p = data - 4;  // the pre-incremented read pointer
-  const auto leading = [](u64 value) { return value ? u32(__builtin_clzll(value)) : 64u; };
-  while (mask) {
-    const u32 skip = leading(mask);
-    mask <<= skip;
-    const u32 run = leading(~mask);
-    p += skip * style.words * 4;
-    const u32 this_reg = reg + skip * style.stride;
-    const u32 words = run * style.words;
-    if (ring + (words + style.extra) * 4 < d.W(0x34)) {
-      if (style.align == RunStyle::kVector) {
-        const u32 pads = (ring & 0xF) == 4 ? 1 : (ring & 0xF) == 0 ? 2 : (ring & 0xF) == 0xC ? 3 : 0;
-        for (u32 i = 0; i < pads; ++i) {
-          ring += 4;
-          f.Put(ring, 0x80000000u);
-        }
-      } else if (style.align == RunStyle::kPad8) {
-        f.Put(ring + 4, 0x80000000u);
-        ring += ring & 7;
-      }
-      ring += 4;
-      f.Put(ring, ((words - 1) << 16) | this_reg);
-      for (u32 bit = 0; bit < run; ++bit) {
-        if (style.align == RunStyle::kVector) {
-          // lvx128 / stvx128 ignore the low four bits of their addresses
-          for (u32 piece = 0; piece < 4; ++piece)
-            std::memcpy(f.G((ring + 4 + 16 * piece) & ~0xFu), f.G((p + 4 + 16 * piece) & ~0xFu), 16);
-        } else {
-          std::memmove(f.G(ring + 4), f.G(p + 4), style.words * 4);
-        }
-        p += style.words * 4;
-        ring += style.words * 4;
-      }
-      mask <<= run;
-    } else {
-      ring = AppendRegisters(f, d, ring, this_reg, p, words, style.per);
-      p += words * 4;
-      mask <<= run;
-    }
-    reg = this_reg + words;
-  }
-  return ring;
-}
-
-// sub_8222CB90(device, mask, register, data): single words.
-bool EmitRegisterWords(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0x90);
-  Device d = DeviceAt(base, ctx.r3.u32);
-  if (!d)
-    return false;
-  const RunStyle style{1, 1, 1, 0, RunStyle::kNone};
-  d.SetW(0x30, EmitRuns(f, d, d.W(0x30), ctx.r4.u64, ctx.r5.u32, ctx.r6.u32, style));
-  return true;
-}
-
-// sub_8222D0E8(device, mask, register, data): 16-word vectors of constants.
-bool EmitConstantVectors(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0xB0);
-  Device d = DeviceAt(base, ctx.r3.u32);
-  if (!d)
-    return false;
-  const RunStyle style{16, 16, 0x10, 3, RunStyle::kVector};
-  d.SetW(0x30, EmitRuns(f, d, d.W(0x30), ctx.r4.u64, ctx.r5.u32, ctx.r6.u32, style));
-  return true;
-}
-
-// sub_8220E2B0(device, mask): the clip planes the mask names (4 words each at +0x2820), after
-// the packets that select them.
-bool EmitClipPlanes(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0xA0);
-  Device d = DeviceAt(base, ctx.r3.u32);
-  if (!d)
-    return false;
-  u32 ring = RingForPacket(f, d);
-  for (const u32 word : {0x2007u, d.W(0x289C), 0xA31u, 0x10000u, 0x10A2Fu, 0u, 0x1000u, 0xC0043C00u, 3u, 0xA31u,
-                         0u, 0x80000000u, 8u}) {
-    ring += 4;
-    f.Put(ring, word);
-  }
-  d.SetW(0x30, ring);
-  const RunStyle style{4, 4, 4, 1, RunStyle::kPad8};
-  d.SetW(0x30, EmitRuns(f, d, ring, ctx.r4.u64, 0x2388, d.va + 0x2820, style));
-  return true;
-}
-
-// sub_8222AB88(device, mask): the ALU constants the mask names (6 words a bit, from +0x480),
-// then the packet that ends the block. The original's two exits write slightly different
-// trailers; this writes the common one.
-bool EmitConstantBlocks(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0x90);
-  Device d = DeviceAt(base, ctx.r3.u32);
-  if (!d)
-    return false;
-  const RunStyle style{6, 6, 6, 5, RunStyle::kPad8};
-  u32 ring = EmitRuns(f, d, d.W(0x30), ctx.r4.u64, 0x4800, d.va + 0x480, style);
-  d.SetW(0x30, ring);
-  if (ring > d.W(0x38))
-    ring = f.Call(sub_82210AB0, {d.va});
-  f.Put(ring + 4, 0x25000u);
-  f.Put(ring + 8, 0u);
-  f.Put(ring + 12, 0u);
-  f.Put(ring + 16, 0u);
-  d.SetW(0x30, ring + 16);
-  return true;
-}
+// sub_8222CB90 / sub_8222D0E8 / sub_8220E2B0 / sub_8222AB88(device, mask, ...): single words,
+// constant vectors, clip planes and ALU constant blocks.
+bool EmitNothing(PPCContext&, uint8_t*) { return true; }
 
 // sub_8226AAB8(device, mask, hi control): the depth/stencil and render-target state the mask
-// names, as register packets (the per-tile predicated ones when the device draws into the
-// tiles of a command buffer). Returns the mask less what it wrote.
+// names. Returns the mask less what it would have written: the depth/stencil control, the
+// surface info and the color mask, whose bits the caller then clears.
 bool EmitSurfaceState(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0xC0);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
     return false;
-  u64 mask = ctx.r4.u64;                 // r24
-  u32 hi_control = ctx.r5.u32;           // r28
-  u32 ring = RingForPacket(f, d);        // r11
-  u32 stencil_mark = ~0u, surface_mark = ~0u, color_mark = ~0u;  // r26, r23, r20
-  constexpr u32 kPredicateSet = 0xC0006100u, kPredicateTest = 0xC0006000u, kRegisterBlock = 0xC0012D01u,
-                kBlockSize = 0x40203u;
-  const auto put = [&](u32 word) {
-    ring += 4;
-    f.Put(ring, word);
-  };
-  const auto room = [&] {
-    d.SetW(0x30, ring);
-    if (ring > d.W(0x38))
-      ring = f.Call(sub_82210AB0, {d.va});
-  };
-  if (mask & 0x100) {
-    bool tiled = (d.B(0x2ABF) & 0x20) && TilingBound(d);
-    if (tiled) {
-      put(kPredicateSet);
-      put(0);
-      u32 last = f.Get(f.sp + 0x50);  // (uninitialised in the original when there are no tiles)
-      const i32 tiles = i32(d.W(0x31CC));
-      for (i32 tile = tiles - 1; tile >= 0; --tile) {
-        const u32 index = d.W(0x3338 + 4 * u32(tile));
-        hi_control = (std::rotl(index, 17) & 0xFFFE0000u) | (hi_control & ~0xFFFE0000u);
-        last = hi_control;
-        const u32 mode = (d.W(0x2E4C) >> 17) & 7;
-        const bool clear_low =
-            mode == 0 || (mode == 2 && (tile != 0 || !(d.B(0x2ABF) & 0x10)));
-        if (clear_low)
-          last = hi_control & ~1u;
-        put(kPredicateTest);
-        put(tile * 2 < 32 ? 3u << (tile * 2) : 0u);
-        put(kRegisterBlock);
-        put(kBlockSize);
-        put(last);
-        room();
-      }
-      if (last != hi_control && (d.B(0x2ABC) & 0x40)) {
-        put(kPredicateTest);
-        put(1);
-        put(kRegisterBlock);
-        put(kBlockSize);
-        put(hi_control);
-      }
-      put(kPredicateTest);
-      put(d.W(0x31A4));
-      put(kPredicateSet);
-      put(d.W(0x31A8));
-    } else {
-      tiled = false;
-    }
-    if (!tiled) {
-      u32 value = hi_control;
-      if ((d.W(0x2E4C) & 0xE0000) == 0)
-        value = hi_control & ~1u;
-      put(0x2203);
-      put(value);
-      if (value != hi_control && (d.B(0x2ABC) & 0x40))
-        stencil_mark = hi_control;
-    }
-    mask &= ~u64(0x100);
-  }
+  u64 mask = ctx.r4.u64 & ~u64(0x100);
   const u64 pending = d.Q(0x28) & mask;
-  if (pending & Bit(57)) {
-    put(0x2000);
-    const u32 info = d.W(0x2880);
-    put(info);
-    mask &= ~Bit(57);
-    surface_mark = (d.W(0x3378) & 0x3FFFu) | (info & 0xFFFFC000u);
-  }
-  if (pending & Bit(37)) {
-    put(0x2104);
-    color_mark = 0;
-    put(d.W(0x28DC));
-    mask &= ~Bit(37);
-  }
-  if ((color_mark & surface_mark & stencil_mark) != ~0u) {
-    put(kPredicateSet);
-    put(0);
-    put(kPredicateTest);
-    put(0x15555555u);
-    if (stencil_mark != ~0u) {
-      put(kRegisterBlock);
-      put(kBlockSize);
-      put(stencil_mark);
-    }
-    if (surface_mark != ~0u) {
-      put(kRegisterBlock);
-      put(0x40000u);
-      put(surface_mark);
-    }
-    if (color_mark != ~0u) {
-      put(kRegisterBlock);
-      put(0x40104u);
-      put(color_mark);
-    }
-    put(kPredicateTest);
-    put(d.W(0x31A4));
-    put(kPredicateSet);
-    put(d.W(0x31A8));
-  }
-  d.SetW(0x30, ring);
+  mask &= ~(pending & (Bit(57) | Bit(37)));
   ctx.r3.u64 = mask;
   return true;
 }
@@ -694,10 +298,9 @@ void FreeSideBuffers(const GuestFrame& f, u32 node) {
 
 
 
-// sub_82663208(device): the register shadow back to its power-on values, and the packets
-// that put the same into the GPU's registers.
+// sub_82663208(device): the register shadow back to its power-on values. (The original also
+// writes the same into the GPU's registers through the ring.)
 bool ResetDeviceRegisters(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0x70);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
     return false;
@@ -723,15 +326,6 @@ bool ResetDeviceRegisters(PPCContext& ctx, uint8_t* base) {
   for (u32 word = 0; word < 5; ++word)
     d.SetPending(word, ~u64(0));
   d.SetW(0x2AA4, 0xE);
-  u32 ring = RingForPacket(f, d);
-  const u32 g1 = f.Get(0x82FAD21C), g2 = f.Get(0x82FAD220);
-  const u32 flush_depth = (d.W(0x5DAC) & 2) ? 0xFu : 3u;
-  for (const u32 word : {0xD01u, 0x04000000u, 0xC0022100u, 0x81u, 0xFFFFFFFFu, g1 | 0x80010000u, 0xC0022100u, 0x82u,
-                         0xFFFFFFFFu, g2, 0xE42u, 0x1F60u, 0xC85u, flush_depth, 0x57Cu, 0x0BADF00Du, 0x57Bu, 0u}) {
-    ring += 4;
-    f.Put(ring, word);
-  }
-  d.SetW(0x30, ring);
   return true;
 }
 
@@ -858,8 +452,7 @@ bool SwapNotify(PPCContext& ctx, uint8_t* base) {
   if (const u32 owner = f.Get(f.Get(0x8200095C)))
     f.CallAddress(f.Get(owner + 0x18), {0x5C, f.sp + 0x50});
   context = f.Get(f.sp + 0x68);
-  u32 ring = RingForPacket(f, d);
-  d.SetW(0x30, f.Call(sub_822052C8, {d.va, ring, 0, 0x8265C418, context}));
+  f.Call(sub_822052C8, {d.va, d.W(0x30), 0, 0x8265C418, context});
   return true;
 }
 
@@ -874,10 +467,10 @@ void RegisterCommandLists() {
   SetHandler(kD3D_ResetDeviceRegisters, ResetDeviceRegisters);
   SetHandler(kD3D_InitializeApiState, InitializeApiState);
   SetHandler(kD3D_EmitSurfaceState, EmitSurfaceState);
-  SetHandler(kD3D_EmitRegisterWords, EmitRegisterWords);
-  SetHandler(kD3D_EmitConstantVectors, EmitConstantVectors);
-  SetHandler(kD3D_EmitClipPlanes, EmitClipPlanes);
-  SetHandler(kD3D_EmitConstantBlocks, EmitConstantBlocks);
+  SetHandler(kD3D_EmitRegisterWords, EmitNothing);
+  SetHandler(kD3D_EmitConstantVectors, EmitNothing);
+  SetHandler(kD3D_EmitClipPlanes, EmitNothing);
+  SetHandler(kD3D_EmitConstantBlocks, EmitNothing);
   SetHandler(kD3D_FrontBufferFormatPacket, FrontBufferFormatPacket);
   SetHandler(kD3D_ResetAllState, ResetAllState);
   SetHandler(kD3D_SetupTileExtent, SetupTileExtent);

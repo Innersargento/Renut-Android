@@ -1,12 +1,17 @@
 // D3DDevice_Swap natively (see swap.h).
 //
 // Offsets are this release's, read off the retail disassembly (not through Layout()).
-// The native front end has recorded the frame (native_d3d.cpp, Swap) before this runs.
+// The native front end has recorded the frame (native_d3d.cpp, Swap) before this runs. The
+// packets the original queues in the ring (the history slots' counter stamps, the front buffer's
+// address and format, the display mode register) are left out: the ring is a stub nothing reads,
+// and the present record (VdSwap, RecordPresent) carries the frame. What stays is the device's
+// swap state, the history slots, the scaler and the calls into the kernel's video code.
 #include "d3d/scene/swap.h"
 
 #include <array>
 #include <cstring>
 
+#include "d3d/frontend/native_d3d.h"
 #include "d3d/hooks/layer.h"
 #include "d3d/device/device.h"
 #include "d3d/device/guest_frame.h"
@@ -24,17 +29,12 @@ REX_FUNC(sub_8264DCD0);  // D3D_CBlocker_Check
 __attribute__((weak)) void sub_82D0827C(PPCContext& __restrict, uint8_t*);  // the device type
 __attribute__((weak)) void sub_821EF4E8(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82D0820C(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_821F7C18(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82D0821C(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82D08B2C(PPCContext& __restrict, uint8_t*);  // the video mode
 __attribute__((weak)) void sub_82D08B6C(PPCContext& __restrict, uint8_t*);  // query the video mode
-__attribute__((weak)) void sub_82654598(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8229A260(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_821ED560(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82D08A6C(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82D088EC(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82289F08(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_821F62E8(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82287D38(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_8264DC08(PPCContext& __restrict, uint8_t*);  // CBlocker cleanup
 }
@@ -59,22 +59,10 @@ u32 InsertMasked(u32 target, u32 source, u32 rotate, u32 mask) {
 }
 
 bool HaveAll() {
-  return sub_82D0827C && sub_821EF4E8 && sub_82D0820C && sub_821F7C18 && sub_82D0821C &&
-         sub_82D08B2C && sub_82D08B6C && sub_82654598 && sub_8229A260 && sub_821ED560 &&
-         sub_82D08A6C && sub_82D088EC && sub_82289F08 && sub_821F62E8 && sub_82287D38 &&
+  return sub_82D0827C && sub_821EF4E8 && sub_82D0820C && sub_82D0821C &&
+         sub_82D08B2C && sub_82D08B6C && sub_821ED560 &&
+         sub_82D08A6C && sub_82D088EC && sub_82287D38 &&
          sub_8264DC08;
-}
-
-// The ring words that write `value` at the per-frame slot (a GPU-side counter).
-u32 PutSlotPacket(const Frame& f, Device d, u32 slot_address) {
-  u32 ring = d.W(0x30);
-  if (ring > d.W(0x38))
-    ring = f.Kick(d.va);
-  f.Put(ring + 4, 0xC0025800u);
-  f.Put(ring + 8, 0x80000003u);
-  f.Put(ring + 12, GpuOf(slot_address));
-  f.Put(ring + 16, 0xDEADBEEFu);
-  return ring + 16;
 }
 
 // D3DDevice_Swap(device, front buffer, scaler parameters)
@@ -129,8 +117,8 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
     const u32 block = d.W(0x2A90);
     f.Put(block + (((d.W(0x547C) & 7) + 0x10) << 2), 0);
     f.Put(block + ((((d.W(0x547C) + 1) & 7) + 0x10) << 2), 0);
-    const u32 slot = d.W(0x2A90) + (((d.W(0x547C) & 7) + 0x10) << 2);
-    d.SetW(0x30, PutSlotPacket(f, d, slot));
+    // (The original also queues a packet that stamps the first slot with the GPU's counter; the
+    // present record stamps both slots when the frame is presented, see RecordPresent.)
     slot_written = true;
   }
 
@@ -138,12 +126,6 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
       parameters != 0 && std::memcmp(f.G(parameters), f.G(dev + 0x3548), 0x1C) != 0;  // r26
 
   if (hardware) {
-    if (f.Get(0x82FAD200) != 0) {
-      u32 ring = d.W(0x30);
-      if (ring > d.W(0x38))
-        ring = f.Kick(dev);
-      d.SetW(0x30, ring);
-    }
     if (scaler_changed)
       d.SetW(0x5D94, d.W(0x5D94) | 0x40000000u);
     f.Call(sub_821EF4E8, {dev, front});
@@ -153,22 +135,20 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
   if (d.W(0x541C)) {
     f.Put(d.W(0x2A90) + 8, f.Get(f.sp + 0x74));
   } else {
-    const u32 buffer = f.Call(sub_821F7C18, {dev, 0x40});
+    // VdSwap takes the buffer its swap packet goes to. Nothing reads the ring, so the packet goes
+    // to the scratch block (the present is recorded from VdSwap's arguments, RecordPresent) and
+    // the ring is left alone.
+    const u32 sink = renut::native_d3d::RingSinkAddress();
+    const u32 buffer = sink ? sink : d.W(0x30);
     f.Put(f.sp + 0x54, f.sp + 0x60);
     f.Put(f.sp + 0x5C, f.sp + 0x64);
     f.Call(sub_82D0821C, {buffer + 4, f.sp + 0xA0, d.W(0x2A90) + 8, f.sp + 0xD0, f.Get(f.sp + 0x74),
                           f.sp + 0x70, f.sp + 0x6C, f.sp + 0x68});
-    d.SetW(0x30, buffer + 0x100);
   }
   d.SetW(0x5B34, f.Get(f.sp + 0xD4));
 
-  if (slot_written) {
-    const u32 next = d.W(0x547C) + 1;
-    const u32 slot = d.W(0x2A90) + (((next & 7) + 0x10) << 2);
-    const u32 ring = PutSlotPacket(f, d, slot);
+  if (slot_written)
     d.SetW(0x547C, d.W(0x547C) + 2);
-    d.SetW(0x30, ring);
-  }
   if (const u32 value = f.Get(f.sp + 0xD8))
     d.SetW(0x5DA8, value);
   u32 changes = d.W(0x4144);  // r27
@@ -241,32 +221,23 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
     changes = 0;
 
   if (changes != 0) {
-    f.Call(sub_82654598, {dev, changes, front_gpu, r30, f.Get(f.sp + 0x60), f.Get(f.sp + 0x64), r28, r26});
+    // sub_82654598 writes the display registers, the front buffer's address, the gamma table and
+    // the scaler's command buffer into the ring: nothing reads it, and the display is the host's.
+    // What it also does is wait for the presentation interval, and kick.
+    if (d.W(0x5DAC) & 4)
+      f.Call(sub_8228A748, {dev, 0});
+    f.Kick(dev);
   } else if (d.W(0x5DAC) & 4) {
     f.Call(sub_8228A748, {dev, front_gpu});
-  } else {
-    u32 ring = d.W(0x30);
-    if (ring > d.W(0x38))
-      ring = f.Kick(dev);
-    f.Put(ring + 4, 0x1844);
-    f.Put(ring + 8, GpuOf(front_gpu));
-    d.SetW(0x30, ring + 8);
-    f.Call(sub_8229A260, {dev, r30});
   }
+  // (Otherwise the original queues the front buffer's address and format as packets.)
 
   f.Put(f.sp + 0x54, r26);
   f.Call(sub_821ED560, {dev, changes, f.Get(f.sp + 0x68), front_gpu, r30, f.Get(f.sp + 0x60),
                         f.Get(f.sp + 0x64), r28});
 
   if ((changes & 8) && hardware) {
-    u32 ring = d.W(0x30);
-    if (ring > d.W(0x38))
-      ring = f.Kick(dev);
-    f.Put(ring + 4, 0xC0022100u);
-    f.Put(ring + 8, 0x1E4E);
-    f.Put(ring + 12, 0xFFFFFFFEu);
-    f.Put(ring + 16, 0);
-    d.SetW(0x30, ring + 16);
+    // (The original queues a register write here; the display mode is the kernel's.)
     std::memset(f.G(f.sp + 0xB8), 0, 12);
     if (f.Call(sub_82D08A6C, {f.sp + 0xB8, f.sp + 0x80}))
       f.Call(sub_82D088EC, {1, f.Get(f.sp + 0x80)});
@@ -275,7 +246,6 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
   const u32 fence = d.W(0x2A9C);  // r30
   d.SetW(0x2AB0, fence);
   f.Kick(dev);
-  f.Call(sub_82289F08, {dev, 0, 0});
   f.Call(sub_822873E8, {dev, d.W(0x3A40) >> 2});
   if (const u32 pending = d.W(0x3A5C))
     f.Call(sub_8228F558, {dev, pending, 3, 0});
@@ -296,7 +266,6 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
     d.SetW(0x3A5C, fence);
   }
   d.SetB(0x2ABD, d.B(0x2ABD) & 0xEF);
-  f.Call(sub_821F62E8, {dev});
   f.Call(sub_82287D38, {dev, 0});
   return true;
 }
