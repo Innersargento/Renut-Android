@@ -1,9 +1,8 @@
 // Tessellation patch expansion.
 #include "gpu/core/internal.h"
+#include "plume/shaders/host_shaders.h"
 
 namespace renut::gpu {
-
-#include "plume/shaders/host_shaders.h"
 
 bool Patches::CreatePackPipeline() {
   if (pack_pipeline_ != VK_NULL_HANDLE) return true;

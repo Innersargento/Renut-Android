@@ -1,9 +1,8 @@
 // Vulkan context set-up and tear-down and the GPU backend's worker loop.
 #include "gpu/core/internal.h"
+#include "plume/shaders/host_shaders.h"
 
 namespace renut::gpu {
-
-#include "plume/shaders/host_shaders.h"
 
 bool GpuBackend::SetupContext() {
   // Direct3D's doorbell wakes the worker through this (native_d3d.h).
