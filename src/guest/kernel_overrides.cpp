@@ -2,7 +2,7 @@
 // differently. The SDK is used exactly as released: the recompiled game calls
 // an import by a symbol name (`__imp__<Export>`), and the build compiles the
 // game's code with that name replaced by `renut_imp_<Export>` for each export
-// listed in kernel_overrides.inc. What is defined here is therefore what the
+// listed in kernel_overrides.h. What is defined here is therefore what the
 // game calls; the SDK's own function stays reachable under its real name for
 // whatever the override does not take over.
 #include <cstdint>
@@ -22,7 +22,7 @@
 
 #include "guest_address.h"
 #include "host_support.h"
-#include "d3d/native_d3d.h"
+#include "d3d/frontend/native_d3d.h"
 #include "plume/plume_gpu.h"
 #if defined(__ANDROID__)
 #include "platform/renut_audio.h"
@@ -32,7 +32,7 @@
 using rex::X_STATUS;
 
 #define X(name) extern "C" void __imp__##name(PPCContext& __restrict ctx, uint8_t* base);
-#include "kernel_overrides.inc"
+#include "kernel_overrides.h"
 #undef X
 
 namespace {

@@ -3,9 +3,7 @@
 // swapchain through Plume and is fed by the Direct3D interception layer.
 // Stage 1: presents the colour of the game's last clear, which proves the
 // path from the game's Direct3D calls to the screen.
-#if defined(__ANDROID__)
 #include <android/native_window.h>
-#endif
 
 #include <cstdint>
 #include <memory>
@@ -20,14 +18,8 @@ struct RenderTexture;
 
 namespace renut {
 
-// The platform's window: the Android surface, or on Windows the HWND, which the
-// callers hand over as an opaque pointer (windows/main_windows.cpp).
-#if defined(__ANDROID__)
+// The platform's window: the Android surface.
 using PlumeWindow = ANativeWindow;
-#else
-struct PlumeWindowTag;
-using PlumeWindow = PlumeWindowTag;
-#endif
 
 // Frames the renderer keeps in flight. The GPU backend records frame N
 // while the GPU runs N-1, so a frame costs the larger of the two instead of

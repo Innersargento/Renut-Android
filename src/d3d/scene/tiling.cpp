@@ -1,0 +1,425 @@
+// BeginTiling, EndTiling, RunCommandBuffer and AllocateEdramMemory, natively (see tiling.h).
+//
+// Offsets are this release's, read off the retail disassembly (not through Layout()).
+// The ring writes are kept as the original makes them: a device recording a command buffer
+// chains the segments its kicks make, and RunCommandBuffer walks that chain.
+#include "d3d/scene/tiling.h"
+
+#include <bit>
+#include <cstring>
+
+#include "d3d/hooks/layer.h"
+#include "d3d/device/guest_frame.h"
+#include "d3d/device/internal.h"
+
+extern "C" {
+REX_FUNC(sub_82210AB0);  // CDevice::KickOff
+REX_FUNC(sub_82222EA0);  // D3DDevice_SetViewport
+REX_FUNC(sub_82223178);  // D3DDevice_SetScissorRect
+REX_FUNC(sub_82223270);  // D3D::SetSurfaceClip
+REX_FUNC(sub_822811A0);  // D3DDevice_ClearF
+REX_FUNC(sub_8222AA18);  // D3DDevice_SetPredication
+REX_FUNC(sub_822899D0);  // D3DDevice_SetRenderState_HiZWriteEnable
+REX_FUNC(sub_8222D6C8);  // D3DDevice_Resolve
+REX_FUNC(sub_821FB688);  // D3DDevice_InsertCallback
+REX_FUNC(sub_826572C8);  // CDevice::QueueIndirectBuffers
+__attribute__((weak)) void sub_82222F20(PPCContext& __restrict, uint8_t*);  // the viewport from floats
+__attribute__((weak)) void sub_8220F610(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_8220F800(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_821F7C18(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_82287D38(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_82210138(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_8222D0E8(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_8222BF10(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_8226AAB8(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_8222CB90(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_8222AB88(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_8220E2B0(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_82657A20(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_82657978(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void sub_82265B90(PPCContext& __restrict, uint8_t*);  // XMemAlloc
+__attribute__((weak)) void sub_822399D8(PPCContext& __restrict, uint8_t*);  // XMemFree
+__attribute__((weak)) void sub_82D0832C(PPCContext& __restrict, uint8_t*);  // initialise a lock
+__attribute__((weak)) void sub_82D082DC(PPCContext& __restrict, uint8_t*);  // lock
+__attribute__((weak)) void sub_82D082EC(PPCContext& __restrict, uint8_t*);  // unlock
+__attribute__((weak)) void sub_82661AF0(PPCContext& __restrict, uint8_t*);  // mark EDRAM tiles
+}
+
+namespace renut::d3d::port {
+namespace {
+
+constexpr u32 kRing = 0x30, kRingGuarantee = 0x38;
+constexpr u32 kViewportDefault = 0x820018DC, kScissorDefault = 0x82001190;
+constexpr u32 kOutOfMemoryHresult = 0x8007000E;
+
+u32 Kick(const GuestFrame& f, u32 dev) { return f.Call(sub_82210AB0, {dev}); }
+
+// A call with a float in f1 and the stack arguments the callers keep at +0x5C and +0x64.
+u32 CallWithFloat(const GuestFrame& f, GuestFn function, std::array<u32, 8> args, float value) {
+  PPCContext call = *f.ctx;
+  call.r1.u32 = f.sp;
+  call.r3.u32 = args[0];
+  call.r4.u32 = args[1];
+  call.r5.u32 = args[2];
+  call.r6.u32 = args[3];
+  call.r7.u32 = args[4];
+  call.r8.u32 = args[5];
+  call.r9.u32 = args[6];
+  call.r10.u32 = args[7];
+  call.f1.f64 = double(value);
+  function(call, f.base);
+  return call.r3.u32;
+}
+
+
+// What BeginTiling, EndTiling and BeginCommandBuffer compute after a mode change: whether
+// the device draws in a tiling-predicated mode (bit 0 of the flags byte).
+u32 TiledBit(Device d) {
+  const u8 mode = d.B(0x2ABC);
+  if ((mode & 0x08) || (mode & 0x04) || d.B(0x2F9B) != 0)
+    return 0;
+  return TilingBound(d) ? 1 : 0;
+}
+
+void SetTiledBit(Device d, u32 tiled) {
+  d.SetB(0x2ABC, u8((d.B(0x2ABC) & 0xFE) | tiled));
+}
+
+// A viewport restored from the 7 words at `saved` (the floats of the original viewport and
+// the last word in r10).
+void RestoreViewport(const GuestFrame& f, u32 dev, u32 saved) {
+  if (!sub_82222F20)
+    return;
+  PPCContext call = *f.ctx;
+  call.r1.u32 = f.sp;
+  call.r3.u32 = dev;
+  call.f1.f64 = std::bit_cast<float>(f.Get(saved));
+  call.f2.f64 = std::bit_cast<float>(f.Get(saved + 4));
+  call.f3.f64 = std::bit_cast<float>(f.Get(saved + 8));
+  call.f4.f64 = std::bit_cast<float>(f.Get(saved + 12));
+  call.f5.f64 = std::bit_cast<float>(f.Get(saved + 16));
+  call.f6.f64 = std::bit_cast<float>(f.Get(saved + 20));
+  call.r10.u32 = f.Get(saved + 24);
+  sub_82222F20(call, f.base);
+}
+
+// --- BeginTiling ----------------------------------------------------------------
+
+bool HaveBegin() {
+  return sub_82222F20 && sub_8220F610 && sub_8220F800 && sub_821F7C18 && sub_82287D38;
+}
+
+// D3DDevice_BeginTiling(device, flags, count, tile rects, clear colour [vector])
+bool BeginTiling(PPCContext& ctx, uint8_t* base) {
+  if (!HaveBegin())
+    return false;
+  GuestFrame f(ctx, base, 0xC0);
+  Device d = DeviceAt(base, ctx.r3.u32);
+  if (!d)
+    return false;
+  const u32 dev = d.va, count = ctx.r5.u32, rects = ctx.r6.u32, color = ctx.r7.u32;
+  const u32 clear_depth_bits = f.Get(0x82000D18);
+  const float clear_depth = std::bit_cast<float>(clear_depth_bits);
+
+  d.SetW(0x31CC, count);
+  u32 extent_x = 0, extent_y = 0;
+  for (u32 i = 0; i < count; ++i) {
+    const u32 x1 = f.Get(rects + 16 * i), y1 = f.Get(rects + 16 * i + 4);
+    const u32 x2 = f.Get(rects + 16 * i + 8), y2 = f.Get(rects + 16 * i + 12);
+    if (!(extent_x > x2))
+      extent_x = x2;
+    if (!(extent_y > y2))
+      extent_y = y2;
+    d.SetW(0x31D0 + 16 * i, x1);
+    d.SetW(0x31D4 + 16 * i, y1);
+    d.SetW(0x31D8 + 16 * i, x2);
+    d.SetW(0x31DC + 16 * i, y2);
+    d.SetW(0x32C0 + 8 * i, x1 & ~31u);
+    d.SetW(0x32C4 + 8 * i, y1 & ~31u);
+  }
+  d.SetW(0x337C, extent_x);
+  d.SetW(0x3380, extent_y);
+  d.SetW(0x3384, 0);
+
+  if (!(d.B(0x2ABF) & 0x20)) {
+    // One clear over a tile's worth of the target (the widest and tallest tile).
+    u32 tile_w = 0, tile_h = 0;
+    for (u32 i = 0; i < count; ++i) {
+      const u32 width = d.W(0x31D8 + 16 * i) - d.W(0x32C0 + 8 * i);
+      const u32 height = d.W(0x31DC + 16 * i) - d.W(0x32C4 + 8 * i);
+      if (!(tile_w > width))
+        tile_w = width;
+      if (!(tile_h > height))
+        tile_h = height;
+    }
+    f.Put(f.sp + 0x58, tile_w);
+    f.Put(f.sp + 0x5C, tile_h);
+    f.Put(f.sp + 0x50, 0);
+    f.Put(f.sp + 0x54, 0);
+    std::memcpy(f.G(f.sp + 0x70), f.G(dev + 0x3168), 0x1C);
+    for (u32 i = 0; i < 4; ++i)
+      f.Put(f.sp + 0x60 + 4 * i, d.W(0x3184 + 4 * i));
+    f.Call(sub_82222EA0, {dev, kViewportDefault});
+    f.Call(sub_82223178, {dev, kScissorDefault});
+    CallWithFloat(f, sub_822811A0, {dev, 0x3F, f.sp + 0x50, color, 0, 0}, clear_depth);
+    RestoreViewport(f, dev, f.sp + 0x70);
+    f.Call(sub_82223178, {dev, f.sp + 0x60});
+  }
+
+  if (color) {
+    std::memcpy(d.bytes + 0x3390, f.G(color), 16);
+  } else {
+    d.SetQ(0x3390, 0);
+    d.SetQ(0x3398, 0);
+  }
+  d.SetW(0x33A0, clear_depth_bits);
+  d.SetW(0x33A4, 0);
+  const u32 first = d.W(0x3098);
+  const u32 surface = first ? first : d.W(0x30A8);
+  d.SetB(0x2ABC, d.B(0x2ABC) | 0x20);
+  d.SetW(0x31B4, surface);
+  for (u32 i = 0; i < 5; ++i)
+    d.SetW(0x31B8 + 4 * i, d.W(0x3098 + 4 * i));
+  d.SetW(0x31B0, 2);
+  d.SetW(0x31AC, 0);
+  const u8 mode = d.B(0x2ABC);
+  const u32 tiled = (!(mode & 0x08) && !(mode & 0x04) && d.B(0x2F9B) == 0) ? 1u : 0u;
+  d.SetW(0x31A8, 0);
+  d.SetW(0x31A4, 0xFFFFFFFFu);
+  d.SetW(0x2AB4, 0);
+  d.SetW(0x2AB8, 0);
+  SetTiledBit(d, tiled);
+  f.Call(sub_8220F610, {dev});
+
+  u32 slot = d.W(0x3440);
+  if (slot + 4 > d.W(0x3444))
+    slot = f.Call(sub_8220F800, {dev + 0x3438});
+  f.Put(slot, 0x86000000u);
+  d.SetW(0x3440, slot + 4);
+  u32 ring = d.W(kRing);
+  if (ring > d.W(kRingGuarantee))
+    ring = Kick(f, dev);
+  f.Put(ring + 4, 0xC0004600u);
+  f.Put(ring + 8, 0x19);
+  ring += 8;
+  d.SetW(kRing, ring);
+  if (const u32 next = f.Call(sub_821F7C18, {dev, 0x46}))
+    d.SetW(kRing, next);
+  f.Call(sub_82222EA0, {dev, kViewportDefault});
+  f.Call(sub_82287D38, {dev, 1});
+  return true;
+}
+
+// --- EndTiling --------------------------------------------------------------------
+
+bool HaveEnd() {
+  return sub_8220F800 && sub_82210138 && sub_82287D38;
+}
+
+u32 TileGpu(u32 address) {
+  return address ? GuestGpu(address) - 0x40000000u : 0;
+}
+
+// HRESULT D3DDevice_EndTiling(device, flags, ?, destination texture, clear colour)
+bool EndTiling(PPCContext& ctx, uint8_t* base) {
+  if (!HaveEnd())
+    return false;
+  GuestFrame f(ctx, base, 0xD0);
+  Device d = DeviceAt(base, ctx.r3.u32);
+  if (!d)
+    return false;
+  const u32 dev = d.va, texture = ctx.r6.u32, color = ctx.r7.u32;
+  const float default_depth = std::bit_cast<float>(f.Get(0x82000D0C));
+  u32 callback_type = 0;
+
+  if (texture && d.W(0x31CC) > 0) {
+    for (u32 i = 0; i < d.W(0x31CC); ++i) {
+      const u32 tile = dev + 0x31D0 + 16 * i;
+      const u32 format = f.Get(d.W(0x31B4) + 0x24);
+      const u32 rect = f.sp + 0x70;
+      for (u32 k = 0; k < 4; ++k)
+        f.Put(rect + 4 * k, f.Get(tile + 4 * k));
+      if (f.Get(rect + 8) == (format >> 18) + 1)
+        f.Put(rect + 8, (f.Get(rect + 8) + 7) & ~7u);
+      if (f.Get(rect + 12) == ((format >> 3) & 0x7FFF) + 1)
+        f.Put(rect + 12, (f.Get(rect + 12) + 7) & ~7u);
+      f.Call(sub_8222AA18, {dev, 3u << (2 * i)});
+      f.Call(sub_822899D0, {dev, ((~u32(d.B(0x2ABF))) >> 4) & 2});
+      const bool last = !(i < d.W(0x31CC) - 1);
+      if (!last) {
+        f.Put(f.sp + 0x64, 0);
+        f.Put(f.sp + 0x5C, d.W(0x33A4));
+        CallWithFloat(f, sub_8222D6C8, {dev, 0x300, rect, texture, tile, 0, 0, dev + 0x3390},
+                      d.F(0x33A0));
+      } else {
+        f.Put(f.sp + 0x64, 0);
+        f.Put(f.sp + 0x5C, 0);
+        CallWithFloat(f, sub_8222D6C8, {dev, 0x300, rect, texture, tile, 0, 0, color}, default_depth);
+      }
+    }
+  }
+  f.Call(sub_8222AA18, {dev, 0});
+  f.Call(sub_822899D0, {dev, 2});
+  callback_type = 0x01000000u << d.W(0x2C38);
+  if (const u32 mask = d.W(0x3384) & 0x3F000000u)
+    callback_type = mask;
+
+  if (d.W(0x31CC) == 1) {
+    Kick(f, dev);
+  } else {
+    const u32 list = dev + 0x3438;
+    f.Call(sub_8222AA18, {dev, 0x80000000u});
+    const u32 context = TileGpu(d.W(0x3438));
+    f.Call(sub_821FB688, {dev, callback_type, 0x82662FE0, context});
+    f.Call(sub_8222AA18, {dev, 0});
+    Kick(f, dev);
+    u32 slot = f.Get(list + 8);
+    if (slot + 8 > f.Get(list + 0xC))
+      slot = f.Call(sub_8220F800, {list});
+    f.Put(slot + 4, 0x80000000u);
+    f.Put(slot, 0x88000000u);
+    d.SetW(0x3440, slot + 8);
+    slot = f.Get(list + 8);
+    if (slot + 0xC > f.Get(list + 0xC))
+      slot = f.Call(sub_8220F800, {list});
+    f.Put(slot, 0x89000000u);
+    f.Put(slot + 4, TileGpu(d.W(0x33C0)));
+    f.Put(slot + 8, TileGpu(d.W(0x3424)));
+    d.SetW(0x3440, slot + 0xC);
+  }
+  u32 slot = d.W(0x3440);
+  if (slot + 4 > d.W(0x3444))
+    slot = f.Call(sub_8220F800, {dev + 0x3438});
+  f.Put(slot, 0x87000000u);
+  const u8 flags3 = d.B(0x2ABF) & 0xCF;
+  const u8 flags = d.B(0x2ABC) & 0xDF;
+  d.SetW(0x3440, slot + 4);
+  d.SetW(0x31B4, 0);
+  d.SetW(0x31AC, 0);
+  d.SetB(0x2ABC, flags);
+  d.SetB(0x2ABF, flags3);
+  const u32 tiled = TiledBit(d);
+  d.SetW(0x31A8, 0);
+  d.SetW(0x31A4, 0xFFFFFFFFu);
+  d.SetW(0x2AB4, 0);
+  d.SetW(0x2AB8, 0);
+  SetTiledBit(d, tiled);
+  const u32 failed = f.Call(sub_82210138, {dev, d.W(0x31CC), callback_type});
+  f.Call(sub_82222EA0, {dev, kViewportDefault});
+  if (failed != 0) {
+    f.Call(sub_82287D38, {dev, 0});
+    ctx.r3.u64 = kOutOfMemoryHresult;
+  } else {
+    ctx.r3.u64 = 0;
+  }
+  return true;
+}
+
+// --- RunCommandBuffer -------------------------------------------------------------
+
+
+
+
+
+// --- AllocateEdramMemory ----------------------------------------------------------
+
+constexpr u32 kEdramGlobal = 0x82FA3C14;
+constexpr u32 kEdramAttributes = 0x64800000;
+
+u32 Cntlzw(u32 value) { return value ? u32(__builtin_clz(value)) : 32u; }
+
+// BOOL D3D::AllocateEdramMemory(tiles, u32* start out): first-fit-best search of a free run
+// of `tiles` bits in the allocator's bitmap (a set bit is a used tile), under its lock.
+bool AllocateEdramMemory(PPCContext& ctx, uint8_t* base) {
+  if (!sub_82265B90 || !sub_822399D8 || !sub_82D0832C || !sub_82D082DC || !sub_82D082EC ||
+      !sub_82661AF0)
+    return false;
+  GuestFrame f(ctx, base, 0x90);
+  const u32 want = ctx.r3.u32, out = ctx.r4.u32;
+  u32 object = f.Get(kEdramGlobal);
+  if (object == 0) {
+    object = f.Call(sub_82265B90, {0x324, kEdramAttributes});
+    if (!object) {
+      ctx.r3.u64 = 0;
+      return true;
+    }
+    f.Call(sub_82D0832C, {object});
+    f.Put(object + 0x1C, 0x1800);
+    f.Put(object + 0x320, 0x55555555);
+    u32 expected = 0;
+    u32 desired = __builtin_bswap32(object);
+    auto* global = reinterpret_cast<u32*>(f.G(kEdramGlobal));
+    if (!__atomic_compare_exchange_n(global, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+      f.Call(sub_822399D8, {object, kEdramAttributes});
+      object = f.Get(kEdramGlobal);
+    }
+  }
+  f.Call(sub_82D082DC, {object});
+  const u32 free_tiles = f.Get(object + 0x1C);
+  u32 result_start = 0xFFFFFFFFu;  // r27
+  if (!(want > free_tiles)) {
+    const u32 bitmap = object + 0x20, bitmap_end = object + 0x320;
+    u32 position = 0, best_start = 0, best_length = 0xFFFFFFFFu;
+    for (;;) {
+      u32 word_at = (((position >> 3) & 0x1FFFFFFC) + bitmap);
+      if (word_at == bitmap_end)
+        break;
+      u32 word = f.Get(word_at);
+      u32 free_from = (0xFFFFFFFFu >> (position & 31)) & ~word;
+      u32 first_free = Cntlzw(free_from);
+      if (first_free == 32) {
+        do {
+          word_at += 4;
+          word = f.Get(word_at);
+        } while (word == 0xFFFFFFFFu);
+        if (word_at == bitmap_end)
+          break;
+        first_free = Cntlzw(~word);
+      }
+      u32 used_after = Cntlzw((0xFFFFFFFFu >> first_free) & word);
+      u32 end_word = word_at;
+      if (used_after == 32) {
+        end_word = word_at + 4;
+        u32 next = f.Get(end_word);
+        while (next == 0) {
+          end_word += 4;
+          next = f.Get(end_word);
+        }
+        used_after = end_word == bitmap_end ? 0 : Cntlzw(f.Get(end_word));
+      }
+      const u32 start = (u32(i32(word_at - bitmap) >> 2) << 5) + first_free;
+      const u32 stop = u32(i32(end_word - bitmap) >> 2) << 5;
+      const u32 length = stop - start + used_after;
+      if (length == 0)
+        break;
+      if (!(length < want) && length < best_length) {
+        best_start = start;
+        best_length = length;
+      }
+      position = start + length;
+    }
+    if (best_length != 0xFFFFFFFFu) {
+      f.Put(object + 0x1C, free_tiles - want);
+      f.Call(sub_82661AF0, {object, best_start, best_start + want, 1});
+      result_start = best_start;
+    }
+  }
+  f.Call(sub_82D082EC, {object});
+  f.Put(out, result_start);
+  ctx.r3.u64 = result_start != 0xFFFFFFFFu ? 1 : 0;
+  return true;
+}
+
+}  // namespace
+
+void RegisterTiling() {
+  SetHandler(kD3DDevice_BeginTiling, BeginTiling);
+  SetHandler(kD3DDevice_EndTiling, EndTiling);
+}
+
+
+void RegisterEdram() {
+  SetHandler(kD3D_AllocateEdramMemory, AllocateEdramMemory);
+}
+
+}  // namespace renut::d3d::port

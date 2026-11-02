@@ -3,7 +3,7 @@
 //
 // One target, read live by every part that paces or presents:
 //   30        the game's own rate. Its presentation interval holds it to every
-//             second vertical blank, and the vblank clock (plume/gpu/host.cpp) is what
+//             second vertical blank, and the vblank clock (gpu/core/host.cpp) is what
 //             makes that steady.
 //   31..240   the game presents immediately (no wait for the vblank) and the
 //             command thread holds it to the target with a Pacer.
@@ -99,12 +99,7 @@ using Clock = std::chrono::steady_clock;
 
 // How much of a wait is spun instead of slept: the wake-up of a sleep has its own
 // jitter (the timer slack, the scheduler) that must not reach the frame.
-#if defined(_WIN32)
-// Sleeps there are only as fine as the system timer.
-inline constexpr std::chrono::microseconds kSpinTail{2000};
-#else
 inline constexpr std::chrono::microseconds kSpinTail{300};
-#endif
 
 // Blocks until `deadline`. The wait itself costs no CPU: a sleep to just short of
 // the deadline, then a spin for the last of it. Never returns early.

@@ -61,7 +61,6 @@ namespace renut::audio {
 namespace {
 
 constexpr uint32_t kFrameSamples = 256;       // per channel, per guest frame
-constexpr uint32_t kGuestChannels = 6;
 constexpr uint32_t kSampleRate = 48000;
 constexpr uint32_t kOutChannels = 2;
 constexpr uint32_t kRingFrames = 64;          // power of two, >= the SDK's 64 queued frames

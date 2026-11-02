@@ -30,7 +30,7 @@
 // shuffle mask was masked again each time. As constants the address is a
 // PC-relative load that is hoisted out of the function once, and the mask's
 // own `and` folds away. Copied from rex/ppc/intrinsics.h by CMake.
-#include "renut_vector_tables.inc"
+#include "renut_vector_tables.h"
 #define VectorMaskL renut_VectorMaskL
 #define VectorMaskR renut_VectorMaskR
 #define VectorShiftTableL renut_VectorShiftTableL

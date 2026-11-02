@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 get_filename_component(RENUT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-# The code reNut itself writes: src/, shared with the Windows build (windows/CMakeLists.txt).
+# The code reNut itself writes: src/.
 set(RENUT_SRC "${RENUT_ROOT}/src")
 set(RENUT_ANDROID "${RENUT_SRC}/platform")
 # The SDK is the git submodule thirdparty/rexglue-sdk (tag v0.10.0) exactly as
@@ -173,7 +173,7 @@ foreach(table VectorMaskL VectorMaskR VectorShiftTableL VectorShiftTableR)
     endif()
     string(APPEND RENUT_VECTOR_TABLES "alignas(16) static const uint8_t renut_${table}[] = {${CMAKE_MATCH_1}};\n")
 endforeach()
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/renut_vector_tables.inc" "${RENUT_VECTOR_TABLES}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/renut_vector_tables.h" "${RENUT_VECTOR_TABLES}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${REXGLUE_ROOT}/include/rex/ppc/intrinsics.h")
 target_include_directories(renut_guest PRIVATE "${RENUT_SRC}" "${CMAKE_CURRENT_BINARY_DIR}")
 # The generated header, then the AArch64 forms of the SSE intrinsics the game
@@ -187,16 +187,15 @@ set_source_files_properties("${RENUT_SRC}/plume/shader_cache_blob.S" PROPERTIES
     COMPILE_OPTIONS "-DRENUT_SHADER_BLOB=\"${RENUT_SHADERS}/shader_spirv.smolv\""
     OBJECT_DEPENDS "${RENUT_SHADERS}/shader_spirv.smolv")
 set(RENUT_RUNTIME_SOURCES
-    # Shared with the Windows build
     guest/game_fixes.cpp guest/frame_fixes.cpp guest/cheats.cpp guest/kernel_overrides.cpp guest/host_support.cpp
-    d3d/d3d_layer.cpp d3d/plume_d3d.cpp
-    d3d/native/lists.cpp d3d/native/flush.cpp d3d/native/draws.cpp d3d/native/commands.cpp d3d/native/sync.cpp d3d/native/entry.cpp d3d/native/report.cpp
+    d3d/hooks/layer.cpp d3d/hooks/plume_d3d.cpp d3d/device/state.cpp d3d/device/bound.cpp d3d/device/getters.cpp d3d/sync/fence.cpp d3d/resources/resource.cpp d3d/resources/shader.cpp d3d/resources/microcode.cpp d3d/device/misc.cpp d3d/scene/frame.cpp d3d/scene/swap.cpp d3d/scene/tiling.cpp d3d/device/leaves.cpp d3d/device/lists.cpp d3d/hooks/handlers.cpp
+    d3d/frontend/lists.cpp d3d/frontend/flush.cpp d3d/frontend/draws.cpp d3d/frontend/commands.cpp d3d/frontend/sync.cpp d3d/frontend/entry.cpp d3d/frontend/report.cpp
     plume/plume_renderer.cpp plume/hiz_model.cpp
-    plume/gpu/context.cpp plume/gpu/draw.cpp plume/gpu/draw_util.cpp plume/gpu/xenos/interpreter.cpp plume/gpu/xenos/register_file.cpp plume/gpu/xenos/registers.cpp plume/gpu/xenos/shader.cpp plume/gpu/xenos/translator.cpp plume/gpu/xenos/translator_disasm.cpp plume/gpu/xenos/ucode.cpp plume/gpu/hiz.cpp plume/gpu/census.cpp plume/gpu/host.cpp
-    plume/gpu/native_exec.cpp plume/gpu/options.cpp plume/gpu/patches.cpp plume/gpu/pipeline_cache.cpp
-    plume/gpu/profiling.cpp plume/gpu/recorder.cpp plume/gpu/report.cpp plume/gpu/resolve.cpp
-    plume/gpu/shaders.cpp plume/gpu/streams.cpp plume/gpu/support.cpp plume/gpu/swap.cpp
-    plume/gpu/targets.cpp plume/gpu/textures.cpp plume/plume_textures.cpp plume/shader_cache_blob.S
+    gpu/core/context.cpp plume/shaders/depth_stencil_pack.comp.cpp plume/shaders/patch_expand.comp.cpp plume/shaders/patch_levels.comp.cpp plume/shaders/point_list.geom.cpp plume/shaders/rect_list.geom.cpp gpu/draw/draw.cpp gpu/draw/draw_util.cpp gpu/xenos/interpreter.cpp gpu/xenos/register_file.cpp gpu/xenos/registers.cpp gpu/xenos/shader.cpp gpu/xenos/translator.cpp gpu/xenos/translator_disasm.cpp gpu/xenos/ucode.cpp gpu/draw/hiz.cpp gpu/debug/census.cpp gpu/core/host.cpp
+    gpu/exec/native_exec.cpp gpu/core/options.cpp gpu/draw/patches.cpp gpu/draw/pipeline_cache.cpp
+    gpu/debug/profiling.cpp gpu/exec/recorder.cpp gpu/debug/report.cpp gpu/targets/resolve.cpp
+    gpu/draw/shaders.cpp gpu/draw/streams.cpp gpu/core/support.cpp gpu/targets/swap.cpp
+    gpu/targets/targets.cpp gpu/targets/textures.cpp plume/plume_textures.cpp plume/shader_cache_blob.S
     vendor/smolv/smolv.cpp
     # Android only
     platform/runtime_jni.cpp platform/achievements_bridge.cpp

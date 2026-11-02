@@ -1,6 +1,6 @@
 // Text entry: when the game asks for the Xbox keyboard (XamShowKeyboardUI, for instance to
 // name a blueprint), renut_imp_XamShowKeyboardUI (below, in place of the SDK's export: see
-// kernel_overrides.inc) copies the request out of guest memory and has the kernel's dispatch
+// kernel_overrides.h) copies the request out of guest memory and has the kernel's dispatch
 // thread run TextInputHandler. It hands the request to RuntimeActivity.requestTextInput, which
 // shows a text box over the game, and waits until nativeTextInputResult brings the player's
 // answer back. With no text box (no activity yet) the SDK's own export answers.

@@ -691,7 +691,7 @@ def stage_shaders(args):
         return
     target = GENERATED / "shaders"
     target.mkdir(parents=True, exist_ok=True)
-    for name in ("shader_cache.cpp", "shader_common.h", "shader_spirv.smolv", "shader_ucode_map.inc"):
+    for name in ("shader_cache.cpp", "shader_common.h", "shader_spirv.smolv", "shader_ucode_map.h"):
         if not (out / name).is_file():
             fail("a recompilação não produziu %s." % name)
         shutil.copyfile(out / name, target / name)

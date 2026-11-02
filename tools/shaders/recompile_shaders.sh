@@ -7,7 +7,7 @@
 #
 # <input dir> holds files with complete shader containers (header followed by
 # microcode): the decrypted xex.bin and the runtime capture (files/shader-dump
-# on the device, written by src/d3d/d3d_layer.cpp), and the output of
+# on the device, written by src/d3d/hooks/layer.cpp), and the output of
 # tools/shaders/extract_caff_shaders.py. Do not point it at the game data
 # itself - the CAFF bundles keep a shader's header apart from its microcode,
 # and XenosRecomp would turn whatever bytes follow each header into a shader
@@ -70,10 +70,10 @@ rm -f "$OUT_DIR/shader_cache.h"
 #                         compressed blob - the decompressed smol-v blob is
 #                         embedded with .incbin instead (no zstd on device)
 #   shader_spirv.smolv    that blob
-#   shader_ucode_map.inc  microcode hash -> container hash, for the command
+#   shader_ucode_map.h  microcode hash -> container hash, for the command
 #                         processor, which only ever sees the microcode
 grep -v -e "^const uint8_t g_compressedSpirvCache" -e "g_spirvCacheCompressedSize" \
     -e "g_spirvCacheDecompressedSize" "$OUT_DIR/shader_cache.cpp" > "$OUT_DIR/shader_cache.tmp"
 mv "$OUT_DIR/shader_cache.tmp" "$OUT_DIR/shader_cache.cpp"
 clang++ -std=c++17 -O2 -Ithirdparty/xxHash -I"$HERE/../../src/plume" "$HERE/ucode_map.cpp" thirdparty/xxHash/xxhash.c -o "$OUT_DIR/ucode_map"
-"$OUT_DIR/ucode_map" "$INPUT" > "$OUT_DIR/shader_ucode_map.inc"
+"$OUT_DIR/ucode_map" "$INPUT" > "$OUT_DIR/shader_ucode_map.h"

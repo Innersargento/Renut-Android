@@ -16,10 +16,10 @@
 #include <atomic>
 #include <android/native_window_jni.h>
 #include <rex/graphics/xenos.h>
-#include "d3d/native_d3d.h"
+#include "d3d/frontend/native_d3d.h"
 #include "android_game_window.h"
 #include "touch_input.h"
-#include "d3d/d3d_layer.h"
+#include "d3d/hooks/layer.h"
 #include "plume/plume_renderer.h"
 #include "plume/plume_gpu.h"
 #include "plume/frame_pacing.h"
@@ -108,7 +108,6 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeS
 // stops at its next present, and its clock crawls so that coming back is not a
 // jump of minutes for the physics.
 extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeBackground(JNIEnv*,jclass) {
-  renut::d3d::SetBackground(true);
   renut::adpf::SetActive(false);
   if(auto* plume=renut::PlumeRenderer::Get())plume->PauseForBackground();
   rex::chrono::Clock::set_guest_time_scalar(0.02);
@@ -130,7 +129,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nat
   ANativeWindow_release(window);
   if(attached){
     rex::chrono::Clock::set_guest_time_scalar(1.0);
-    renut::d3d::SetBackground(false);
     renut::adpf::SetActive(!pause_wanted.load());
   }
   return attached?JNI_TRUE:JNI_FALSE;
@@ -145,7 +143,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nat
   renut::adpf::SetActive(!paused);
   renut::SetTitlePaused(paused);
   plume->SetPaused(paused);
-  renut::d3d::SetBackground(paused);
   rex::chrono::Clock::set_guest_time_scalar(paused?0.02:1.0);
   std::thread(ApplyAudioPause).detach();
   return JNI_TRUE;

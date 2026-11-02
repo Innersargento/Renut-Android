@@ -24,7 +24,7 @@
 #include "touch_input.h"
 
 #define X(name) extern "C" void __imp__##name(PPCContext& __restrict ctx, uint8_t* base);
-#include "guest/kernel_overrides.inc"
+#include "guest/kernel_overrides.h"
 #undef X
 
 using rex::X_RESULT;

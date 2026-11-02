@@ -20,7 +20,7 @@
 #include <rex/ppc/func.h>
 #include <rex/hook.h>
 
-#include "d3d/native_d3d.h"
+#include "d3d/frontend/native_d3d.h"
 #include "plume/frame_pacing.h"
 #include "plume/plume_gpu.h"
 
@@ -70,7 +70,7 @@ void ForceSceneSinglePass(uint8_t* base) {
 // immediate mode; preserve the original routine's device bookkeeping. Anything
 // but the game's own 30 FPS asks for the immediate one here, as before the
 // frame-rate slider; a target that changes later is also applied per frame at the
-// swap's synchronization point (d3d/native/sync.cpp SynchronizeToPresentationInterval).
+// swap's synchronization point (d3d/frontend/sync.cpp SynchronizeToPresentationInterval).
 // What the game ends up with is noted, so that the command thread paces the frames
 // itself whenever the vblank does not (frame_pacing.h VblankPaces).
 extern "C" void __imp__rex_setParamInterval(PPCContext& __restrict, uint8_t*);
@@ -131,7 +131,7 @@ REX_HOOK_RAW(sub_82535F20) {
 // pipelines exist, as UnleashedRecomp holds its loading screen
 // (CGameModeStage::ExitLoading) until its compiles finish, so a scene is never
 // drawn without them. The request only moves the scene's pipelines to the front
-// of the queue (plume/gpu/host.cpp: PlumeSceneRequested); the hold is further down,
+// of the queue (gpu/core/host.cpp: PlumeSceneRequested); the hold is further down,
 // where the loaded scene would start.
 //
 // sub_822BC0D8 replaces the running scene: it saves, pops the scene stack and
@@ -395,7 +395,7 @@ REX_HOOK_RAW(sub_8265AB70) {
 // shader runs as its binding 0 holds it - the microcode Plume sees.
 namespace {
 
-// Direct3D's view of physical memory (d3d/native/internal.h's Phys).
+// Direct3D's view of physical memory (d3d/frontend/internal.h's Phys).
 uint32_t Physical(uint32_t address) { return (address & 0x1FFFFFFF) + (((address >> 20) + 0x200) & 0x1000); }
 
 }  // namespace
@@ -474,7 +474,7 @@ REX_HOOK_RAW(sub_82B673D0) {
     const auto& [vs, ps, alpha] = shaders;
     renut::PlumeShaderPair pair;
     pair.passes = passes;
-    // Vertex shader binding 0, and the pixel shader's microcode (d3d/native/flush.cpp).
+    // Vertex shader binding 0, and the pixel shader's microcode (d3d/frontend/flush.cpp).
     const uint32_t vs_info = GuestWord(base, vs + 112 * 8) + vs;
     pair.vs_address = Physical(GuestWord(base, vs_info + 872) + GuestWord(base, vs + 32));
     pair.vs_dwords = GuestWord(base, vs_info + 876) >> 2;

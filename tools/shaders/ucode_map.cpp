@@ -15,7 +15,7 @@
 // key up first, and a stand-in captured with the exact bind-time swizzle would otherwise win over the real
 // container that the loose key finds (that took the bloom pass's vertex shader away).
 //
-//   ucode_map <input dir> > shader_ucode_map.inc
+//   ucode_map <input dir> > shader_ucode_map.h
 #include <xxhash.h>
 
 #include "xenos_ucode_key.h"

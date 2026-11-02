@@ -20,11 +20,11 @@ final class RuntimeOptions {
         "renut_cheat_extended_build_range", "renut_cheat_super_punch"};
     static final String CHEAT_SKIN = "renut_cheat_banjo_skin";
     static final String[] SKINS = {"default", "robot", "tuxedo"};
-    /** 0 full, 1 half, 2 quarter: how far the world's textures are reduced (plume/gpu). */
+    /** 0 full, 1 half, 2 quarter: how far the world's textures are reduced (gpu). */
     static final String TEXTURE_QUALITY = "renut_plume_texture_quality";
-    /** 0 full, 1 medium, 2 low: how many small shadow casters are left out (plume/gpu). */
+    /** 0 full, 1 medium, 2 low: how many small shadow casters are left out (gpu). */
     static final String SHADOW_QUALITY = "renut_plume_shadow_quality";
-    /** 0 full, 1 three quarters, 2 half: the resolution the scene is drawn at (plume/gpu). */
+    /** 0 full, 1 three quarters, 2 half: the resolution the scene is drawn at (gpu). */
     static final String INTERNAL_RESOLUTION = "renut_plume_internal_resolution";
 
     /**

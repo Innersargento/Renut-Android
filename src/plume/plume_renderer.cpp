@@ -19,23 +19,17 @@
 #include <system_error>
 #include <vector>
 
-#if defined(_WIN32)
-#include <windows.h>
-#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
-#if defined(__ANDROID__)
 // The session's own Vulkan loader (the bundled driver), opened by android_vulkan_loader.cpp.
 void* renutXenosVulkanSymbol(const char* name);
 void renutSetPlumeVulkanEntry(PFN_vkGetInstanceProcAddr entry);
-#endif
 
 REXCVAR_DEFINE_BOOL(renut_plume_vsync, true, "reNut/Plume",
                     "Present through the display's vertical sync (FIFO). Off asks for immediate "
@@ -46,16 +40,10 @@ using namespace plume;
 
 namespace {
 // The platform window as Plume's swapchain wants it, and the reference the
-// renderer keeps on it (the Android surface is reference counted; an HWND is not).
-#if defined(__ANDROID__)
+// renderer keeps on it (the Android surface is reference counted).
 RenderWindow ToRenderWindow(PlumeWindow* window) { return window; }
 void AcquireWindow(PlumeWindow* window) { ANativeWindow_acquire(window); }
 void ReleaseWindow(PlumeWindow* window) { ANativeWindow_release(window); }
-#else
-RenderWindow ToRenderWindow(PlumeWindow* window) { return reinterpret_cast<RenderWindow>(window); }
-void AcquireWindow(PlumeWindow*) {}
-void ReleaseWindow(PlumeWindow*) {}
-#endif
 }  // namespace
 
 namespace {
@@ -197,24 +185,6 @@ VkPipelineCache LoadCacheFile(VkDevice device, const std::string& path, size_t* 
   *bytes = 0;
   void* data = nullptr;
   size_t size = 0;
-#if defined(_WIN32)
-  // No mapping here: the file is read into memory.
-  std::vector<uint8_t> contents;
-  if (!path.empty()) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (file) {
-      const auto length = file.tellg();
-      if (length > 0) {
-        contents.resize(size_t(length));
-        file.seekg(0);
-        if (file.read(reinterpret_cast<char*>(contents.data()), std::streamsize(length))) {
-          data = contents.data();
-          size = contents.size();
-        }
-      }
-    }
-  }
-#else
   const int fd = path.empty() ? -1 : open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
     struct stat st {};
@@ -228,7 +198,6 @@ VkPipelineCache LoadCacheFile(VkDevice device, const std::string& path, size_t* 
     }
     close(fd);
   }
-#endif
   VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
   info.initialDataSize = size;
   info.pInitialData = data;
@@ -238,9 +207,7 @@ VkPipelineCache LoadCacheFile(VkDevice device, const std::string& path, size_t* 
   } else {
     cache = CreateEmptyCache(device);
   }
-#if !defined(_WIN32)
   if (data) munmap(data, size);
-#endif
   return cache;
 }
 
@@ -255,23 +222,6 @@ bool WriteCacheFile(VkDevice device, VkPipelineCache cache, const std::string& p
   // Room for what other threads add between the two calls.
   const size_t room = size + size / 16 + (size_t(1) << 20);
   const std::string temporary = path + ".tmp";
-#if defined(_WIN32)
-  std::vector<uint8_t> data(room);
-  size = room;
-  if (vkGetPipelineCacheData(device, cache, &size, data.data()) != VK_SUCCESS) return false;
-  {
-    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-    if (!file.write(reinterpret_cast<const char*>(data.data()), std::streamsize(size))) return false;
-  }
-  std::error_code error;
-  std::filesystem::rename(temporary, path, error);
-  if (error) {
-    std::filesystem::remove(temporary, error);
-    return false;
-  }
-  if (written) *written = size;
-  return true;
-#else
   const int fd = open(temporary.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   if (fd < 0) return false;
   bool ok = false;
@@ -298,7 +248,6 @@ bool WriteCacheFile(VkDevice device, VkPipelineCache cache, const std::string& p
     *written = size;
   }
   return ok;
-#endif
 }
 
 // Called with `mutex` held, before anything else can use the caches.
@@ -438,12 +387,7 @@ PlumeRenderer::PlumeRenderer() : state_(std::make_unique<State>()) {}
 PlumeRenderer::~PlumeRenderer() = default;
 
 bool PlumeRenderer::IsAvailable() {
-#if defined(__ANDROID__)
   return renutXenosVulkanSymbol("vkGetInstanceProcAddr") != nullptr;
-#else
-  HMODULE loader = LoadLibraryA("vulkan-1.dll");
-  return loader && GetProcAddress(loader, "vkGetInstanceProcAddr");
-#endif
 }
 
 bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
@@ -456,12 +400,10 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     return false;
   }
   try {
-#if defined(__ANDROID__)
     auto entry = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
         renutXenosVulkanSymbol("vkGetInstanceProcAddr"));
     Require(entry, "Plume: carregador Vulkan da sessão indisponível.");
     renutSetPlumeVulkanEntry(entry);
-#endif
     std::unique_ptr<PlumeRenderer> renderer(new PlumeRenderer());
     auto& s = *renderer->state_;
     s.window = window;
@@ -480,18 +422,10 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     // The Android surface reports RGBA8 on the tested devices; fall back to BGRA8.
     auto* device = static_cast<VulkanDevice*>(s.device.get());
     VkSurfaceKHR surface = VK_NULL_HANDLE;
-#if defined(__ANDROID__)
     VkAndroidSurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
     info.window = window;
     Require(vkCreateAndroidSurfaceKHR(s.api->instance, &info, nullptr, &surface) == VK_SUCCESS,
             "Plume: superfície indisponível.");
-#else
-    VkWin32SurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-    info.hinstance = GetModuleHandleW(nullptr);
-    info.hwnd = reinterpret_cast<HWND>(window);
-    Require(vkCreateWin32SurfaceKHR(s.api->instance, &info, nullptr, &surface) == VK_SUCCESS,
-            "Plume: superfície indisponível.");
-#endif
     uint32_t count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(device->physicalDevice, surface, &count, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(count);
