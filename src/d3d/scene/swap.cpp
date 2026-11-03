@@ -17,7 +17,13 @@
 #include "d3d/device/guest_frame.h"
 #include "d3d/device/retail.h"
 
+#include <rex/cvar.h>
 #include <rex/ppc/context.h>
+
+REXCVAR_DEFINE_BOOL(renut_native_swap, true, "reNut",
+                    "D3DDevice_Swap natively (d3d/scene/swap.cpp): the swap's bookkeeping and the history "
+                    "slots are done here, and the packets the original queues into the ring are left out. "
+                    "Off: the recompiled function");
 
 extern "C" {
 REX_FUNC(sub_82210AB0);  // CDevice::KickOff
@@ -26,16 +32,19 @@ REX_FUNC(sub_8265F688);  // D3DDevice_SetScalerParameters
 REX_FUNC(sub_822873E8);  // CDevice::StartNewSegment
 REX_FUNC(sub_8228F558);  // CDevice::BlockOnFence
 REX_FUNC(sub_8264DCD0);  // D3D_CBlocker_Check
-__attribute__((weak)) void sub_82D0827C(PPCContext& __restrict, uint8_t*);  // the device type
 __attribute__((weak)) void sub_821EF4E8(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82D0820C(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82D0821C(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82D08B2C(PPCContext& __restrict, uint8_t*);  // the video mode
-__attribute__((weak)) void sub_82D08B6C(PPCContext& __restrict, uint8_t*);  // query the video mode
 __attribute__((weak)) void sub_821ED560(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82D08A6C(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82D088EC(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82287D38(PPCContext& __restrict, uint8_t*);
+// The kernel imports the original calls. 0x82D0827C, 0x82D0820C, 0x82D0821C, 0x82D08B2C,
+// 0x82D08B6C, 0x82D08A6C and 0x82D088EC are their import thunks in the title, not functions of the
+// recompiled code: they are the exports themselves here (the port used to name the thunk addresses,
+// found no function there and so never ran). VdSwap is reNut's own (guest/kernel_overrides.cpp), the
+// one the recompiled code reaches; the process type and the system command buffer are done below.
+void renut_imp_VdSwap(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void __imp__VdSetDisplayMode(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void __imp__VdGetCurrentDisplayInformation(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void __imp__VdPersistDisplay(PPCContext& __restrict, uint8_t*);
+__attribute__((weak)) void __imp__MmFreePhysicalMemory(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_8264DC08(PPCContext& __restrict, uint8_t*);  // CBlocker cleanup
 }
 
@@ -59,15 +68,30 @@ u32 InsertMasked(u32 target, u32 source, u32 rotate, u32 mask) {
 }
 
 bool HaveAll() {
-  return sub_82D0827C && sub_821EF4E8 && sub_82D0820C && sub_82D0821C &&
-         sub_82D08B2C && sub_82D08B6C && sub_821ED560 &&
-         sub_82D08A6C && sub_82D088EC && sub_82287D38 &&
-         sub_8264DC08;
+  return sub_821EF4E8 && __imp__VdSetDisplayMode && __imp__VdGetCurrentDisplayInformation && sub_821ED560 &&
+         __imp__VdPersistDisplay && __imp__MmFreePhysicalMemory && sub_82287D38 && sub_8264DC08;
+}
+
+// KeGetCurrentProcessType, as the kernel answers it for the calling thread: the type its DPC set while
+// one is running (the PCR, r13, holds the processor block at +0x100: dpc_active at +0x50, the type in
+// the DPC at PCR + 0xC), otherwise the current thread's (processor block +0, type at thread + 0x73).
+// 2 is the system process, whose devices have no hardware.
+u32 ProcessType(const GuestFrame& f, u32 pcr) {
+  if (f.Get(pcr + 0x150)) return *f.G(pcr + 0xC);
+  return *f.G(f.Get(pcr + 0x100) + 0x73);
+}
+
+// VdGetSystemCommandBuffer(buffer, id), which only fills what the swap hands VdSwap along: 0x94 zero
+// bytes with 0xBEEF0000 first, and 0xBEEF0001 in *id.
+void SystemCommandBuffer(const GuestFrame& f, u32 buffer, u32 id) {
+  std::memset(f.G(buffer), 0, 0x94);
+  f.Put(buffer, 0xBEEF0000u);
+  f.Put(id, 0xBEEF0001u);
 }
 
 // D3DDevice_Swap(device, front buffer, scaler parameters)
 bool Swap(PPCContext& ctx, uint8_t* base) {
-  if (!HaveAll())
+  if (!REXCVAR_GET(renut_native_swap) || !HaveAll())
     return false;
   Frame f(ctx, base, 0x230);
   Device d = DeviceAt(base, ctx.r3.u32);
@@ -75,7 +99,7 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
     return false;
   const u32 front = ctx.r4.u32, parameters = ctx.r5.u32;
   const u32 dev = d.va;
-  const bool hardware = f.Call(sub_82D0827C) != 2;  // r22
+  const bool hardware = ProcessType(f, ctx.r13.u32) != 2;  // r22
 
   d.SetW(0x40B0, d.W(0x40B0) + 1);
   std::memcpy(f.G(f.sp + 0xA0), f.G(front + 0x1C), 0x18);
@@ -131,7 +155,7 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
     f.Call(sub_821EF4E8, {dev, front});
   }
 
-  f.Call(sub_82D0820C, {f.sp + 0xD0, f.sp + 0x74});
+  SystemCommandBuffer(f, f.sp + 0xD0, f.sp + 0x74);
   if (d.W(0x541C)) {
     f.Put(d.W(0x2A90) + 8, f.Get(f.sp + 0x74));
   } else {
@@ -142,7 +166,7 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
     const u32 buffer = sink ? sink : d.W(0x30);
     f.Put(f.sp + 0x54, f.sp + 0x60);
     f.Put(f.sp + 0x5C, f.sp + 0x64);
-    f.Call(sub_82D0821C, {buffer + 4, f.sp + 0xA0, d.W(0x2A90) + 8, f.sp + 0xD0, f.Get(f.sp + 0x74),
+    f.Call(renut_imp_VdSwap, {buffer + 4, f.sp + 0xA0, d.W(0x2A90) + 8, f.sp + 0xD0, f.Get(f.sp + 0x74),
                           f.sp + 0x70, f.sp + 0x6C, f.sp + 0x68});
   }
   d.SetW(0x5B34, f.Get(f.sp + 0xD4));
@@ -165,9 +189,9 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
         if (height == 0x1E0 || height == 0x240)
           mode |= 2;
       }
-      f.Call(sub_82D08B2C, {mode});
+      f.Call(__imp__VdSetDisplayMode, {mode});
     }
-    f.Call(sub_82D08B6C, {f.sp + 0x170});
+    f.Call(__imp__VdGetCurrentDisplayInformation, {f.sp + 0x170});
     d.SetW(0x5428, LoadBE16(f.G(f.sp + 0x1B8)));
     d.SetW(0x542C, LoadBE16(f.G(f.sp + 0x1BA)));
     d.SetW(0x5430, LoadBE16(f.G(f.sp + 0x1C6)));
@@ -239,8 +263,8 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
   if ((changes & 8) && hardware) {
     // (The original queues a register write here; the display mode is the kernel's.)
     std::memset(f.G(f.sp + 0xB8), 0, 12);
-    if (f.Call(sub_82D08A6C, {f.sp + 0xB8, f.sp + 0x80}))
-      f.Call(sub_82D088EC, {1, f.Get(f.sp + 0x80)});
+    if (f.Call(__imp__VdPersistDisplay, {f.sp + 0xB8, f.sp + 0x80}))
+      f.Call(__imp__MmFreePhysicalMemory, {1, f.Get(f.sp + 0x80)});
   }
 
   const u32 fence = d.W(0x2A9C);  // r30
