@@ -63,6 +63,13 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       return RingAllocate(ctx, base);
     case kD3D_ReserveRing:
       return ReserveRing(ctx, base);
+    case kD3D_InvalidateRange:
+      return InvalidateRange(ctx, base);
+    case kD3D_CacheFlush:
+      // D3D::CacheFlush(address, size) (sub_8220F508): dcbf over the range, then a sync. The host's
+      // caches are coherent, so only the barrier is kept, for what the CPU wrote before the GPU reads it.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      return true;
     case kD3D_CDevice_BeginRingManual:
       return BeginRingManual(ctx, base);
     case kD3D_CDevice_StartNewSegment:

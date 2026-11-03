@@ -52,7 +52,6 @@ extern "C" {
 REX_FUNC(sub_82223270);  // D3D::SetSurfaceClip (hooked: the front end records the clip)
 __attribute__((weak)) void sub_82658818(PPCContext& __restrict, uint8_t*);  // the one-pass Z pass set-up
 __attribute__((weak)) void sub_8264E1A8(PPCContext& __restrict, uint8_t*);  // unbinds the targets, shaders, streams
-__attribute__((weak)) void sub_82657160(PPCContext& __restrict, uint8_t*);  // the device writes nowhere
 }
 
 namespace renut::d3d::port {
@@ -106,7 +105,7 @@ u32 EmptyCallList() {
 
 bool Enabled() {
   return REXCVAR_GET(renut_native_command_buffers) && REXCVAR_GET(renut_stub_command_buffers) &&
-         sub_82658818 && sub_8264E1A8 && sub_82657160 && EmptyCallList();
+         sub_82658818 && sub_8264E1A8 && EmptyCallList();
 }
 
 // sub_82223270's arguments: a signed 16-bit field of the window scissor words.
@@ -282,8 +281,10 @@ bool EndCommandBuffer(PPCContext& ctx, uint8_t* base) {
   g.SetW(buffer + kBufferCallList, EmptyCallList());
   const bool out_of_memory = (d.B(off::Flags1) & 0x20) != 0;
   g.SetW(buffer + kBufferFlags, Insert(g.W(buffer + kBufferFlags), out_of_memory ? 7 : 1, 0, 4));
-  // The device writes nowhere until the next Begin.
-  f.Call(sub_82657160, {dev});
+  // CDevice::MarkAsOutOfMemory (sub_82657160), stubbed as reNut's End does: the original points the
+  // ring at the device's side buffer so nothing is written until the next Begin; the ring is the sink
+  // here (rewound above), so only the flag is left, which Begin clears.
+  d.SetB(off::Flags1, d.B(off::Flags1) | 0x20);
   ctx.r3.u64 = out_of_memory ? kOutOfMemoryHresult : 0;
   return true;
 }

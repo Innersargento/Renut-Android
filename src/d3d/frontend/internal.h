@@ -560,6 +560,7 @@ bool BeginRingAlloc(PPCContext& ctx, uint8_t* base);
 bool RingAllocate(PPCContext& ctx, uint8_t* base);
 bool StartNewSegment(PPCContext& ctx, uint8_t* base);
 bool ReserveRing(PPCContext& ctx, uint8_t* base);
+bool InvalidateRange(PPCContext& ctx, uint8_t* base);
 bool BeginRingManual(PPCContext& ctx, uint8_t* base);
 // CDevice::KickOff (sub_82210AB0) and KickOffSegment (sub_822106C8): publish the list, issue
 // the fence and point the device's ring at a scratch block nothing reads. KickOff returns the ring.

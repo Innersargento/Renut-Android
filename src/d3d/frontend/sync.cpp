@@ -224,6 +224,16 @@ bool ReserveRing(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// D3D::InvalidateRange(device, address, size) (sub_8226BA20): the original kicks when the ring is past
+// its guarantee and writes an invalidate packet there (eleven dwords). Nothing reads the ring, so it
+// writes none and the ring stays where it is; the result is the ring pointer, as the original's.
+bool InvalidateRange(PPCContext& ctx, uint8_t* base) {
+  const uint32_t dev = ctx.r3.u32;
+  if (KeepsOriginal(base, dev)) return false;
+  ctx.r3.u64 = U32(base, dev + kRingWrite);
+  return true;
+}
+
 // CDevice::BeginRingManual(device) (sub_82A11158): the ring pointer, nothing reserved.
 bool BeginRingManual(PPCContext& ctx, uint8_t* base) {
   ctx.r3.u64 = U32(base, ctx.r3.u32 + kRingWrite);
