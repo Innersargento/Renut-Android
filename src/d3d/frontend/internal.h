@@ -525,6 +525,9 @@ void SetCommandBufferPredication(PPCContext& ctx);
 // window scissor, written straight into the ring (0x2080-0x2082), never
 // kept in the device.
 void SetSurfaceClip(PPCContext& ctx, uint8_t* base);
+// Whether the original SetSurfaceClip, which only writes its clip packets into the ring and kicks it when
+// full, can be skipped once the front end has recorded the clip (sync.cpp).
+bool SkipSurfaceClip(PPCContext& ctx, uint8_t* base);
 
 void Swap(PPCContext& ctx);
 

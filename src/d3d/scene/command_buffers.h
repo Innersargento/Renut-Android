@@ -4,5 +4,8 @@
 namespace renut::d3d::port {
 
 void RegisterCommandBuffers();
+// Whether Begin, End and Run are the native ones: no segment is chained into a buffer, so the ring
+// writes of a recording device are not read by anything.
+bool NativeCommandBuffers();
 
 }  // namespace renut::d3d::port

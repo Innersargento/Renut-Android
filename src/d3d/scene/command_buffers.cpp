@@ -323,6 +323,8 @@ bool RunCommandBuffer(PPCContext& ctx, uint8_t* base) {
 
 }  // namespace
 
+bool NativeCommandBuffers() { return Enabled(); }
+
 void RegisterCommandBuffers() {
   SetHandler(kD3DDevice_BeginCommandBuffer, BeginCommandBuffer);
   SetHandler(kD3DDevice_EndCommandBuffer, EndCommandBuffer);

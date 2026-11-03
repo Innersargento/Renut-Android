@@ -47,7 +47,7 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       return false;
     case kD3D_SetSurfaceClip:
       SetSurfaceClip(ctx, base);
-      return false;
+      return SkipSurfaceClip(ctx, base);
     case kD3DDevice_Swap:
       Swap(ctx);
       return false;

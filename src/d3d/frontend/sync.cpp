@@ -1,5 +1,6 @@
 // What the GPU writes back for the CPU: fences, callbacks, the swap's wait.
 #include "d3d/frontend/internal.h"
+#include "d3d/scene/command_buffers.h"
 #include "guest/host_support.h"
 
 #if defined(__linux__)
@@ -232,6 +233,19 @@ bool InvalidateRange(PPCContext& ctx, uint8_t* base) {
   if (KeepsOriginal(base, dev)) return false;
   ctx.r3.u64 = U32(base, dev + kRingWrite);
   return true;
+}
+
+// D3D::SetSurfaceClip(device, x1, y1, x2, y2) (sub_82223270) writes the window scissor and the per-tile clip
+// packets into the ring, and kicks it first when it is past its guarantee: nothing else (it changes
+// the device only through the ring pointer), and the front end has recorded the clip itself. reNut on PC
+// hooks it to nothing. What kept this from being skipped before was a device recording a command buffer
+// with the original Begin/End/Run: its ring writes chained segments that Run walked (the loading
+// screens hung on a null segment). With the native command buffers nothing chains, so only a recording
+// device on the original ones keeps it.
+bool SkipSurfaceClip(PPCContext& ctx, uint8_t* base) {
+  const uint32_t dev = ctx.r3.u32;
+  if (KeepsOriginal(base, dev)) return false;
+  return !U32(base, dev + kRecording) || renut::d3d::port::NativeCommandBuffers();
 }
 
 // CDevice::BeginRingManual(device) (sub_82A11158): the ring pointer, nothing reserved.
