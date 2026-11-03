@@ -32,6 +32,8 @@ final class RuntimeOptions {
      * player's choosing, 0 unlimited.
      */
     static final String FPS_TARGET = "renut_fps_target";
+    /** Present through the display's vertical sync (FIFO); off asks for immediate presentation. On by default. */
+    static final String VSYNC = "renut_plume_vsync";
     /** The switch the slider replaced; still read from an older renut.toml. */
     private static final String LEGACY_UNCAP_FPS = "renut_plume_uncap_fps";
     static final int FPS_ORIGINAL = 30, FPS_MIN = 30, FPS_MAX = 240, FPS_STEP = 5, FPS_UNLIMITED = 0;
@@ -63,7 +65,7 @@ final class RuntimeOptions {
     }
 
     private static final Set<String> BOOLEANS = new java.util.HashSet<>(java.util.Arrays.asList(
-        LEGACY_UNCAP_FPS, "renut_plume_no_shadows", "renut_adpf", CHEATS));
+        LEGACY_UNCAP_FPS, "renut_plume_no_shadows", "renut_adpf", "renut_plume_vsync", CHEATS));
     static {
         BOOLEANS.addAll(java.util.Arrays.asList(CHEAT_FLAGS));
     }

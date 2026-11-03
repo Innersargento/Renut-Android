@@ -105,6 +105,8 @@
     <string name="settings_fps_original">%1$d FPS (original)</string>
     <string name="settings_fps_unlimited">Unlimited</string>
     <string name="settings_fps_target_note">30 is the game\'s original pace. Above it the game presents without waiting for the vblank and is held to the chosen rate; the end of the bar has no limit at all, not even the screen\'s refresh rate. It changes at once, and can change the pacing of parts of the game.</string>
+    <string name="settings_vsync">VSync</string>
+    <string name="settings_vsync_note">Presents through the screen\'s vertical sync. Off, frames go out without waiting for the refresh (tearing is possible).</string>
     <string name="settings_controls">Controls</string>
     <string name="settings_show_controls">Show on-screen controls</string>
     <string name="settings_external">External controllers and players</string>

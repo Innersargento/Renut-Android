@@ -105,6 +105,8 @@
     <string name="settings_fps_original">%1$d FPS（原版）</string>
     <string name="settings_fps_unlimited">不限制</string>
     <string name="settings_fps_target_note">30 为游戏原版节奏。高于 30 时，游戏不再等待垂直消隐并保持在所选帧率；滑块末端完全不限制，也不受屏幕刷新率约束。更改立即生效，可能会改变游戏部分内容的节奏。</string>
+    <string name="settings_vsync">垂直同步</string>
+    <string name="settings_vsync_note">通过屏幕的垂直同步呈现画面。关闭后，画面不再等待刷新（可能出现撕裂）。</string>
     <string name="settings_controls">控制</string>
     <string name="settings_show_controls">显示屏幕控制按键</string>
     <string name="settings_external">外接手柄与玩家</string>

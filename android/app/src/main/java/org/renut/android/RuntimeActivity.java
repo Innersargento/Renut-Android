@@ -349,6 +349,13 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         try{RuntimeOptions.set(this,RuntimeOptions.FPS_TARGET,Integer.toString(fps));}
         catch(java.io.IOException e){Toast.makeText(this,Language.s(R.string.toml_save_failed,e.getMessage()),Toast.LENGTH_SHORT).show();}
     }
+    public boolean uiVsync(){return !"false".equals(RuntimeOptions.get(this,RuntimeOptions.VSYNC,"true"));}
+    /** Live: the renderer reads the cvar at its next present (FIFO or mailbox/immediate); kept for the next start. */
+    public void uiSetVsync(boolean on){
+        if(loaded)nativeSetCvar(RuntimeOptions.VSYNC,Boolean.toString(on));
+        try{RuntimeOptions.set(this,RuntimeOptions.VSYNC,Boolean.toString(on));}
+        catch(java.io.IOException e){Toast.makeText(this,Language.s(R.string.toml_save_failed,e.getMessage()),Toast.LENGTH_SHORT).show();}
+    }
     public boolean uiFpsVisible(){return fpsWanted;}
     public void uiSetFpsVisible(boolean visible){
         if(fps==null)return;

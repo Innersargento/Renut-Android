@@ -105,6 +105,8 @@
     <string name="settings_fps_original">%1$d FPS (original)</string>
     <string name="settings_fps_unlimited">Sin límite</string>
     <string name="settings_fps_target_note">30 es el ritmo original del juego. Por encima, el juego presenta sin esperar al vblank y se mantiene en la tasa elegida; el final de la barra no tiene límite, ni siquiera el de la frecuencia de la pantalla. Cambia al instante y puede alterar el ritmo de partes del juego.</string>
+    <string name="settings_vsync">VSync</string>
+    <string name="settings_vsync_note">Presenta con la sincronización vertical de la pantalla. Desactivado, los fotogramas salen sin esperar al refresco (puede haber tearing).</string>
     <string name="settings_controls">Controles</string>
     <string name="settings_show_controls">Mostrar controles en pantalla</string>
     <string name="settings_external">Mandos externos y jugadores</string>

@@ -706,6 +706,7 @@ private val SKIN_LABELS = listOf(
     val logLevel = activity.uiRuntimeOption("log_level", "info")
     val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val sustained = activity.uiRuntimeOption("renut_adpf", "true") == "true"
+    val vsyncOn = activity.uiRuntimeOption(RuntimeOptions.VSYNC, "true") == "true"
     val textureLevels = listOf(stringResource(R.string.texture_quality_full), stringResource(R.string.texture_quality_half),
         stringResource(R.string.texture_quality_quarter))
     var textureQuality by remember {
@@ -749,6 +750,10 @@ private val SKIN_LABELS = listOf(
                     activity.uiSetRuntimeOption(RuntimeOptions.FPS_TARGET, it.toString())
                 }
                 Text(stringResource(R.string.settings_fps_target_note), color = Muted, fontSize = 12.sp)
+                ToggleRow(stringResource(R.string.settings_vsync), vsyncOn, !busy) {
+                    activity.uiSetRuntimeOption(RuntimeOptions.VSYNC, it.toString())
+                }
+                Text(stringResource(R.string.settings_vsync_note), color = Muted, fontSize = 12.sp)
             }
         }
         item {
@@ -1046,6 +1051,7 @@ private val SidebarWidth = 360.dp
     var fpsVisible by remember { mutableStateOf(activity.uiFpsVisible()) }
     var tempVisible by remember { mutableStateOf(activity.uiTempVisible()) }
     var rumbleOn by remember { mutableStateOf(activity.uiRumbleEnabled()) }
+    var vsyncOn by remember { mutableStateOf(activity.uiVsync()) }
     // The summary line is read from the files the runtime keeps, off the main thread.
     val snapshot by produceState<Achievements.Snapshot?>(null) {
         value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
@@ -1084,6 +1090,10 @@ private val SidebarWidth = 360.dp
             activity.uiSetFpsVisible(it)
         }
         SidebarFpsTarget(activity)
+        SidebarToggle(Icons.Default.Speed, stringResource(R.string.settings_vsync), vsyncOn) {
+            vsyncOn = it
+            activity.uiSetVsync(it)
+        }
         SidebarToggle(Icons.Default.Thermostat, stringResource(R.string.settings_temp), tempVisible) {
             tempVisible = it
             activity.uiSetTempVisible(it)
