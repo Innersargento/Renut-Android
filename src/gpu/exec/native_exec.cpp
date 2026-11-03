@@ -197,6 +197,8 @@ bool Lists::RunNative(uint32_t until) {
         for (uint32_t cpu = 0; cpu < 6; ++cpu) {
           if ((w[3] >> cpu) & 1) backend.dispatch_callback_(w[1], w[2], cpu);
         }
+        // The swap callback counts the swaps presented, which a thread waiting in D3DDevice_Swap sleeps for.
+        native_d3d::NotifyFenceCompleted();
         break;
       }
       case native_d3d::kOpStreams: {
@@ -290,6 +292,7 @@ void Lists::NativeEffects(const uint32_t* pairs, uint32_t count) {
       backend.shaders.WriteRegister(reg, value);
     }
   }
+  native_d3d::NotifyFenceCompleted();  // as after a callback record
 }
 
 // A clear record: Direct3D's clear of the current targets, without its draw.

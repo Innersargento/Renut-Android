@@ -9,6 +9,7 @@
 #include "d3d/scene/swap.h"
 
 #include <array>
+#include <chrono>
 #include <cstring>
 
 #include "d3d/frontend/native_d3d.h"
@@ -16,8 +17,12 @@
 #include "d3d/device/device.h"
 #include "d3d/device/guest_frame.h"
 #include "d3d/device/retail.h"
+#include "guest/host_support.h"
 
 #include <rex/cvar.h>
+#include <rex/kernel/xboxkrnl/video.h>
+#include <rex/logging.h>
+#include <rex/system/xvideo.h>
 #include <rex/ppc/context.h>
 
 REXCVAR_DEFINE_BOOL(renut_native_swap, true, "reNut",
@@ -41,10 +46,6 @@ __attribute__((weak)) void sub_82287D38(PPCContext& __restrict, uint8_t*);
 // found no function there and so never ran). VdSwap is reNut's own (guest/kernel_overrides.cpp), the
 // one the recompiled code reaches; the process type and the system command buffer are done below.
 void renut_imp_VdSwap(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void __imp__VdSetDisplayMode(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void __imp__VdGetCurrentDisplayInformation(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void __imp__VdPersistDisplay(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void __imp__MmFreePhysicalMemory(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_8264DC08(PPCContext& __restrict, uint8_t*);  // CBlocker cleanup
 }
 
@@ -68,8 +69,7 @@ u32 InsertMasked(u32 target, u32 source, u32 rotate, u32 mask) {
 }
 
 bool HaveAll() {
-  return sub_821EF4E8 && __imp__VdSetDisplayMode && __imp__VdGetCurrentDisplayInformation && sub_821ED560 &&
-         __imp__VdPersistDisplay && __imp__MmFreePhysicalMemory && sub_82287D38 && sub_8264DC08;
+  return sub_821EF4E8 && sub_821ED560 && sub_82287D38;
 }
 
 // KeGetCurrentProcessType, as the kernel answers it for the calling thread: the type its DPC set while
@@ -179,22 +179,14 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
   d.SetW(0x4144, 0);
 
   if (changes & 8) {
-    if (hardware) {
-      const u32 kind = d.W(0x3528) & 0x3F;
-      u32 mode = 0x40000000u | ((d.W(0x352C) & 3) << 28);
-      if (kind == 7 || kind == 0x36)
-        mode |= 0x08000000;
-      if (d.W(0x34E8) == 0x2D0) {
-        const u32 height = d.W(0x34EC);
-        if (height == 0x1E0 || height == 0x240)
-          mode |= 2;
-      }
-      f.Call(__imp__VdSetDisplayMode, {mode});
-    }
-    f.Call(__imp__VdGetCurrentDisplayInformation, {f.sp + 0x170});
-    d.SetW(0x5428, LoadBE16(f.G(f.sp + 0x1B8)));
-    d.SetW(0x542C, LoadBE16(f.G(f.sp + 0x1BA)));
-    d.SetW(0x5430, LoadBE16(f.G(f.sp + 0x1C6)));
+    // The original sets the display mode (VdSetDisplayMode, which the kernel here answers with 0 and
+    // does nothing) and asks what the display is (VdGetCurrentDisplayInformation, whose width, height
+    // and actual width are the configured video mode's: the swap takes those three).
+    rex::system::X_VIDEO_MODE mode;
+    rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
+    d.SetW(0x5428, u16(mode.display_width));
+    d.SetW(0x542C, u16(mode.display_height));
+    d.SetW(0x5430, u16(mode.display_width));
     f.Kick(dev);
   }
 
@@ -260,12 +252,8 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
   f.Call(sub_821ED560, {dev, changes, f.Get(f.sp + 0x68), front_gpu, r30, f.Get(f.sp + 0x60),
                         f.Get(f.sp + 0x64), r28});
 
-  if ((changes & 8) && hardware) {
-    // (The original queues a register write here; the display mode is the kernel's.)
-    std::memset(f.G(f.sp + 0xB8), 0, 12);
-    if (f.Call(__imp__VdPersistDisplay, {f.sp + 0xB8, f.sp + 0x80}))
-      f.Call(__imp__MmFreePhysicalMemory, {1, f.Get(f.sp + 0x80)});
-  }
+  // (With a new mode on hardware the original also queues a register write and calls VdPersistDisplay,
+  // which only allocates a 64-byte block the swap frees at once with MmFreePhysicalMemory: nothing.)
 
   const u32 fence = d.W(0x2A9C);  // r30
   d.SetW(0x2AB0, fence);
@@ -275,17 +263,27 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
     f.Call(sub_8228F558, {dev, pending, 3, 0});
 
   if (d.W(0x5DAC) & 4) {
-    const u32 record = f.sp + 0x80;
-    const u32 thread = f.Get(f.Get(ctx.r13.u32 + 0x100) + 0x58);
-    f.Put(record, dev);
-    f.Put(record + 4, 3);
-    f.Put(record + 8, f.Get(d.W(0x2A90)));
-    f.Put(record + 12, thread);
-    f.Put(record + 16, thread);
-    f.Put(record + 20, 0);
-    while (f.Call(sub_8264DCD0, {record}) && d.W(0x40B0) - d.W(0x40B8) >= 0xF) {
+    // Never more than 15 swaps ahead of the ones presented (+16560 counts the swaps, +16568 the ones the
+    // swap callback has presented). The original polls CBlocker::Check in a loop; this sleeps until the
+    // backend has run a list (it wakes waiters after every callback record), and gives up as the
+    // fence wait does when the backend has nothing left to run.
+    auto last_progress = std::chrono::steady_clock::now();
+    u32 last_presented = d.W(0x40B8);
+    while (d.W(0x40B0) - d.W(0x40B8) >= 0xF) {
+      const u32 epoch = renut::native_d3d::FenceEpoch();
+      if (d.W(0x40B0) - d.W(0x40B8) < 0xF) break;
+      renut::WaitIfTitlePaused();
+      renut::native_d3d::FenceWait(epoch, 1000);
+      const auto now = std::chrono::steady_clock::now();
+      if (d.W(0x40B8) != last_presented) {
+        last_presented = d.W(0x40B8);
+        last_progress = now;
+      } else if (now - last_progress > std::chrono::milliseconds(1500) && renut::native_d3d::ExecutorIdle()) {
+        REXLOG_WARN("Renut: native swap: {} swaps ahead of the presented ones with every list run; going on",
+                    d.W(0x40B0) - d.W(0x40B8));
+        break;
+      }
     }
-    f.Call(sub_8264DC08, {record});
   } else {
     d.SetW(0x3A5C, fence);
   }

@@ -27,8 +27,19 @@
 #include "d3d/frontend/native_d3d.h"
 #include "guest/host_support.h"
 
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
+#include <cstring>
+
 #include <rex/cvar.h>
 #include <rex/ppc/context.h>
+
+REXCVAR_DEFINE_BOOL(renut_native_gamma, true, "reNut",
+                    "D3DDevice_SetGammaRamp and SetPWLGamma natively: the device keeps the corrected ramp as the "
+                    "original does, without the display-gamma call to the kernel and the ring packets. Off: the "
+                    "recompiled functions");
 
 REXCVAR_DEFINE_BOOL(renut_native_fence_wait, true, "reNut",
                     "D3DDevice_IsFencePending, D3DDevice_BlockOnFence and CDevice::BlockOnFence natively: "
@@ -430,6 +441,21 @@ bool CDeviceBlockOnFenceCall(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// D3DDevice_BlockUntilIdle(device): the original kicks if the ring is past its guarantee, writes a
+// cache-flush packet, waits for the current fence (CDevice::BlockOnFence, kick allowed) and then spins
+// while a word at +11008 is nonzero, which nothing sets on this device. reNut on PC waits for the
+// fence and nothing else.
+bool BlockUntilIdleCall(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(renut_native_fence_wait)) return false;
+  const Device device = DeviceAt(base, ctx.r3.u32);
+  if (!device) return false;
+  if (const u32 fence = device.W(off::FenceTag)) {
+    KickCall kick{&ctx, base};
+    BlockOnFence(device, fence, false, MakeFenceHooks(kick));
+  }
+  return true;
+}
+
 // D3DDevice_BlockOnFence(fence) (sub_8228F3B0): the title's device, kick allowed.
 bool BlockOnFenceCall(PPCContext& ctx, uint8_t* base) {
   if (!REXCVAR_GET(renut_native_fence_wait))
@@ -718,6 +744,99 @@ bool DeviceRelease(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// --- Gamma --------------------------------------------------------------
+
+// D3D's table for the display gamma (GammaRampCorrected, sub_826593F8 and sub_82659490, through
+// sub_82659140): 1024 entries taking a 10-bit value through the display's curve. The kernel's
+// VdGetCurrentDisplayGamma answers type 2 (the TV curve, BT.709) for this title, a constant of the
+// SDK, so the table is computed once for that curve: the sRGB value to linear, then the TV curve.
+// (reNut on PC does the same; its renderer does not use the ramp either, the device only keeps it.)
+float FloatBits(u32 bits) { return std::bit_cast<float>(bits); }
+
+const std::array<u16, 1024>& GammaTable() {
+  static const std::array<u16, 1024> table = [] {
+    std::array<u16, 1024> out{};
+    for (u32 i = 0; i < 1024; ++i) {
+      float v = float(i) * FloatBits(0x3A802008);  // 1 / 1023
+      v = v > 0.04045f ? float(std::pow(double((v + FloatBits(0x3D6147AE)) * FloatBits(0x3F72A76F)),
+                                         2.4000000953674316))
+                       : v * FloatBits(0x3D9E8391);
+      const float tv = v < 0.018f ? v * 4.5f
+                                  : std::fmaf(float(std::pow(double(v), 0.44999998807907104)),
+                                              FloatBits(0x3F8CAC08), -FloatBits(0x3DCAC083));
+      out[i] = u16(std::clamp(i32(std::fma(double(tv), 1023.0, 0.5)), 0, 0x3FF));
+    }
+    return out;
+  }();
+  return table;
+}
+
+// KeGetCurrentProcessType for the calling thread (see scene/swap.cpp ProcessType).
+u32 CurrentProcessType(uint8_t* base, u32 pcr) {
+  auto load = [&](u32 address) {
+    return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(renut::GuestPtr(base, address)));
+  };
+  if (load(pcr + 0x150)) return *renut::GuestPtr(base, pcr + 0xC);
+  return *renut::GuestPtr(base, load(pcr + 0x100) + 0x73);
+}
+
+// What D3DDevice_SetGammaRamp and SetPWLGamma do with the corrected ramp (768 big-endian words): when
+// it differs from the device's (at +15004) the previous one goes to the display's pending copy (+23952)
+// unless that is already taken (bit 31 of +23956), the display is told it has a new one, and the ramp
+// is kept with bit 1 of the device's change word (+16708) set, which the swap acts on.
+void StoreGamma(PPCContext& ctx, uint8_t* base, u32 device, const u16 (&corrected)[768]) {
+  uint8_t* kept = renut::GuestPtr(base, device + 15004);
+  uint16_t big[768];
+  for (u32 i = 0; i < 768; ++i) big[i] = __builtin_bswap16(corrected[i]);
+  if (std::memcmp(big, kept, sizeof(big)) == 0) return;
+  auto word = [&](u32 offset) {
+    return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(renut::GuestPtr(base, device + offset)));
+  };
+  auto put = [&](u32 offset, u32 value) {
+    *reinterpret_cast<uint32_t*>(renut::GuestPtr(base, device + offset)) = __builtin_bswap32(value);
+  };
+  if (CurrentProcessType(base, ctx.r13.u32) != 2) {
+    if (const u32 pending = word(23952); pending && !(word(23956) & 0x80000000u))
+      std::memcpy(renut::GuestPtr(base, pending), kept, sizeof(big));
+    put(23956, word(23956) | 0x80000000u);
+  }
+  std::memcpy(kept, big, sizeof(big));
+  put(16708, word(16708) | 2);
+}
+
+u16 RampWord(uint8_t* base, u32 ramp, u32 index) {
+  return __builtin_bswap16(*reinterpret_cast<const uint16_t*>(renut::GuestPtr(base, ramp + index * 2)));
+}
+
+// D3DDevice_SetGammaRamp(device, flags, D3DGAMMARAMP*): 3 x 256 words through the table.
+bool SetGammaRampCall(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(renut_native_gamma) || !ctx.r3.u32 || !ctx.r5.u32) return false;
+  u16 corrected[768];
+  for (u32 i = 0; i < 768; ++i)
+    corrected[i] = u16((GammaTable()[RampWord(base, ctx.r5.u32, i) >> 6] & 0x3FF) << 6);
+  StoreGamma(ctx, base, ctx.r3.u32, corrected);
+  return true;
+}
+
+// D3DDevice_SetPWLGamma(device, flags, D3DPWLGAMMA*): 3 x 128 {base, delta} through the table, each
+// segment's end clamped to 0x3FF.
+bool SetPWLGammaCall(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(renut_native_gamma) || !ctx.r3.u32 || !ctx.r5.u32) return false;
+  u16 corrected[768];
+  const auto& table = GammaTable();
+  for (u32 c = 0; c < 3; ++c) {
+    for (u32 i = 0; i < 128; ++i) {
+      const u32 at = c * 256 + i * 2;
+      const u32 first = RampWord(base, ctx.r5.u32, at) >> 6;
+      const u32 end = std::min(first + (RampWord(base, ctx.r5.u32, at + 1) >> 6), 0x3FFu);
+      corrected[at] = u16((table[first] & 0x3FF) << 6);
+      corrected[at + 1] = u16(((table[end] - table[first]) & 0x3FF) << 6);
+    }
+  }
+  StoreGamma(ctx, base, ctx.r3.u32, corrected);
+  return true;
+}
+
 // D3DDevice_DrawVerticesUP(device, primitive, vertex count, data, stride): room for
 // the vertices from BeginVertices (the native front end's), then the data.
 bool MiscDrawVerticesUP(PPCContext& ctx, uint8_t* base) {
@@ -737,6 +856,9 @@ bool MiscDrawVerticesUP(PPCContext& ctx, uint8_t* base) {
 namespace {
 
 void RegisterMisc() {
+  SetHandler(kD3DDevice_SetGammaRamp, SetGammaRampCall);
+  SetHandler(kD3DDevice_SetPWLGamma, SetPWLGammaCall);
+  SetHandler(kD3DDevice_BlockUntilIdle, BlockUntilIdleCall);
   SetHandler(kD3DDevice_AddRef, DeviceAddRef);
   SetHandler(kD3DDevice_Release, DeviceRelease);
   SetHandler(kD3DDevice_GetDeviceCaps, MiscGetDeviceCaps);
