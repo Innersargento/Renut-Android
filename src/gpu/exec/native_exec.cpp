@@ -183,6 +183,20 @@ bool Lists::RunNative(uint32_t until) {
         NativeEffects(w + 1, count);
         break;
       }
+      case native_d3d::kOpCallback: {
+        if (f.pos + 4 > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        f.pos += 4;
+        ++native_callbacks_;
+        if (!backend.dispatch_callback_) break;
+        for (uint32_t cpu = 0; cpu < 6; ++cpu) {
+          if ((w[3] >> cpu) & 1) backend.dispatch_callback_(w[1], w[2], cpu);
+        }
+        break;
+      }
       case native_d3d::kOpStreams: {
         const uint32_t mask = (w[0] >> 8) & 0x3FFFF;
         const size_t n = 1 + 2 * size_t(__builtin_popcount(mask));

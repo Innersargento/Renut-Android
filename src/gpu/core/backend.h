@@ -39,6 +39,8 @@ class GpuBackend final {
   rex::memory::Memory* memory_ = nullptr;
   rex::system::KernelState* kernel_state_ = nullptr;
   std::function<void(uint32_t, uint32_t)> dispatch_interrupt_;
+  // Calls a guest callback (function, context) as the CPU it names: a callback record of a list.
+  std::function<void(uint32_t, uint32_t, uint32_t)> dispatch_callback_;
   // The GPU's registers: the lists write them, the draws read them, and the CPU sees them
   // through the register window (host.cpp).
   RegisterFile registers_;

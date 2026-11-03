@@ -14,6 +14,11 @@ REXCVAR_DEFINE_BOOL(renut_stub_command_buffers, true, "reNut",
                     "segments chained into the buffer (the draws are recorded on the host anyway). Off: the "
                     "recompiled kicks and allocators build the buffer's segments, as before");
 
+REXCVAR_DEFINE_BOOL(renut_direct_callbacks, true, "reNut",
+                    "A callback the game inserts (D3DDevice_InsertCallback) is one record of the list that "
+                    "makes the GPU backend call it, with no scratch register writes or interrupt handler "
+                    "(as reNut on PC). Off: the register effects and the interrupt, as before");
+
 namespace renut::native_d3d {
 
 Effects CallbackEffects(uint32_t flags, uint32_t function, uint32_t context) {
@@ -305,6 +310,21 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   ctx.r3.u64 = ring;
   List& list = Current(dev);
   g_counts.callbacks.fetch_add(1, std::memory_order_relaxed);
+  if (REXCVAR_GET(renut_direct_callbacks)) {
+    // Flag 2 is the callback, 4 the reset of its address, both when neither is set; the reset and the
+    // waits are the scratch registers' business, which nothing here reads.
+    const uint32_t kind = (flags & 6) ? (flags & 6) : 6;
+    if (kind & 2) {
+      uint32_t mask = (flags >> 24) & 0x3F;
+      if (!mask) mask = 4;
+      list.words.push_back(kOpCallback);
+      list.words.push_back(function);
+      list.words.push_back(context);
+      list.words.push_back(mask);
+      g_counts.effect_records.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+  }
   PushEffects(list, CallbackEffects(flags, function, context));
   return true;
 }

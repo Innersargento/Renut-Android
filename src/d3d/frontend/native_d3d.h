@@ -72,6 +72,10 @@ enum Op : uint32_t {
   // does to the GPU's registers, in order. A register of 0xFFFFFFFF is the
   // interrupt, its value the mask of CPUs. Native sync
   kOpEffects = 20,
+  // [op] function, context, mask: the GPU backend calls function(context) once per CPU in the
+  // mask (bits 0-5), where the list stands: what D3DDevice_InsertCallback asks of the GPU, without
+  // the scratch registers and the interrupt handler it goes through on the console
+  kOpCallback = 21,
 };
 constexpr uint32_t kResolveWords = 30, kClearWords = 18;
 

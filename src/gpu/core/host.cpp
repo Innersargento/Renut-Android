@@ -26,6 +26,9 @@ class PlumeGpu {
     backend_ = std::make_unique<GpuBackend>(
         memory_, kernel_state_, [this](uint32_t source, uint32_t cpu) { DispatchInterruptCallback(source, cpu); },
         [this] { return ServiceRing(); });
+    backend_->dispatch_callback_ = [this](uint32_t function, uint32_t context, uint32_t cpu) {
+      RunCallback(function, context, cpu);
+    };
     if (!backend_->Initialize()) return false;
     // The GPU's registers are 0x7FC80000-0x7FCFFFFF; the game reads the display
     // counters there and writes the ring's write pointer.
@@ -71,6 +74,15 @@ class PlumeGpu {
     uint64_t args[] = {source, interrupt_callback_data_};
     function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                            rex::countof(args));
+  }
+
+  // A callback record of a list: function(context) on the backend's thread, as the CPU it names.
+  void RunCallback(uint32_t function, uint32_t context, uint32_t cpu) {
+    auto* thread = rex::system::XThread::GetCurrentThread();
+    if (!thread || !function) return;
+    thread->SetActiveCpu(cpu);
+    uint64_t args[] = {context};
+    function_dispatcher_->ExecuteInterrupt(thread->thread_state(), function, args, rex::countof(args));
   }
 
   // The graphics interrupt handler's source 1 (sub_826573F0), served natively. The GPU's scratch
