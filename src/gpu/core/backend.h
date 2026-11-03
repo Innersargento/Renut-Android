@@ -32,6 +32,7 @@ class GpuBackend final {
   void Wake();
   uint32_t counter() const;
   void increment_counter();
+  void add_counter(uint32_t n);
   RegisterFile* registers();
   Shader* active_vertex_shader() const;
   Shader* active_pixel_shader() const;
@@ -41,6 +42,9 @@ class GpuBackend final {
   std::function<void(uint32_t, uint32_t)> dispatch_interrupt_;
   // Calls a guest callback (function, context) as the CPU it names: a callback record of a list.
   std::function<void(uint32_t, uint32_t, uint32_t)> dispatch_callback_;
+  // Brings the vertical blank's clock up to date (host.cpp TickVblank): called before a present or a
+  // callback record is run, on the backend's thread. Empty when a thread ticks it.
+  std::function<void()> tick_vblank_;
   // The GPU's registers: the lists write them, the draws read them, and the CPU sees them
   // through the register window (host.cpp).
   RegisterFile registers_;
@@ -179,6 +183,7 @@ inline void GpuBackend::Wake() { wake_->Set(); }
 inline uint32_t GpuBackend::counter() const { return counter_; }
 
 inline void GpuBackend::increment_counter() { counter_++; }
+inline void GpuBackend::add_counter(uint32_t n) { counter_ += n; }
 
 inline RegisterFile* GpuBackend::registers() { return &registers_; }
 

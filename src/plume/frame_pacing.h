@@ -2,9 +2,11 @@
 // The frame rate the player asked for, and the clock that holds the game to it.
 //
 // One target, read live by every part that paces or presents:
-//   30        the game's own rate. Its presentation interval holds it to every
-//             second vertical blank, and the vblank clock (gpu/core/host.cpp) is what
-//             makes that steady.
+//   30        the game's own rate. By default (renut_pace_original_fps) it is held like the
+//             others, by the Pacer, with the game's presentation interval immediate - the way
+//             reNut on PC holds it, which has no vblank at all. Off, the game's presentation
+//             interval holds it to every second vertical blank, and the vblank clock
+//             (gpu/core/host.cpp) is what makes that steady.
 //   31..240   the game presents immediately (no wait for the vblank) and the
 //             command thread holds it to the target with a Pacer.
 //   0         unlimited: immediate presentation, no pacer and, so that the
@@ -82,12 +84,22 @@ inline void NoteGameInterval(uint32_t index) {
   GameIntervalCell().store(index == 0, std::memory_order_relaxed);
 }
 
+// Whether the game's own 30 FPS is held by the Pacer like every other target (the cvar
+// renut_pace_original_fps, applied with the target) or by the vblank.
+inline std::atomic<bool>& PaceOriginalCell() {
+  static std::atomic<bool> pace{true};
+  return pace;
+}
+
 // The target asks for the game's swap not to wait for the vblank.
-inline bool ImmediatePresentation() { return Target() != kOriginalFps; }
+inline bool ImmediatePresentation() {
+  return Target() != kOriginalFps || PaceOriginalCell().load(std::memory_order_relaxed);
+}
 // The vblank is what holds the game: its own 30 FPS target and an interval that
 // waits for it. Otherwise the command thread's Pacer holds the target.
 inline bool VblankPaces() {
-  return Target() == kOriginalFps && !GameIntervalCell().load(std::memory_order_relaxed);
+  return Target() == kOriginalFps && !PaceOriginalCell().load(std::memory_order_relaxed) &&
+         !GameIntervalCell().load(std::memory_order_relaxed);
 }
 // The swapchain presents on the display's vertical sync.
 inline bool PresentVsync() {

@@ -156,6 +156,7 @@ bool Lists::RunNative(uint32_t until) {
           break;
         }
         f.pos += 6;
+        if (backend.tick_vblank_) backend.tick_vblank_();
         // As the ring had it: a history slot stamped with the vblank counter,
         // the swap, the counter moving on, the second slot.
         if (w[4]) StoreBig(w[4], backend.counter());
@@ -191,6 +192,7 @@ bool Lists::RunNative(uint32_t until) {
         }
         f.pos += 4;
         ++native_callbacks_;
+        if (backend.tick_vblank_) backend.tick_vblank_();
         if (!backend.dispatch_callback_) break;
         for (uint32_t cpu = 0; cpu < 6; ++cpu) {
           if ((w[3] >> cpu) & 1) backend.dispatch_callback_(w[1], w[2], cpu);

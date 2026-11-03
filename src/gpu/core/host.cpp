@@ -15,6 +15,18 @@ REXCVAR_DEFINE_BOOL(renut_native_gpu_callbacks, true, "reNut",
                     "the callback is called with its context and the CPU's bit in the writeback block is cleared, "
                     "without the recompiled interrupt handler. Off: the handler runs, as before");
 
+REXCVAR_DEFINE_BOOL(renut_native_vblank, true, "reNut",
+                    "The vertical blank (interrupt source 0) is served here when nothing waits on it: the device's "
+                    "vblank counter and times move on without the recompiled interrupt handler. The handler still "
+                    "runs when a swap is queued behind a vblank or the game set a vblank callback");
+
+REXCVAR_DEFINE_BOOL(renut_stub_vsync_thread, true, "reNut",
+                    "No \"GPU VSync\" thread: with the frame pacer holding the game (presentation always "
+                    "immediate) nothing needs the emulated vertical blank to tick between swaps, so the vblank "
+                    "counter and the device's clock words are brought up to date when a swap or a callback "
+                    "reaches the GPU backend. Off: the thread ticks them 60 times a second, as before");
+REXCVAR_DECLARE(bool, renut_pace_original_fps);
+
 namespace renut::gpu {
 
 class PlumeGpu {
@@ -29,12 +41,21 @@ class PlumeGpu {
     backend_->dispatch_callback_ = [this](uint32_t function, uint32_t context, uint32_t cpu) {
       RunCallback(function, context, cpu);
     };
+    backend_->tick_vblank_ = [this] { TickVblank(); };
     if (!backend_->Initialize()) return false;
     // The GPU's registers are 0x7FC80000-0x7FCFFFFF; the game reads the display
     // counters there and writes the ring's write pointer.
     memory_->AddVirtualMappedRange(0x7FC80000, 0xFFFF0000, 0x0000FFFF, this,
                                    reinterpret_cast<rex::runtime::MMIOReadCallback>(ReadRegisterThunk),
                                    reinterpret_cast<rex::runtime::MMIOWriteCallback>(WriteRegisterThunk));
+    // The frame pacer makes every swap immediate when the game's own 30 FPS is paced too
+    // (renut_pace_original_fps); then the vertical blank only has a clock to keep, which TickVblank
+    // does at the swaps. Otherwise a swap can be queued behind a vblank and the thread must deliver it.
+    stub_vsync_ = REXCVAR_GET(renut_stub_vsync_thread) && REXCVAR_GET(renut_pace_original_fps);
+    if (stub_vsync_) {
+      REXLOG_INFO("Renut: no GPU VSync thread (the vblank clock is kept at the swaps)");
+      return true;
+    }
     vsync_running_ = true;
     vsync_thread_ = rex::system::object_ref<rex::system::XHostThread>(
         new rex::system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() { return VblankClock(); }));
@@ -121,9 +142,63 @@ class PlumeGpu {
     return true;
   }
 
+  // The vblank handler (sub_826541C8, source 0 of sub_826573F0) with nothing for it to do besides the
+  // device's clock: it adds one to the vblank counter (+16548), stamps the time (+16552, and
+  // +21676 in milliseconds-ish units, timebase >> 10), presents the swaps queued behind a vblank
+  // (the queue at +16572, read index +16700, write index +16704) and calls the game's vblank
+  // callback (+16544). With the frame pacer holding the game its swaps are immediate and queue
+  // nothing, and nothing in the title sets a vblank callback, so the counter and the stamps are what
+  // is left. False when the queue is not empty or a callback is set (the handler runs).
+  bool RunVblankNatively(uint32_t vblanks = 1) {
+    if (!interrupt_callback_data_) return false;
+    auto word = [&](uint32_t offset) {
+      return reinterpret_cast<uint32_t*>(memory_->TranslateVirtual<uint8_t*>(interrupt_callback_data_ + offset));
+    };
+    auto load = [&](uint32_t offset) { return __builtin_bswap32(std::atomic_ref<uint32_t>(*word(offset)).load()); };
+    auto store = [&](uint32_t offset, uint32_t value) {
+      std::atomic_ref<uint32_t>(*word(offset)).store(__builtin_bswap32(value));
+    };
+    if (load(16700) != load(16704) || load(16544) != 0) return false;
+    const uint64_t time = rex::chrono::Clock::QueryGuestTickCount();
+    store(16548, load(16548) + vblanks);
+    store(16552, uint32_t(time));
+    store(21676, uint32_t(time >> 10));
+    return true;
+  }
+
+  // Without the thread: the vblanks since the last call, by the clock of the video mode (the guest's, which
+  // crawls while the game is paused), are added to the backend's counter and to the device's words. Called
+  // on the GPU backend's thread when a present or a callback record is reached, which are the only
+  // moments the counter or the words are read. A queue of swaps or a vblank callback cannot be here
+  // (the presentation is immediate and nothing sets one), but if there is one the handler runs.
+  void TickVblank() {
+    if (!stub_vsync_) return;
+    using pacing::Clock;
+    if (!tick_hz_) {
+      rex::system::X_VIDEO_MODE mode;
+      rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
+      tick_hz_ = std::max(1.0, double(float(mode.refresh_rate)));
+    }
+    const auto now = Clock::now();
+    if (!tick_origin_.time_since_epoch().count()) {
+      tick_origin_ = now;
+      return;
+    }
+    const double scale = std::max(0.001, rex::chrono::Clock::guest_time_scalar());
+    const auto period = std::chrono::nanoseconds(int64_t(1e9 / tick_hz_ / scale));
+    const int64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tick_origin_).count();
+    const int64_t vblanks = elapsed / std::max<int64_t>(1, period.count());
+    if (vblanks <= 0) return;
+    tick_origin_ += period * vblanks;
+    if (backend_) backend_->add_counter(uint32_t(vblanks));
+    if (!(REXCVAR_GET(renut_native_vblank) && RunVblankNatively(uint32_t(vblanks))))
+      DispatchInterruptCallback(0, 2);
+  }
+
   void MarkVblank() {
     // The counter the game sees move, then the interrupt that runs its handler.
     if (backend_) backend_->increment_counter();
+    if (REXCVAR_GET(renut_native_vblank) && pacing::ImmediatePresentation() && RunVblankNatively()) return;
     DispatchInterruptCallback(0, 2);
   }
 
@@ -230,6 +305,9 @@ class PlumeGpu {
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;
   std::atomic<bool> vsync_running_{false};
+  bool stub_vsync_ = false;  // no thread: TickVblank at the swaps
+  double tick_hz_ = 0;
+  pacing::Clock::time_point tick_origin_{};
   rex::system::object_ref<rex::system::XHostThread> vsync_thread_;
 };
 
