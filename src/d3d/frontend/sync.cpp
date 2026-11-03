@@ -9,6 +9,11 @@
 #include <ctime>
 #endif
 
+REXCVAR_DEFINE_BOOL(renut_stub_command_buffers, true, "reNut",
+                    "A device recording a command buffer writes into the ring sink like any other, with no "
+                    "segments chained into the buffer (the draws are recorded on the host anyway). Off: the "
+                    "recompiled kicks and allocators build the buffer's segments, as before");
+
 namespace renut::native_d3d {
 
 Effects CallbackEffects(uint32_t flags, uint32_t function, uint32_t context) {
@@ -44,6 +49,7 @@ namespace {
 constexpr uint32_t kRingLimit = 52, kRingGuarantee = 56;
 constexpr uint32_t kRingSinkMargin = 256u << 10;
 constexpr uint32_t kFenceTag = 10908, kFenceCompletion = 10896;
+constexpr uint32_t kSegmentStart = 14928;
 
 uint32_t RingSink() {
   static std::once_flag made;
@@ -93,6 +99,16 @@ void RewindRing(uint8_t* base, uint32_t dev) {
   S32(base, dev + kRingWrite, sink);
   S32(base, dev + kRingLimit, sink + kRingSinkSize);
   S32(base, dev + kRingGuarantee, sink + kRingSinkSize - kRingSinkMargin);
+  // A device recording a command buffer also names where its segment starts (the first dword
+  // written, one past the ring pointer): EndCommandBuffer sizes the segment from it, and a size
+  // beyond the segment limit makes it report the buffer out of memory.
+  if (U32(base, dev + kRecording)) S32(base, dev + kSegmentStart, sink + 4);
+}
+
+// A device recording a command buffer is the original's when the cvar is off: its kicks and its
+// allocators chain real segments into the buffer.
+bool KeepsOriginal(const uint8_t* base, uint32_t dev) {
+  return U32(base, dev + kRecording) && !REXCVAR_GET(renut_stub_command_buffers);
 }
 
 // CDevice::KickOff without a ring: the fence covering the work so far is issued as the original
@@ -116,6 +132,8 @@ void KickDevice(PPCContext& ctx, uint8_t* base, uint32_t dev) {
 }  // namespace
 
 uint32_t RingSinkAddress() { return RingSink(); }
+
+void RewindRecordingRing(uint8_t* base, uint32_t device) { RewindRing(base, device); }
 
 // D3DDevice_SetRingBufferParameters(device, parameters) (sub_82657508), the device's first act.
 // The original allocates the ring and its secondary segment, registers them with the kernel's
@@ -154,10 +172,12 @@ void SetRingBufferParameters(PPCContext& ctx, uint8_t* base) {
   fields[0] = 0, fields[1] = 1, fields[2] = 0x08, fields[3] = 0x00;
 }
 
-// CDevice::BeginRingAlloc(device, dwords, alignment) (sub_8222D240): room for inline data. A device
-// recording a command buffer takes it from the buffer's allocator, which stays the original's.
+// CDevice::BeginRingAlloc(device, dwords, alignment) (sub_8222D240): room for inline data. The
+// inline draws a recording device makes are hooked and take their data from their own scratch
+// (ScratchAlloc, which the list names by address), so what the ring scratch holds here is not
+// something a list reads.
 bool BeginRingAlloc(PPCContext& ctx, uint8_t* base) {
-  if (U32(base, ctx.r3.u32 + kRecording)) return false;
+  if (KeepsOriginal(base, ctx.r3.u32)) return false;
   ctx.r3.u64 = RingData(ctx.r4.u32 * 4, ctx.r5.u32);
   return true;
 }
@@ -172,7 +192,7 @@ bool RingAllocate(PPCContext& ctx, uint8_t* base) {
 // sink again.
 bool StartNewSegment(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
-  if (U32(base, dev + kRecording)) return false;
+  if (KeepsOriginal(base, dev)) return false;
   RewindRing(base, dev);
   ctx.r3.u64 = U32(base, dev + kRingWrite);
   return true;
@@ -184,26 +204,35 @@ bool StartNewSegment(PPCContext& ctx, uint8_t* base) {
 // fences, and moves the fence tag on by 2. The writes go nowhere here, so what is kept is the rest:
 // the position, the tag, the immediate completion, and the record the backend completes the fence
 // from when it runs the list (kOpFence), in order with the callbacks and the presents.
-// A device recording a command buffer, one with no completion word, and the time before the first
-// act are the original's: the packets it writes there are the buffer's.
+// A device with no completion word and the time before the first act are the original's. So is a
+// device recording a command buffer that does not have immediate fences (the recorders do): the
+// fence would be a packet in the buffer. One that does completes its own fence and records nothing,
+// as the original's packets only matter to a GPU that runs the buffer.
 constexpr uint32_t kFenceBytes = 40;  // the ten words the original writes
 bool SetFence(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, ring = ctx.r4.u32;
-  if (U32(base, dev + kRecording)) return false;
+  const bool recording = U32(base, dev + kRecording) != 0;
+  const bool immediate = (*GuestPtr(base, dev + 10941) & 2) != 0;
+  if (recording && (!immediate || !REXCVAR_GET(renut_stub_command_buffers))) return false;
   const uint32_t block = U32(base, dev + kFenceCompletion);
   if (!block) return false;
-  std::lock_guard lock(g_front.mutex);
-  if (!g_front.sync_recording) return false;
+  std::unique_lock lock(g_front.mutex, std::defer_lock);
+  if (!recording) {
+    lock.lock();
+    if (!g_front.sync_recording) return false;
+  }
   const uint32_t fence = U32(base, dev + kFenceTag);
   const uint32_t position = (U32(base, dev + 14920) & 3) | U32(base, dev + kRingWrite);
   S32(base, dev + 13240, U32(base, dev + kRingWrite));
   S32(base, dev + 13244, U32(base, dev + 14920));
-  List& list = Current(dev);
-  list.words.push_back(kOpFence);
-  list.words.push_back(Phys(block));
-  list.words.push_back(position);
-  list.words.push_back(fence);
-  g_counts.fences.fetch_add(1, std::memory_order_relaxed);
+  if (!recording) {
+    List& list = Current(dev);
+    list.words.push_back(kOpFence);
+    list.words.push_back(Phys(block));
+    list.words.push_back(position);
+    list.words.push_back(fence);
+    g_counts.fences.fetch_add(1, std::memory_order_relaxed);
+  }
   // A device with immediate fences (and no memory export in progress, +21532) completes its own.
   if (!U32(base, dev + 21532) && (*GuestPtr(base, dev + 10941) & 2)) {
     S32(base, block, fence);
@@ -215,12 +244,12 @@ bool SetFence(PPCContext& ctx, uint8_t* base) {
 }
 
 // CDevice::KickOff(device) returns the new write pointer; KickOffSegment ignores r3. A device
-// recording a command buffer is left to the original: its kick chains the segment into the buffer,
-// which EndCommandBuffer and RunCommandBuffer (the originals) walk, so its ring pointers must stay
-// inside the buffer's memory.
+// recording a command buffer only starts over (KickDevice): the original's kick would chain a
+// segment into the buffer, which EndCommandBuffer and RunCommandBuffer (the originals) then walk,
+// and they find none; its segment start is kept with the ring (RewindRing).
 bool KickOff(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
-  if (U32(base, dev + kRecording)) return false;
+  if (KeepsOriginal(base, dev)) return false;
   KickDevice(ctx, base, dev);
   ctx.r3.u64 = U32(base, dev + kRingWrite);
   return true;

@@ -443,6 +443,9 @@ void ResetAllState(Device device) {
     device.SetPending(word, ~u64(0));
 }
 
+// UpdateTilePredicated for the command buffer calls (command_buffers.cpp).
+void RefreshTilePredicated(Device device) { UpdateTilePredicated(device); }
+
 // D3D::InvalidateConstants (0x8264E128, D3DDevice_FlushHiZStencil here): an
 // invalidate packet, after which the constants are not known to be loaded.
 void InvalidateConstants(Device device) {

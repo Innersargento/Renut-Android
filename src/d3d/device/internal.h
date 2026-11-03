@@ -69,6 +69,10 @@ void SetScissorRect(Device device, i32 left, i32 top, i32 right, i32 bottom);
 // BeginCommandBuffer and the tiling calls all make (bound.cpp).
 bool TilingBound(Device device);
 
+// Flags bit 0 (the draws run in each tile's pass), recomputed from the flags, the predication
+// and the bound targets (bound.cpp).
+void RefreshTilePredicated(Device device);
+
 // D3D::SetSurfaceClip (0x82223270) is called at the end of SetScissorRect and
 // CleanupGprAllocationSetup. The recompiled one writes the window scissor into the
 // ring, which nothing reads, but the native front end (d3d/frontend) records the clip

@@ -17,6 +17,7 @@
 #include "d3d/device/misc.h"
 #include "d3d/resources/resource.h"
 #include "d3d/resources/shader.h"
+#include "d3d/scene/command_buffers.h"
 #include "d3d/scene/swap.h"
 #include "d3d/scene/tiling.h"
 #include "d3d/device/internal.h"
@@ -876,6 +877,7 @@ void RegisterStateHandlers() {
   RegisterFrame();
   RegisterSwap();
   RegisterTiling();
+  RegisterCommandBuffers();
   RegisterEdram();
   RegisterLeaves();
 }

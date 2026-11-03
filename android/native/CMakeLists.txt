@@ -188,7 +188,7 @@ set_source_files_properties("${RENUT_SRC}/plume/shader_cache_blob.S" PROPERTIES
     OBJECT_DEPENDS "${RENUT_SHADERS}/shader_spirv.smolv")
 set(RENUT_RUNTIME_SOURCES
     guest/game_fixes.cpp guest/frame_fixes.cpp guest/cheats.cpp guest/kernel_overrides.cpp guest/host_support.cpp
-    d3d/hooks/layer.cpp d3d/hooks/plume_d3d.cpp d3d/device/state.cpp d3d/device/bound.cpp d3d/device/getters.cpp d3d/sync/fence.cpp d3d/resources/resource.cpp d3d/resources/shader.cpp d3d/resources/microcode.cpp d3d/device/misc.cpp d3d/scene/frame.cpp d3d/scene/swap.cpp d3d/scene/tiling.cpp d3d/device/leaves.cpp d3d/device/lists.cpp d3d/hooks/handlers.cpp
+    d3d/hooks/layer.cpp d3d/hooks/plume_d3d.cpp d3d/device/state.cpp d3d/device/bound.cpp d3d/device/getters.cpp d3d/sync/fence.cpp d3d/resources/resource.cpp d3d/resources/shader.cpp d3d/resources/microcode.cpp d3d/device/misc.cpp d3d/scene/frame.cpp d3d/scene/swap.cpp d3d/scene/tiling.cpp d3d/scene/command_buffers.cpp d3d/device/leaves.cpp d3d/device/lists.cpp d3d/hooks/handlers.cpp
     d3d/frontend/lists.cpp d3d/frontend/flush.cpp d3d/frontend/draws.cpp d3d/frontend/commands.cpp d3d/frontend/sync.cpp d3d/frontend/entry.cpp d3d/frontend/report.cpp
     plume/plume_renderer.cpp plume/hiz_model.cpp
     gpu/core/context.cpp plume/shaders/depth_stencil_pack.comp.cpp plume/shaders/patch_expand.comp.cpp plume/shaders/patch_levels.comp.cpp plume/shaders/point_list.geom.cpp plume/shaders/rect_list.geom.cpp gpu/draw/draw.cpp gpu/draw/draw_util.cpp gpu/xenos/interpreter.cpp gpu/xenos/register_file.cpp gpu/xenos/registers.cpp gpu/xenos/shader.cpp gpu/xenos/translator.cpp gpu/xenos/translator_disasm.cpp gpu/xenos/ucode.cpp gpu/draw/hiz.cpp gpu/debug/census.cpp gpu/core/host.cpp
