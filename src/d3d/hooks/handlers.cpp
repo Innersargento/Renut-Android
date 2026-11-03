@@ -686,6 +686,38 @@ bool MiscGetResourceDevice(PPCContext& ctx, uint8_t* base) {
 }
 
 
+// D3DDevice_AddRef(device) (sub_8264E068) and D3DDevice_Release (Direct3DDevice_Release): the device's
+// reference count is the word at +60. The original adds one and returns it. Release subtracts one and
+// returns it, except on the last reference, where it tears the device down (D3D::UninitializeDevice,
+// then frees the allocation at device - 4): that stays the original's, so the handler declines it.
+// The count is changed atomically (the original's is not) because many threads share the device.
+uint32_t* DeviceReferences(uint8_t* base, u32 device) {
+  return reinterpret_cast<uint32_t*>(renut::GuestPtr(base, device + 60));
+}
+
+bool DeviceAddRef(PPCContext& ctx, uint8_t* base) {
+  if (!ctx.r3.u32) return false;
+  std::atomic_ref<uint32_t> references(*DeviceReferences(base, ctx.r3.u32));
+  uint32_t seen = references.load(std::memory_order_relaxed), added;
+  do {
+    added = __builtin_bswap32(seen) + 1;
+  } while (!references.compare_exchange_weak(seen, __builtin_bswap32(added), std::memory_order_relaxed));
+  ctx.r3.u64 = added;
+  return true;
+}
+
+bool DeviceRelease(PPCContext& ctx, uint8_t* base) {
+  if (!ctx.r3.u32) return false;
+  std::atomic_ref<uint32_t> references(*DeviceReferences(base, ctx.r3.u32));
+  uint32_t seen = references.load(std::memory_order_relaxed), left;
+  do {
+    if (__builtin_bswap32(seen) <= 1) return false;  // the last reference: the original tears down
+    left = __builtin_bswap32(seen) - 1;
+  } while (!references.compare_exchange_weak(seen, __builtin_bswap32(left), std::memory_order_relaxed));
+  ctx.r3.u64 = left;
+  return true;
+}
+
 // D3DDevice_DrawVerticesUP(device, primitive, vertex count, data, stride): room for
 // the vertices from BeginVertices (the native front end's), then the data.
 bool MiscDrawVerticesUP(PPCContext& ctx, uint8_t* base) {
@@ -705,6 +737,8 @@ bool MiscDrawVerticesUP(PPCContext& ctx, uint8_t* base) {
 namespace {
 
 void RegisterMisc() {
+  SetHandler(kD3DDevice_AddRef, DeviceAddRef);
+  SetHandler(kD3DDevice_Release, DeviceRelease);
   SetHandler(kD3DDevice_GetDeviceCaps, MiscGetDeviceCaps);
   SetHandler(kD3DResource_GetDevice, MiscGetResourceDevice);
   SetHandler(kD3DDevice_DrawVerticesUP, MiscDrawVerticesUP);
