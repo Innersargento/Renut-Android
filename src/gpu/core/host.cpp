@@ -10,6 +10,11 @@
 // its interrupt, the ring and the GPU backend behind it. The SDK has no
 // part in it (RuntimeConfig::graphics is null); the three Vd exports that
 // reach it are overridden in kernel_overrides.cpp.
+REXCVAR_DEFINE_BOOL(renut_native_gpu_callbacks, true, "reNut",
+                    "The GPU's callback interrupt (the one D3DDevice_InsertCallback raises) is served here: "
+                    "the callback is called with its context and the CPU's bit in the writeback block is cleared, "
+                    "without the recompiled interrupt handler. Off: the handler runs, as before");
+
 namespace renut::gpu {
 
 class PlumeGpu {
@@ -62,9 +67,38 @@ class PlumeGpu {
     if (!thread) return;
     if (cpu == 0xFFFFFFFF) cpu = 2;
     thread->SetActiveCpu(cpu);
+    if (source == 1 && REXCVAR_GET(renut_native_gpu_callbacks) && RunCallbackInterrupt(thread, cpu)) return;
     uint64_t args[] = {source, interrupt_callback_data_};
     function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                            rex::countof(args));
+  }
+
+  // The graphics interrupt handler's source 1 (sub_826573F0), served natively. The GPU's scratch
+  // registers 4 and 5 were written back to the device's writeback block (device + 10900) at +16 and
+  // +20: the callback and its context. The handler calls the callback when there is one, then takes
+  // its CPU's bit out of the mask at +0 (scratch register 0, which the GPU sets for the CPUs the
+  // callback is for) under the device's lock at +10904; the bit is the only thing it changes there, so
+  // an atomic clear does for the lock. False when the device or its block is not there (the handler runs).
+  bool RunCallbackInterrupt(rex::system::XThread* thread, uint32_t cpu) {
+    if (!interrupt_callback_data_ || cpu >= 6) return false;
+    auto word = [&](uint32_t address) {
+      return reinterpret_cast<uint32_t*>(memory_->TranslateVirtual<uint8_t*>(address));
+    };
+    const uint32_t* device_block = word(interrupt_callback_data_ + 10900);
+    const uint32_t block = device_block ? __builtin_bswap32(*device_block) : 0;
+    if (!block) return false;
+    const uint32_t callback = __builtin_bswap32(*word(block + 16));
+    if (callback) {
+      uint64_t args[] = {__builtin_bswap32(*word(block + 20))};
+      function_dispatcher_->ExecuteInterrupt(thread->thread_state(), callback, args, rex::countof(args));
+    }
+    auto mask = std::atomic_ref<uint32_t>(*word(block));
+    uint32_t seen = mask.load(std::memory_order_relaxed);
+    for (;;) {
+      const uint32_t cleared = __builtin_bswap32((__builtin_bswap32(seen) & ~(1u << cpu)) & 0x3F);
+      if (mask.compare_exchange_weak(seen, cleared, std::memory_order_acq_rel)) break;
+    }
+    return true;
   }
 
   // Called by the renderer's worker on every pass.
