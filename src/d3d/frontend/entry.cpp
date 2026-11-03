@@ -61,6 +61,10 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       return BeginRingAlloc(ctx, base);
     case kD3D_RingAllocate:
       return RingAllocate(ctx, base);
+    case kD3D_ReserveRing:
+      return ReserveRing(ctx, base);
+    case kD3D_CDevice_BeginRingManual:
+      return BeginRingManual(ctx, base);
     case kD3D_CDevice_StartNewSegment:
       return StartNewSegment(ctx, base);
     case kD3D_CaptureRing:

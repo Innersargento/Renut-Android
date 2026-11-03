@@ -22,8 +22,8 @@ struct FenceHooks {
 // IsFencePending's test: the fence has been issued and the GPU has not reached it.
 bool FencePending(Device device, u32 fence);
 
-// D3DDevice_IsFencePending(Fence): on the title's device. The current fence is
-// kicked first, as games poll this and the fence is only issued by a KickOff.
+// D3DDevice_IsFencePending, D3DDevice_BlockOnFence and CDevice::BlockOnFence are handlers in
+// hooks/handlers.cpp (cvar renut_native_fence_wait); IsFencePending kicks the current fence first.
 
 // CDevice::BlockOnFence(Fence, Type, NoKick): kick the fence if no KickOff has
 // covered it yet, then wait for it.

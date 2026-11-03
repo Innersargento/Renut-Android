@@ -198,6 +198,33 @@ bool StartNewSegment(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// CDevice::BeginRingBig(device, dwords) (sub_821F7C18): room for dwords in the ring. When the
+// segment is full the original kicks, starts a new segment, and gives 0 if even that is too small.
+bool ReserveRing(PPCContext& ctx, uint8_t* base) {
+  const uint32_t dev = ctx.r3.u32;
+  if (KeepsOriginal(base, dev)) return false;
+  const uint32_t bytes = ctx.r4.u32 * 4;
+  auto fits = [&] { return U32(base, dev + kRingWrite) + bytes <= U32(base, dev + kRingLimit); };
+  if (!fits()) {
+    KickDevice(ctx, base, dev);
+    if (!fits()) {
+      RewindRing(base, dev);
+      if (!fits()) {
+        ctx.r3.u64 = 0;
+        return true;
+      }
+    }
+  }
+  ctx.r3.u64 = U32(base, dev + kRingWrite);
+  return true;
+}
+
+// CDevice::BeginRingManual(device) (sub_82A11158): the ring pointer, nothing reserved.
+bool BeginRingManual(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = U32(base, ctx.r3.u32 + kRingWrite);
+  return true;
+}
+
 // CDevice::SetFence(device, ring) (sub_82278528), without the packets. The original writes ten words
 // at `ring` (two EVENT_WRITE_SHDs: the ring position to completion+4, the fence to completion+0),
 // remembers the ring position in +13240/+13244, completes the fence itself on a device with immediate

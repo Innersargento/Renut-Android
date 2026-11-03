@@ -30,6 +30,11 @@
 #include <rex/cvar.h>
 #include <rex/ppc/context.h>
 
+REXCVAR_DEFINE_BOOL(renut_native_fence_wait, true, "reNut",
+                    "D3DDevice_IsFencePending, D3DDevice_BlockOnFence and CDevice::BlockOnFence natively: "
+                    "the wait sleeps until the GPU backend completes a fence (the recompiled functions' "
+                    "wait loop is not run). Off: the recompiled functions");
+
 // The recompiled originals UnsetAll hands the shaders to.
 extern "C" {
 REX_FUNC(sub_82223270);  // D3D_SetSurfaceClip
@@ -393,6 +398,49 @@ void WaitFenceCall(u32 fence) {
                MakeFenceHooks(kick));
 }
 
+// D3DDevice_IsFencePending(fence) (sub_8228F650): fence 0 is never pending; the current
+// fence is kicked first, as it is only issued by a KickOff, then the test.
+bool IsFencePendingCall(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(renut_native_fence_wait))
+    return false;
+  const u32 fence = ctx.r3.u32;
+  if (!fence) {
+    ctx.r3.u64 = 0;
+    return true;
+  }
+  const Device device = DeviceAt(base, renut::native_d3d::MainDevice());
+  if (!device) {
+    ctx.r3.u64 = 0;
+    return true;
+  }
+  if (fence == device.W(off::FenceTag)) {
+    KickCall kick{&ctx, base};
+    KickOffDevice(&kick, device.va);
+  }
+  ctx.r3.u64 = FencePending(device, fence) ? 1 : 0;
+  return true;
+}
+
+// CDevice::BlockOnFence(device, fence, type, no kick) (sub_8228F558).
+bool CDeviceBlockOnFenceCall(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(renut_native_fence_wait))
+    return false;
+  KickCall kick{&ctx, base};
+  BlockOnFence(DeviceAt(base, ctx.r3.u32), ctx.r4.u32, (ctx.r6.u32 & 0xFF) != 0, MakeFenceHooks(kick));
+  return true;
+}
+
+// D3DDevice_BlockOnFence(fence) (sub_8228F3B0): the title's device, kick allowed.
+bool BlockOnFenceCall(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(renut_native_fence_wait))
+    return false;
+  if (ctx.r3.u32) {
+    KickCall kick{&ctx, base};
+    BlockOnFence(DeviceAt(base, renut::native_d3d::MainDevice()), ctx.r3.u32, false, MakeFenceHooks(kick));
+  }
+  return true;
+}
+
 bool CreateVertexBufferCall(PPCContext& ctx, uint8_t* base) {
   CallScope scope(ctx, base);
   ctx.r3.u64 = CreateVertexBuffer(ctx.r3.u32, ctx.r4.u32);
@@ -684,6 +732,9 @@ void RegisterResources() {
   calls.xmem_free = XMemFreeCall;
   calls.wait_fence = WaitFenceCall;
   SetGuestCalls(calls);
+  SetHandler(kD3DDevice_IsFencePending, IsFencePendingCall);
+  SetHandler(kD3D_CDevice_BlockOnFence, CDeviceBlockOnFenceCall);
+  SetHandler(kD3DDevice_BlockOnFence, BlockOnFenceCall);
   SetHandler(kD3DDevice_CreateVertexBuffer, CreateVertexBufferCall);
   SetHandler(kD3DDevice_CreateIndexBuffer, CreateIndexBufferCall);
   SetHandler(kD3DDevice_CreateTexture, CreateTextureCall);
