@@ -113,34 +113,8 @@ bool Present(PPCContext& ctx, uint8_t* base) {
 
 // --- Gamma -----------------------------------------------------------------
 
-// The shared tail of SetGammaRamp and SetPWLGamma: `convert` builds the 0x600-byte
-// table from the ramp; a table that differs from the device's replaces it (the old one
-// is saved first, for a device that is not the type-2 one, unless it already was).
-bool SetGamma(PPCContext& ctx, uint8_t* base, Fn convert) {
-  if (!convert || !sub_82D0827C)
-    return false;
-  Frame f(ctx, base, 0x670);
-  Device d = DeviceAt(base, ctx.r3.u32);
-  if (!d)
-    return false;
-  const u32 table = f.sp + 0x50;
-  f.Call(convert, {table, ctx.r5.u32, 0});
-  const u32 current = d.va + 0x3A9C;
-  if (std::memcmp(f.G(table), f.G(current), 0x600) == 0)
-    return true;
-  if (f.Call(sub_82D0827C) != 2) {
-    const u32 save = d.W(0x5D90);
-    if (save && !(d.W(0x5D94) & 0x80000000u))
-      std::memcpy(f.G(save), f.G(current), 0x600);
-    d.SetW(0x5D94, d.W(0x5D94) | 0x80000000u);
-  }
-  std::memcpy(f.G(current), f.G(table), 0x600);
-  d.SetW(0x4144, d.W(0x4144) | 2);
-  return true;
-}
-
-bool SetGammaRamp(PPCContext& ctx, uint8_t* base) { return SetGamma(ctx, base, sub_826593F8); }
-bool SetPWLGamma(PPCContext& ctx, uint8_t* base) { return SetGamma(ctx, base, sub_82659490); }
+// SetGammaRamp and SetPWLGamma are in hooks/handlers.cpp (renut_native_gamma). The port that was here
+// named the kernel's process-type thunk (0x82D0827C) as a function, found none, and so always declined.
 
 // --- Scaler ----------------------------------------------------------------
 
@@ -409,8 +383,6 @@ void RegisterFrame() {
   SetHandler(kD3D_SetSurfaceClip, SetSurfaceClip);
   SetHandler(kD3DDevice_ClearF, ClearF);
   SetHandler(kD3DDevice_Present, Present);
-  SetHandler(kD3DDevice_SetGammaRamp, SetGammaRamp);
-  SetHandler(kD3DDevice_SetPWLGamma, SetPWLGamma);
   SetHandler(kD3DDevice_SetScalerParameters, SetScalerParameters);
   SetHandler(kD3DDevice_DrawIndexedVerticesUP, DrawIndexedVerticesUP);
   SetHandler(kD3DDevice_BeginExport, BeginExport);
