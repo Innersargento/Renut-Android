@@ -306,6 +306,21 @@ bool SynchronizeToPresentationInterval(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+void WaitForBackend(uint32_t max_lists_ahead, uint32_t timeout_ms) {
+  const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  for (;;) {
+    const uint64_t published = g_counts.lists_published.load(std::memory_order_relaxed);
+    const uint64_t executed = g_counts.lists_executed.load(std::memory_order_relaxed);
+    if (published <= executed + max_lists_ahead) return;
+    if (std::chrono::steady_clock::now() >= until) {
+      if (g_counts.brake_timeouts.fetch_add(1, std::memory_order_relaxed) == 0)
+        REXLOG_WARN("Renut: the command buffer brake timed out ({} lists ahead of the backend)", published - executed);
+      return;
+    }
+    FenceWait(FenceEpoch(), 1000);
+  }
+}
+
 uint32_t MainDevice() {
   std::lock_guard lock(g_front.mutex);
   return g_front.main_device;

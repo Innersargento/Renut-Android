@@ -145,6 +145,9 @@ uint32_t RingSinkAddress();
 // Points a device's ring at the sink, as a kick does (and, for a device recording a command buffer,
 // names the segment start EndCommandBuffer sizes the segment from).
 void RewindRecordingRing(uint8_t* base, uint32_t device);
+// Waits (at most timeout_ms) until no more than max_lists_ahead published lists are waiting for the
+// backend: the brake a thread that records command buffers takes before it starts another.
+void WaitForBackend(uint32_t max_lists_ahead, uint32_t timeout_ms);
 
 // Fence waits sleep instead of polling. The GPU backend calls NotifyFenceCompleted
 // after it writes a fence word; a waiter reads FenceEpoch() before it tests the fence

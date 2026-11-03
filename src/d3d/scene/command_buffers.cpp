@@ -1,7 +1,8 @@
-// D3DDevice_BeginCommandBuffer and D3DDevice_EndCommandBuffer, natively (see command_buffers.h).
+// D3DDevice_BeginCommandBuffer, EndCommandBuffer and RunCommandBuffer, natively (see
+// command_buffers.h).
 //
-// Translated from this executable's own code (sub_82657CB0 and sub_826582A0, read off the recompiled
-// code), not from reNut's; the offsets are this release's. The native front end has opened the
+// Translated from this executable's own code (sub_82657CB0, sub_826582A0 and sub_82222888, read off
+// the recompiled code), not from reNut's; the offsets are this release's. The native front end has opened the
 // buffer's host list (Begin) or closes it (End) before these run: the draws a recording device makes
 // are recorded on the host, and the buffer's memory never holds what the GPU would run.
 //
@@ -12,11 +13,13 @@
 //    and does not flush the dirty state as packets: the front end has recorded that state, and the
 //    pending masks are cleared as the packets' writer clears them.
 // The ring of a device recording is the sink, as for every device (sync.cpp), so the sizes End
-// reads of it (the segment start, +14928) are the ones the sink gives. Run, which walks the buffer's
-// call list (+116) in both of its modes without a null test, gets one empty node (EmptyCallList):
-// without it the first Run read guest address 4 over and over and the game froze at the first 3D.
+// reads of it (the segment start, +14928) are the ones the sink gives. The recompiled Run walks the
+// buffer's call list (+116) in both of its modes without a null test, so End still names one empty
+// node there (EmptyCallList) for a Run that is not this one: without it the first Run read guest
+// address 4 over and over and the game froze at the first 3D. Run itself keeps the device's
+// bookkeeping and leaves the packets out (see its comment).
 //
-// Both leave the original to run when the cvar is off, when the stub of the recording ring (the
+// All three leave the original to run when the cvar is off, when the stub of the recording ring (the
 // stub_command_buffers cvar of sync.cpp) is off, or for what they do not cover.
 #include "d3d/scene/command_buffers.h"
 
@@ -24,7 +27,6 @@
 #include "d3d/hooks/layer.h"
 #include "d3d/device/guest_frame.h"
 #include "d3d/device/internal.h"
-#include "d3d/device/retail.h"
 
 #include <atomic>
 #include <cstring>
@@ -35,13 +37,18 @@
 #include <rex/system/xmemory.h>
 
 REXCVAR_DECLARE(bool, renut_stub_command_buffers);
+REXCVAR_DEFINE_INT32(renut_command_buffer_lists_ahead, 32, "reNut",
+                     "The brake of BeginCommandBuffer: a thread that starts recording a buffer waits (at most "
+                     "50 ms) while more than this many published lists are waiting for the GPU backend. The "
+                     "console made it wait for the buffer's own previous run; the buffers are copies on the host, "
+                     "so this bounds what piles up instead. 0: no brake")
+    .range(0, 4096);
 REXCVAR_DEFINE_BOOL(renut_native_command_buffers, true, "reNut",
                     "BeginCommandBuffer and EndCommandBuffer natively: the buffer's memory (segments, "
                     "allocator, allocation list) is not built, the draws are recorded on the host. Off: "
                     "the recompiled functions. Needs renut_stub_command_buffers");
 
 extern "C" {
-REX_FUNC(sub_8228F558);  // CDevice::BlockOnFence
 REX_FUNC(sub_82223270);  // D3D::SetSurfaceClip (hooked: the front end records the clip)
 __attribute__((weak)) void sub_82658818(PPCContext& __restrict, uint8_t*);  // the one-pass Z pass set-up
 __attribute__((weak)) void sub_8264E1A8(PPCContext& __restrict, uint8_t*);  // unbinds the targets, shaders, streams
@@ -106,6 +113,16 @@ bool Enabled() {
 i32 LowHalf(u32 word) { return i32(word << 17) >> 17; }
 i32 HighHalf(u32 word) { return i32(word << 1) >> 17; }
 
+// The window scissor, when the tags (the last word of a buffer's) do not say the buffer carries
+// its own: SetSurfaceClip with the device's two scissor words split into signed halves. The front
+// end records the clip from its hook on that function.
+void SetWindowClip(const GuestFrame& f, Device d, u64 last_tags) {
+  if ((last_tags & (u64(7) << 46)) == (u64(7) << 46)) return;
+  const u32 top_left = d.W(kWindowTopLeft), bottom_right = d.W(kWindowBottomRight);
+  f.Call(sub_82223270, {d.va, u32(LowHalf(top_left)), u32(HighHalf(top_left)), u32(LowHalf(bottom_right)),
+                        u32(HighHalf(bottom_right))});
+}
+
 // D3DDevice_BeginCommandBuffer(device, buffer, flags, inheritTags, persistTags, rects, count)
 // (sub_82657CB0): this release's has the persist tags that reNut's (title update 3) dropped; they
 // are not read.
@@ -120,13 +137,15 @@ bool BeginCommandBuffer(PPCContext& ctx, uint8_t* base) {
   const u32 dev = d.va;
 
   g.SetW(buffer + kBufferFlags, Insert(g.W(buffer + kBufferFlags), 2, 0, 4));
-  // The fence of the buffer's last run: wait for it before the buffer is written again. The title's
-  // device is the one the wait goes through (every thread of the title is a title process).
-  if (const u32 fence = g.W(buffer + kBufferFence)) {
-    if (const u32 title = g.W(g.W(retail::kVdGlobalDeviceSlot)))
-      f.Call(sub_8228F558, {title, fence, 16, 0});
-    g.SetW(buffer + kBufferFence, 0);
-  }
+  // The brake. The console waited here for the buffer's last run to finish, because the GPU read the
+  // buffer's memory; here the buffer is a copy on the host, a Run never marks it busy (below), and what
+  // is left to hold a thread that records is the backend: not too many lists ahead of it.
+  if (const int ahead = REXCVAR_GET(renut_command_buffer_lists_ahead))
+    renut::native_d3d::WaitForBackend(u32(ahead), 50);
+  // The buffer's fence is cleared, not waited for: nothing writes one any more (the original Run did,
+  // the native one does not), and a stale one from a Run of the original would only make
+  // D3DResource_Destroy wait for a buffer that is a copy on the host.
+  g.SetW(buffer + kBufferFence, 0);
   // (The original resets the buffer's allocator here when the buffer has no fixed memory.)
 
   d.SetW(off::CommandBuffer, buffer);
@@ -225,12 +244,7 @@ bool BeginCommandBuffer(PPCContext& ctx, uint8_t* base) {
   std::memset(d.bytes + kTextureFetch, 0, kTextureFetchBytes);
 
   // A buffer that does not inherit the window scissor sets its own from the device's.
-  const u64 own_tags = g.Q(buffer + kBufferTags + 32);
-  if ((own_tags & (u64(7) << 46)) != (u64(7) << 46)) {
-    const u32 top_left = d.W(kWindowTopLeft), bottom_right = d.W(kWindowBottomRight);
-    f.Call(sub_82223270, {dev, u32(LowHalf(top_left)), u32(HighHalf(top_left)), u32(LowHalf(bottom_right)),
-                          u32(HighHalf(bottom_right))});
-  }
+  SetWindowClip(f, d, g.Q(buffer + kBufferTags + 32));
   // Everything the buffer does not inherit is dirty in it.
   for (u32 i = 0; i < 5; ++i) d.SetPending(i, ~g.Q(buffer + kBufferTags + i * 8));
   ctx.r3.u64 = 0;
@@ -274,11 +288,44 @@ bool EndCommandBuffer(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// D3DDevice_RunCommandBuffer(device, buffer, predication) (sub_82222888). The front end has
+// recorded the buffer's list into the device's (and flushed the state the buffer inherits); what the
+// original does besides writing packets is the device's bookkeeping, which stays:
+//  * the dirty words the buffer inherits are cleared (the original writes that state out first);
+//  * the buffer is NOT marked busy: the original writes the fence the device is at into its +8, which
+//    the next Begin waits for and the resource code reads (D3DResource_Destroy waits for it before
+//    freeing); the buffer is a copy on the host, so nothing is left to wait for (reNut's Run does not
+//    write it either, nor does its Begin find one). The brake is Begin's;
+//  * the window scissor is set again unless the buffer carries its own, and what the buffer set
+//    is dirty on the device (the complement of its set tags).
+// Left out are the packets: the indirect calls for the buffer's segments (its call list, +116, whose
+// walk it did in two modes), the preamble and predication words, the ring kicks they brought and the
+// bookkeeping of the lists a ring replay would use (the device's own allocation lists, 13348 and
+// 13248, and a recording device's call list: Run inside a recording is recorded by the front end).
+bool RunCommandBuffer(PPCContext& ctx, uint8_t* base) {
+  if (!Enabled()) return false;
+  Device d = DeviceAt(base, ctx.r3.u32);
+  const u32 buffer = ctx.r4.u32;
+  if (!d || !buffer) return false;
+  GuestFrame f(ctx, base, 0x40);
+  Device g = GuestOnly(base);
+
+  for (u32 word = 0; word < 5; ++word) {
+    if (g.Q(buffer + kBufferTags + word * 8) & d.Pending(word)) d.SetPending(word, 0);
+  }
+  const u64 set_last = g.Q(buffer + kBufferSetTags + 32);
+  SetWindowClip(f, d, set_last);
+  for (u32 word = 0; word < 4; ++word) d.SetPending(word, ~g.Q(buffer + kBufferSetTags + word * 8));
+  d.SetPending(4, ~set_last);
+  return true;
+}
+
 }  // namespace
 
 void RegisterCommandBuffers() {
   SetHandler(kD3DDevice_BeginCommandBuffer, BeginCommandBuffer);
   SetHandler(kD3DDevice_EndCommandBuffer, EndCommandBuffer);
+  SetHandler(kD3DDevice_RunCommandBuffer, RunCommandBuffer);
 }
 
 }  // namespace renut::d3d::port

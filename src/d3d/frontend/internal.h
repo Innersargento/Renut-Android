@@ -162,7 +162,7 @@ inline struct Counters {
   std::atomic<uint64_t> no_scratch{0}, hiz_events{0}, unknown_runs{0}, nested_recordings{0};
   std::atomic<uint64_t> surface_clips{0}, tiled_surface_clips{0}, foreign_immediate{0}, devices{0};
   std::atomic<uint64_t> fences{0}, presents{0}, callbacks{0}, doorbells{0}, native_doorbells{0};
-  std::atomic<uint64_t> stuck_waits{0}, lists_published{0}, lists_executed{0}, indexed_up{0};
+  std::atomic<uint64_t> stuck_waits{0}, lists_published{0}, lists_executed{0}, indexed_up{0}, brake_timeouts{0};
   std::atomic<uint64_t> effect_records{0}, doorbells_skipped{0};
   std::atomic<uint64_t> worker_runs{0};
 } g_counts;
