@@ -318,6 +318,10 @@ namespace renut::gpu {
   struct HizModelEntry {
     std::shared_ptr<renut::hiz::Model> model;
     bool validated = false;
+    // Draws of this entry that had no model since the last report, and the
+    // shader they came from (for the report's ranking).
+    uint64_t nomodel_draws = 0;
+    uint64_t vs_hash = 0;
   };
 
   // An object-space box of the fetched element over the vertices a draw reads,

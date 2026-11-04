@@ -26,8 +26,6 @@ struct Reporting {
   // whose box lies wholly outside the frustum or the scissor (exact).
   uint32_t hiz_mode_ = 0;
   std::unordered_map<uint64_t, uint64_t> hiz_clip_states_;
-  std::unordered_map<uint64_t, uint64_t> hiz_nomodel_draws_;
-  std::unordered_map<uint64_t, uint32_t> hiz_nomodel_why_;
   RecStats rec_stats_;
   uint64_t reported_silent_frames_ = 0;
 };

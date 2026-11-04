@@ -125,22 +125,22 @@ void Reporting::Report() {
         backend.stats_.hiz_model_us / 1000, backend.stats_.hiz_boxes_made, backend.stats_.hiz_box_us / 1000, backend.stats_.hiz_box_hits,
         backend.stats_.hiz_why[0], backend.stats_.hiz_why[1], backend.stats_.hiz_why[2], backend.stats_.hiz_why[3], backend.stats_.hiz_why[4]);
   }
-  if (hiz_mode_ && !hiz_nomodel_draws_.empty()) {
-    std::vector<std::pair<uint64_t, uint64_t>> ranked;
-    for (const auto& [key, count] : hiz_nomodel_draws_) ranked.emplace_back(count, key);
-    std::sort(ranked.rbegin(), ranked.rend());
-    std::string line = "Renut: Plume Hi-Z shaders without a model (vs hash/why/draws):";
-    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); ++i) {
-      uint64_t hash = ranked[i].second;
-      uint32_t why = 0;
-      for (uint32_t w = 0; w < 16; ++w) {
-        auto it = hiz_nomodel_why_.find(hash ^ w);
-        if (it != hiz_nomodel_why_.end() && it->second == w) { why = w; hash ^= w; break; }
-      }
-      line += fmt::format(" [{:016X}/{}/{}]", hash, why, ranked[i].first);
+  if (hiz_mode_) {
+    // (draws, vs hash, why) per entry with draws since the last report.
+    std::vector<std::tuple<uint64_t, uint64_t, uint32_t>> ranked;
+    for (auto& [key, entry] : backend.hiz.hiz_models_) {
+      if (!entry.nomodel_draws) continue;
+      ranked.emplace_back(entry.nomodel_draws, entry.vs_hash, entry.model ? uint32_t(entry.model->why) : 0u);
+      entry.nomodel_draws = 0;
     }
-    REXLOG_INFO("{}", line);
-    hiz_nomodel_draws_.clear();
+    if (!ranked.empty()) {
+      std::sort(ranked.rbegin(), ranked.rend());
+      std::string line = "Renut: Plume Hi-Z shaders without a model (vs hash/why/draws):";
+      for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); ++i) {
+        line += fmt::format(" [{:016X}/{}/{}]", std::get<1>(ranked[i]), std::get<2>(ranked[i]), std::get<0>(ranked[i]));
+      }
+      REXLOG_INFO("{}", line);
+    }
   }
   if (hiz_mode_ && !hiz_clip_states_.empty()) {
     std::vector<std::pair<uint64_t, uint64_t>> ranked;

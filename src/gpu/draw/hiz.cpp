@@ -318,8 +318,12 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   // vtx_w0_fmt set is the usual case: the shader's W is W, not 1/W.
   if (clip.clip_disable || vte.vtx_xy_fmt || vte.vtx_z_fmt || !vte.vtx_w0_fmt || !vte.vport_x_scale_ena ||
       !vte.vport_x_offset_ena || !vte.vport_y_scale_ena || !vte.vport_y_offset_ena) {
-    ++backend.report.hiz_clip_states_[(uint64_t(vte.value) << 32) | clip.value];
-    return ++backend.stats_.hiz_why[3], false;
+    // Which states, for the report: one draw in 16 is enough, and a hash map
+    // insert on each of them was a cost of its own.
+    if ((backend.stats_.hiz_why[3]++ & 15) == 0) {
+      backend.report.hiz_clip_states_[(uint64_t(vte.value) << 32) | clip.value] += 16;
+    }
+    return false;
   }
   if (regs.sq_vs_const.base != 0) return ++backend.stats_.hiz_why[4], false;
 
@@ -332,8 +336,9 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   if (!entry->model || !entry->model->valid) {
     ++backend.stats_.hiz_no_model[kind];
     ++backend.stats_.hiz_why_model[kind][entry->model ? uint32_t(entry->model->why) % 12 : 0];
-    ++backend.report.hiz_nomodel_draws_[(vs.entry ? vs.entry->hash : 0) ^ (entry->model ? uint64_t(entry->model->why) & 15 : 0)];
-    backend.report.hiz_nomodel_why_[vs.entry ? vs.entry->hash : 0] = entry->model ? uint32_t(entry->model->why) : 0;
+    // Counted on the entry; the report ranks them (no hash map on this path).
+    ++entry->nomodel_draws;
+    entry->vs_hash = vs.entry ? vs.entry->hash : 0;
     return false;
   }
   renut::hiz::Model& model = *entry->model;
@@ -424,6 +429,13 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   // components, the columns A[.][1 + j] * half_j. A plane's value over it ranges
   // over centre +- sum |coefficient along j| * half_j, so "all of it outside" is
   // one comparison per plane and no corner is formed.
+  //
+  // Most draws are in view, and for those the centre alone settles every test:
+  // the range's low end is below the centre and its high end above it, so a
+  // centre on the inner side of a plane means the box is not wholly outside it.
+  // The ranges (the costly part: a dot product per plane and per component) are
+  // only formed when a centre is on the wrong side of some plane. The decisions
+  // are the same as with the ranges, which the fast tests only skip.
   float centre[4], half[4], mid[4];
   uint32_t comps[4], ncomps = 0;
   for (uint32_t j = 0; j < 4; ++j) {
@@ -434,22 +446,22 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     for (int o = 0; o < 4; ++o) any = any || affine[o][1 + j] != 0.f;
     if (any) comps[ncomps++] = j;
   }
-  float magnitude = 0.f;
   for (int o = 0; o < 4; ++o) {
     float c = affine[o][0];
     for (uint32_t i = 0; i < ncomps; ++i) {
       const uint32_t j = comps[i];
       c += affine[o][1 + j] * mid[j];
-      magnitude += std::fabs(affine[o][1 + j] * half[j]);
     }
     if (!std::isfinite(c)) return false;
     centre[o] = c;
-    magnitude += std::fabs(c);
   }
   ++backend.stats_.hiz_eligible[kind];
-  // [lowest, highest] of the plane s . clip over the box.
+  // The plane s . clip at the centre, and its [lowest, highest] over the box.
+  auto plane_centre = [&](float sx, float sy, float sz, float sw) {
+    return sx * centre[0] + sy * centre[1] + sz * centre[2] + sw * centre[3];
+  };
   auto plane_range = [&](float sx, float sy, float sz, float sw, float* lowest, float* highest) {
-    float c = sx * centre[0] + sy * centre[1] + sz * centre[2] + sw * centre[3];
+    float c = plane_centre(sx, sy, sz, sw);
     float r = 0.f;
     for (uint32_t i = 0; i < ncomps; ++i) {
       const uint32_t j = comps[i];
@@ -459,24 +471,49 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     *lowest = c - r;
     *highest = c + r;
   };
-  const float slack = 1e-4f * magnitude;
+  // Formed when the first range is needed.
+  float slack = -1.f;
+  auto get_slack = [&]() {
+    if (slack < 0.f) {
+      float magnitude = 0.f;
+      for (int o = 0; o < 4; ++o) {
+        for (uint32_t i = 0; i < ncomps; ++i) {
+          const uint32_t j = comps[i];
+          magnitude += std::fabs(affine[o][1 + j] * half[j]);
+        }
+        magnitude += std::fabs(centre[o]);
+      }
+      slack = 1e-4f * magnitude;
+    }
+    return slack;
+  };
   auto wholly_outside = [&](float sx, float sy, float sz, float sw) {
     float low, high;
     plane_range(sx, sy, sz, sw, &low, &high);
-    return high < -slack;
+    return high < -get_slack();
   };
-  if (wholly_outside(1, 0, 0, 1) || wholly_outside(-1, 0, 0, 1) || wholly_outside(0, 1, 0, 1) ||
-      wholly_outside(0, -1, 0, 1) ||
-      (clip.dx_clip_space_def && (wholly_outside(0, 0, 1, 0) || wholly_outside(0, 0, -1, 1)))) {
-    ++backend.stats_.hiz_frustum[kind];
-    if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
-    return backend.report.hiz_mode_ >= 2;
+  const uint32_t ucp = clip.clip_disable ? 0u : uint32_t(clip.ucp_ena);
+  // A comparison that is false on NaN sends the draw to the full tests.
+  bool inside = centre[3] + centre[0] >= 0.f && centre[3] - centre[0] >= 0.f && centre[3] + centre[1] >= 0.f &&
+                centre[3] - centre[1] >= 0.f;
+  if (inside && clip.dx_clip_space_def) inside = centre[2] >= 0.f && centre[3] - centre[2] >= 0.f;
+  for (uint32_t i = 0; inside && ucp && i < 6; ++i) {
+    if (!(ucp & (1u << i))) continue;
+    const float* plane = regs.clip_planes[i];
+    inside = plane_centre(plane[0], plane[1], plane[2], plane[3]) >= 0.f;
   }
-  // User clip planes (the quarter-resolution mirrored pass clips at plane 0):
-  // the shaders keep what has dot(clip position, plane) >= 0 on every enabled
-  // plane, so a box wholly below one of them draws nothing.
-  if (const uint32_t ucp = clip.clip_disable ? 0u : uint32_t(clip.ucp_ena)) {
-    for (uint32_t i = 0; i < 6; ++i) {
+  if (!inside) {
+    if (wholly_outside(1, 0, 0, 1) || wholly_outside(-1, 0, 0, 1) || wholly_outside(0, 1, 0, 1) ||
+        wholly_outside(0, -1, 0, 1) ||
+        (clip.dx_clip_space_def && (wholly_outside(0, 0, 1, 0) || wholly_outside(0, 0, -1, 1)))) {
+      ++backend.stats_.hiz_frustum[kind];
+      if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
+      return backend.report.hiz_mode_ >= 2;
+    }
+    // User clip planes (the quarter-resolution mirrored pass clips at plane 0):
+    // the shaders keep what has dot(clip position, plane) >= 0 on every enabled
+    // plane, so a box wholly below one of them draws nothing.
+    for (uint32_t i = 0; ucp && i < 6; ++i) {
       if (!(ucp & (1u << i))) continue;
       const float* plane = regs.clip_planes[i];
       if (wholly_outside(plane[0], plane[1], plane[2], plane[3])) {
@@ -487,10 +524,6 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
       }
     }
   }
-  // Wholly in front of the eye: the scissor and the screen rectangle make sense.
-  float w_low, w_high;
-  plane_range(0, 0, 0, 1, &w_low, &w_high);
-  if (!(w_low > 1e-6f)) return false;
   float window_x = 0.f, window_y = 0.f;
   if (regs.raster.vtx_window_offset_enable) {
     const auto offset = regs.window_offset;
@@ -511,14 +544,29 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   const float right = left + float(scissor.extent[0]), bottom = top + float(scissor.extent[1]);
   // x_screen = xo + window_x + xs * x / w. All of the box left of (left - 1):
   // (left - 1 - xo - window_x) * w - xs * x > 0 everywhere, and so on.
+  const float bx = xo + window_x, by = yo + window_y;
+  const float sc[4][3] = {{-xs, 0.f, left - 1.0f - bx},
+                          {xs, 0.f, -(right + 1.0f - bx)},
+                          {0.f, -ys, top - 1.0f - by},
+                          {0.f, ys, -(bottom + 1.0f - by)}};
+  // A centre that is not beyond a scissor edge leaves that edge's range with its
+  // low end at or under zero, which is never "all positive". All four so: the
+  // draw is in the scissor, whatever the eye side of the box.
+  if (plane_centre(sc[0][0], sc[0][1], 0, sc[0][2]) <= 0.f && plane_centre(sc[1][0], sc[1][1], 0, sc[1][2]) <= 0.f &&
+      plane_centre(sc[2][0], sc[2][1], 0, sc[2][2]) <= 0.f && plane_centre(sc[3][0], sc[3][1], 0, sc[3][2]) <= 0.f) {
+    return false;
+  }
+  // Wholly in front of the eye: the scissor and the screen rectangle make sense.
+  float w_low, w_high;
+  plane_range(0, 0, 0, 1, &w_low, &w_high);
+  if (!(w_low > 1e-6f)) return false;
   auto all_positive = [&](float sx, float sy, float sw) {
     float low, high;
     plane_range(sx, sy, 0, sw, &low, &high);
-    return low > slack;
+    return low > get_slack();
   };
-  const float bx = xo + window_x, by = yo + window_y;
-  if (all_positive(-xs, 0, left - 1.0f - bx) || all_positive(xs, 0, -(right + 1.0f - bx)) ||
-      all_positive(0, -ys, top - 1.0f - by) || all_positive(0, ys, -(bottom + 1.0f - by))) {
+  if (all_positive(sc[0][0], sc[0][1], sc[0][2]) || all_positive(sc[1][0], sc[1][1], sc[1][2]) ||
+      all_positive(sc[2][0], sc[2][1], sc[2][2]) || all_positive(sc[3][0], sc[3][1], sc[3][2])) {
     ++backend.stats_.hiz_scissor[kind];
     if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
     return backend.report.hiz_mode_ >= 2;
