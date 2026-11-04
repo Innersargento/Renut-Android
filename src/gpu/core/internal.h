@@ -35,4 +35,3 @@
 // All of it lives in renut::gpu. Nothing here is for other parts of the app; they use
 // plume_gpu.h.
 #include "gpu/core/backend.h"
-#include "gpu/debug/format_census.h"

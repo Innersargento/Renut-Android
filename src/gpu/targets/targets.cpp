@@ -357,7 +357,6 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
     width = std::max((width * scale + 3) / 4, 16u);
     height = std::max((height * scale + 3) / 4, 16u);
   }
-  if (depth) format_census::DepthTarget(format); else format_census::ColorTarget(format);
   const RenderFormat rf = depth ? RenderFormat::D32_FLOAT_S8_UINT
                                 : ColorFormat(xenos::ColorRenderTargetFormat(format));
   target.texture = backend.device_->createTexture(depth ? RenderTextureDesc::DepthTarget(width, height, rf)

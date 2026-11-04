@@ -62,7 +62,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     explicit InDraw(bool& f) : flag(f) { flag = true; }
     ~InDraw() { flag = false; }
   } in_draw(in_issue_draw_);
-  format_census::Primitive(uint32_t(prim_type), index_buffer_info ? (index_buffer_info->format == xenos::IndexFormat::kInt32 ? 4 : 2) : 0);
   if (g_predict.queued.load(std::memory_order_relaxed)) backend.pipelines.PredictPipelines();
   const DrawState& regs = backend.state_;
   const auto edram_mode = xenos::EdramMode(backend.lists.draw_mode_);

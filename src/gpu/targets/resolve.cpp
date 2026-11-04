@@ -24,7 +24,6 @@ bool Resolve::DecodeResolve(const uint32_t* w, ResolveCopy& out) {
   out.dest_format = uint32_t(is_depth ? rex::graphics::DepthRenderTargetToTextureFormat(depth_format)
                                       : xenos::TextureFormat(dest_info.copy_dest_format));
   out.depth = is_depth;
-  format_census::Resolve(out.dest_format);
   out.clear_depth = control.depth_clear_enable != 0;
   out.clear_color = !is_depth && control.color_clear_enable != 0;
   out.endian = uint32_t(dest_info.copy_dest_endian);

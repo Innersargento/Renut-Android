@@ -169,7 +169,6 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
 void DecodeLiveElements(HostShader& shader) {
   shader.elements_decoded = true;
   DecodeLiveElements(shader, shader.entry, shader.elements, shader.live_fetches);
-  for (const LiveElement& e : shader.elements) format_census::Vertex(e.format, e.is_signed, e.normalized);
 }
 
 std::unique_ptr<RenderPipeline> CreateGraphicsPipeline(RenderDevice* device, const RenderGraphicsPipelineDesc& desc) {

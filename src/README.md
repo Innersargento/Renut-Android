@@ -19,7 +19,6 @@ gpu/            the GPU backend that runs those lists on Plume (renut::gpu)
   exec/         executes the lists (native_exec.cpp), records Vulkan commands
   draw/         draws, streams, pipelines and their cache, shaders, patches, Hi-Z
   targets/      render targets, resolves, textures, the swap
-  debug/        format census
   xenos/        microcode analysis, interpreter, translator
 plume/          the Plume renderer glue: swapchain, textures, frame pacing, host shaders
 guest/          what is done to the recompiled game: kernel overrides, fixes, cheats

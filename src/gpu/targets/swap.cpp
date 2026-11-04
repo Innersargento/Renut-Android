@@ -14,7 +14,6 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   native_d3d::NativeReport(backend.swaps_, backend.lists.native_draws_, backend.lists.native_bad_,
                            [this] { return backend.targets.SurfaceReport(); });
   backend.recorder.FlushDeferred();
-  if (backend.swaps_ % format_census::kDumpEverySwaps == 0) format_census::Dump(backend.miss_dump_directory_, backend.swaps_);
   if (skin_log_ && backend.swaps_ == 930) backend.resolve.LogSkinned();
   if (backend.draw.validate_windows_ && backend.swaps_ % 60 == 0) {
     REXLOG_INFO("Renut: Plume validation at swap {}: {} ranges compared, {} stale", backend.swaps_, backend.resolve.validate_ranges_, backend.resolve.validate_stale_);

@@ -64,7 +64,6 @@ const FetchLayout* Textures::LayoutOfByContents(
   }
 
   FetchLayout& layout = fetch_layouts_[fetch_key];
-  format_census::Texture(fetch);
   layout_memo_.Put(fetch_key, &layout);
   uint64_t key = 0;
   HashCombine(key, fetch.dword_0 & ~0x3FFu);  // pitch, tiling, (not clamp/sign)
