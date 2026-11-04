@@ -205,6 +205,9 @@ struct Stats {
   uint64_t hiz_clip_plane[2] = {};
   uint64_t hiz_boxes_made = 0, hiz_box_us = 0, hiz_box_hits = 0, hiz_models = 0, hiz_models_valid = 0,
            hiz_model_rejected = 0, hiz_model_us = 0;
+  // Boxes: erased by guest writes, made but not kept (memory the guest protects),
+  // made invalid, and the vertices read to make them.
+  uint64_t hiz_box_drops = 0, hiz_box_uncached = 0, hiz_box_invalid = 0, hiz_box_vertices = 0;
   uint64_t hiz_culled_total = 0;
   // Windows closed, and the draws they held, by reason: 0 elsewhere, 1 state change, 2 full, 3 an immediate
   // draw, 4 something the draw itself needed (a texture, a barrier).

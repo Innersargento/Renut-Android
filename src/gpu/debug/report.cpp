@@ -125,6 +125,25 @@ void Reporting::Report() {
         backend.stats_.hiz_model_us / 1000, backend.stats_.hiz_boxes_made, backend.stats_.hiz_box_us / 1000, backend.stats_.hiz_box_hits,
         backend.stats_.hiz_why[0], backend.stats_.hiz_why[1], backend.stats_.hiz_why[2], backend.stats_.hiz_why[3], backend.stats_.hiz_why[4]);
   }
+  if (hiz_mode_ && backend.stats_.hiz_boxes_made) {
+    // Where box making goes: totals, then the shaders whose draws made the most.
+    std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> churn;  // us, made, hash
+    for (auto& [key, entry] : backend.hiz.hiz_models_) {
+      if (!entry.boxes_made) continue;
+      churn.emplace_back(entry.box_us, entry.boxes_made, entry.vs_hash);
+      entry.boxes_made = entry.box_us = 0;
+    }
+    std::sort(churn.rbegin(), churn.rend());
+    std::string line = fmt::format(
+        "Renut: Plume Hi-Z boxes: {} kept, {} made ({} uncached, {} invalid), {} dropped by guest writes, "
+        "{} vertices read; made by shader (vs hash/made/us):",
+        backend.hiz.hiz_boxes_.size(), backend.stats_.hiz_boxes_made, backend.stats_.hiz_box_uncached,
+        backend.stats_.hiz_box_invalid, backend.stats_.hiz_box_drops, backend.stats_.hiz_box_vertices);
+    for (size_t i = 0; i < std::min<size_t>(churn.size(), 8); ++i) {
+      line += fmt::format(" [{:016X}/{}/{}]", std::get<2>(churn[i]), std::get<1>(churn[i]), std::get<0>(churn[i]));
+    }
+    REXLOG_INFO("{}", line);
+  }
   if (hiz_mode_) {
     // (draws, vs hash, why) per entry with draws since the last report.
     std::vector<std::tuple<uint64_t, uint64_t, uint32_t>> ranked;

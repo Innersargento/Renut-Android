@@ -33,7 +33,10 @@ void HiZ::HizIndexBox(uint64_t key, const HizBox& box) {
 // The guest wrote [start, start + length): the boxes made from any of it go.
 void HiZ::HizDropBoxes(uint32_t start, uint32_t length) {
   if (!length) return;
-  ++hiz_box_generation_;
+  // Only a box that goes can leave a pointer behind in hiz_front_, so the
+  // generation moves only then: a guest write that touches no box (most of them
+  // are textures and streams) used to empty the whole front each time.
+  size_t erased = 0;
   const uint32_t first = start >> 16, last = uint32_t((uint64_t(start) + length - 1) >> 16);
   if (last - first > 4096) {
     // A huge range: cheaper to look at every box.
@@ -43,16 +46,21 @@ void HiZ::HizDropBoxes(uint32_t start, uint32_t length) {
                         start < box.vertex_base + box.vertex_size) ||
                        (box.index_size && box.index_base < uint64_t(start) + length &&
                         start < box.index_base + box.index_size);
+      if (hit) ++erased;
       it = hit ? hiz_boxes_.erase(it) : std::next(it);
     }
-    return;
-  }
-  for (uint32_t block = first; block <= last; ++block) {
-    auto range = hiz_box_blocks_.equal_range(block);
-    for (auto it = range.first; it != range.second;) {
-      hiz_boxes_.erase(it->second);
-      it = hiz_box_blocks_.erase(it);
+  } else {
+    for (uint32_t block = first; block <= last; ++block) {
+      auto range = hiz_box_blocks_.equal_range(block);
+      for (auto it = range.first; it != range.second;) {
+        erased += hiz_boxes_.erase(it->second);
+        it = hiz_box_blocks_.erase(it);
+      }
     }
+  }
+  if (erased) {
+    ++hiz_box_generation_;
+    backend.stats_.hiz_box_drops += erased;
   }
 }
 
@@ -224,6 +232,8 @@ const HizBox* HiZ::HizBoxFor(
     backend.stats_.hiz_box_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                                       std::chrono::steady_clock::now() - start).count());
     ++backend.stats_.hiz_boxes_made;
+    if (!valid) ++backend.stats_.hiz_box_invalid;
+    else if (!cache) ++backend.stats_.hiz_box_uncached;
     box.valid = valid;
     if (!valid && !cache) return nullptr;
     if (!cache) {
@@ -268,6 +278,7 @@ const HizBox* HiZ::HizBoxFor(
   const int64_t first = lowest + base_vertex, last = highest + base_vertex;
   if (first < 0 || last - first > 20000) return finish(false, true);
   float lo[4] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX}, hi[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
+  backend.stats_.hiz_box_vertices += uint64_t(last - first + 1);
   for (int64_t v = first; v <= last; ++v) {
     float p[4];
     if (!renut::hiz::FetchVertex(f, memory, fetch.address, fetch.size, uint32_t(fetch.endian), uint32_t(v), p)) {
@@ -383,7 +394,13 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   const auto stage_b = hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+  const uint64_t made_before = backend.stats_.hiz_boxes_made, made_us_before = backend.stats_.hiz_box_us;
   const HizBox* box = HizBoxFor(model, fetch, index_info, index_count, base_vertex);
+  if (backend.stats_.hiz_boxes_made != made_before) {
+    ++entry->boxes_made;
+    entry->box_us += backend.stats_.hiz_box_us - made_us_before;
+    entry->vs_hash = vs.entry ? vs.entry->hash : 0;
+  }
   if (hiz_stage_timing_) {
     backend.stats_.hiz_stage_ns[1] += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                 std::chrono::steady_clock::now() - stage_b).count());

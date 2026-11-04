@@ -322,6 +322,9 @@ namespace renut::gpu {
     // shader they came from (for the report's ranking).
     uint64_t nomodel_draws = 0;
     uint64_t vs_hash = 0;
+    // Boxes made for draws of this entry, and the time they took (us), since the
+    // last report: a shader whose draws keep making boxes is a churn source.
+    uint64_t boxes_made = 0, box_us = 0;
   };
 
   // An object-space box of the fetched element over the vertices a draw reads,
