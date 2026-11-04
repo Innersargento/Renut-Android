@@ -35,10 +35,11 @@ struct Recorder {
   std::unique_ptr<RenderCommandFence> fence_;
   bool list_open_ = false;
   const RenderPipeline* bound_pipeline_ = nullptr;
-  uint64_t bound_interface_key_ = 0;
   std::vector<RecentDraw> recent_draws_ = std::vector<RecentDraw>(kRecentDraws);
   std::atomic<uint64_t> recent_draw_count_{0};
   std::unordered_map<uint64_t, uint64_t> pair_first_frame_;
+  // Draws recorded: one in eight asks for its pair's first frame.
+  uint64_t drawn_ = 0;
   void ReportDeviceLost();
   // files/plume-syncwatch (hex hash): a synced draw whose vertex or pixel shader is this one is logged whole.
   uint64_t sync_watch_ = 0;

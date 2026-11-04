@@ -67,10 +67,8 @@ struct Targets {
   std::array<VertexBinding, 17> bound_vertex_buffers_{};
   const RenderBuffer* bound_index_buffer_ = nullptr;
   RenderFormat bound_index_format_ = RenderFormat::UNKNOWN;
-  std::array<std::vector<PassMark>, kPlumeFramesInFlight> pass_marks_;
   uint32_t color_count_of_pass_ = 0;
   bool depth_of_pass_ = false;
-  bool pair_capture_ = false;
   RenderCommandList* list_ = nullptr;
   // Where the current slot's slice of the ring starts.
   uint64_t slice_base_ = 0;

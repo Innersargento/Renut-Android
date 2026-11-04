@@ -86,7 +86,6 @@ bool GpuBackend::SetupContext() {
   REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
               swap.bc_mode_ ? "on" : "off");
   texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
-  swap.key_reuse_ = REXCVAR_GET(renut_plume_key_reuse);
   REXLOG_INFO("Renut: Plume texture quality: {}",
               texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
   targets.shadow_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
@@ -110,30 +109,9 @@ bool GpuBackend::SetupContext() {
   }
   watch_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(Streams::WatchHitThunk, &streams);
 
-  {
-    auto* vulkan_device = static_cast<VulkanDevice*>(device_);
-    profiling.timestamp_ns_ = vulkan_device->physicalDeviceProperties.limits.timestampPeriod;
-    VkQueryPoolCreateInfo info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    info.queryCount = kMaxTimestamps * kPlumeFramesInFlight;
-    if (vkCreateQueryPool(vulkan_device->vk, &info, nullptr, &timestamp_pool_) != VK_SUCCESS) {
-      timestamp_pool_ = VK_NULL_HANDLE;
-      REXLOG_WARN("Renut: Plume timestamp queries unavailable; no per-pass GPU time");
-    }
-    info.queryCount = kPairQueries * kPlumeFramesInFlight;
-    if (timestamp_pool_ == VK_NULL_HANDLE ||
-        vkCreateQueryPool(vulkan_device->vk, &info, nullptr, &pair_pool_) != VK_SUCCESS) {
-      pair_pool_ = VK_NULL_HANDLE;
-    }
-  }
   for (auto& list : lists_) list = queue_->createCommandList();
   targets.list_ = lists_[0].get();
-  swap.defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
-  report.hiz_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2));
-  census.Init();
-  swap.fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
-  swap.depth_strip_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1));
-  draw.rel_constants_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2));
+  hiz.mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2));
   no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
   swap.adaptive_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1));
   if (no_shadows_) swap.shadow_min_indices_ = UINT32_MAX;
@@ -198,10 +176,9 @@ bool GpuBackend::SetupContext() {
   }
   draw.lookup_budget_us_ = uint64_t(REXCVAR_GET(renut_plume_pipeline_lookup_ms)) * 1000;
   draw.lookup_here_ = draw.lookup_budget_us_ && PlumePipelineLookupSupported();
-  REXLOG_INFO("Renut: Plume pipelines: async compile, {}, boolean registers {}",
+  REXLOG_INFO("Renut: Plume pipelines: async compile, {}, boolean registers read from the shared block",
               draw.lookup_here_ ? fmt::format("cache lookups at the draw up to {} ms a frame", draw.lookup_budget_us_ / 1000)
-                           : std::string("no cache lookups at the draw"),
-              REXCVAR_GET(renut_plume_bool_spec) ? "specialized" : "read from the shared block");
+                           : std::string("no cache lookups at the draw"));
   targets.BeginFrame();
   REXLOG_INFO("Renut: Plume GPU backend ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);
@@ -261,7 +238,6 @@ void GpuBackend::ShutdownContext() {
   }
   // Frames may still be running; nothing below may be freed under them.
   if (auto* renderer = PlumeRenderer::Get()) renderer->WaitForAllSlots();
-  census.Shutdown();
   pipelines.pipelines_.clear();
   draw.standins_.clear();
   draw.pipeline_memo_.Clear();
@@ -289,14 +265,6 @@ void GpuBackend::ShutdownContext() {
   shaders.patched_shaders_.clear();
   shaders.identity_shaders_.clear();
   shaders.shaders_.clear();
-  if (timestamp_pool_ != VK_NULL_HANDLE) {
-    vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_, nullptr);
-    timestamp_pool_ = VK_NULL_HANDLE;
-  }
-  if (pair_pool_ != VK_NULL_HANDLE) {
-    vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, pair_pool_, nullptr);
-    pair_pool_ = VK_NULL_HANDLE;
-  }
   if (draw.upload_) draw.upload_->unmap();
   draw.upload_.reset();
   {

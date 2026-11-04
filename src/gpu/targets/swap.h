@@ -17,7 +17,7 @@ struct Swap {
   // Debug: <files>/plume-no-persist sends every stream through the ring again.
   bool keep_streams_ = true;
   bool depth_alias_ = true;
-  bool key_reuse_ = true;
+  static constexpr bool key_reuse_ = true;
   std::vector<TracedStream> traced_streams_;
   // Pixel shaders whose shadow-cascade constants this trace already holds.
   std::unordered_set<uint64_t> traced_cascade_ps_;
@@ -90,7 +90,6 @@ struct Swap {
   std::unique_ptr<RenderBuffer> depth_dump_;
   uint32_t depth_dump_w_ = 0, depth_dump_h_ = 0, depth_dump_row_ = 0, depth_dump_format_ = 0;
   uint64_t depth_dump_generation_ = 0, depth_dump_frame_ = 0;
-  uint32_t pairprof_mode_ = 0, pairprof_frames_left_ = 0;
   // Whether each recorded draw leaves its entry in recent_draws_, for the report
   // of a lost device. A hash lookup, ~200 bytes of stream addresses and a few
   // buffer-address calls a draw: on by default only where the GPU is a Mali,
@@ -99,15 +98,16 @@ struct Swap {
   bool skin_log_ = false;
   std::unordered_set<uint64_t> skin_skip_;
   std::mutex skinned_mutex_;
-  uint32_t defer_mode_ = 1;
+  // Deferred draws: 0 off, 1 depth-only, 2 opaque colour too.
+  static constexpr uint32_t defer_mode_ = 2;
   // files/plume-fetchspec (or the cvar): 1 hands the live fetch table to the
   // driver as specialization constants. Part of the pipeline key, so a change
   // builds the pipelines of the shaders it touches afresh.
-  uint32_t fetch_spec_mode_ = 1;
+  static constexpr uint32_t fetch_spec_mode_ = 1;
   // files/plume-depthstrip (or the cvar): 1 draws the draws that have no
   // fragment shader with the vertex shader's output-less form. Part of the
   // pipeline key.
-  uint32_t depth_strip_mode_ = 1;
+  static constexpr uint32_t depth_strip_mode_ = 1;
   // files/plume-patchlevel: percent of the guest's tessellation level the water
   // grid uses (100 = as the game sets it).
   uint32_t patch_level_percent_ = 100;

@@ -104,7 +104,6 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
   // Not from the recorder (the Hi-Z windows, the debug modes): nothing may be
   // in flight while this thread touches the bound state.
   if (!OnRecorder()) SyncRecorder();
-  const bool pair_stamped = backend.targets.pair_capture_ && backend.profiling.PairBegin(pk);
   if (OnRecorder()) {
     backend.targets.emit_colors_ = pk.pass_colors;
     backend.targets.emit_depth_ = pk.pass_depth;
@@ -113,15 +112,9 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
     backend.targets.depth_of_pass_ = pk.pass_depth;
   }
   backend.targets.SetFramebuffer(pk.framebuffer);
-  // plume-skip bit 262144 keeps the bound pipeline whenever it can stand in
-  // for the draw's own (same attachments and vertex input): the picture is
-  // wrong, and what the GPU saves is the price of switching programs.
-  const bool keep_pipeline = (backend.skip_mask_ & 262144) && bound_pipeline_ && pk.interface_key == bound_interface_key_;
-  if (bound_pipeline_ != pk.pipeline && !keep_pipeline) {
+  if (bound_pipeline_ != pk.pipeline) {
     L()->setPipeline(pk.pipeline);
     bound_pipeline_ = pk.pipeline;
-    bound_interface_key_ = pk.interface_key;
-    ++backend.report.rec_stats_.pipeline_binds;
   }
   // Dynamic state of the pipelines that use it (the Vulkan layer makes it so,
   // see plume_renderer.cpp): not part of Plume's interface, so on the command
@@ -180,17 +173,6 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
       bound.offset = view.buffer.offset;
     }
   }
-  // renut_plume_zero_census: the draw runs inside its occlusion query.
-  const bool counted = pk.census_query != UINT32_MAX && pk.kind != DrawPacket::Kind::kNone;
-  VkCommandBuffer census_cb = VK_NULL_HANDLE;
-  if (counted) {
-    auto* vulkan = static_cast<VulkanCommandList*>(L());
-    vulkan->checkActiveRenderPass();
-    census_cb = vulkan->vk;
-    vkCmdBeginQuery(census_cb, backend.census.pool_, pk.census_query, 0);
-    const auto& marks = backend.targets.pass_marks_[backend.slot_];
-    backend.census.positions_[backend.slot_][pk.census_query % Census::kQueries] = marks.empty() ? 0 : marks.back().draws;
-  }
   switch (pk.kind) {
     case DrawPacket::Kind::kNone: break;
     case DrawPacket::Kind::kIndexed:
@@ -211,16 +193,13 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
     }
     case DrawPacket::Kind::kPlain: L()->drawInstanced(pk.count, 1, pk.first, 0); break;
   }
-  if (counted) vkCmdEndQuery(census_cb, backend.census.pool_, pk.census_query);
-  if (pair_stamped) backend.profiling.PairStamp();
-  ++backend.report.rec_stats_.drawn;
-  if (!backend.targets.pass_marks_[backend.slot_].empty()) ++backend.targets.pass_marks_[backend.slot_].back().draws;
+  ++drawn_;
   if (backend.swap.trail_) {
     // Only one draw in eight asks (a hash lookup a draw was over 1% of this
     // thread): the report of a lost device calls a pair new from its first
     // frame, and an unknown one is simply not called new.
     uint64_t first_frame = 0;
-    if ((backend.report.rec_stats_.drawn & 7) == 0) {
+    if ((drawn_ & 7) == 0) {
       first_frame = pair_first_frame_.try_emplace(pk.vs_hash * 1099511628211ull ^ pk.ps_hash, backend.swaps_).first->second;
     }
     const uint64_t at = recent_draw_count_.load(std::memory_order_relaxed);

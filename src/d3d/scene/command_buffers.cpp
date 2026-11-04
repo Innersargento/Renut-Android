@@ -36,12 +36,12 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
-REXCVAR_DEFINE_INT32(renut_command_buffer_lists_ahead, 32, "reNut",
-                     "The brake of BeginCommandBuffer: a thread that starts recording a buffer waits (at most "
-                     "50 ms) while more than this many published lists are waiting for the GPU backend. The "
-                     "console made it wait for the buffer's own previous run; the buffers are copies on the host, "
-                     "so this bounds what piles up instead. 0: no brake")
-    .range(0, 4096);
+// The brake of BeginCommandBuffer: a thread that starts recording a buffer waits (at most 50 ms)
+// while more than this many published lists are waiting for the GPU backend. The console made it
+// wait for the buffer's own previous run; the buffers are copies on the host, so this bounds what
+// piles up instead.
+constexpr uint32_t kListsAhead = 32;
+
 extern "C" {
 REX_FUNC(sub_82223270);  // D3D::SetSurfaceClip (hooked: the front end records the clip)
 __attribute__((weak)) void sub_82658818(PPCContext& __restrict, uint8_t*);  // the one-pass Z pass set-up
@@ -132,8 +132,7 @@ bool BeginCommandBuffer(PPCContext& ctx, uint8_t* base) {
   // The brake. The console waited here for the buffer's last run to finish, because the GPU read the
   // buffer's memory; here the buffer is a copy on the host, a Run never marks it busy (below), and what
   // is left to hold a thread that records is the backend: not too many lists ahead of it.
-  if (const int ahead = REXCVAR_GET(renut_command_buffer_lists_ahead))
-    renut::native_d3d::WaitForBackend(u32(ahead), 50);
+  renut::native_d3d::WaitForBackend(kListsAhead, 50);
   // The buffer's fence is cleared, not waited for: nothing writes one any more (the original Run did,
   // the native one does not), and a stale one from a Run of the original would only make
   // D3DResource_Destroy wait for a buffer that is a copy on the host.

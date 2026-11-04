@@ -64,6 +64,7 @@ const FetchLayout* Textures::LayoutOfByContents(
   }
 
   FetchLayout& layout = fetch_layouts_[fetch_key];
+  format_census::Texture(fetch);
   layout_memo_.Put(fetch_key, &layout);
   uint64_t key = 0;
   HashCombine(key, fetch.dword_0 & ~0x3FFu);  // pitch, tiling, (not clamp/sign)
@@ -75,8 +76,6 @@ const FetchLayout* Textures::LayoutOfByContents(
   uint32_t base_page, mip_page, top_level, last_level;
   gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
       &base_page, &mip_page, &top_level, &last_level);
-  if (backend.skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
-  if (backend.skip_mask_ & 8192) last_level = top_level;
   layout.levels = last_level - top_level + 1;
   layout.top_level = top_level;
   HashCombine(key, last_level);
@@ -336,19 +335,14 @@ void Textures::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
 //
 // A stacked texture's Z picks a slice of an array and follows the fetch
 // constant's mode like any other axis: the water's runs far past the end of its
-// stack with the clock and relies on repeating. With renut_plume_stack_wrap off
-// the layer is clamped to the ends of the stack whatever the mode reads (the
-// old behaviour, which leaves the water still).
+// stack with the clock and relies on repeating.
 uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
-  const bool stack_wrap = fetch.stacked && REXCVAR_GET(renut_plume_stack_wrap);
+  const bool stack_wrap = fetch.stacked;
   const uint32_t key = uint32_t(fetch.mag_filter) | (uint32_t(fetch.min_filter) << 2) |
                        (uint32_t(fetch.mip_filter) << 4) | (uint32_t(fetch.aniso_filter) << 6) |
                        (uint32_t(fetch.clamp_x) << 9) | (uint32_t(fetch.clamp_y) << 12) |
                        (uint32_t(fetch.clamp_z) << 15) | (uint32_t(fetch.stacked) << 18) |
                        ((uint32_t(fetch.lod_bias) & 0x3FF) << 19) | (stack_wrap ? 1u << 30 : 0u);
-  // The fallback is the old behaviour: linear everywhere, no anisotropy, and
-  // every axis wrapped, for comparing a capture against.
-  if (backend.skip_mask_ & 524288) return kSamplerDefault;
   if (const uint32_t* memo = sampler_memo_.Find(key)) return *memo;
   auto found = sampler_indices_.find(key);
   if (found != sampler_indices_.end()) {
@@ -421,7 +415,7 @@ uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
 // the menu does.
 uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
-  if (!address || (backend.skip_mask_ & 65536)) return 0;
+  if (!address) return 0;
   const uint32_t depth = uint32_t(fetch.size_2d.stack_depth) + 1;
   uint64_t key = 0;
   HashCombine(key, fetch.dword_0 & ~0x3FFu);
@@ -433,8 +427,7 @@ uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& f
   uint32_t base_page, mip_page, top_level, last_level;
   gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
       &base_page, &mip_page, &top_level, &last_level);
-  if (backend.skip_mask_ & 32768) { base_page = fetch.base_address; top_level = last_level = 0; }
-  if (depth > 1 || (backend.skip_mask_ & (8192 | 262144))) last_level = top_level;
+  if (depth > 1) last_level = top_level;
   const uint32_t levels = last_level - top_level + 1;
   HashCombine(key, last_level);
   HashCombine(key, uint32_t(fetch.packed_mips));
@@ -596,7 +589,7 @@ uint32_t Textures::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fe
 // other at a 4 KB aligned stride, each decoded like a 2D texture.
 uint32_t Textures::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t address = fetch.base_address << 12;
-  if (!address || (backend.skip_mask_ & 16384)) return 0;
+  if (!address) return 0;
   uint64_t key = 0;
   HashCombine(key, fetch.dword_0 & ~0x3FFu);
   HashCombine(key, fetch.dword_1);

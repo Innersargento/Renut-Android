@@ -318,7 +318,6 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   // vtx_w0_fmt set is the usual case: the shader's W is W, not 1/W.
   if (clip.clip_disable || vte.vtx_xy_fmt || vte.vtx_z_fmt || !vte.vtx_w0_fmt || !vte.vport_x_scale_ena ||
       !vte.vport_x_offset_ena || !vte.vport_y_scale_ena || !vte.vport_y_offset_ena) {
-    ++backend.report.hiz_clip_states_[(uint64_t(vte.value) << 32) | clip.value];
     return ++backend.stats_.hiz_why[3], false;
   }
   if (regs.sq_vs_const.base != 0) return ++backend.stats_.hiz_why[4], false;
@@ -332,8 +331,6 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   if (!entry->model || !entry->model->valid) {
     ++backend.stats_.hiz_no_model[kind];
     ++backend.stats_.hiz_why_model[kind][entry->model ? uint32_t(entry->model->why) % 12 : 0];
-    ++backend.report.hiz_nomodel_draws_[(vs.entry ? vs.entry->hash : 0) ^ (entry->model ? uint64_t(entry->model->why) & 15 : 0)];
-    backend.report.hiz_nomodel_why_[vs.entry ? vs.entry->hash : 0] = entry->model ? uint32_t(entry->model->why) : 0;
     return false;
   }
   renut::hiz::Model& model = *entry->model;
@@ -353,7 +350,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   // never reaches the box lookup either.
   HizCold* cold_slot = nullptr;
   bool sampled_cold = false;
-  if (backend.swap.hiz_skip_ && backend.report.hiz_mode_ == 2) {
+  if (backend.swap.hiz_skip_ && backend.hiz.mode_ == 2) {
     const uint64_t index_word = index_info && index_info->guest_base
                                     ? (uint64_t(index_info->guest_base) << 32) | index_count
                                     : uint64_t(index_count);
@@ -470,7 +467,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
       (clip.dx_clip_space_def && (wholly_outside(0, 0, 1, 0) || wholly_outside(0, 0, -1, 1)))) {
     ++backend.stats_.hiz_frustum[kind];
     if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
-    return backend.report.hiz_mode_ >= 2;
+    return backend.hiz.mode_ >= 2;
   }
   // User clip planes (the quarter-resolution mirrored pass clips at plane 0):
   // the shaders keep what has dot(clip position, plane) >= 0 on every enabled
@@ -483,7 +480,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
         ++backend.stats_.hiz_frustum[kind];
         ++backend.stats_.hiz_clip_plane[kind];
         if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
-        return backend.report.hiz_mode_ >= 2;
+        return backend.hiz.mode_ >= 2;
       }
     }
   }
@@ -521,7 +518,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
       all_positive(0, -ys, top - 1.0f - by) || all_positive(0, ys, -(bottom + 1.0f - by))) {
     ++backend.stats_.hiz_scissor[kind];
     if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
-    return backend.report.hiz_mode_ >= 2;
+    return backend.hiz.mode_ >= 2;
   }
   return false;
 }

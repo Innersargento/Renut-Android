@@ -22,12 +22,6 @@
 #include <rex/system/kernel_state.h>
 #include <rex/hook.h>
 
-REXCVAR_DEFINE_BOOL(renut_d3d_dump_shaders, true, "reNut",
-                    "Save every shader the game creates or registers (Create*Shader, "
-                    "XGRegister*Shader) as a complete container, for offline recompilation");
-REXCVAR_DEFINE_BOOL(renut_count_hooks, true, "reNut",
-                    "Count, per intercepted Direct3D function, the calls the native code took and the calls that ran "
-                    "the recompiled original (a line of native-d3d.txt)");
 REXCVAR_DEFINE_INT32(renut_d3d_report_swaps, 0, "reNut",
                      "Log the most called Direct3D functions every N swaps (0 = off). Off by "
                      "default: the game polls D3D_CBlocker_Check tens of millions of times a "
@@ -81,7 +75,7 @@ bool IsContainer(const uint8_t* data) {
 // shader object 40, and the container's virtual part follows the object. The
 // physical part's guest address is stored at +32 (vertex) or +24 (pixel).
 void DumpShaderObject(uint8_t* base, uint32_t object, bool vertex) {
-  if (!REXCVAR_GET(renut_d3d_dump_shaders) || !object) {
+  if (!object) {
     return;
   }
   uint32_t container = 0;
@@ -157,8 +151,7 @@ inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
     Handler handler = handlers[function].load(std::memory_order_acquire);
     taken = handler && handler(ctx, base);
   }
-  static const bool count = REXCVAR_GET(renut_count_hooks);  // read once: every call tests it
-  if (count) (taken ? taken_counts : original_counts)[function].fetch_add(1, std::memory_order_relaxed);
+  (taken ? taken_counts : original_counts)[function].fetch_add(1, std::memory_order_relaxed);
   return taken;
 }
 

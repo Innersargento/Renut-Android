@@ -99,7 +99,7 @@ struct Draw {
   // Default 2: measured on identical frames, mode
   // 1 costs +8% on the 108 vertex shaders that read by a0/aL, mode 2 -27%, and a
   // frame costs 22% fewer GPU cycles in the heavy plaza.
-  uint32_t rel_constants_mode_ = 0;
+  static constexpr uint32_t rel_constants_mode_ = 2;
   // Modes 11 and 12 alternate between mode 0 and mode 1 or 2 from one draw of a
   // shader to the next, and mark the alternate's vertex shader hash in the pair
   // profile (bit 60 and 61 xored in), so a single capture holds both variants

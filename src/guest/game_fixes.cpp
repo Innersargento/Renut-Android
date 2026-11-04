@@ -37,14 +37,10 @@ REXCVAR_DEFINE_BOOL(renut_pace_original_fps, true, "reNut/Plume",
                     "The game's own 30 FPS is held by the frame pacer with an immediate presentation "
                     "interval, like every other target (and like reNut on PC, which has no vertical blank). "
                     "Off: the game's presentation interval waits for the emulated vertical blank");
-// The old switch, still read so that a renut.toml written before the slider keeps its meaning.
-REXCVAR_DEFINE_BOOL(renut_plume_uncap_fps, false, "reNut/Plume",
-                    "Deprecated: renut_fps_target = 0 (unlimited) replaces it");
 
 namespace renut::pacing {
 void ApplyConfiguredTarget() {
   int fps = REXCVAR_GET(renut_fps_target);
-  if (fps == kOriginalFps && REXCVAR_GET(renut_plume_uncap_fps)) fps = kUnlimited;
   SetTarget(fps);
   PaceOriginalCell().store(REXCVAR_GET(renut_pace_original_fps), std::memory_order_relaxed);
 }

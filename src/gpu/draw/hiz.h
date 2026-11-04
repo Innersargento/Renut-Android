@@ -32,6 +32,9 @@ struct HiZ {
                    const IndexBufferInfo* index_info, bool color_pass);
   uint64_t hiz_last_box_key_ = 0;
   bool hiz_stage_timing_ = false;
+  // renut_plume_hiz: 0 off, 1 counts what could be dropped, 2 drops the draws whose box lies
+  // wholly outside the frustum or the scissor (exact).
+  uint32_t mode_ = 0;
 };
 
 }  // namespace renut::gpu
