@@ -25,8 +25,6 @@ struct Lists {
   // A dword the GPU writes back (big-endian), at a GPU address.
   void StoreBig(uint32_t physical, uint32_t value);
   BufferRange native_indices_{};
-  void NativeEffects(const uint32_t* pairs, uint32_t count);
-  uint64_t native_effects_applied_ = 0;
   // Runs the published records until the end, or until the opaque-call
   // marker `until` (consumed; returns true), never past another marker.
   bool RunNative(uint32_t until);

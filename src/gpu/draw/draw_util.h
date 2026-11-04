@@ -18,8 +18,8 @@
 #include <vector>
 
 #include <rex/assert.h>
-#include "gpu/xenos/register_file.h"
-#include "gpu/xenos/registers.h"
+#include "gpu/core/draw_state.h"
+#include "gpu/core/state_bits.h"
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 
@@ -48,10 +48,10 @@ constexpr bool IsPrimitiveLine(bool vgt_output_path_is_tessellation_enable,
   return false;
 }
 
-inline bool IsPrimitiveLine(const RegisterFile& regs) {
-  return IsPrimitiveLine(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+inline bool IsPrimitiveLine(const DrawState& st) {
+  return IsPrimitiveLine(st.output_path_cntl.path_select ==
                              xenos::VGTOutputPath::kTessellationEnable,
-                         regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type);
+                         st.draw_initiator.prim_type);
 }
 
 // Polygonal primitive types (not including points and lines) are rasterized as
@@ -90,10 +90,10 @@ constexpr bool IsPrimitivePolygonal(bool vgt_output_path_is_tessellation_enable,
   return false;
 }
 
-inline bool IsPrimitivePolygonal(const RegisterFile& regs) {
-  return IsPrimitivePolygonal(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+inline bool IsPrimitivePolygonal(const DrawState& st) {
+  return IsPrimitivePolygonal(st.output_path_cntl.path_select ==
                                   xenos::VGTOutputPath::kTessellationEnable,
-                              regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type);
+                              st.draw_initiator.prim_type);
 }
 
 // Direct3D 10.1+ standard sample positions, also used in Vulkan, for
@@ -101,7 +101,7 @@ inline bool IsPrimitivePolygonal(const RegisterFile& regs) {
 extern const int8_t kD3D10StandardSamplePositions2x[2][2];
 extern const int8_t kD3D10StandardSamplePositions4x[4][2];
 
-reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs, xenos::EdramMode edram_mode);
+bits::RB_DEPTHCONTROL GetNormalizedDepthControl(const DrawState& st, xenos::EdramMode edram_mode);
 
 // Direct3D 9 and Xenos constant polygon offset is an absolute floating-point
 // value.
@@ -195,7 +195,7 @@ constexpr float kD3D10PolygonOffsetFactorFloat24 = float(UINT32_C(1) << (21 + 3)
 // registers (the scale is for 1/16 subpixels, multiply by
 // xenos::kPolygonOffsetScaleSubpixelUnit outside if the value for pixels is
 // needed).
-void GetPreferredFacePolygonOffset(const RegisterFile& regs, bool primitive_polygonal,
+void GetPreferredFacePolygonOffset(const DrawState& st, bool primitive_polygonal,
                                    float& scale_out, float& offset_out);
 
 struct Scissor {
@@ -205,6 +205,6 @@ struct Scissor {
   uint32_t extent[2];
 };
 // `surface_pitch`: the pitch of the bound surface, in pixels, which the scissor is held inside; 0 for none.
-void GetScissor(const RegisterFile& regs, Scissor& scissor_out, uint32_t surface_pitch = 0);
+void GetScissor(const DrawState& st, Scissor& scissor_out, uint32_t surface_pitch = 0);
 
 }  // namespace renut::gpu::draw_util

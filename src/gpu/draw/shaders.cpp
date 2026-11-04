@@ -3,33 +3,6 @@
 
 namespace renut::gpu {
 
-void Shaders::WriteRegister(uint32_t index, uint32_t value) {
-  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    if (backend.register_file_->values[index] != value) {
-      backend.register_file_->values[index] = value;
-      backend.draw.MarkConstantsWritten(index, 1);
-    }
-    return;
-  }
-  if (index >= RegisterFile::kRegisterCount) {
-    extended_register_values_.insert_or_assign(index, value);
-    return;
-  }
-  RegisterFile& regs = *backend.register_file_;
-  // Volatile: the waits in the lists' sync read these from other threads.
-  const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
-    // Scratch register write-back: what a callback's waits and the swap's
-    // pacing read in memory.
-    const uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
-    if ((1u << scratch_reg) & regs.values[XE_GPU_REG_SCRATCH_UMSK]) {
-      backend.lists.StoreBig(regs.values[XE_GPU_REG_SCRATCH_ADDR] + scratch_reg * 4, value);
-    }
-  } else if (index == XE_GPU_REG_COHER_STATUS_HOST) {
-    const_cast<volatile uint32_t&>(regs.values[index]) |= UINT32_C(0x80000000);
-  }
-}
-
 Shader* Shaders::LoadShaderByContents(xenos::ShaderType shader_type,
                                                          const uint32_t* host_address, uint32_t dword_count) {
   // The load of a shader nobody has a name for (the pipeline prediction's, and any the game's Direct3D

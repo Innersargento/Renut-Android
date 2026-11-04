@@ -18,7 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
-#include "gpu/xenos/registers.h"
+#include "gpu/core/state_bits.h"
 #include "gpu/draw/draw_util.h"
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -32,14 +32,14 @@ namespace memory = rex::memory;
 namespace ui = rex::ui;
 
 
-reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs, xenos::EdramMode edram_mode) {
+bits::RB_DEPTHCONTROL GetNormalizedDepthControl(const DrawState& st, xenos::EdramMode edram_mode) {
   if (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly) {
     // Both depth and stencil disabled (EDRAM depth and stencil ignored).
-    reg::RB_DEPTHCONTROL disabled;
+    bits::RB_DEPTHCONTROL disabled;
     disabled.value = 0;
     return disabled;
   }
-  reg::RB_DEPTHCONTROL depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
+  bits::RB_DEPTHCONTROL depthcontrol = st.depth_control;
   // For more reliable skipping of depth render target management for draws not
   // requiring depth.
   if (depthcontrol.z_enable && !depthcontrol.z_write_enable &&
@@ -55,43 +55,43 @@ reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs, xenos::
 const int8_t kD3D10StandardSamplePositions2x[2][2] = {{4, 4}, {-4, -4}};
 const int8_t kD3D10StandardSamplePositions4x[4][2] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
 
-void GetPreferredFacePolygonOffset(const RegisterFile& regs, bool primitive_polygonal,
+void GetPreferredFacePolygonOffset(const DrawState& st, bool primitive_polygonal,
                                    float& scale_out, float& offset_out) {
   float scale = 0.0f, offset = 0.0f;
-  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  const auto& pa_su_sc_mode_cntl = st.raster;
   if (primitive_polygonal) {
     // Prefer the front polygon offset because in general, front faces are the
     // ones that are rendered (except for shadow volumes).
     if (pa_su_sc_mode_cntl.poly_offset_front_enable && !pa_su_sc_mode_cntl.cull_front) {
-      scale = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
-      offset = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
+      scale = st.poly_offset_front_scale;
+      offset = st.poly_offset_front_offset;
     }
     if (pa_su_sc_mode_cntl.poly_offset_back_enable && !pa_su_sc_mode_cntl.cull_back && !scale &&
         !offset) {
-      scale = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE);
-      offset = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET);
+      scale = st.poly_offset_back_scale;
+      offset = st.poly_offset_back_offset;
     }
   } else {
     // Non-triangle primitives use the front offset, but it's toggled via
     // poly_offset_para_enable.
     if (pa_su_sc_mode_cntl.poly_offset_para_enable) {
-      scale = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
-      offset = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
+      scale = st.poly_offset_front_scale;
+      offset = st.poly_offset_front_offset;
     }
   }
   scale_out = scale;
   offset_out = offset;
 }
 
-void GetScissor(const RegisterFile& regs, Scissor& scissor_out, uint32_t surface_pitch) {
-  auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+void GetScissor(const DrawState& st, Scissor& scissor_out, uint32_t surface_pitch) {
+  auto pa_sc_window_scissor_tl = st.window_scissor_tl;
   int32_t tl_x = int32_t(pa_sc_window_scissor_tl.tl_x);
   int32_t tl_y = int32_t(pa_sc_window_scissor_tl.tl_y);
-  auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+  auto pa_sc_window_scissor_br = st.window_scissor_br;
   int32_t br_x = int32_t(pa_sc_window_scissor_br.br_x);
   int32_t br_y = int32_t(pa_sc_window_scissor_br.br_y);
   if (!pa_sc_window_scissor_tl.window_offset_disable) {
-    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    auto pa_sc_window_offset = st.window_offset;
     tl_x += pa_sc_window_offset.window_x_offset;
     tl_y += pa_sc_window_offset.window_y_offset;
     br_x += pa_sc_window_offset.window_x_offset;
@@ -99,10 +99,10 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, uint32_t surface
   }
   // Screen scissor is not used by Direct3D 9 (always 0, 0 to 8192, 8192), but
   // still handled here for completeness.
-  auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
+  auto pa_sc_screen_scissor_tl = st.screen_scissor_tl;
   tl_x = std::max(tl_x, int32_t(pa_sc_screen_scissor_tl.tl_x));
   tl_y = std::max(tl_y, int32_t(pa_sc_screen_scissor_tl.tl_y));
-  auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+  auto pa_sc_screen_scissor_br = st.screen_scissor_br;
   br_x = std::min(br_x, int32_t(pa_sc_screen_scissor_br.br_x));
   br_y = std::min(br_y, int32_t(pa_sc_screen_scissor_br.br_y));
   if (surface_pitch) {

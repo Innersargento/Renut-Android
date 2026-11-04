@@ -70,7 +70,7 @@ void SetSurfaceClip(PPCContext& ctx, uint8_t* base) {
   const std::array<uint32_t, 3> values = {0, ((y1 << 16) & 0x3FFF0000u) | (x1 & 0x3FFF),
                                           ((y2 << 16) & 0x3FFF0000u) | (x2 & 0x3FFF)};
   if (List* own = OwnRecording(dev)) {
-    Builder(*own).Regs(0x2080, values.data(), 3);
+    Builder(*own).State(RENUT_STATE_WORD(window_offset), values.data(), 3);
     return;
   }
   if (g_front.main_device && dev != g_front.main_device) {
@@ -80,14 +80,8 @@ void SetSurfaceClip(PPCContext& ctx, uint8_t* base) {
   }
   g_front.window_clip[dev] = values;
   List& list = Current(dev);
-  if (&list != g_front.immediate.get()) {
-    Builder(list).Regs(0x2080, values.data(), 3);
-  } else if (g_foreign_mode.load(std::memory_order_relaxed) != 1) {
-    // (In mode 1 Current has just put this device's scissor back.)
-    Builder(list).Regs(0x2080, values.data(), 3);
-    g_front.immediate_clip = values;
-    g_front.immediate_clip_known = true;
-  }
+  // (Current has just put this device's scissor back into the immediate list.)
+  if (&list != g_front.immediate.get()) Builder(list).State(RENUT_STATE_WORD(window_offset), values.data(), 3);
 }
 
 void Swap(PPCContext& ctx) {

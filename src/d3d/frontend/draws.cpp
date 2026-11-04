@@ -26,7 +26,7 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
     uint32_t start = first, count = total;
     while (true) {
       const uint32_t chunk = SplitCount(base, primitive, count);
-      d.out.Reg(0x2102, base_vertex);
+      d.out.StateWord(RENUT_STATE_WORD(base_vertex), base_vertex);
       uint32_t initiator = (chunk << 16) | (primitive & 0x3F);
       uint32_t address, size;
       if (wide) {
@@ -94,7 +94,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
     const uint32_t extent = (U8(base, dev + 10940) & 1) ? kDrawScreenExtent : 0;
     uint32_t start = first, count = total;
     while (true) {
-      d.out.Reg(0x2102, base_vertex);
+      d.out.StateWord(RENUT_STATE_WORD(base_vertex), base_vertex);
       uint32_t chunk = count;
       if (count > 65535) {
         const uint32_t divisor = U32(base, kTessSplit + primitive * 8);
@@ -139,7 +139,7 @@ bool DrawVertices(PPCContext& ctx, uint8_t* base) {
     uint32_t start = first, count = total;
     while (true) {
       const uint32_t chunk = SplitCount(base, primitive, count);
-      d.out.Reg(0x2102, start);
+      d.out.StateWord(RENUT_STATE_WORD(base_vertex), start);
       if (extent) g_counts.screen_extent.fetch_add(1, std::memory_order_relaxed);
       d.out.Draw(DrawMode(base, dev) | extent, viz, (chunk << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
       g_counts.draws.fetch_add(1, std::memory_order_relaxed);
@@ -174,9 +174,9 @@ bool BeginVertices(PPCContext& ctx, uint8_t* base) {
     S64(base, dev + 24, U64(base, dev + 24) & ~1ull);
     FlushAll(d);
     S8(base, dev + 12528, old_stride);
-    d.out.Reg(0x2102, 0);
+    d.out.StateWord(RENUT_STATE_WORD(base_vertex), 0);
     const uint32_t fetch[6] = {1, 0, 1, 0, Phys(data) | 3, 0x10000002u | ((dwords << 2) & 0x03FFFFFCu)};
-    d.out.Regs(0x4800 + 31 * 6, fetch, 6);
+    d.out.State(RENUT_STATE_WORD(fetch) + 31 * 6, fetch, 6);
     d.out.Draw(DrawMode(base, dev), VizToken(base, dev), (count << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
     g_counts.draws.fetch_add(1, std::memory_order_relaxed);
   });
@@ -214,10 +214,10 @@ bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
     }
     FlushAll(d);
     S8(base, dev + 12528, old_stride);
-    d.out.Reg(0x2102, base_vertex);
+    d.out.StateWord(RENUT_STATE_WORD(base_vertex), base_vertex);
     const uint32_t fetch[6] = {0, 0, 0, 0, Phys(vertex_data) | 3,
                                0x10000002u | ((vertex_dwords << 2) & 0x03FFFFFCu)};
-    d.out.Regs(0x4800 + 31 * 6, fetch, 6);
+    d.out.State(RENUT_STATE_WORD(fetch) + 31 * 6, fetch, 6);
     const uint32_t endian = (format << 30) & 0xC0000000u;
     const uint32_t initiator = (indices << 16) | (primitive & 0x3F) | (wide ? 0x800 : 0);
     const uint32_t size = (wide ? ((indices << 1) & 0x00FFFFFEu) : (indices & 0x00FFFFFFu)) | endian;

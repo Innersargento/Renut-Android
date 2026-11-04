@@ -3,27 +3,28 @@
 
 namespace renut::gpu {
 
+// A state record: `count` words of the DrawState from word `first` (RENUT_STATE_WORD).
 void Lists::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) {
-  if (first >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
-      uint64_t(first) + count <= uint64_t(XE_GPU_REG_SHADER_CONSTANT_LOOP_31) + 1) {
+  if (first >= kStateConstantsFirst) {
+    // The constants, the fetch constants, the booleans and the loops: the guest writes thousands of
+    // them a frame, compared with what is here so that only a change marks a block.
     StoreConstants(first, values, count);
     return;
   }
-  for (uint32_t i = 0; i < count; ++i) backend.shaders.WriteRegister(first + i, values[i]);
+  std::memcpy(reinterpret_cast<uint32_t*>(&backend.state_) + first, values, size_t(count) * sizeof(uint32_t));
 }
 
 // A draw record.
 void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
-  backend.shaders.WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator);
-  reg::VGT_DRAW_INITIATOR draw;
-  draw.value = initiator;
+  DrawState& state = backend.state_;
+  state.draw_initiator.value = initiator;
+  const bits::VGT_DRAW_INITIATOR draw = state.draw_initiator;
   IndexBufferInfo info;
   bool indexed = false;
   if (draw.source_select == xenos::SourceSelect::kDMA) {
-    backend.shaders.WriteRegister(XE_GPU_REG_VGT_DMA_BASE, dma_base);
-    backend.shaders.WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, dma_size);
-    reg::VGT_DMA_SIZE size;
-    size.value = dma_size;
+    state.dma_base = dma_base;
+    state.dma_size.value = dma_size;
+    const bits::VGT_DMA_SIZE size = state.dma_size;
     const uint32_t bytes = draw.index_size == xenos::IndexFormat::kInt16 ? 2 : 4;
     info.guest_base = dma_base & ~(bytes - 1);
     info.endianness = size.swap_mode;
@@ -35,7 +36,7 @@ void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, ui
     ++native_bad_;
     return;
   }
-  const auto viz = backend.register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+  const auto viz = state.viz_query;
   if (viz.viz_query_ena && viz.kill_pix_post_hi_z) return;
   ++native_draws_;
   draw_pass_ = uint8_t((flags >> native_d3d::kDrawPassShift) & 0xF);
@@ -68,9 +69,9 @@ bool Lists::RunNative(uint32_t until) {
     const uint32_t* w = words.data() + f.pos;
     const uint32_t op = w[0] & 0xFF;
     switch (op) {
-      case native_d3d::kOpRegs: {
+      case native_d3d::kOpState: {
         const uint32_t count = w[0] >> 8, first = w[1];
-        if (f.pos + 2 + count > words.size() || first + count > RegisterFile::kRegisterCount) {
+        if (f.pos + 2 + count > words.size() || first + count > kStateWords) {
           ++native_bad_;
           f.pos = words.size();
           break;
@@ -185,17 +186,16 @@ bool Lists::RunNative(uint32_t until) {
         }
         break;
       }
-      case native_d3d::kOpEffects: {
-        const uint32_t count = w[0] >> 8;
-        if (f.pos + 1 + 2 * size_t(count) > words.size()) {
+      case native_d3d::kOpStore:
+        if (f.pos + 3 > words.size()) {
           ++native_bad_;
           f.pos = words.size();
           break;
         }
-        f.pos += 1 + 2 * size_t(count);
-        NativeEffects(w + 1, count);
+        StoreBig(w[1], w[2]);
+        native_d3d::NotifyFenceCompleted();
+        f.pos += 3;
         break;
-      }
       case native_d3d::kOpCallback: {
         if (f.pos + 4 > words.size()) {
           ++native_bad_;
@@ -287,24 +287,6 @@ bool Lists::RunNative(uint32_t until) {
     }
   }
   return found;
-}
-
-// A record of register writes and interrupts, in order (what a callback does, see d3d/frontend/).
-void Lists::NativeEffects(const uint32_t* pairs, uint32_t count) {
-  ++native_callbacks_;
-  ++native_effects_applied_;
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint32_t reg = pairs[2 * i], value = pairs[2 * i + 1];
-    if (reg == 0xFFFFFFFFu) {
-      if (!backend.dispatch_interrupt_) continue;
-      for (uint32_t cpu = 0; cpu < 6; ++cpu) {
-        if ((value >> cpu) & 1) backend.dispatch_interrupt_(1, cpu);
-      }
-    } else {
-      backend.shaders.WriteRegister(reg, value);
-    }
-  }
-  native_d3d::NotifyFenceCompleted();  // as after a callback record
 }
 
 // A clear record: Direct3D's clear of the current targets, without its draw.

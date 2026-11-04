@@ -10,16 +10,6 @@
 // its interrupt, the ring and the GPU backend behind it. The SDK has no
 // part in it (RuntimeConfig::graphics is null); the three Vd exports that
 // reach it are overridden in kernel_overrides.cpp.
-REXCVAR_DEFINE_BOOL(renut_native_gpu_callbacks, true, "reNut",
-                    "The GPU's callback interrupt (the one D3DDevice_InsertCallback raises) is served here: "
-                    "the callback is called with its context and the CPU's bit in the writeback block is cleared, "
-                    "without the recompiled interrupt handler. Off: the handler runs, as before");
-
-REXCVAR_DEFINE_BOOL(renut_native_vblank, true, "reNut",
-                    "The vertical blank (interrupt source 0) is served here when nothing waits on it: the device's "
-                    "vblank counter and times move on without the recompiled interrupt handler. The handler still "
-                    "runs when a swap is queued behind a vblank or the game set a vblank callback");
-
 REXCVAR_DEFINE_BOOL(renut_stub_vsync_thread, true, "reNut",
                     "No \"GPU VSync\" thread: with the frame pacer holding the game (presentation always "
                     "immediate) nothing needs the emulated vertical blank to tick between swaps, so the vblank "
@@ -35,16 +25,13 @@ class PlumeGpu {
     memory_ = dispatcher->memory();
     function_dispatcher_ = dispatcher;
     kernel_state_ = kernel;
-    backend_ = std::make_unique<GpuBackend>(
-        memory_, kernel_state_, [this](uint32_t source, uint32_t cpu) { DispatchInterruptCallback(source, cpu); },
-        [this] { return ServiceRing(); });
+    backend_ = std::make_unique<GpuBackend>(memory_, kernel_state_);
     backend_->dispatch_callback_ = [this](uint32_t function, uint32_t context, uint32_t cpu) {
       RunCallback(function, context, cpu);
     };
     backend_->tick_vblank_ = [this] { TickVblank(); };
     if (!backend_->Initialize()) return false;
-    // The GPU's registers are 0x7FC80000-0x7FCFFFFF; the game reads the display
-    // counters there and writes the ring's write pointer.
+    // The GPU's registers are 0x7FC80000-0x7FCFFFFF (see NoteRegister).
     memory_->AddVirtualMappedRange(0x7FC80000, 0xFFFF0000, 0x0000FFFF, this,
                                    reinterpret_cast<rex::runtime::MMIOReadCallback>(ReadRegisterThunk),
                                    reinterpret_cast<rex::runtime::MMIOWriteCallback>(WriteRegisterThunk));
@@ -91,7 +78,6 @@ class PlumeGpu {
     if (!thread) return;
     if (cpu == 0xFFFFFFFF) cpu = 2;
     thread->SetActiveCpu(cpu);
-    if (source == 1 && REXCVAR_GET(renut_native_gpu_callbacks) && RunCallbackInterrupt(thread, cpu)) return;
     uint64_t args[] = {source, interrupt_callback_data_};
     function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                            rex::countof(args));
@@ -104,42 +90,6 @@ class PlumeGpu {
     thread->SetActiveCpu(cpu);
     uint64_t args[] = {context};
     function_dispatcher_->ExecuteInterrupt(thread->thread_state(), function, args, rex::countof(args));
-  }
-
-  // The graphics interrupt handler's source 1 (sub_826573F0), served natively. The GPU's scratch
-  // registers 4 and 5 were written back to the device's writeback block (device + 10900) at +16 and
-  // +20: the callback and its context. The handler calls the callback when there is one, then takes
-  // its CPU's bit out of the mask at +0 (scratch register 0, which the GPU sets for the CPUs the
-  // callback is for) under the device's lock at +10904; the bit is the only thing it changes there, so
-  // an atomic clear does for the lock. False when the device or its block is not there (the handler runs).
-  bool RunCallbackInterrupt(rex::system::XThread* thread, uint32_t cpu) {
-    if (!interrupt_callback_data_ || cpu >= 6) return false;
-    auto word = [&](uint32_t address) {
-      return reinterpret_cast<uint32_t*>(memory_->TranslateVirtual<uint8_t*>(address));
-    };
-    const uint32_t* device_block = word(interrupt_callback_data_ + 10900);
-    const uint32_t block = device_block ? __builtin_bswap32(*device_block) : 0;
-    if (!block) return false;
-    const uint32_t callback = __builtin_bswap32(*word(block + 16));
-    if (callback) {
-      uint64_t args[] = {__builtin_bswap32(*word(block + 20))};
-      function_dispatcher_->ExecuteInterrupt(thread->thread_state(), callback, args, rex::countof(args));
-    }
-    auto mask = std::atomic_ref<uint32_t>(*word(block));
-    uint32_t seen = mask.load(std::memory_order_relaxed);
-    for (;;) {
-      const uint32_t cleared = __builtin_bswap32((__builtin_bswap32(seen) & ~(1u << cpu)) & 0x3F);
-      if (mask.compare_exchange_weak(seen, cleared, std::memory_order_acq_rel)) break;
-    }
-    return true;
-  }
-
-  // Called by the renderer's worker on every pass.
-  bool ServiceRing() {
-    const uint32_t write_index = ring_.write_index.load();
-    if (write_index == 0xBAADF00D || ring_.read_index == write_index) return false;
-    ring_.read_index = write_index;
-    return true;
   }
 
   // The vblank handler (sub_826541C8, source 0 of sub_826573F0) with nothing for it to do besides the
@@ -191,14 +141,13 @@ class PlumeGpu {
     if (vblanks <= 0) return;
     tick_origin_ += period * vblanks;
     if (backend_) backend_->add_counter(uint32_t(vblanks));
-    if (!(REXCVAR_GET(renut_native_vblank) && RunVblankNatively(uint32_t(vblanks))))
-      DispatchInterruptCallback(0, 2);
+    if (!RunVblankNatively(uint32_t(vblanks))) DispatchInterruptCallback(0, 2);
   }
 
   void MarkVblank() {
     // The counter the game sees move, then the interrupt that runs its handler.
     if (backend_) backend_->increment_counter();
-    if (REXCVAR_GET(renut_native_vblank) && pacing::ImmediatePresentation() && RunVblankNatively()) return;
+    if (pacing::ImmediatePresentation() && RunVblankNatively()) return;
     DispatchInterruptCallback(0, 2);
   }
 
@@ -255,53 +204,30 @@ class PlumeGpu {
     gpu->WriteRegister(addr, value);
   }
 
+  // The GPU's register window (0x7FC80000): nothing in the title reaches it any more - a session of
+  // the native front end (6900 frames) logged no access - so reads are 0 and writes are dropped. The
+  // first read and the first write of each register are logged, to say so if something does.
+  void NoteRegister(uint32_t r, bool write, uint32_t value) {
+    std::atomic<uint8_t>& seen = seen_registers_[r];
+    const uint8_t bit = write ? 2 : 1;
+    if (seen.load(std::memory_order_relaxed) & bit) return;
+    if (seen.fetch_or(bit, std::memory_order_relaxed) & bit) return;
+    REXLOG_INFO("Renut: MMIO register {:04X} first {}{}", r, write ? "written, value " : "read",
+                write ? fmt::format("{:08X}", value) : std::string());
+  }
+
   uint32_t ReadRegister(uint32_t addr) {
-    const uint32_t r = (addr & 0xFFFF) / 4;
-    switch (r) {
-      case 0x0F00:  // RB_EDRAM_TIMING
-        return 0x08100748;
-      case 0x0F01:  // RB_BC_CONTROL
-        return 0x0000200E;
-      case 0x194C: {  // R500_D1MODE_V_COUNTER
-        rex::system::X_VIDEO_MODE mode;
-        rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
-        return std::min(uint32_t(mode.display_height), uint32_t(0x0FFF));
-      }
-      case 0x1951:  // interrupt status
-        return 1;   // vblank
-      case 0x1961: {  // AVIVO_D1MODE_VIEWPORT_SIZE: [width(0x0FFF), height(0x0FFF)]
-        rex::system::X_VIDEO_MODE mode;
-        rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
-        return (std::min(uint32_t(mode.display_width), uint32_t(0x0FFF)) << 16) |
-               std::min(uint32_t(mode.display_height), uint32_t(0x0FFF));
-      }
-      default:
-        break;
-    }
-    return backend_ && r < RegisterFile::kRegisterCount ? backend_->ReadRegisterValue(r) : 0;
+    NoteRegister((addr & 0xFFFF) / 4, false, 0);
+    return 0;
   }
 
-  void WriteRegister(uint32_t addr, uint32_t value) {
-    const uint32_t r = (addr & 0xFFFF) / 4;
-    if (r == 0x01C5) {  // CP_RB_WPTR
-      ring_.write_index = value;
-      if (backend_) backend_->Wake();
-      return;
-    }
-    if (r == 0x1844) return;  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
-    if (backend_ && r < RegisterFile::kRegisterCount) backend_->registers()->values[r] = value;
-  }
+  void WriteRegister(uint32_t addr, uint32_t value) { NoteRegister((addr & 0xFFFF) / 4, true, value); }
 
+  std::array<std::atomic<uint8_t>, 0x4000> seen_registers_{};
   rex::memory::Memory* memory_ = nullptr;
   rex::runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
   rex::system::KernelState* kernel_state_ = nullptr;
   std::unique_ptr<GpuBackend> backend_;
-  // The write pointer a device that still rings the doorbell moves (CP_RB_WPTR). The ring has no
-  // contents: a pointer that moves is only work for the worker.
-  struct Ring {
-    uint32_t read_index = 0;  // the worker's thread only
-    std::atomic<uint32_t> write_index{0};
-  } ring_;
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;
   std::atomic<bool> vsync_running_{false};

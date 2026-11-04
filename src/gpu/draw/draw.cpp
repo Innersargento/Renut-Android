@@ -8,6 +8,58 @@ namespace renut::gpu {
 // zero-sample census can be compared with them on and off.
 constexpr uint32_t kStateOnlySkipBits = 1024 | 131072 | 4096 | 67108864;
 
+const Draw::OutputState& Draw::Output() {
+  const DrawState& st = backend.state_;
+  const uint32_t words[OutputState::kWords] = {st.blend_control0.value,       st.blend_control123[0].value,
+                                               st.blend_control123[1].value, st.blend_control123[2].value,
+                                               st.color_mask.value,          st.depth_control.value,
+                                               st.raster.value};
+  if (output_ && std::memcmp(output_->words, words, sizeof(words)) == 0) return *output_;
+  uint64_t hash = XXH3_64bits(words, sizeof(words));
+  for (auto found = output_states_.find(hash); found != output_states_.end(); found = output_states_.find(++hash)) {
+    if (std::memcmp(found->second->words, words, sizeof(words)) == 0) {
+      output_ = found->second.get();
+      return *output_;
+    }
+  }
+  auto made = std::make_unique<OutputState>();
+  std::memcpy(made->words, words, sizeof(words));
+  made->id = ++output_ids_;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const bits::RB_BLENDCONTROL& bc = st.BlendControl(i);
+    RenderBlendDesc& b = made->blends[i];
+    b.srcBlend = Blend(bc.color_srcblend);
+    b.dstBlend = Blend(bc.color_destblend);
+    b.blendOp = BlendOp(bc.color_comb_fcn);
+    b.srcBlendAlpha = Blend(bc.alpha_srcblend);
+    b.dstBlendAlpha = Blend(bc.alpha_destblend);
+    b.blendOpAlpha = BlendOp(bc.alpha_comb_fcn);
+    b.blendEnabled = !(b.srcBlend == RenderBlend::ONE && b.dstBlend == RenderBlend::ZERO &&
+                       b.blendOp == RenderBlendOperation::ADD && b.srcBlendAlpha == RenderBlend::ONE &&
+                       b.dstBlendAlpha == RenderBlend::ZERO && b.blendOpAlpha == RenderBlendOperation::ADD);
+    b.renderTargetWriteMask = uint8_t((st.color_mask.value >> (4 * i)) & 0xF);
+  }
+  auto stencil_face = [](xenos::CompareFunction func, xenos::StencilOp fail, xenos::StencilOp zpass,
+                         xenos::StencilOp zfail) {
+    // RenderStencilOp lists the Xenos operations in order, after UNKNOWN.
+    auto op = [](xenos::StencilOp o) { return RenderStencilOp(uint32_t(o) + 1); };
+    RenderStencilFaceDesc face;
+    face.compareFunction = Compare(func);
+    face.failOp = op(fail);
+    face.passOp = op(zpass);
+    face.depthFailOp = op(zfail);
+    return face;
+  };
+  const bits::RB_DEPTHCONTROL& dc = st.depth_control;
+  made->stencil_front = stencil_face(dc.stencilfunc, dc.stencilfail, dc.stencilzpass, dc.stencilzfail);
+  made->stencil_back = dc.backface_enable
+                           ? stencil_face(dc.stencilfunc_bf, dc.stencilfail_bf, dc.stencilzpass_bf, dc.stencilzfail_bf)
+                           : made->stencil_front;
+  output_ = made.get();
+  output_states_.emplace(hash, std::move(made));
+  return *output_;
+}
+
 bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info, bool) {
   struct InDraw {
@@ -16,7 +68,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     ~InDraw() { flag = false; }
   } in_draw(in_issue_draw_);
   if (g_predict.queued.load(std::memory_order_relaxed)) backend.pipelines.PredictPipelines();
-  const RegisterFile& regs = *backend.register_file_;
+  const DrawState& regs = backend.state_;
   const auto edram_mode = xenos::EdramMode(backend.lists.draw_mode_);
   if (edram_mode == xenos::EdramMode::kCopy) return true;  // resolves are records
   ++backend.stats_.draws;
@@ -24,13 +76,13 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (draw_index >= backend.swap.drawskip_first_ && draw_index < backend.swap.drawskip_end_) return true;
   for (const ConstOverride& o : backend.swap.const_overrides_) {
     if (o.bool_word) {
-      uint32_t& word = backend.register_file_->values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + o.reg];
+      uint32_t& word = backend.state_.bools[o.reg];
       word = (word | o.set) & ~o.clear;
       continue;
     }
-    const uint32_t at = (o.pixel ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X) + o.reg * 4;
-    std::memcpy(&backend.register_file_->values[at], o.value, sizeof(o.value));
-    MarkConstantsWritten(at, 4);
+    const uint32_t at = (o.pixel ? DrawState::kPixelConstants : 0u) + o.reg * 4;
+    std::memcpy(&backend.state_.float_constants[at], o.value, sizeof(o.value));
+    MarkConstantsWritten(kStateConstantsFirst + at, 4);
   }
 
   auto* vs = static_cast<HostShader*>(backend.active_vertex_shader());
@@ -41,7 +93,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           backend.targets.native_surfaces_[0].object, backend.targets.native_surfaces_[4].object,
           dc.z_enable ? "t" : "",
           dc.z_write_enable ? "w" : "", dc.stencil_enable ? "s" : "", uint32_t(dc.zfunc),
-          regs[XE_GPU_REG_RB_COLOR_MASK]);
+          regs.color_mask.value);
   }
   if (!vs || !vs->entry) {
     ++backend.stats_.no_vs;
@@ -138,8 +190,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // the tessellation mode say which.
     Trace("dropped prim={} n={} vs={:016X} ps={:016X} tess={} indexed={}", uint32_t(prim_type),
           index_count, vs->entry->hash, ps ? ps->entry->hash : 0,
-          uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
-          uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().source_select));
+          uint32_t(regs.hos_cntl.tess_mode),
+          uint32_t(regs.draw_initiator.source_select));
     return true;
   }
   if ((rect_list && !rect_list_gs_) || (point_list && !point_list_gs_)) {
@@ -174,11 +226,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // Render targets.
   const uint32_t pitch = backend.targets.SurfacePitch();
   if (!pitch) return backend.shaders.Drop("no pitch", vs, ps);
-  const uint32_t height = std::clamp<uint32_t>(regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y, 16, 4096);
-  const uint32_t color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
-  static constexpr Register kBlendControl[4] = {
-      XE_GPU_REG_RB_BLENDCONTROL0, XE_GPU_REG_RB_BLENDCONTROL1, XE_GPU_REG_RB_BLENDCONTROL2,
-      XE_GPU_REG_RB_BLENDCONTROL3};
+  const uint32_t height = std::clamp<uint32_t>(regs.window_scissor_br.br_y, 16, 4096);
+  const uint32_t color_mask = regs.color_mask.value;
   std::array<Target*, 4> colors{};
   uint32_t color_count = 0;
   if (color_pass) {
@@ -193,7 +242,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       }
     }
   }
-  const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs, edram_mode);
+  const bits::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs, edram_mode);
   Target* depth = nullptr;
   if (depth_control.z_enable || depth_control.stencil_enable) {
     depth = backend.targets.NativeTarget(4);
@@ -328,7 +377,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                    draw_index,
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
                                    index_count, uint32_t(edram_mode), pitch, height,
-                                   regs[XE_GPU_REG_RB_COLORCONTROL], color_mask, uint32_t(0));
+                                   regs.color_control.value, color_mask, uint32_t(0));
     for (uint32_t i = 0; i < color_count; ++i) {
       const auto& rt = backend.targets.native_surfaces_[i];
       line += fmt::format(" rt{}={:X}/f{}", i, rt.object, (rt.info >> 16) & 0xF);
@@ -358,21 +407,15 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     Trace("{}", line);
     Trace("  depthcontrol={:08X} stencilrefmask={:08X} bf={:08X} sqconst vs={:08X} ps={:08X} bool={:08X}.{:08X}.{:08X}.{:08X}.{:08X}.{:08X}.{:08X}.{:08X}",
-          regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_STENCILREFMASK],
-          regs[XE_GPU_REG_RB_STENCILREFMASK_BF], regs[XE_GPU_REG_SQ_VS_CONST], regs[XE_GPU_REG_SQ_PS_CONST],
-          regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 1],
-          regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 2], regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 3],
-          regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 4], regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 5],
-          regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 6], regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 7]);
+          regs.depth_control.value, regs.stencil_ref_mask.value,
+          regs.stencil_ref_mask_bf.value, regs.sq_vs_const.value, regs.sq_ps_const.value,
+          regs.bools[0], regs.bools[1], regs.bools[2], regs.bools[3], regs.bools[4], regs.bools[5], regs.bools[6],
+          regs.bools[7]);
     Trace("  raster mode={:08X} clip={:08X} offset=({},{},{},{}) blend={:08X} constants=({},{},{},{}) alpha={}",
-          regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_PA_CL_CLIP_CNTL],
-          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
-          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
-          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
-          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), regs[XE_GPU_REG_RB_BLENDCONTROL0],
-          regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
-          regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
-          regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF));
+          regs.raster.value, regs.clip_cntl.value,
+          regs.poly_offset_front_scale, regs.poly_offset_front_offset, regs.poly_offset_back_scale,
+          regs.poly_offset_back_offset, regs.blend_control0.value, regs.blend_color[0], regs.blend_color[1],
+          regs.blend_color[2], regs.blend_color[3], regs.alpha_ref);
     // What a stacked fetch is actually handed: the pixel shader constants,
     // among them the one whose Z picks the slice.
     if (ps) {
@@ -386,10 +429,10 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         std::string constants;
         for (uint32_t i = 0; i < 4; ++i) {
           constants += fmt::format(" c{}=({},{},{},{})", i,
-                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + 0),
-                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + 1),
-                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + 2),
-                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + 3));
+                                   regs.PixelFloat(i * 4 + 0),
+                                   regs.PixelFloat(i * 4 + 1),
+                                   regs.PixelFloat(i * 4 + 2),
+                                   regs.PixelFloat(i * 4 + 3));
         }
         Trace("  ps{:016X}{}", ps->entry->hash, constants);
       }
@@ -413,7 +456,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         std::string constants;
         for (uint32_t i = 0; i < 256; ++i) {
           float c[4];
-          for (uint32_t j = 0; j < 4; ++j) c[j] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + j);
+          for (uint32_t j = 0; j < 4; ++j) c[j] = regs.PixelFloat(i * 4 + j);
           if (!c[0] && !c[1] && !c[2] && !c[3]) continue;
           constants += fmt::format(" c{}=({},{},{},{})", i, c[0], c[1], c[2], c[3]);
         }
@@ -459,17 +502,17 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
   std::memcpy(sh + RENUT_SHARED_TEXTURE3D_OFFSET, stack_descriptor, sizeof(stack_descriptor));
   std::memcpy(sh + RENUT_SHARED_SAMPLER_OFFSET, sampler_descriptor, sizeof(sampler_descriptor));
-  std::memcpy(sh + RENUT_SHARED_BOOLEANS_OFFSET, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+  std::memcpy(sh + RENUT_SHARED_BOOLEANS_OFFSET, regs.bools,
               RENUT_BOOL_REGISTER_COUNT / 8);
   if (loop_constants_dirty_) {
     loop_constants_dirty_ = false;
     for (uint32_t i = 0; i < RENUT_LOOP_CONSTANT_COUNT; ++i) {
-      uint32_t v = regs.values[XE_GPU_REG_SHADER_CONSTANT_LOOP_00 + i];
+      uint32_t v = regs.loops[i];
       int32_t loop[4] = {int32_t(v & 0xFF), int32_t((v >> 8) & 0xFF), int32_t(int8_t((v >> 16) & 0xFF)), 0};
       std::memcpy(sh + RENUT_SHARED_LOOP_OFFSET + i * 16, loop, 16);
     }
   }
-  const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+  const auto color_control = regs.color_control;
   const bool alpha_test_enabled = color_control.alpha_test_enable &&
                                   color_control.alpha_func != xenos::CompareFunction::kAlways;
   // Alpha to coverage (N&B's grass and foliage) has no samples to cover
@@ -477,7 +520,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // half coverage.
   const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(backend.skip_mask_ & 4096);
   bool alpha_test = ps && (alpha_test_enabled || alpha_to_mask);
-  float alpha_ref = alpha_test_enabled ? regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF) : 0.5f;
+  float alpha_ref = alpha_test_enabled ? regs.alpha_ref : 0.5f;
   // The pixel shaders only clip(alpha - ref), i.e. pass at alpha >= ref. N&B's
   // alpha tests are GREATER (97% of the traced ones, mostly against 0) and
   // GREATER_EQUAL, so GREATER takes the next float up: against 0 the shader
@@ -689,7 +732,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       }
       uint32_t max_vertex = 0;
       for (uint32_t v : used) max_vertex = std::max(max_vertex, v);
-      const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+      const int32_t base_vertex = int32_t(regs.base_vertex);
       info += fmt::format(" max_index={} base={} palette={}", max_vertex, base_vertex, slot_sizes[10] / 64);
       for (const LiveElement& e : vs->elements) {
         if (e.normalized || !e.stride || (e.format != 6 && e.format != 25 && e.format != 26)) continue;
@@ -735,7 +778,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) {
     uint32_t ranges[RENUT_EXPORT_RANGE_COUNT * 4] = {};
     uint32_t range_count = 0;
-    const uint32_t* constants = &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X];
+    const uint32_t* constants = regs.VertexConstants();
     // Only the constants the shader builds its addresses from: the register
     // file still holds the stream constants of earlier draws, and a range made
     // from one of those would shadow guest memory the CPU is still writing.
@@ -892,7 +935,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     uint32_t max_vertex = 0;
     for (uint32_t v : used) max_vertex = std::max(max_vertex, v);
-    diag += fmt::format(" max_index={} base_vertex={} elements:", max_vertex, int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]));
+    diag += fmt::format(" max_index={} base_vertex={} elements:", max_vertex, int32_t(regs.base_vertex));
     for (const LiveElement& e : vs->elements) {
       xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - e.slot);
       diag += fmt::format(" L{}(slot {} fmt {}{} stride {} off {} cap {})", e.location, e.slot, e.format,
@@ -903,7 +946,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                   uint32_t(stream.size()), fetch.endian);
       int32_t lo = INT32_MAX, hi = INT32_MIN;
       for (uint32_t v : used) {
-        const uint64_t at = uint64_t(int64_t(v) + int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET])) * e.stride + e.offset;
+        const uint64_t at = uint64_t(int64_t(v) + int32_t(regs.base_vertex)) * e.stride + e.offset;
         if (at + 8 > stream.size()) continue;
         const int16_t* comps = reinterpret_cast<const int16_t*>(stream.data() + at);
         for (int c = 0; c < 4; ++c) {
@@ -947,16 +990,16 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     line = "  vsc";
     for (uint32_t i = 0; i < 8; ++i) {
-      line += fmt::format(" c{}=({},{},{},{})", i, regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 0),
-                          regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 1),
-                          regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 2),
-                          regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + 3));
+      line += fmt::format(" c{}=({},{},{},{})", i, regs.VertexFloat(i * 4 + 0),
+                          regs.VertexFloat(i * 4 + 1),
+                          regs.VertexFloat(i * 4 + 2),
+                          regs.VertexFloat(i * 4 + 3));
     }
     Trace("{}", line);
     if (ps && (ps->entry->hash == debug_shader_ || ps->entry->hash == arm_target_)) {
       for (uint32_t i = 0; i < 32; ++i) {
         float c[4];
-        for (uint32_t j = 0; j < 4; ++j) c[j] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4 + j);
+        for (uint32_t j = 0; j < 4; ++j) c[j] = regs.PixelFloat(i * 4 + j);
         if (c[0] || c[1] || c[2] || c[3]) Trace("  psc{}=({},{},{},{})", i, c[0], c[1], c[2], c[3]);
       }
     }
@@ -964,11 +1007,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       // Every constant for the shader under study, to run it by hand.
       for (uint32_t i = 8; i < 256; ++i) {
         float c[4];
-        for (uint32_t j = 0; j < 4; ++j) c[j] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4 + j);
+        for (uint32_t j = 0; j < 4; ++j) c[j] = regs.VertexFloat(i * 4 + j);
         if (c[0] || c[1] || c[2] || c[3]) Trace("  vsc{}=({},{},{},{})", i, c[0], c[1], c[2], c[3]);
       }
-      Trace("  bools {:08X} {:08X}", regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
-            regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 1]);
+      Trace("  bools {:08X} {:08X}", regs.bools[0],
+            regs.bools[1]);
     }
     for (const auto& [k, entry] : patch_list ? vs->domain_live_fetches : vs->live_fetches) {
       float scale;
@@ -984,7 +1027,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       skinned |= e.usage == 2;
       half_position |= e.usage == 0 && e.format == 32;
     }
-    const int32_t base = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+    const int32_t base = int32_t(regs.base_vertex);
     if (((backend.skip_mask_ & 1) && int_inputs) || ((backend.skip_mask_ & 2) && packed_inputs) ||
         ((backend.skip_mask_ & 4) && skinned) || ((backend.skip_mask_ & 8) && half_position) ||
         ((backend.skip_mask_ & 16) && quad_list) || ((backend.skip_mask_ & 32) && base != 0) ||
@@ -1012,7 +1055,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // shader emits window coordinates and g_ViewportScaleOffset maps them.
   // XenosRecomp compiles with -fvk-invert-y, so the shaders already negate Y:
   // window y = yo + ys * ndc becomes a viewport of height -2 * ys at yo + ys.
-  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+  const auto vte = regs.vte_cntl;
   const Target* extent = colors[0] ? colors[0] : depth;
   // Its size in guest pixels: a shadow map is drawn at a fraction of it.
   const uint32_t guest_width = extent ? (extent->width * 4 + extent->scale - 1) / extent->scale : 0;
@@ -1020,27 +1063,27 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // Window offset (predicated tiling moves each band to the target's origin)
   // and the D3D9 pixel centre at integer coordinates.
   float window_x = 0.f, window_y = 0.f;
-  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
-    const auto offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  if (regs.raster.vtx_window_offset_enable) {
+    const auto offset = regs.window_offset;
     window_x = float(offset.window_x_offset);
     window_y = float(offset.window_y_offset);
   }
   const bool keep_pixel_center =
       backend.swap.pixel_center_debug_ == 0 ||
       (backend.swap.pixel_center_debug_ == 1 && edram_mode != xenos::EdramMode::kDepthOnly);
-  if (keep_pixel_center && regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
+  if (keep_pixel_center && regs.vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero) {
     window_x += 0.5f;
     window_y += 0.5f;
   }
   RenderViewport viewport;
   float scale_offset[4] = {1.f, 1.f, 0.f, 0.f};
   if (vte.vport_x_scale_ena) {
-    float xs = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
-    float xo = vte.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.f;
-    float ys = vte.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.f;
-    float yo = vte.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.f;
-    float zs = vte.vport_z_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE) : 1.f;
-    float zo = vte.vport_z_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET) : 0.f;
+    float xs = regs.vport_x_scale;
+    float xo = vte.vport_x_offset_ena ? regs.vport_x_offset : 0.f;
+    float ys = vte.vport_y_scale_ena ? regs.vport_y_scale : 1.f;
+    float yo = vte.vport_y_offset_ena ? regs.vport_y_offset : 0.f;
+    float zs = vte.vport_z_scale_ena ? regs.vport_z_scale : 1.f;
+    float zo = vte.vport_z_offset_ena ? regs.vport_z_offset : 0.f;
     viewport = RenderViewport(xo - xs + window_x, yo + ys + window_y, 2.f * xs, -2.f * ys,
                               std::clamp(zo, 0.f, 1.f), std::clamp(zo + zs, 0.f, 1.f));
   } else {
@@ -1063,11 +1106,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // quarter-resolution mirrored pass clips at plane 0, and without it the
   // geometry on the far side of the plane filled the buffer the fog reads.
   // Which planes are on is a specialization constant (g_SpecUserClipMask).
-  const auto clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+  const auto clip_cntl = regs.clip_cntl;
   const uint32_t ucp_mask = clip_cntl.clip_disable ? 0u : uint32_t(clip_cntl.ucp_ena);
   if (ucp_mask) {
     for (uint32_t i = 0; i < RENUT_USER_CLIP_PLANE_COUNT; ++i) {
-      std::memcpy(sh + RENUT_SHARED_UCP_OFFSET + i * 16, &regs[XE_GPU_REG_PA_CL_UCP_0_X + i * 4], 16);
+      std::memcpy(sh + RENUT_SHARED_UCP_OFFSET + i * 16, regs.clip_planes[i], 16);
     }
   }
 
@@ -1076,8 +1119,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // diameter over the viewport's extent is the radius in NDC - signed with the
   // viewport, so that -y is the top of the screen whichever way it is flipped.
   if (point_list) {
-    const auto point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
-    const auto point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
+    const auto point_size = regs.point_size;
+    const auto point_minmax = regs.point_minmax;
     const float point[6] = {float(point_size.width) * (2.f / 16.f),
                             float(point_size.height) * (2.f / 16.f),
                             float(point_minmax.min_size) * (2.f / 16.f),
@@ -1103,16 +1146,16 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // as blocks of the sky's blue or the cliff's brown. The bounds are put in
   // order for this draw only; the register goes back afterwards.
   constexpr uint64_t kRefractionSpritePs = 0xA8DCAC7963881F1Cull;
-  constexpr uint32_t kRefractionBoundsAt = XE_GPU_REG_SHADER_CONSTANT_256_X + 5 * 4;
+  constexpr uint32_t kRefractionBoundsAt = DrawState::kPixelConstants + 5 * 4;
   float refraction_saved[4] = {};
   bool refraction_fixed = false;
   if (backend.swap.refraction_fix_ && ps && ps->entry && ps->entry->hash == kRefractionSpritePs &&
       !REXCVAR_GET(renut_scene_msaa)) {
-    float* bounds = reinterpret_cast<float*>(&backend.register_file_->values[kRefractionBoundsAt]);
+    float* bounds = reinterpret_cast<float*>(&backend.state_.float_constants[kRefractionBoundsAt]);
     if (bounds[1] > bounds[2]) {
       std::memcpy(refraction_saved, bounds, sizeof(refraction_saved));
       std::swap(bounds[1], bounds[2]);
-      MarkConstantsWritten(kRefractionBoundsAt, 4);
+      MarkConstantsWritten(kStateConstantsFirst + kRefractionBoundsAt, 4);
       refraction_fixed = true;
     }
   }
@@ -1122,8 +1165,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     bool active;
     ~RefractionBoundsRestore() {
       if (!active) return;
-      std::memcpy(&self->backend.register_file_->values[kRefractionBoundsAt], saved, 4 * sizeof(float));
-      self->MarkConstantsWritten(kRefractionBoundsAt, 4);
+      std::memcpy(&self->backend.state_.float_constants[kRefractionBoundsAt], saved, 4 * sizeof(float));
+      self->MarkConstantsWritten(kStateConstantsFirst + kRefractionBoundsAt, 4);
     }
   } refraction_restore{this, refraction_saved, refraction_fixed};
   uint32_t rel_variant = 0;
@@ -1142,7 +1185,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     for (uint32_t stage = 0; stage < (ps || !backend.swap.shadow_native_constants_ ? 2u : 1u) && placed; ++stage) {
       uint8_t* shadow = stage ? ps_shadow_ : vs_shadow_;
       const auto* file = reinterpret_cast<const uint8_t*>(
-          &regs.values[stage ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X]);
+          stage ? regs.PixelConstants() : regs.VertexConstants());
       for (uint32_t chunk = 0; chunk < kConstantChunks && placed; ++chunk) {
         placed = backend.streams.CommitConstants(shadow + chunk * kConstantChunkSize, file + chunk * kConstantChunkSize,
                                  kConstantChunkSize, constant_offsets_[stage][chunk],
@@ -1151,7 +1194,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     if (placed && rel_active) {
       placed = backend.streams.CommitConstants(vs_all_shadow_,
-                               reinterpret_cast<const uint8_t*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]),
+                               reinterpret_cast<const uint8_t*>(regs.VertexConstants()),
                                kStageConstantSize, vs_all_offset_, nullptr);
     }
     if (!placed ||
@@ -1171,15 +1214,15 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     Trace("  viewport ({}, {}) {}x{} window ({}, {}) scissor ({}, {})-({}, {}) vte={:X}", viewport.x,
           viewport.y, viewport.width, viewport.height, window_x, window_y, scissor_rect.left,
           scissor_rect.top, scissor_rect.right, scissor_rect.bottom, vte.value);
-    Trace("  zviewport scale={} offset={}", regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
-          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET));
+    Trace("  zviewport scale={} offset={}", regs.vport_z_scale,
+          regs.vport_z_offset);
   }
   if (scissor_rect.right <= scissor_rect.left || scissor_rect.bottom <= scissor_rect.top) {
     return backend.shaders.Drop("empty scissor", vs, ps);
   }
 
   // Pipeline.
-  const auto raster = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  const auto raster = regs.raster;
   const bool polygonal = draw_util::IsPrimitivePolygonal(false, prim_type);
   RenderCullMode cull = RenderCullMode::NONE;
   if (polygonal && !(backend.skip_mask_ & 131072)) {
@@ -1218,44 +1261,18 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // whole volume. Plume takes one reference and one pair of masks for both
   // faces, so the back face shares the front's.
   const bool stencil_enabled = depth && depth_control.stencil_enable;
-  const auto stencil_ref_mask = regs.Get<reg::RB_STENCILREFMASK>();
-  auto stencil_face = [](xenos::CompareFunction func, xenos::StencilOp fail, xenos::StencilOp zpass,
-                         xenos::StencilOp zfail) {
-    // RenderStencilOp lists the Xenos operations in order, after UNKNOWN.
-    auto op = [](xenos::StencilOp o) { return RenderStencilOp(uint32_t(o) + 1); };
-    RenderStencilFaceDesc face;
-    face.compareFunction = Compare(func);
-    face.failOp = op(fail);
-    face.passOp = op(zpass);
-    face.depthFailOp = op(zfail);
-    return face;
-  };
+  const auto stencil_ref_mask = regs.stencil_ref_mask;
+  const OutputState& output = Output();
   RenderStencilFaceDesc stencil_front, stencil_back;
   if (stencil_enabled) {
-    stencil_front = stencil_face(depth_control.stencilfunc, depth_control.stencilfail,
-                                 depth_control.stencilzpass, depth_control.stencilzfail);
-    stencil_back = depth_control.backface_enable
-                       ? stencil_face(depth_control.stencilfunc_bf, depth_control.stencilfail_bf,
-                                      depth_control.stencilzpass_bf, depth_control.stencilzfail_bf)
-                       : stencil_front;
+    stencil_front = output.stencil_front;
+    stencil_back = output.stencil_back;
   }
   RenderBlendDesc blends[4];
   for (uint32_t i = 0; i < color_count; ++i) {
-    reg::RB_BLENDCONTROL bc;
-    bc.value = regs[kBlendControl[i]];
     RenderBlendDesc& b = blends[i];
-    b.srcBlend = Blend(bc.color_srcblend);
-    b.dstBlend = Blend(bc.color_destblend);
-    b.blendOp = BlendOp(bc.color_comb_fcn);
-    b.srcBlendAlpha = Blend(bc.alpha_srcblend);
-    b.dstBlendAlpha = Blend(bc.alpha_destblend);
-    b.blendOpAlpha = BlendOp(bc.alpha_comb_fcn);
-    b.blendEnabled = IsBlendable(colors[i]->format) &&
-                     !(b.srcBlend == RenderBlend::ONE && b.dstBlend == RenderBlend::ZERO &&
-                       b.blendOp == RenderBlendOperation::ADD &&
-                       b.srcBlendAlpha == RenderBlend::ONE && b.dstBlendAlpha == RenderBlend::ZERO &&
-                       b.blendOpAlpha == RenderBlendOperation::ADD);
-    b.renderTargetWriteMask = uint8_t((color_mask >> (4 * i)) & 0xF);
+    b = output.blends[i];
+    b.blendEnabled = b.blendEnabled && IsBlendable(colors[i]->format);
     if (debug_draw && (debug_mode_ & 2)) {
       b.blendEnabled = false;
       b.renderTargetWriteMask = 0xF;
@@ -1295,10 +1312,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   auto bools_of = [](HostShader* shader) -> const uint32_t* {
     if (!shader) return nullptr;
     if (!shader->bool_mask_decoded) {
-      rex::string::StringBuffer disassembly;
-      shader->AnalyzeUcode(disassembly);
-      std::memcpy(shader->bool_mask, shader->constant_register_map().bool_bitmap,
-                  sizeof(shader->bool_mask));
+      shader->AnalyzeUcode();
+      std::memcpy(shader->bool_mask, shader->bool_bitmap(), sizeof(shader->bool_mask));
       shader->bool_mask_decoded = true;
     }
     return shader->bool_mask;
@@ -1309,7 +1324,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   const uint32_t* ps_bools = ps && ps->compiled && ps->compiled->dynamic_bools ? nullptr : bools_of(ps);
   for (uint32_t word = 0; word < 8 && (vs_bools || ps_bools); ++word) {
     const uint32_t tested = (vs_bools ? vs_bools[word] : 0) | (ps_bools ? ps_bools[word] : 0);
-    const uint32_t value = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + word] & tested;
+    const uint32_t value = regs.bools[word] & tested;
     if (value) spec_constants.emplace_back(RENUT_SPEC_BOOLS_BASE + word, value);
   }
   // The live vertex fetch table, if the shader's module has a form that reads
@@ -1359,16 +1374,12 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   key_bytes.Put(cull);
   key_bytes.Put(front_face);
   key_bytes.Put(color_count);
+  // The blend fields come with the output state's id; what a draw adds to them (the target's format
+  // blends or not, the debug override of the write mask) is the byte after each format.
+  key_bytes.Put(output.id);
   for (uint32_t i = 0; i < color_count; ++i) {
     key_bytes.Put(colors[i]->format);
-    key_bytes.Put(blends[i].blendEnabled);
-    key_bytes.Put(blends[i].srcBlend);
-    key_bytes.Put(blends[i].dstBlend);
-    key_bytes.Put(blends[i].blendOp);
-    key_bytes.Put(blends[i].srcBlendAlpha);
-    key_bytes.Put(blends[i].dstBlendAlpha);
-    key_bytes.Put(blends[i].blendOpAlpha);
-    key_bytes.Put(blends[i].renderTargetWriteMask);
+    key_bytes.Put(uint8_t(blends[i].blendEnabled | ((blends[i].renderTargetWriteMask != output.blends[i].renderTargetWriteMask) << 1)));
   }
   key_bytes.Put(uint8_t((depth != nullptr) | (depth_enabled << 1) | (depth_write << 2)));
   key_bytes.Put(depth_control.zfunc);
@@ -1702,7 +1713,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // be, computed by a draw that exports them to memory; the level is still
     // the ceiling the guest set for this draw.
     const uint32_t patches = index_count / (quad_patch ? 4 : 3);
-    const float wanted = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
+    const float wanted = regs.hos_max_tess_level + 1.0f;
     uint32_t level = std::clamp(uint32_t(wanted > 1.0f ? wanted : 1.0f), 1u, kMaxPatchLevel);
     // files/plume-patchlevel: a share of the guest's level, in percent. The
     // grid has level^2 cells, so half the level is a quarter of the vertices.
@@ -1717,9 +1728,9 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // edge on the GPU, most of them - all that are off screen - into a single
     // triangle. Quad patches stay on the grid.
     if (backend.swap.adaptive_mode_ && !quad_patch &&
-        regs.Get<reg::VGT_HOS_CNTL>().tess_mode == xenos::TessellationMode::kAdaptive && index_buffer_info &&
+        regs.hos_cntl.tess_mode == xenos::TessellationMode::kAdaptive && index_buffer_info &&
         index_buffer_info->guest_base && index_buffer_info->format == xenos::IndexFormat::kInt32) {
-      const float least = regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
+      const float least = regs.hos_min_tess_level + 1.0f;
       const uint32_t min_level = std::clamp(uint32_t(least > 1.0f ? least : 1.0f), 1u, level);
       adaptive = backend.patches.ExpandAdaptivePatches(index_buffer_info->guest_base, index_buffer_info->endianness, patches,
                                        min_level, level, adaptive_draw);
@@ -1810,10 +1821,10 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   }
   if (blend_constants) {
     pk.blend_constants = true;
-    pk.blend_factor[0] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED);
-    pk.blend_factor[1] = regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN);
-    pk.blend_factor[2] = regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE);
-    pk.blend_factor[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
+    pk.blend_factor[0] = regs.blend_color[0];
+    pk.blend_factor[1] = regs.blend_color[1];
+    pk.blend_factor[2] = regs.blend_color[2];
+    pk.blend_factor[3] = regs.blend_color[3];
   }
   if (stencil_enabled) {
     pk.stencil = true;
@@ -1880,7 +1891,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     draw_slots_.push_back(entry);
   }
   pk.slot_count = uint32_t(draw_slots_.size());
-  const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+  const int32_t base_vertex = int32_t(regs.base_vertex);
   if (trace_ && index_buffer == upload_.get()) {
     uint32_t lo = UINT32_MAX, hi = 0;
     for (uint32_t i = 0; i < vertex_count; ++i) {
@@ -2016,12 +2027,12 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     sig.ps = pk.ps_hash;
     sig.depth_control = depth_control.value;
     sig.stencil = stencil_ref_mask.value;
-    sig.stencil_bf = regs[XE_GPU_REG_RB_STENCILREFMASK_BF];
+    sig.stencil_bf = regs.stencil_ref_mask_bf.value;
     sig.raster = raster.value;
     sig.color_control = color_control.value;
-    const float census_alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
+    const float census_alpha_ref = regs.alpha_ref;
     std::memcpy(&sig.alpha_ref, &census_alpha_ref, 4);
-    sig.clip = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
+    sig.clip = regs.clip_cntl.value;
     sig.color_mask = color_mask;
     sig.viewport_w = uint32_t(std::fabs(viewport.width));
     sig.viewport_h = uint32_t(std::fabs(viewport.height));

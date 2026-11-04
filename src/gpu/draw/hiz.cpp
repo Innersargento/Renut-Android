@@ -58,16 +58,15 @@ void HiZ::HizDropBoxes(uint32_t start, uint32_t length) {
 
 HizModelEntry* HiZ::HizModelFor(HostShader& vs) {
   if (!vs.bool_mask_decoded) {
-    rex::string::StringBuffer disassembly;
-    vs.AnalyzeUcode(disassembly);
-    std::memcpy(vs.bool_mask, vs.constant_register_map().bool_bitmap, sizeof(vs.bool_mask));
+    vs.AnalyzeUcode();
+    std::memcpy(vs.bool_mask, vs.bool_bitmap(), sizeof(vs.bool_mask));
     vs.bool_mask_decoded = true;
   }
-  const RegisterFile& regs = *backend.register_file_;
+  const DrawState& regs = backend.state_;
   uint32_t bools[8];
   bool same = vs.hiz_entry != nullptr;
   for (uint32_t word = 0; word < 8; ++word) {
-    bools[word] = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + word] & vs.bool_mask[word];
+    bools[word] = regs.bools[word] & vs.bool_mask[word];
     same = same && bools[word] == vs.hiz_bools[word];
   }
   if (same) return static_cast<HizModelEntry*>(vs.hiz_entry);
@@ -111,10 +110,10 @@ bool HiZ::HizValidate(HostShader& vs, renut::hiz::Model& model,
       }
     }
   } sink;
-  auto interpreter = std::make_unique<ShaderInterpreter>(*backend.register_file_, *backend.memory_);
+  auto interpreter = std::make_unique<ShaderInterpreter>(backend.state_, *backend.memory_);
   interpreter->SetShader(vs);
   interpreter->SetExportSink(&sink);
-  const float* constants = reinterpret_cast<const float*>(&backend.register_file_->values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+  const float* constants = reinterpret_cast<const float*>(backend.state_.float_constants);
   float affine[4][5];
   renut::hiz::Evaluate(model, constants, 0, affine);
   const uint8_t* memory = backend.memory_->TranslatePhysical<const uint8_t*>(0);
@@ -312,17 +311,17 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     case xenos::PrimitiveType::kQuadList: break;
     default: return ++backend.stats_.hiz_why[1], false;
   }
-  const RegisterFile& regs = *backend.register_file_;
+  const DrawState& regs = backend.state_;
   if (vs.entry && (vs.entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) return ++backend.stats_.hiz_why[2], false;
-  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
-  const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
+  const auto vte = regs.vte_cntl;
+  const auto clip = regs.clip_cntl;
   // vtx_w0_fmt set is the usual case: the shader's W is W, not 1/W.
   if (clip.clip_disable || vte.vtx_xy_fmt || vte.vtx_z_fmt || !vte.vtx_w0_fmt || !vte.vport_x_scale_ena ||
       !vte.vport_x_offset_ena || !vte.vport_y_scale_ena || !vte.vport_y_offset_ena) {
     ++backend.report.hiz_clip_states_[(uint64_t(vte.value) << 32) | clip.value];
     return ++backend.stats_.hiz_why[3], false;
   }
-  if (regs.Get<reg::SQ_VS_CONST>(XE_GPU_REG_SQ_VS_CONST).base != 0) return ++backend.stats_.hiz_why[4], false;
+  if (regs.sq_vs_const.base != 0) return ++backend.stats_.hiz_why[4], false;
 
   const auto stage_a = hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   HizModelEntry* entry = HizModelFor(vs);
@@ -343,7 +342,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     ++backend.stats_.hiz_no_box[kind];
     return false;
   }
-  const int32_t base_vertex = int32_t(regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+  const int32_t base_vertex = int32_t(regs.base_vertex);
   // A mesh whose draws are almost never found outside (under 1 in 16, over the
   // last 64-128 draws of it, every instance together) costs more in tests than
   // the few culls save: break-even is about one cull in ten. Only every 8th draw
@@ -400,7 +399,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     entry->validated = true;
   }
   // The constants as the shader sees them, and the model's affine map.
-  const float* constants = reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+  const float* constants = reinterpret_cast<const float*>(regs.float_constants);
   float affine[4][5];
   const auto stage_c = hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   renut::hiz::Evaluate(model, constants, 0, affine);
@@ -479,8 +478,8 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   if (const uint32_t ucp = clip.clip_disable ? 0u : uint32_t(clip.ucp_ena)) {
     for (uint32_t i = 0; i < 6; ++i) {
       if (!(ucp & (1u << i))) continue;
-      const uint32_t r = XE_GPU_REG_PA_CL_UCP_0_X + i * 4;
-      if (wholly_outside(regs.Get<float>(r), regs.Get<float>(r + 1), regs.Get<float>(r + 2), regs.Get<float>(r + 3))) {
+      const float* plane = regs.clip_planes[i];
+      if (wholly_outside(plane[0], plane[1], plane[2], plane[3])) {
         ++backend.stats_.hiz_frustum[kind];
         ++backend.stats_.hiz_clip_plane[kind];
         if (cold_slot) cold_slot->culled += sampled_cold ? 8 : 1;
@@ -493,19 +492,19 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   plane_range(0, 0, 0, 1, &w_low, &w_high);
   if (!(w_low > 1e-6f)) return false;
   float window_x = 0.f, window_y = 0.f;
-  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
-    const auto offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  if (regs.raster.vtx_window_offset_enable) {
+    const auto offset = regs.window_offset;
     window_x = float(offset.window_x_offset);
     window_y = float(offset.window_y_offset);
   }
-  if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
+  if (regs.vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero) {
     window_x += 0.5f;
     window_y += 0.5f;
   }
-  const float xs = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
-  const float xo = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
-  const float ys = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
-  const float yo = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+  const float xs = regs.vport_x_scale;
+  const float xo = regs.vport_x_offset;
+  const float ys = regs.vport_y_scale;
+  const float yo = regs.vport_y_offset;
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor, backend.targets.SurfacePitch());
   const float left = float(scissor.offset[0]), top = float(scissor.offset[1]);

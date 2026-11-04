@@ -113,7 +113,7 @@ bool Present(PPCContext& ctx, uint8_t* base) {
 
 // --- Gamma -----------------------------------------------------------------
 
-// SetGammaRamp and SetPWLGamma are in hooks/handlers.cpp (renut_native_gamma). The port that was here
+// SetGammaRamp and SetPWLGamma are in hooks/handlers.cpp. The port that was here
 // named the kernel's process-type thunk (0x82D0827C) as a function, found none, and so always declined.
 
 // --- Scaler ----------------------------------------------------------------

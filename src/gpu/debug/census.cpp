@@ -68,7 +68,7 @@ void Census::BeginSlot(uint32_t slot) {
       ++e.draws;
       e.samples += samples[i];
       if (!samples[i]) ++e.zero;
-      reg::RB_DEPTHCONTROL dc;
+      bits::RB_DEPTHCONTROL dc;
       dc.value = e.sig.depth_control;
       if ((e.sig.flags & kColorPass) && (e.sig.flags & kDepth) && e.sig.color_mask &&
           dc.zfunc == xenos::CompareFunction::kGreaterEqual) {
@@ -104,15 +104,15 @@ const char* Op(uint32_t o) {
 }
 
 std::string Describe(const CensusSignature& s) {
-  reg::RB_DEPTHCONTROL dc;
+  bits::RB_DEPTHCONTROL dc;
   dc.value = s.depth_control;
-  reg::RB_STENCILREFMASK sr;
+  bits::RB_STENCILREFMASK sr;
   sr.value = s.stencil;
-  reg::PA_SU_SC_MODE_CNTL ra;
+  bits::PA_SU_SC_MODE_CNTL ra;
   ra.value = s.raster;
-  reg::RB_COLORCONTROL cc;
+  bits::RB_COLORCONTROL cc;
   cc.value = s.color_control;
-  reg::PA_CL_CLIP_CNTL cl;
+  bits::PA_CL_CLIP_CNTL cl;
   cl.value = s.clip;
   float alpha_ref;
   std::memcpy(&alpha_ref, &s.alpha_ref, 4);
@@ -128,7 +128,7 @@ std::string Describe(const CensusSignature& s) {
                        uint32_t(sr.stencilwritemask), Op(uint32_t(dc.stencilfail)), Op(uint32_t(dc.stencilzpass)),
                        Op(uint32_t(dc.stencilzfail)));
     if (dc.backface_enable) {
-      reg::RB_STENCILREFMASK bf;
+      bits::RB_STENCILREFMASK bf;
       bf.value = s.stencil_bf;
       out += fmt::format(" bf={} ref={:02X} mask={:02X}", Func(uint32_t(dc.stencilfunc_bf)), uint32_t(bf.stencilref),
                          uint32_t(bf.stencilmask));

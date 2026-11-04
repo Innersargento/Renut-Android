@@ -8,13 +8,13 @@ namespace renut::gpu {
 // resolve, which names its texture and its rectangle by D3D objects. `w` is a kOpResolve record.
 bool Resolve::DecodeResolve(const uint32_t* w, ResolveCopy& out) {
   out = ResolveCopy{};
-  reg::RB_COPY_CONTROL control;
+  bits::RB_COPY_CONTROL control;
   control.value = w[5];
   if (control.copy_command != xenos::CopyCommand::kRaw && control.copy_command != xenos::CopyCommand::kConvert) {
     REXLOG_INFO("Renut: Plume resolve with copy command {} dropped", uint32_t(control.copy_command));
     return false;
   }
-  reg::RB_COPY_DEST_INFO dest_info;
+  bits::RB_COPY_DEST_INFO dest_info;
   dest_info.value = w[6];
   const bool is_depth = control.copy_src_select >= xenos::kMaxColorRenderTargets;
   // A depth copy is asked for in k_8_8_8_8 by Direct3D 9; the host copies the depth in the depth

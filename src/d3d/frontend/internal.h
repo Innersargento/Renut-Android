@@ -35,6 +35,7 @@
 // the next bit the next register, and so on (SetPending_RenderStates,
 // sub_8222CB90).
 #include "d3d/frontend/native_d3d.h"
+#include "gpu/core/draw_state.h"
 #include "guest/guest_address.h"
 
 #include "d3d/hooks/layer.h"
@@ -136,13 +137,10 @@ inline thread_local uint32_t t_function = 0;  // the Direct3D function this thre
 // nothing, go into the immediate list; the report names them. On the console
 // they go into that device's own ring, so what they set (the window scissor
 // above all: SetSurfaceClip writes it straight into the ring) never reaches
-// the swapping device's draws. The renut_native_d3d_foreign_mode cvar: 0 as they come,
-// 1 each device's window scissor put back before its calls (default), 2
-// dropped.
+// the swapping device's draws, so each device's window scissor is put back before its calls.
 inline std::array<std::atomic<uint64_t>, renut::d3d::kFunctionCount> g_foreign{};
 inline std::atomic<uint32_t> g_foreign_device{0};
 inline std::atomic<uint64_t> g_foreign_clip{0}, g_foreign_doorbells{0};
-inline std::atomic<int> g_foreign_mode{1};
 constexpr const char* kFunctionNames[] = {
 #define X(symbol, name) #name,
 #include "d3d/hooks/functions.h"
@@ -179,20 +177,21 @@ inline std::atomic<int32_t> g_executor_busy{0};
 class Builder {
  public:
   explicit Builder(List& list) : list_(list) {}
-  void Regs(uint32_t first, const uint32_t* values, uint32_t count) {
+  // `count` words of the DrawState from `first` on (RENUT_STATE_WORD).
+  void State(uint32_t first, const uint32_t* values, uint32_t count) {
     if (!count) return;
     uint32_t* p = Grow(2 + size_t(count));
-    p[0] = kOpRegs | (count << 8);
+    p[0] = kOpState | (count << 8);
     p[1] = first;
     std::memcpy(p + 2, values, size_t(count) * 4);
   }
-  void Reg(uint32_t index, uint32_t value) { Regs(index, &value, 1); }
+  void StateWord(uint32_t first, uint32_t value) { State(first, &value, 1); }
   // `count` big-endian dwords of guest memory, read now. (The constant blocks
   // are most of a list: one resize, not a push_back a dword.)
-  void RegsFromGuest(const uint8_t* base, uint32_t first, uint32_t address, uint32_t count) {
+  void StateFromGuest(const uint8_t* base, uint32_t first, uint32_t address, uint32_t count) {
     if (!count) return;
     uint32_t* p = Grow(2 + size_t(count));
-    p[0] = kOpRegs | (count << 8);
+    p[0] = kOpState | (count << 8);
     p[1] = first;
     const uint8_t* source = GuestPtr(base, address);
     for (uint32_t i = 0; i < count; ++i) {
@@ -274,8 +273,6 @@ inline struct FrontEnd {
   std::unordered_map<uint32_t, std::array<uint32_t, 3>> window_clip;
   std::array<uint32_t, 3> immediate_clip{};
   bool immediate_clip_known = false;
-  // Where another device's calls go when they are dropped (mode 2).
-  List discard;
   std::deque<std::shared_ptr<const List>> published;
   std::mutex published_mutex;
   uint32_t marker_serial = 0;
@@ -530,21 +527,10 @@ void Swap(PPCContext& ctx);
 // Native sync: what the GPU writes back for the CPU, recorded where Direct3D
 // asks for it, so the GPU backend need not walk the game's segments.
 
-// Callbacks. What InsertCallback (sub_822052C8) writes is a pure function of its
-// arguments - it changes nothing in the device - so the
-// lists carry its effects: the register writes in order and the
-// interrupt (the waits it also writes are not needed on the host). Flags: bit 1 the callback
-// itself, bit 2 the reset of the callback address (both set when neither is), bit 0 leaves
-// out the wait-until write, bits 24-29 the CPUs (4 when none).
-using Effects = std::vector<std::pair<uint32_t, uint32_t>>;
-constexpr uint32_t kEffectInterrupt = 0xFFFFFFFFu;
-constexpr uint32_t kRegCallbackAck = 0x045E, kRegScratch0 = 0x0578, kRegScratch1 = 0x0579,
-                   kRegCallbackAddress = 0x057C, kRegCallbackContext = 0x057D, kRegWaitUntil = 0x05C8;
-constexpr uint32_t kRegScratchUmsk = 0x01DC, kRegScratchAddr = 0x01DD;
-
-Effects CallbackEffects(uint32_t flags, uint32_t function, uint32_t context);
-
-void PushEffects(List& list, const Effects& effects);
+// Callbacks. What InsertCallback (sub_822052C8) writes is a pure function of its arguments - it changes
+// nothing in the device - so the lists carry one record that makes the GPU backend call the function
+// (kOpCallback): no scratch register writes and no interrupt. Flags: bit 1 the callback itself, bit 2 the
+// reset of the callback address (both set when neither is), bits 24-29 the CPUs (4 when none).
 
 // D3D::CDevice::SetFence(device, ring) (sub_82278528): the fence is recorded for the backend to
 // complete (kOpFence: the ring position to the writeback block's +4, the fence to +0) and the tag

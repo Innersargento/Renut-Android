@@ -10,43 +10,7 @@
 #include <ctime>
 #endif
 
-REXCVAR_DEFINE_BOOL(renut_stub_command_buffers, true, "reNut",
-                    "A device recording a command buffer writes into the ring sink like any other, with no "
-                    "segments chained into the buffer (the draws are recorded on the host anyway). Off: the "
-                    "recompiled kicks and allocators build the buffer's segments, as before");
-
-REXCVAR_DEFINE_BOOL(renut_direct_callbacks, true, "reNut",
-                    "A callback the game inserts (D3DDevice_InsertCallback) is one record of the list that "
-                    "makes the GPU backend call it, with no scratch register writes or interrupt handler "
-                    "(as reNut on PC). Off: the register effects and the interrupt, as before");
-
 namespace renut::native_d3d {
-
-Effects CallbackEffects(uint32_t flags, uint32_t function, uint32_t context) {
-  Effects out;
-  uint32_t mask = (flags >> 24) & 0x3F;
-  if (!mask) mask = 4;
-  if (!(flags & 6)) flags |= 6;
-  if (flags & 2) {
-    if (!(flags & 1)) out.push_back({kRegWaitUntil, 0x20000u});
-    out.push_back({kRegCallbackAddress, function});
-    out.push_back({kRegCallbackContext, context});
-    out.push_back({kRegScratch0, mask});
-    out.push_back({kEffectInterrupt, mask});
-    out.push_back({kRegCallbackAck, mask});
-  }
-  if (flags & 4) out.push_back({kRegCallbackAddress, 0x0BADF00Du});
-  return out;
-}
-
-void PushEffects(List& list, const Effects& effects) {
-  list.words.push_back(kOpEffects | (uint32_t(effects.size()) << 8));
-  for (const auto& [reg, value] : effects) {
-    list.words.push_back(reg);
-    list.words.push_back(value);
-  }
-  g_counts.effect_records.fetch_add(1, std::memory_order_relaxed);
-}
 
 namespace {
 
@@ -109,12 +73,6 @@ void RewindRing(uint8_t* base, uint32_t dev) {
   // written, one past the ring pointer): EndCommandBuffer sizes the segment from it, and a size
   // beyond the segment limit makes it report the buffer out of memory.
   if (U32(base, dev + kRecording)) S32(base, dev + kSegmentStart, sink + 4);
-}
-
-// A device recording a command buffer is the original's when the cvar is off: its kicks and its
-// allocators chain real segments into the buffer.
-bool KeepsOriginal(const uint8_t* base, uint32_t dev) {
-  return U32(base, dev + kRecording) && !REXCVAR_GET(renut_stub_command_buffers);
 }
 
 // CDevice::KickOff without a ring: the fence covering the work so far is issued as the original
@@ -183,7 +141,6 @@ void SetRingBufferParameters(PPCContext& ctx, uint8_t* base) {
 // (ScratchAlloc, which the list names by address), so what the ring scratch holds here is not
 // something a list reads.
 bool BeginRingAlloc(PPCContext& ctx, uint8_t* base) {
-  if (KeepsOriginal(base, ctx.r3.u32)) return false;
   ctx.r3.u64 = RingData(ctx.r4.u32 * 4, ctx.r5.u32);
   return true;
 }
@@ -198,7 +155,6 @@ bool RingAllocate(PPCContext& ctx, uint8_t* base) {
 // sink again.
 bool StartNewSegment(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
-  if (KeepsOriginal(base, dev)) return false;
   RewindRing(base, dev);
   ctx.r3.u64 = U32(base, dev + kRingWrite);
   return true;
@@ -208,7 +164,6 @@ bool StartNewSegment(PPCContext& ctx, uint8_t* base) {
 // segment is full the original kicks, starts a new segment, and gives 0 if even that is too small.
 bool ReserveRing(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
-  if (KeepsOriginal(base, dev)) return false;
   const uint32_t bytes = ctx.r4.u32 * 4;
   auto fits = [&] { return U32(base, dev + kRingWrite) + bytes <= U32(base, dev + kRingLimit); };
   if (!fits()) {
@@ -230,7 +185,6 @@ bool ReserveRing(PPCContext& ctx, uint8_t* base) {
 // writes none and the ring stays where it is; the result is the ring pointer, as the original's.
 bool InvalidateRange(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
-  if (KeepsOriginal(base, dev)) return false;
   ctx.r3.u64 = U32(base, dev + kRingWrite);
   return true;
 }
@@ -244,7 +198,6 @@ bool InvalidateRange(PPCContext& ctx, uint8_t* base) {
 // device on the original ones keeps it.
 bool SkipSurfaceClip(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
-  if (KeepsOriginal(base, dev)) return false;
   return !U32(base, dev + kRecording) || renut::d3d::port::NativeCommandBuffers();
 }
 
@@ -269,7 +222,7 @@ bool SetFence(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, ring = ctx.r4.u32;
   const bool recording = U32(base, dev + kRecording) != 0;
   const bool immediate = (*GuestPtr(base, dev + 10941) & 2) != 0;
-  if (recording && (!immediate || !REXCVAR_GET(renut_stub_command_buffers))) return false;
+  if (recording && !immediate) return false;
   const uint32_t block = U32(base, dev + kFenceCompletion);
   if (!block) return false;
   std::unique_lock lock(g_front.mutex, std::defer_lock);
@@ -305,7 +258,6 @@ bool SetFence(PPCContext& ctx, uint8_t* base) {
 // and they find none; its segment start is kept with the ring (RewindRing).
 bool KickOff(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
-  if (KeepsOriginal(base, dev)) return false;
   KickDevice(ctx, base, dev);
   ctx.r3.u64 = U32(base, dev + kRingWrite);
   return true;
@@ -326,7 +278,7 @@ bool AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t*) {
 bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   // D3D::InsertCallback(device, ring, flags, function, context) returns the ring past the packets
   // that make the GPU call the function. The ring is a stub, so there are none: the callback
-  // goes into the list as an effect and the ring comes back as it was.
+  // goes into the list as a record and the ring comes back as it was.
   const uint32_t dev = ctx.r3.u32, ring = ctx.r4.u32;
   const uint32_t flags = ctx.r5.u32, function = ctx.r6.u32, context = ctx.r7.u32;
   std::unique_lock lock(g_front.mutex);
@@ -334,22 +286,18 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   ctx.r3.u64 = ring;
   List& list = Current(dev);
   g_counts.callbacks.fetch_add(1, std::memory_order_relaxed);
-  if (REXCVAR_GET(renut_direct_callbacks)) {
-    // Flag 2 is the callback, 4 the reset of its address, both when neither is set; the reset and the
-    // waits are the scratch registers' business, which nothing here reads.
-    const uint32_t kind = (flags & 6) ? (flags & 6) : 6;
-    if (kind & 2) {
-      uint32_t mask = (flags >> 24) & 0x3F;
-      if (!mask) mask = 4;
-      list.words.push_back(kOpCallback);
-      list.words.push_back(function);
-      list.words.push_back(context);
-      list.words.push_back(mask);
-      g_counts.effect_records.fetch_add(1, std::memory_order_relaxed);
-    }
-    return true;
+  // Flag 2 is the callback, 4 the reset of its address, both when neither is set; the reset and the
+  // waits are the scratch registers' business, which nothing here reads.
+  const uint32_t kind = (flags & 6) ? (flags & 6) : 6;
+  if (kind & 2) {
+    uint32_t mask = (flags >> 24) & 0x3F;
+    if (!mask) mask = 4;
+    list.words.push_back(kOpCallback);
+    list.words.push_back(function);
+    list.words.push_back(context);
+    list.words.push_back(mask);
+    g_counts.effect_records.fetch_add(1, std::memory_order_relaxed);
   }
-  PushEffects(list, CallbackEffects(flags, function, context));
   return true;
 }
 
@@ -362,7 +310,10 @@ bool SynchronizeToPresentationInterval(PPCContext& ctx, uint8_t* base) {
   const bool wait = !immediate && block;
   if (wait) {
     List& list = Current(dev);
-    PushEffects(list, {{kRegScratch1, 1}});  // the present interval, written back
+    // The present interval: the writeback block's +4 is marked, and the wait below is for it to clear.
+    list.words.push_back(kOpStore);
+    list.words.push_back(Phys(block + 4));
+    list.words.push_back(1);
   }
   lock.unlock();
   __imp__sub_8228A748(ctx, base);

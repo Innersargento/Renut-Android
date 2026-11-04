@@ -36,16 +36,6 @@
 #include <rex/cvar.h>
 #include <rex/ppc/context.h>
 
-REXCVAR_DEFINE_BOOL(renut_native_gamma, true, "reNut",
-                    "D3DDevice_SetGammaRamp and SetPWLGamma natively: the device keeps the corrected ramp as the "
-                    "original does, without the display-gamma call to the kernel and the ring packets. Off: the "
-                    "recompiled functions");
-
-REXCVAR_DEFINE_BOOL(renut_native_fence_wait, true, "reNut",
-                    "D3DDevice_IsFencePending, D3DDevice_BlockOnFence and CDevice::BlockOnFence natively: "
-                    "the wait sleeps until the GPU backend completes a fence (the recompiled functions' "
-                    "wait loop is not run). Off: the recompiled functions");
-
 // The recompiled originals UnsetAll hands the shaders to.
 extern "C" {
 REX_FUNC(sub_82223270);  // D3D_SetSurfaceClip
@@ -412,8 +402,6 @@ void WaitFenceCall(u32 fence) {
 // D3DDevice_IsFencePending(fence) (sub_8228F650): fence 0 is never pending; the current
 // fence is kicked first, as it is only issued by a KickOff, then the test.
 bool IsFencePendingCall(PPCContext& ctx, uint8_t* base) {
-  if (!REXCVAR_GET(renut_native_fence_wait))
-    return false;
   const u32 fence = ctx.r3.u32;
   if (!fence) {
     ctx.r3.u64 = 0;
@@ -434,8 +422,6 @@ bool IsFencePendingCall(PPCContext& ctx, uint8_t* base) {
 
 // CDevice::BlockOnFence(device, fence, type, no kick) (sub_8228F558).
 bool CDeviceBlockOnFenceCall(PPCContext& ctx, uint8_t* base) {
-  if (!REXCVAR_GET(renut_native_fence_wait))
-    return false;
   KickCall kick{&ctx, base};
   BlockOnFence(DeviceAt(base, ctx.r3.u32), ctx.r4.u32, (ctx.r6.u32 & 0xFF) != 0, MakeFenceHooks(kick));
   return true;
@@ -446,7 +432,6 @@ bool CDeviceBlockOnFenceCall(PPCContext& ctx, uint8_t* base) {
 // while a word at +11008 is nonzero, which nothing sets on this device. reNut on PC waits for the
 // fence and nothing else.
 bool BlockUntilIdleCall(PPCContext& ctx, uint8_t* base) {
-  if (!REXCVAR_GET(renut_native_fence_wait)) return false;
   const Device device = DeviceAt(base, ctx.r3.u32);
   if (!device) return false;
   if (const u32 fence = device.W(off::FenceTag)) {
@@ -458,8 +443,6 @@ bool BlockUntilIdleCall(PPCContext& ctx, uint8_t* base) {
 
 // D3DDevice_BlockOnFence(fence) (sub_8228F3B0): the title's device, kick allowed.
 bool BlockOnFenceCall(PPCContext& ctx, uint8_t* base) {
-  if (!REXCVAR_GET(renut_native_fence_wait))
-    return false;
   if (ctx.r3.u32) {
     KickCall kick{&ctx, base};
     BlockOnFence(DeviceAt(base, renut::native_d3d::MainDevice()), ctx.r3.u32, false, MakeFenceHooks(kick));
@@ -810,7 +793,7 @@ u16 RampWord(uint8_t* base, u32 ramp, u32 index) {
 
 // D3DDevice_SetGammaRamp(device, flags, D3DGAMMARAMP*): 3 x 256 words through the table.
 bool SetGammaRampCall(PPCContext& ctx, uint8_t* base) {
-  if (!REXCVAR_GET(renut_native_gamma) || !ctx.r3.u32 || !ctx.r5.u32) return false;
+  if (!ctx.r3.u32 || !ctx.r5.u32) return false;
   u16 corrected[768];
   for (u32 i = 0; i < 768; ++i)
     corrected[i] = u16((GammaTable()[RampWord(base, ctx.r5.u32, i) >> 6] & 0x3FF) << 6);
@@ -821,7 +804,7 @@ bool SetGammaRampCall(PPCContext& ctx, uint8_t* base) {
 // D3DDevice_SetPWLGamma(device, flags, D3DPWLGAMMA*): 3 x 128 {base, delta} through the table, each
 // segment's end clamped to 0x3FF.
 bool SetPWLGammaCall(PPCContext& ctx, uint8_t* base) {
-  if (!REXCVAR_GET(renut_native_gamma) || !ctx.r3.u32 || !ctx.r5.u32) return false;
+  if (!ctx.r3.u32 || !ctx.r5.u32) return false;
   u16 corrected[768];
   const auto& table = GammaTable();
   for (u32 c = 0; c < 3; ++c) {

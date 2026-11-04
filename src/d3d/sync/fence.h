@@ -23,7 +23,7 @@ struct FenceHooks {
 bool FencePending(Device device, u32 fence);
 
 // D3DDevice_IsFencePending, D3DDevice_BlockOnFence and CDevice::BlockOnFence are handlers in
-// hooks/handlers.cpp (cvar renut_native_fence_wait); IsFencePending kicks the current fence first.
+// hooks/handlers.cpp; IsFencePending kicks the current fence first.
 
 // CDevice::BlockOnFence(Fence, Type, NoKick): kick the fence if no KickOff has
 // covered it yet, then wait for it.

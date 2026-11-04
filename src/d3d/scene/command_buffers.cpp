@@ -36,18 +36,12 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
-REXCVAR_DECLARE(bool, renut_stub_command_buffers);
 REXCVAR_DEFINE_INT32(renut_command_buffer_lists_ahead, 32, "reNut",
                      "The brake of BeginCommandBuffer: a thread that starts recording a buffer waits (at most "
                      "50 ms) while more than this many published lists are waiting for the GPU backend. The "
                      "console made it wait for the buffer's own previous run; the buffers are copies on the host, "
                      "so this bounds what piles up instead. 0: no brake")
     .range(0, 4096);
-REXCVAR_DEFINE_BOOL(renut_native_command_buffers, true, "reNut",
-                    "BeginCommandBuffer and EndCommandBuffer natively: the buffer's memory (segments, "
-                    "allocator, allocation list) is not built, the draws are recorded on the host. Off: "
-                    "the recompiled functions. Needs renut_stub_command_buffers");
-
 extern "C" {
 REX_FUNC(sub_82223270);  // D3D::SetSurfaceClip (hooked: the front end records the clip)
 __attribute__((weak)) void sub_82658818(PPCContext& __restrict, uint8_t*);  // the one-pass Z pass set-up
@@ -104,8 +98,7 @@ u32 EmptyCallList() {
 }
 
 bool Enabled() {
-  return REXCVAR_GET(renut_native_command_buffers) && REXCVAR_GET(renut_stub_command_buffers) &&
-         sub_82658818 && sub_8264E1A8 && EmptyCallList();
+  return sub_82658818 && sub_8264E1A8 && EmptyCallList();
 }
 
 // sub_82223270's arguments: a signed 16-bit field of the window scissor words.

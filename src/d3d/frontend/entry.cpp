@@ -102,7 +102,6 @@ void RingBufferParameters(PPCContext& ctx, uint32_t dev, uint8_t* base) {
   const uint32_t block = U32(base, dev + 10900);
   if (!block) return;
   std::lock_guard lock(g_front.mutex);
-  PushEffects(Current(dev), {{kRegScratchAddr, Phys(block)}, {kRegScratchUmsk, 0x00020037u}});
   // The only device that sets a ring up is the one that draws and swaps, so from here its
   // doorbells are the main ones; and the lists carry their sync records from the first doorbell.
   if (!g_front.main_device) g_front.main_device = dev;

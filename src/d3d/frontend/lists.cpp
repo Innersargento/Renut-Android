@@ -17,7 +17,7 @@ void PutBackClip(uint32_t dev, List& list) {
   auto it = g_front.window_clip.find(dev);
   if (it == g_front.window_clip.end()) return;
   if (g_front.immediate_clip_known && g_front.immediate_clip == it->second) return;
-  Builder(list).Regs(0x2080, it->second.data(), 3);
+  Builder(list).State(RENUT_STATE_WORD(window_offset), it->second.data(), 3);
   g_front.immediate_clip = it->second;
   g_front.immediate_clip_known = true;
 }
@@ -26,17 +26,12 @@ List& Current(uint32_t dev) {
   if (List* own = OwnRecording(dev)) return *own;
   auto it = g_front.recording.find(dev);
   if (it != g_front.recording.end() && it->second) return *it->second;
-  const int mode = g_foreign_mode.load(std::memory_order_relaxed);
   if (g_front.main_device && dev != g_front.main_device) {
     g_counts.foreign_immediate.fetch_add(1, std::memory_order_relaxed);
     if (t_function < g_foreign.size()) g_foreign[t_function].fetch_add(1, std::memory_order_relaxed);
     g_foreign_device.store(dev, std::memory_order_relaxed);
-    if (mode == 2) {
-      if (g_front.discard.words.size() > (1u << 20)) g_front.discard.words.clear();
-      return g_front.discard;
-    }
   }
-  if (mode == 1) PutBackClip(dev, *g_front.immediate);
+  PutBackClip(dev, *g_front.immediate);
   return *g_front.immediate;
 }
 

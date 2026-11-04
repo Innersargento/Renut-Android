@@ -30,7 +30,9 @@ namespace renut::native_d3d {
 // Record opcodes, in the low 8 bits of a record's first word; the upper 24
 // bits hold a count or flags.
 enum Op : uint32_t {
-  kOpRegs = 1,     // [op | count << 8] first register, count values
+  // [op | count << 8] first word, count values: the words of the GPU backend's DrawState (gpu/core/draw_state.h)
+  // from the one at `first` on, in the format the device keeps them in
+  kOpState = 1,
   // [op | count << 8 | program << kShaderProgramShift] type | physical address, dwords, the shader's
   // name (low, high; 0: none): the hash of the container the shader object was made from, `program`
   // saying which of its programs this is. The microcode at the address is that program as created, and
@@ -74,10 +76,9 @@ enum Op : uint32_t {
   // masked, equals the reference (the swap's wait for its
   // vertical blank, which paces the game), native sync
   kOpWaitMemory = 19,
-  // [op | count << 8] then count pairs (register, value): what a callback or the swap's pacing
-  // does to the GPU's registers, in order. A register of 0xFFFFFFFF is the
-  // interrupt, its value the mask of CPUs. Native sync
-  kOpEffects = 20,
+  // [op] GPU address, value: the dword there is set (big-endian) and the fence waiters are woken -
+  // the swap's pacing marks the writeback block with it. Native sync
+  kOpStore = 20,
   // [op] function, context, mask: the GPU backend calls function(context) once per CPU in the
   // mask (bits 0-5), where the list stands: what D3DDevice_InsertCallback asks of the GPU, without
   // the scratch registers and the interrupt handler it goes through on the console

@@ -1,44 +1,22 @@
 /**
- ******************************************************************************
- * Xenia : Xbox 360 Emulator Research Project                                 *
- ******************************************************************************
- * Copyright 2020 Ben Vanik. All rights reserved.                             *
- * Released under the BSD license - see LICENSE in the root for more details. *
- ******************************************************************************
- *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
- * @modified    reNut - taken into the app (renut::gpu::xshader), so that the renderer does not
- *              depend on the SDK's Xenos GPU emulation
+ * @modified    reNut - taken into the app (renut::gpu::xshader), see shader.h
  */
 
-#include <cinttypes>
-#include <cstring>
-#include <utility>
-
-#include <fmt/format.h>
-
-#include <rex/filesystem.h>
-#include <rex/graphics/format/ucode.h>
 #include "gpu/xenos/shader.h"
-#include <rex/math.h>
-#include <rex/memory.h>
-#include <rex/string.h>
+
+#include <algorithm>
+#include <cstring>
 
 namespace renut::gpu {
 namespace xshader {
-namespace xenos = rex::graphics::xenos;
 namespace ucode = rex::graphics::ucode;
-namespace memory = rex::memory;
-namespace string = rex::string;
-namespace filesystem = rex::filesystem;
 
 using namespace ucode;
 
-Shader::Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
-               const uint32_t* ucode_dwords, size_t ucode_dword_count,
-               std::endian ucode_source_endian)
+Shader::Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash, const uint32_t* ucode_dwords,
+               size_t ucode_dword_count, std::endian ucode_source_endian)
     : shader_type_(shader_type), ucode_data_hash_(ucode_data_hash) {
-  // We keep ucode data in host native format so it's easier to work with.
   ucode_data_.resize(ucode_dword_count);
   if (std::endian::native != ucode_source_endian) {
     memory::copy_and_swap(ucode_data_.data(), ucode_dwords, ucode_dword_count);
@@ -47,124 +25,81 @@ Shader::Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
   }
 }
 
-Shader::~Shader() {
-  for (auto it : translations_) {
-    delete it.second;
-  }
-}
+void Shader::AnalyzeUcode() {
+  if (is_ucode_analyzed_) return;
+  is_ucode_analyzed_ = true;
 
-std::string Shader::Translation::GetTranslatedBinaryString() const {
-  std::string result;
-  result.resize(translated_binary_.size());
-  std::memcpy(const_cast<char*>(result.data()), translated_binary_.data(),
-              translated_binary_.size());
-  return result;
-}
-
-std::pair<std::filesystem::path, std::filesystem::path> Shader::Translation::Dump(
-    const std::filesystem::path& base_path, const char* path_prefix) const {
-  if (!is_valid()) {
-    return std::make_pair(std::filesystem::path(), std::filesystem::path());
-  }
-
-  std::filesystem::path path = base_path;
-  // Ensure target path exists.
-  std::filesystem::path target_path = base_path;
-  if (!target_path.empty()) {
-    target_path = std::filesystem::absolute(target_path);
-    std::filesystem::create_directories(target_path);
-  }
-
-  const char* type_extension = shader().type() == xenos::ShaderType::kVertex ? "vert" : "frag";
-
-  std::filesystem::path binary_path =
-      target_path / fmt::format("shader_{:016X}_{:016X}.{}.bin.{}", shader().ucode_data_hash(),
-                                modification(), path_prefix, type_extension);
-  FILE* binary_file = filesystem::OpenFile(binary_path, "wb");
-  if (binary_file) {
-    fwrite(translated_binary_.data(), sizeof(*translated_binary_.data()), translated_binary_.size(),
-           binary_file);
-    fclose(binary_file);
-  }
-
-  std::filesystem::path disasm_path;
-  if (!host_disassembly_.empty()) {
-    disasm_path =
-        target_path / fmt::format("shader_{:016X}_{:016X}.{}.{}", shader().ucode_data_hash(),
-                                  modification(), path_prefix, type_extension);
-    FILE* disasm_file = filesystem::OpenFile(disasm_path, "w");
-    if (disasm_file) {
-      fwrite(host_disassembly_.data(), sizeof(*host_disassembly_.data()), host_disassembly_.size(),
-             disasm_file);
-      fclose(disasm_file);
+  // The control flow instructions come in pairs of three dwords, all listed at the top of the
+  // microcode. Its length is guessed by the first exec's address (as freedreno does).
+  uint32_t bound = uint32_t(ucode_data_.size() / 3);
+  for (uint32_t i = 0; i < bound; ++i) {
+    ControlFlowInstruction cf_ab[2];
+    UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
+    for (uint32_t j = 0; j < 2; ++j) {
+      if (IsControlFlowOpcodeExec(cf_ab[j].opcode())) bound = std::min(bound, uint32_t(cf_ab[j].exec.address()));
     }
   }
 
-  return std::make_pair(std::move(binary_path), std::move(disasm_path));
-}
-
-Shader::Translation* Shader::GetOrCreateTranslation(uint64_t modification, bool* is_new) {
-  auto it = translations_.find(modification);
-  if (it != translations_.end()) {
-    if (is_new) {
-      *is_new = false;
-    }
-    return it->second;
-  }
-  Translation* translation = CreateTranslationInstance(modification);
-  translations_.emplace(modification, translation);
-  if (is_new) {
-    *is_new = true;
-  }
-  return translation;
-}
-
-void Shader::DestroyTranslation(uint64_t modification) {
-  auto it = translations_.find(modification);
-  if (it == translations_.end()) {
-    return;
-  }
-  delete it->second;
-  translations_.erase(it);
-}
-
-std::pair<std::filesystem::path, std::filesystem::path> Shader::DumpUcode(
-    const std::filesystem::path& base_path) const {
-  // Ensure target path exists.
-  std::filesystem::path target_path = base_path;
-  if (!target_path.empty()) {
-    target_path = std::filesystem::absolute(target_path);
-    std::filesystem::create_directories(target_path);
-  }
-
-  const char* type_extension = type() == xenos::ShaderType::kVertex ? "vert" : "frag";
-
-  std::filesystem::path binary_path =
-      target_path / fmt::format("shader_{:016X}.ucode.bin.{}", ucode_data_hash(), type_extension);
-  FILE* binary_file = filesystem::OpenFile(binary_path, "wb");
-  if (binary_file) {
-    fwrite(ucode_data().data(), sizeof(*ucode_data().data()), ucode_data().size(), binary_file);
-    fclose(binary_file);
-  }
-
-  std::filesystem::path disasm_path;
-  if (is_ucode_analyzed()) {
-    disasm_path =
-        target_path / fmt::format("shader_{:016X}.ucode.{}", ucode_data_hash(), type_extension);
-    FILE* disasm_file = filesystem::OpenFile(disasm_path, "w");
-    if (disasm_file) {
-      fwrite(ucode_disassembly().data(), sizeof(*ucode_disassembly().data()),
-             ucode_disassembly().size(), disasm_file);
-      fclose(disasm_file);
+  auto test_bool = [&](uint32_t index) { bool_bitmap_[(index / 32) % 8] |= uint32_t(1) << (index % 32); };
+  for (uint32_t i = 0; i < bound; ++i) {
+    ControlFlowInstruction cf_ab[2];
+    UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
+    for (uint32_t j = 0; j < 2; ++j) {
+      const ControlFlowInstruction& cf = cf_ab[j];
+      switch (cf.opcode()) {
+        case ControlFlowOpcode::kCondExec:
+        case ControlFlowOpcode::kCondExecEnd:
+        case ControlFlowOpcode::kCondExecPredClean:
+        case ControlFlowOpcode::kCondExecPredCleanEnd:
+          test_bool(cf.cond_exec.bool_address());
+          GatherExec(cf.cond_exec.address(), cf.cond_exec.count(), cf.cond_exec.sequence());
+          break;
+        case ControlFlowOpcode::kExec:
+        case ControlFlowOpcode::kExecEnd:
+          GatherExec(cf.exec.address(), cf.exec.count(), cf.exec.sequence());
+          break;
+        case ControlFlowOpcode::kCondExecPred:
+        case ControlFlowOpcode::kCondExecPredEnd:
+          GatherExec(cf.cond_exec_pred.address(), cf.cond_exec_pred.count(), cf.cond_exec_pred.sequence());
+          break;
+        case ControlFlowOpcode::kCondCall:
+          if (!cf.cond_call.is_unconditional() && !cf.cond_call.is_predicated()) test_bool(cf.cond_call.bool_address());
+          break;
+        case ControlFlowOpcode::kCondJmp:
+          if (!cf.cond_jmp.is_unconditional() && !cf.cond_jmp.is_predicated()) test_bool(cf.cond_jmp.bool_address());
+          break;
+        default:
+          break;
+      }
     }
   }
-
-  return std::make_pair(std::move(binary_path), std::move(disasm_path));
 }
 
-Shader::Translation* Shader::CreateTranslationInstance(uint64_t modification) {
-  // Default implementation for simple cases like ucode disassembly.
-  return new Translation(*this, modification);
+// The instructions of one exec clause: two bits of `sequence` each, bit 0 a fetch (else an ALU
+// instruction). Only texture fetches whose result reaches a register matter.
+void Shader::GatherExec(uint32_t address, uint32_t count, uint32_t sequence) {
+  for (uint32_t offset = address; offset < address + count; ++offset, sequence >>= 2) {
+    if ((uint64_t(offset) + 1) * 3 > ucode_data_.size()) break;
+    if (!(sequence & 0b01)) continue;
+    const auto& fetch = *reinterpret_cast<const FetchInstruction*>(ucode_data_.data() + offset * 3);
+    switch (fetch.opcode()) {
+      case FetchOpcode::kTextureFetch:
+      case FetchOpcode::kGetTextureBorderColorFrac:
+      case FetchOpcode::kGetTextureComputedLod:
+      case FetchOpcode::kGetTextureGradients:
+      case FetchOpcode::kGetTextureWeights: {
+        // A destination component taken from the fetched value (x to w), not a constant or a keep.
+        const uint32_t swizzle = fetch.texture_fetch().dest_swizzle();
+        for (uint32_t c = 0; c < 4; ++c) {
+          if (uint32_t(GetFetchDestinationComponentSwizzle(swizzle, c)) <= uint32_t(FetchDestinationSwizzle::kW)) {
+            uses_texture_fetch_instruction_results_ = true;
+          }
+        }
+      } break;
+      default:
+        break;
+    }
+  }
 }
 
 }  // namespace xshader

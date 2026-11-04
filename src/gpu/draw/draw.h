@@ -19,6 +19,24 @@ struct Draw {
   std::array<BufferRange, 18> native_streams_{};
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
+  // The output merger's words - the four blend controls, the color mask, the depth control and the
+  // raster mode - decoded once for each distinct set of them. A draw finds its set with a compare
+  // against the last one's (Output()), and the pipeline key carries its id instead of the fields.
+  struct OutputState {
+    static constexpr uint32_t kWords = 7;
+    uint32_t words[kWords] = {};
+    uint32_t id = 0;  // 1.., in order of first use
+    // As the words say: blendEnabled is "not the pass-through blend" (a draw also asks that its
+    // target's format blends), the write mask is the color mask's nibble.
+    RenderBlendDesc blends[4];
+    // Of the depth control, for a draw that tests stencil (the back face shares the front's
+    // when the control has no back face).
+    RenderStencilFaceDesc stencil_front, stencil_back;
+  };
+  const OutputState& Output();
+  const OutputState* output_ = nullptr;
+  uint32_t output_ids_ = 0;
+  std::unordered_map<uint64_t, std::unique_ptr<OutputState>> output_states_;
   uint8_t* Pointer(uint64_t offset);
   uint64_t Address(uint64_t offset) const;
   bool validate_windows_ = false;

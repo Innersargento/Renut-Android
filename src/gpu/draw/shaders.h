@@ -10,13 +10,6 @@ struct Shaders {
   explicit Shaders(GpuBackend& owner) : backend(owner) {}
   GpuBackend& backend;
 
-  std::unordered_map<uint32_t, uint32_t> extended_register_values_;
-  // Register writes. The shader constants (ALU, fetch, boolean and loop,
-  // 0x4000-0x4927) have no side effects in the base class, and the guest
-  // writes thousands of them a frame through one virtual call each: those
-  // ranges are swapped in bulk here, and every write into a stage's float
-  // constants marks that stage's block as needing a look (CommitConstants).
-  void WriteRegister(uint32_t index, uint32_t value);
   // A draw left out for a reason no other counter names: counted by reason
   // and shader for the periodic report, and named in a trace.
   bool Drop(const char* reason, const HostShader* vs, const HostShader* ps);

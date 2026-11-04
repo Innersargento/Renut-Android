@@ -1,10 +1,6 @@
 // The report written to files/native-d3d.txt.
 #include "d3d/frontend/internal.h"
 
-REXCVAR_DEFINE_INT32(renut_native_d3d_foreign_mode, 1, "reNut/D3D",
-                     "How the native Direct3D front end treats immediate calls on a device other than the main one: 0, 1 or 2.")
-    .range(0, 2);
-
 namespace renut::native_d3d {
 
 // The report.
@@ -17,13 +13,6 @@ std::string g_report_path;
 void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
                   const std::function<std::string()>& executor) {
   static uint64_t last_frame = 0, last_draws = 0;
-  {
-    // Other devices' immediate calls: the cvar, read every frame.
-    const int mode = std::clamp(REXCVAR_GET(renut_native_d3d_foreign_mode), 0, 2);
-    if (mode != g_foreign_mode.exchange(mode, std::memory_order_relaxed)) {
-      REXLOG_INFO("Renut: native Direct3D: other devices' immediate calls in mode {}", mode);
-    }
-  }
   if (frame < last_frame + 300) return;
   const double f = double(frame - last_frame);
   auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
@@ -49,9 +38,9 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
   {
     const uint64_t clip = g_foreign_clip.load(std::memory_order_relaxed);
     out += fmt::format(
-        "== other devices' immediate calls (mode {}): last device {:08X}, doorbells {}, last surface clip "
+        "== other devices' immediate calls: last device {:08X}, doorbells {}, last surface clip "
         "({},{})-({},{}); per frame by function:",
-        g_foreign_mode.load(), g_foreign_device.load(), c(g_foreign_doorbells), clip >> 48, (clip >> 32) & 0xFFFF,
+        g_foreign_device.load(), c(g_foreign_doorbells), clip >> 48, (clip >> 32) & 0xFFFF,
         (clip >> 16) & 0xFFFF, clip & 0xFFFF);
     static std::array<uint64_t, renut::d3d::kFunctionCount> last{};
     for (uint32_t i = 0; i < g_foreign.size(); ++i) {
@@ -61,7 +50,7 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
     }
     out += "\n";
   }
-  out += fmt::format("== sync records: {} structured effect records, {} of {} doorbells without a ring packet, "
+  out += fmt::format("== sync records: {} callback records, {} of {} doorbells without a ring packet, "
                      "worker runs {}\n",
                      c(g_counts.effect_records), c(g_counts.doorbells_skipped), c(g_counts.doorbells),
                      c(g_counts.worker_runs));

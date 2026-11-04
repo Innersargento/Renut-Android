@@ -20,38 +20,29 @@ namespace renut::gpu {
 
 class GpuBackend final {
  public:
-  // `service_hardware` is called by the worker on every pass: the video hardware's own
-  // upkeep (the ring's pointers, in host.cpp), true when it had something to do.
-  GpuBackend(rex::memory::Memory* memory, rex::system::KernelState* kernel,
-                        std::function<void(uint32_t, uint32_t)> dispatch_interrupt,
-                        std::function<bool()> service_hardware);
+  GpuBackend(rex::memory::Memory* memory, rex::system::KernelState* kernel);
   // Starts the worker ("GPU Commands"): SetupContext runs on it, then the loop.
   bool Initialize();
   void Shutdown();
-  // Wakes the worker: a list was published, or the video hardware has work for it.
+  // Wakes the worker: a list was published.
   void Wake();
   uint32_t counter() const;
   void increment_counter();
   void add_counter(uint32_t n);
-  RegisterFile* registers();
+  DrawState& state() { return state_; }
   Shader* active_vertex_shader() const;
   Shader* active_pixel_shader() const;
-  uint32_t ReadRegisterValue(uint32_t index) const;
   rex::memory::Memory* memory_ = nullptr;
   rex::system::KernelState* kernel_state_ = nullptr;
-  std::function<void(uint32_t, uint32_t)> dispatch_interrupt_;
   // Calls a guest callback (function, context) as the CPU it names: a callback record of a list.
   std::function<void(uint32_t, uint32_t, uint32_t)> dispatch_callback_;
   // Brings the vertical blank's clock up to date (host.cpp TickVblank): called before a present or a
   // callback record is run, on the backend's thread. Empty when a thread ticks it.
   std::function<void()> tick_vblank_;
-  // The GPU's registers: the lists write them, the draws read them, and the CPU sees them
-  // through the register window (host.cpp).
-  RegisterFile registers_;
-  RegisterFile* register_file_ = nullptr;
+  // The state the lists write and the draws read (gpu/core/draw_state.h).
+  DrawState state_;
   std::atomic<bool> worker_running_;
   rex::system::object_ref<rex::system::XHostThread> worker_thread_;
-  std::function<bool()> service_hardware_;
   uint32_t counter_ = 0;
   std::unique_ptr<rex::thread::Event> wake_;
   bool SetupContext();
@@ -140,17 +131,11 @@ class GpuBackend final {
 };
 
 
-inline GpuBackend::GpuBackend(rex::memory::Memory* memory, rex::system::KernelState* kernel,
-                        std::function<void(uint32_t, uint32_t)> dispatch_interrupt,
-                        std::function<bool()> service_hardware)
+inline GpuBackend::GpuBackend(rex::memory::Memory* memory, rex::system::KernelState* kernel)
       : memory_(memory),
         kernel_state_(kernel),
-        dispatch_interrupt_(std::move(dispatch_interrupt)),
-        service_hardware_(std::move(service_hardware)),
         worker_running_(true),
-        wake_(rex::thread::Event::CreateAutoResetEvent(false)) {
-    register_file_ = &registers_;
-  }
+        wake_(rex::thread::Event::CreateAutoResetEvent(false)) {}
 
 inline bool GpuBackend::Initialize() {
     worker_running_ = true;
@@ -185,40 +170,30 @@ inline uint32_t GpuBackend::counter() const { return counter_; }
 inline void GpuBackend::increment_counter() { counter_++; }
 inline void GpuBackend::add_counter(uint32_t n) { counter_ += n; }
 
-inline RegisterFile* GpuBackend::registers() { return &registers_; }
-
 inline Shader* GpuBackend::active_vertex_shader() const { return lists.active_vertex_shader_; }
 
 inline Shader* GpuBackend::active_pixel_shader() const { return lists.active_pixel_shader_; }
 
-inline uint32_t GpuBackend::ReadRegisterValue(uint32_t index) const {
-    if (index < RegisterFile::kRegisterCount) return registers_.values[index];
-    auto it = shaders.extended_register_values_.find(index);
-    return it != shaders.extended_register_values_.end() ? it->second : 0;
-  }
-
 inline void Draw::MarkConstantsWritten(uint32_t first, uint32_t count) {
-    // The two files are contiguous (vertex c0 at 0x4000, pixel c0 at 0x4400)
-    // and so are the flags, one per 256 registers: the block is the offset
-    // shifted. This runs for every constant register the guest writes.
-    static_assert(XE_GPU_REG_SHADER_CONSTANT_256_X - XE_GPU_REG_SHADER_CONSTANT_000_X ==
-                  kConstantChunks * (kConstantChunkSize / 4));
+    // `first` is a DrawState word. The two float files are contiguous (vertex c0, then
+    // pixel c0) and so are the flags, one per 256 words: the block is the offset
+    // shifted. This runs for every constant word the guest writes.
+    static_assert(DrawState::kPixelConstants == kConstantChunks * (kConstantChunkSize / 4));
     constexpr uint32_t kShift = 8;
     static_assert((1u << kShift) == kConstantChunkSize / 4);
-    constexpr uint32_t kRegisters = 2 * kConstantChunks << kShift;
-    if (first <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31 &&
-        uint64_t(first) + count > XE_GPU_REG_SHADER_CONSTANT_LOOP_00) {
-      loop_constants_dirty_ = true;
-    }
-    const uint32_t lo = first - XE_GPU_REG_SHADER_CONSTANT_000_X;
-    if (first < XE_GPU_REG_SHADER_CONSTANT_000_X || lo >= kRegisters || !count) return;
-    const uint32_t hi = std::min(lo + count, kRegisters) - 1;
+    constexpr uint32_t kWords = 2 * kConstantChunks << kShift;
+    static_assert(kWords == sizeof(DrawState::float_constants) / sizeof(uint32_t));
+    if (first < kStateLoopsFirst + 32 && uint64_t(first) + count > kStateLoopsFirst) loop_constants_dirty_ = true;
+    if (first < kStateConstantsFirst || !count) return;
+    const uint32_t lo = first - kStateConstantsFirst;
+    if (lo >= kWords) return;
+    const uint32_t hi = std::min(lo + count, kWords) - 1;
     bool* written = &constants_written_[0][0];
     for (uint32_t block = lo >> kShift; block <= hi >> kShift; ++block) written[block] = true;
   }
 
 inline void Lists::StoreConstants(uint32_t first, const uint32_t* values, uint32_t count) {
-    uint32_t* dst = &backend.register_file_->values[first];
+    uint32_t* dst = reinterpret_cast<uint32_t*>(&backend.state_) + first;
     uint32_t lo = 0;
     while (lo < count && dst[lo] == values[lo]) ++lo;
     if (lo == count) return;

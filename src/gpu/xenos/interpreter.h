@@ -20,7 +20,7 @@
 #include <rex/assert.h>
 #include <rex/graphics/format/ucode.h>
 #include "gpu/xenos/shader.h"
-#include "gpu/xenos/register_file.h"
+#include "gpu/core/draw_state.h"
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 
@@ -35,8 +35,8 @@ using xshader::Shader;
 
 class ShaderInterpreter {
  public:
-  ShaderInterpreter(const RegisterFile& register_file, const memory::Memory& memory)
-      : register_file_(register_file), memory_(memory) {}
+  ShaderInterpreter(const DrawState& state, const memory::Memory& memory)
+      : state_constants_(state), memory_(memory) {}
 
   class ExportSink {
    public:
@@ -127,7 +127,7 @@ class ShaderInterpreter {
   void StoreFetchResult(uint32_t dest, bool is_dest_relative, uint32_t swizzle, const float* value);
   void ExecuteVertexFetchInstruction(ucode::VertexFetchInstruction instr);
 
-  const RegisterFile& register_file_;
+  const DrawState& state_constants_;
   const memory::Memory& memory_;
 
   ExportSink* export_sink_ = nullptr;

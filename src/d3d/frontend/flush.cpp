@@ -83,6 +83,76 @@ void NoteShaderObject(const uint8_t* base, uint32_t shader, bool pixel) {
 // The dirty bits of the first six registers of the 0x2000 block, RB_SURFACE_INFO .. RB_COLOR3_INFO.
 constexpr uint64_t kTargetRegisters = 0xFC00000000000000ull;
 
+// Where each word of a device block goes in the DrawState, by the word's place in the block; kSkip for
+// a word the backend does not read (the surfaces are named by kOpSurfaces, the resolve by kOpResolve,
+// the shader program by kOpShader). The blocks are the device's register runs 0x2000, 0x2100, 0x2200,
+// 0x2280, 0x2300 and 0x2380 (0x2180, the program control, has no word kept).
+constexpr uint32_t kSkip = ~0u;
+template <size_t N>
+struct BlockMap {
+  uint32_t word[N];
+  constexpr BlockMap() : word{} {
+    for (size_t i = 0; i < N; ++i) word[i] = kSkip;
+  }
+  // `count` words of the block from `at` go to `count` DrawState words from `to`.
+  constexpr BlockMap& Set(size_t at, uint32_t to, size_t count = 1) {
+    for (size_t i = 0; i < count; ++i) word[at + i] = to + uint32_t(i);
+    return *this;
+  }
+};
+#define RENUT_W(member) RENUT_STATE_WORD(member)
+// What each Set below counts on: the members follow each other in the DrawState.
+static_assert(RENUT_W(screen_scissor_br) == RENUT_W(screen_scissor_tl) + 1);
+static_assert(RENUT_W(alpha_ref) == RENUT_W(stencil_ref_mask_bf) + 2 &&
+              RENUT_W(vport_z_offset) == RENUT_W(stencil_ref_mask_bf) + 8);
+static_assert(RENUT_W(color_control) == RENUT_W(depth_control) + 2 && RENUT_W(vte_cntl) == RENUT_W(clip_cntl) + 2);
+static_assert(RENUT_W(hos_min_tess_level) == RENUT_W(output_path_cntl) + 3);
+static_assert(RENUT_W(sq_ps_const) == RENUT_W(sq_vs_const) + 1);
+static_assert(RENUT_W(poly_offset_back_offset) == RENUT_W(poly_offset_front_scale) + 3);
+constexpr auto kTargetsMap = BlockMap<16>().Set(14, RENUT_W(screen_scissor_tl), 2);
+constexpr auto kMergerMap = BlockMap<21>()
+                                .Set(2, RENUT_W(base_vertex))
+                                .Set(4, RENUT_W(color_mask))
+                                .Set(5, RENUT_W(blend_color), 4)
+                                .Set(12, RENUT_W(stencil_ref_mask_bf), 9);  // + the mask, the alpha reference, the viewport
+constexpr auto kPipelineMap = BlockMap<12>()
+                                  .Set(0, RENUT_W(depth_control), 3)  // + the blend control 0, the color control
+                                  .Set(4, RENUT_W(clip_cntl), 3)      // + the raster mode, the viewport transform
+                                  .Set(9, RENUT_W(blend_control123), 3);
+constexpr auto kGeometryMap = BlockMap<21>()
+                                  .Set(0, RENUT_W(point_size), 2)
+                                  .Set(4, RENUT_W(output_path_cntl), 4)  // + the tessellation mode and levels
+                                  .Set(19, RENUT_W(viz_query));
+// The copy block: the vertex control and the two constant ranges; the copy's own words are kOpResolve's.
+constexpr auto kCopyBlockMap = BlockMap<38>().Set(2, RENUT_W(vtx_cntl)).Set(7, RENUT_W(sq_vs_const), 2);
+constexpr auto kPolyOffsetMap = BlockMap<8>().Set(0, RENUT_W(poly_offset_front_scale), 4);
+#undef RENUT_W
+
+// The dirty words of a block (the first at the mask's top bit), each sent to the DrawState word `map`
+// names; runs of words that stay together there go as one record.
+void MappedStates(Device& d, uint64_t mask, const uint32_t* map, uint32_t shadow) {
+  uint32_t at = 0;
+  while (mask) {
+    const uint32_t skip = uint32_t(__builtin_clzll(mask));
+    mask <<= skip;
+    at += skip;
+    const uint32_t run = ~mask ? uint32_t(__builtin_clzll(~mask)) : 64;
+    for (uint32_t k = 0; k < run;) {
+      if (map[at + k] == kSkip) {
+        ++k;
+        continue;
+      }
+      uint32_t n = 1;
+      while (k + n < run && map[at + k + n] == map[at + k] + n) ++n;
+      d.out.StateFromGuest(d.base, map[at + k], shadow + (at + k) * 4, n);
+      k += n;
+    }
+    at += run;
+    mask = run >= 64 ? 0 : mask << run;
+  }
+}
+
+// `first`: the DrawState word the block starts at.
 void RenderStates(Device& d, uint64_t mask, uint32_t first, uint32_t shadow) {
   while (mask) {
     const uint32_t skip = uint32_t(__builtin_clzll(mask));
@@ -90,7 +160,7 @@ void RenderStates(Device& d, uint64_t mask, uint32_t first, uint32_t shadow) {
     first += skip;
     shadow += skip * 4;
     const uint32_t run = ~mask ? uint32_t(__builtin_clzll(~mask)) : 64;
-    d.out.RegsFromGuest(d.base, first, shadow, run);
+    d.out.StateFromGuest(d.base, first, shadow, run);
     first += run;
     shadow += run * 4;
     mask = run >= 64 ? 0 : mask << run;
@@ -122,7 +192,7 @@ void AluConstants(Device& d, uint64_t mask, uint32_t first, uint32_t shadow) {
     first += skip * 16;
     shadow += skip * 64;
     const uint32_t run = ~mask ? uint32_t(__builtin_clzll(~mask)) : 64;
-    d.out.RegsFromGuest(d.base, first, shadow, run * 16);
+    d.out.StateFromGuest(d.base, first, shadow, run * 16);
     first += run * 16;
     shadow += run * 64;
     mask = run >= 64 ? 0 : mask << run;
@@ -136,7 +206,7 @@ void FetchConstants(Device& d, uint64_t mask) {
     mask <<= skip;
     slot += skip;
     const uint32_t run = ~mask ? uint32_t(__builtin_clzll(~mask)) : 64;
-    d.out.RegsFromGuest(d.base, 0x4800 + slot * 6, d.dev + kFetchShadow + slot * 24, run * 6);
+    d.out.StateFromGuest(d.base, RENUT_STATE_WORD(fetch) + slot * 6, d.dev + kFetchShadow + slot * 24, run * 6);
     for (uint32_t i = slot; i < slot + run && i < 32; ++i) sent |= 1u << i;
     slot += run;
     mask = run >= 64 ? 0 : mask << run;
@@ -179,14 +249,13 @@ void Indices(Device& d, uint32_t ib) {
 }
 
 void ClipPlanes(Device& d, uint64_t mask) {
-  d.out.Reg(0x2007, U32(d.base, d.dev + kRegs2000 + 7 * 4));
   uint32_t plane = 0;
   while (mask) {
     const uint32_t skip = uint32_t(__builtin_clzll(mask));
     mask <<= skip;
     plane += skip;
     const uint32_t run = ~mask ? uint32_t(__builtin_clzll(~mask)) : 64;
-    d.out.RegsFromGuest(d.base, 0x2388 + plane * 4, d.dev + kClipPlanes + plane * 16, run * 4);
+    d.out.StateFromGuest(d.base, RENUT_STATE_WORD(clip_planes) + plane * 4, d.dev + kClipPlanes + plane * 16, run * 4);
     plane += run;
     mask = run >= 64 ? 0 : mask << run;
   }
@@ -204,7 +273,7 @@ void LiteralConstants(Device& d, uint32_t header, uint32_t physical) {
     if (!dwords) break;
     const uint32_t source = U32(d.base, entry + 4) + physical;
     entry += 8;
-    d.out.RegsFromGuest(d.base, 0x4000 + constant * 4, Cpu(Phys(source)), dwords);
+    d.out.StateFromGuest(d.base, RENUT_STATE_WORD(float_constants) + constant * 4, Cpu(Phys(source)), dwords);
     g_counts.literal_blocks.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -302,7 +371,6 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
   if (!ps) {
     const uint8_t b43 = U8(base, dev + 10943);
     if (b43 & 1) {
-      d.out.Reg(0x05C8, 0x20000);
       S8(base, dev + 10943, b43 & 0xFE);
     }
     if (U32(base, vs + 872) & 0x20) {
@@ -423,14 +491,12 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
     // Predicated tiling: the band variants once, unpredicated.
     g_counts.predicated_tiling.fetch_add(1, std::memory_order_relaxed);
     if (r20 & 8) {
-      d.out.Reg(0x2208, U32(base, dev + 10580));
       r20 &= ~uint64_t(8);
     }
     if (r20 & (1ull << 56)) {
       r20 &= ~(1ull << 56);  // (RB_COLOR_INFO: the surface's own word, see RenderStates)
     }
     if (r20 & 0x10000) {
-      d.out.RegsFromGuest(base, 0x2180, dev + 10528, 2);
       r20 &= ~uint64_t(0x18000);
     }
     if (r19 != -1) {
@@ -451,11 +517,11 @@ void Flush(Device& d, const uint64_t (&masks)[5]) {
   const uint64_t d0 = masks[0], d1 = masks[1], d3 = masks[3], d4 = masks[4];
   uint64_t d2 = masks[2];
   if (d0) {
-    AluConstants(d, d0, 0x4000, dev + kVsConstants);
+    AluConstants(d, d0, RENUT_STATE_WORD(float_constants), dev + kVsConstants);
     S64(base, dev + 0, 0);
   }
   if (d1) {
-    AluConstants(d, d1, 0x4400, dev + kPsConstants);
+    AluConstants(d, d1, RENUT_STATE_WORD(float_constants) + gpu::DrawState::kPixelConstants, dev + kPsConstants);
     S64(base, dev + 8, 0);
   }
   if (d2) {
@@ -465,32 +531,31 @@ void Flush(Device& d, const uint64_t (&masks)[5]) {
       // windows. One pass on the host; counted to see it never comes.
       g_counts.set_pending_predicated.fetch_add(1, std::memory_order_relaxed);
     }
-    if (d2 & 0xFFF) RenderStates(d, d2 << 52, 0x2200, dev + kRegs2200);
-    if (d2 & 0x1F000) RenderStates(d, (d2 << 47) & 0xF800000000000000ull, 0x2180, dev + kRegs2180);
+    if (d2 & 0xFFF) MappedStates(d, d2 << 52, kPipelineMap.word, dev + kRegs2200);
     if (d2 & (0xFFFFull << 42)) {
       const uint64_t mask = (d2 << 6) & 0xFFFF000000000000ull;
       // RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005) are the surfaces' own words, which
       // kOpSurfaces carries: the GPU backend reads no register for its targets.
-      RenderStates(d, mask & ~kTargetRegisters, 0x2000, dev + kRegs2000);
+      MappedStates(d, mask & ~kTargetRegisters, kTargetsMap.word, dev + kRegs2000);
       Surfaces(d, mask);
     }
     if (d2 & 0x000003FFFFE00000ull) {
-      RenderStates(d, (d2 << 22) & 0xFFFFF80000000000ull, 0x2100, dev + kRegs2100);
+      MappedStates(d, (d2 << 22) & 0xFFFFF80000000000ull, kMergerMap.word, dev + kRegs2100);
     }
     S64(base, dev + 16, 0);
   }
   if (d3) {
     if (d3 & 0xFFFFFFFFull) FetchConstants(d, d3 << 32);
     if (d3 & 0x007FFFFC00000000ull) {
-      RenderStates(d, (d3 << 9) & 0xFFFFF80000000000ull, 0x2280, dev + kRegs2280);
+      MappedStates(d, (d3 << 9) & 0xFFFFF80000000000ull, kGeometryMap.word, dev + kRegs2280);
     }
     S64(base, dev + 24, 0);
   }
   if (d4) {
-    if (d4 & 0x3FFFFFFFFFull) RenderStates(d, (d4 << 26) & 0xFFFFFFFFFC000000ull, 0x2300, dev + kRegs2300);
-    if (d4 & (0xFFull << 38)) RenderStates(d, (d4 << 18) & 0xFF00000000000000ull, 0x2380, dev + kRegs2380);
+    if (d4 & 0x3FFFFFFFFFull) MappedStates(d, (d4 << 26) & 0xFFFFFFFFFC000000ull, kCopyBlockMap.word, dev + kRegs2300);
+    if (d4 & (0xFFull << 38)) MappedStates(d, (d4 << 18) & 0xFF00000000000000ull, kPolyOffsetMap.word, dev + kRegs2380);
     if (d4 & (0x3Full << 49)) ClipPlanes(d, (d4 << 9) & 0xFC00000000000000ull);
-    if (d4 & (1ull << 56)) RenderStates(d, 0xFFFFFFFFFF000000ull, 0x4900, dev + kBoolLoop);
+    if (d4 & (1ull << 56)) RenderStates(d, 0xFFFFFFFFFF000000ull, RENUT_STATE_WORD(bools), dev + kBoolLoop);
     S64(base, dev + 32, 0);
   }
 }
@@ -502,35 +567,32 @@ void FlushRenderStates(Device& d) {
   if (d2) {
     if (U64(base, dev + kPredicatedMask) & d2) g_counts.set_pending_predicated.fetch_add(1, std::memory_order_relaxed);
     if (d2 & 0xFFF) {
-      RenderStates(d, d2 << 52, 0x2200, dev + kRegs2200);
+      MappedStates(d, d2 << 52, kPipelineMap.word, dev + kRegs2200);
       d2 &= ~0xFFFull;
     }
-    if (d2 & 0x1F000) {
-      RenderStates(d, (d2 << 47) & 0xF800000000000000ull, 0x2180, dev + kRegs2180);
-      d2 &= ~0x1F000ull;
-    }
+    d2 &= ~0x1F000ull;  // the program control (0x2180) has no word kept
     if (d2 & (0xFFFFull << 42)) {
       const uint64_t mask = (d2 << 6) & 0xFFFF000000000000ull;
       // RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005) are the surfaces' own words, which
       // kOpSurfaces carries: the GPU backend reads no register for its targets.
-      RenderStates(d, mask & ~kTargetRegisters, 0x2000, dev + kRegs2000);
+      MappedStates(d, mask & ~kTargetRegisters, kTargetsMap.word, dev + kRegs2000);
       Surfaces(d, mask);
       d2 &= ~(0xFFFFull << 42);
     }
     if (d2 & 0x000003FFFFE00000ull) {
-      RenderStates(d, (d2 << 22) & 0xFFFFF80000000000ull, 0x2100, dev + kRegs2100);
+      MappedStates(d, (d2 << 22) & 0xFFFFF80000000000ull, kMergerMap.word, dev + kRegs2100);
       d2 &= ~0x000003FFFFE00000ull;
     }
     S64(base, dev + 16, d2);
   }
   const uint64_t d3 = U64(base, dev + 24);
   if (d3 & 0x007FFFFC00000000ull) {
-    RenderStates(d, (d3 << 9) & 0xFFFFF80000000000ull, 0x2280, dev + kRegs2280);
+    MappedStates(d, (d3 << 9) & 0xFFFFF80000000000ull, kGeometryMap.word, dev + kRegs2280);
     S64(base, dev + 24, d3 & ~0x007FFFFC00000000ull);
   }
   const uint64_t d4 = U64(base, dev + 32);
   if (d4 & 0x3FFFFFFFFFull) {
-    RenderStates(d, (d4 << 26) & 0xFFFFFFFFFC000000ull, 0x2300, dev + kRegs2300);
+    MappedStates(d, (d4 << 26) & 0xFFFFFFFFFC000000ull, kCopyBlockMap.word, dev + kRegs2300);
     S64(base, dev + 32, d4 & ~0x3FFFFFFFFFull);
   }
 }

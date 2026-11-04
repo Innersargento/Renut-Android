@@ -25,11 +25,6 @@
 #include <rex/system/xvideo.h>
 #include <rex/ppc/context.h>
 
-REXCVAR_DEFINE_BOOL(renut_native_swap, true, "reNut",
-                    "D3DDevice_Swap natively (d3d/scene/swap.cpp): the swap's bookkeeping and the history "
-                    "slots are done here, and the packets the original queues into the ring are left out. "
-                    "Off: the recompiled function");
-
 extern "C" {
 REX_FUNC(sub_82210AB0);  // CDevice::KickOff
 REX_FUNC(sub_8228A748);  // D3D::SynchronizeToPresentationInterval
@@ -91,7 +86,7 @@ void SystemCommandBuffer(const GuestFrame& f, u32 buffer, u32 id) {
 
 // D3DDevice_Swap(device, front buffer, scaler parameters)
 bool Swap(PPCContext& ctx, uint8_t* base) {
-  if (!REXCVAR_GET(renut_native_swap) || !HaveAll())
+  if (!HaveAll())
     return false;
   Frame f(ctx, base, 0x230);
   Device d = DeviceAt(base, ctx.r3.u32);
