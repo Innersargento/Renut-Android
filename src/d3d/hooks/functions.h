@@ -22,7 +22,7 @@ X(sub_8264E068, D3DDevice_AddRef)
 X(sub_82657CB0, D3DDevice_BeginCommandBuffer)  // a command buffer gets a host list of its own
 X(sub_82269618, D3DDevice_BeginExport)
 X(sub_82656208, D3DDevice_BeginIndexedVertices)  // immediate-mode indexed draw: scratch vertex and index buffers, the draw is recorded
-X(sub_822788A0, D3DDevice_BeginTiling)  // with renut_single_tile, the bands are rewritten to one before the original runs
+X(sub_822788A0, D3DDevice_BeginTiling)
 X(sub_8222CC50, D3DDevice_BeginVertices)  // immediate-mode draw: the vertices go to fetch constant 95 from a scratch buffer, the draw is recorded
 X(sub_8228F3B0, D3DDevice_BlockOnFence)
 X(sub_822812C8, D3DDevice_Clear)  // the Plume handler mirrors the clear colour

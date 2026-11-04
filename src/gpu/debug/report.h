@@ -15,7 +15,7 @@ struct Reporting {
   // total moved by 32 MB since the last line (and never twice within 15 frames).
   void ReportMemory();
   uint64_t reported_memory_blocks_ = 0;
-  uint64_t shader_cache_hits_ = 0, shader_cache_drops_ = 0;
+  uint64_t shader_cache_hits_ = 0;
   std::unordered_map<uint64_t, uint64_t> missed_draws_;
   std::map<std::tuple<std::string, uint64_t, uint64_t, bool>, uint64_t> drops_;
   uint64_t reported_guest_swaps_ = 0;

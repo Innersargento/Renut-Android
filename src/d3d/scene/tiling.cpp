@@ -33,12 +33,6 @@ __attribute__((weak)) void sub_8222AB88(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_8220E2B0(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82657A20(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82657978(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82265B90(PPCContext& __restrict, uint8_t*);  // XMemAlloc
-__attribute__((weak)) void sub_822399D8(PPCContext& __restrict, uint8_t*);  // XMemFree
-__attribute__((weak)) void sub_82D0832C(PPCContext& __restrict, uint8_t*);  // initialise a lock
-__attribute__((weak)) void sub_82D082DC(PPCContext& __restrict, uint8_t*);  // lock
-__attribute__((weak)) void sub_82D082EC(PPCContext& __restrict, uint8_t*);  // unlock
-__attribute__((weak)) void sub_82661AF0(PPCContext& __restrict, uint8_t*);  // mark EDRAM tiles
 }
 
 namespace renut::d3d::port {
@@ -284,90 +278,12 @@ bool EndTiling(PPCContext& ctx, uint8_t* base) {
 
 // --- AllocateEdramMemory ----------------------------------------------------------
 
-constexpr u32 kEdramGlobal = 0x82FA3C14;
-constexpr u32 kEdramAttributes = 0x64800000;
-
-u32 Cntlzw(u32 value) { return value ? u32(__builtin_clz(value)) : 32u; }
-
-// BOOL D3D::AllocateEdramMemory(tiles, u32* start out): first-fit-best search of a free run
-// of `tiles` bits in the allocator's bitmap (a set bit is a used tile), under its lock.
+// BOOL D3D::AllocateEdramMemory(tiles, u32* start out): the console's search of its EDRAM bitmap
+// for a free run. There is no EDRAM behind the host's targets (each lives in its own image, found by
+// its surface), so nothing is searched or marked: the call always succeeds, with a start of 0.
 bool AllocateEdramMemory(PPCContext& ctx, uint8_t* base) {
-  if (!sub_82265B90 || !sub_822399D8 || !sub_82D0832C || !sub_82D082DC || !sub_82D082EC ||
-      !sub_82661AF0)
-    return false;
-  GuestFrame f(ctx, base, 0x90);
-  const u32 want = ctx.r3.u32, out = ctx.r4.u32;
-  u32 object = f.Get(kEdramGlobal);
-  if (object == 0) {
-    object = f.Call(sub_82265B90, {0x324, kEdramAttributes});
-    if (!object) {
-      ctx.r3.u64 = 0;
-      return true;
-    }
-    f.Call(sub_82D0832C, {object});
-    f.Put(object + 0x1C, 0x1800);
-    f.Put(object + 0x320, 0x55555555);
-    u32 expected = 0;
-    u32 desired = __builtin_bswap32(object);
-    auto* global = reinterpret_cast<u32*>(f.G(kEdramGlobal));
-    if (!__atomic_compare_exchange_n(global, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-      f.Call(sub_822399D8, {object, kEdramAttributes});
-      object = f.Get(kEdramGlobal);
-    }
-  }
-  f.Call(sub_82D082DC, {object});
-  const u32 free_tiles = f.Get(object + 0x1C);
-  u32 result_start = 0xFFFFFFFFu;  // r27
-  if (!(want > free_tiles)) {
-    const u32 bitmap = object + 0x20, bitmap_end = object + 0x320;
-    u32 position = 0, best_start = 0, best_length = 0xFFFFFFFFu;
-    for (;;) {
-      u32 word_at = (((position >> 3) & 0x1FFFFFFC) + bitmap);
-      if (word_at == bitmap_end)
-        break;
-      u32 word = f.Get(word_at);
-      u32 free_from = (0xFFFFFFFFu >> (position & 31)) & ~word;
-      u32 first_free = Cntlzw(free_from);
-      if (first_free == 32) {
-        do {
-          word_at += 4;
-          word = f.Get(word_at);
-        } while (word == 0xFFFFFFFFu);
-        if (word_at == bitmap_end)
-          break;
-        first_free = Cntlzw(~word);
-      }
-      u32 used_after = Cntlzw((0xFFFFFFFFu >> first_free) & word);
-      u32 end_word = word_at;
-      if (used_after == 32) {
-        end_word = word_at + 4;
-        u32 next = f.Get(end_word);
-        while (next == 0) {
-          end_word += 4;
-          next = f.Get(end_word);
-        }
-        used_after = end_word == bitmap_end ? 0 : Cntlzw(f.Get(end_word));
-      }
-      const u32 start = (u32(i32(word_at - bitmap) >> 2) << 5) + first_free;
-      const u32 stop = u32(i32(end_word - bitmap) >> 2) << 5;
-      const u32 length = stop - start + used_after;
-      if (length == 0)
-        break;
-      if (!(length < want) && length < best_length) {
-        best_start = start;
-        best_length = length;
-      }
-      position = start + length;
-    }
-    if (best_length != 0xFFFFFFFFu) {
-      f.Put(object + 0x1C, free_tiles - want);
-      f.Call(sub_82661AF0, {object, best_start, best_start + want, 1});
-      result_start = best_start;
-    }
-  }
-  f.Call(sub_82D082EC, {object});
-  f.Put(out, result_start);
-  ctx.r3.u64 = result_start != 0xFFFFFFFFu ? 1 : 0;
+  if (ctx.r4.u32) GuestFrame(ctx, base, 0).Put(ctx.r4.u32, 0);
+  ctx.r3.u64 = 1;
   return true;
 }
 

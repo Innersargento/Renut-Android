@@ -2,7 +2,86 @@
 #include "d3d/frontend/internal.h"
 #include "d3d/resources/microcode.h"
 
+#include <algorithm>
+#include <shared_mutex>
+#include <cstring>
+#include <unordered_map>
+#include <vector>
+
 namespace renut::native_d3d {
+
+namespace port = renut::d3d::port;
+
+namespace {
+
+// The container hash of each shader object (NoteShaderObject), with the header words it was made
+// from: an address the game's Direct3D frees and fills again - with a shader it builds in memory,
+// which no hook sees - must not keep the name of the object that was there.
+struct ContainerEntry {
+  uint64_t hash;
+  uint32_t virtual_size, physical_size, physical;
+};
+
+struct ContainerHashes {
+  std::shared_mutex mutex;
+  std::unordered_map<uint32_t, ContainerEntry> by_object;
+};
+
+// Where an object keeps its container header and the pointer to the physical part.
+uint32_t ContainerAt(uint32_t shader, bool pixel) { return shader + (pixel ? 0x28 : 0x368); }
+uint32_t PhysicalAt(uint32_t shader, bool pixel) { return shader + (pixel ? 0x18 : 0x20); }
+
+ContainerHashes& Containers() {
+  static ContainerHashes containers;
+  return containers;
+}
+
+// What a shader load names its microcode by: the hash of the container the object was made from, or 0
+// when it is not one that was seen (a shader the game's Direct3D builds in memory, or a stale address),
+// and the GPU backend reads and watches the memory itself.
+uint64_t NameShader(const Device& d, uint32_t object, bool pixel) {
+  if (!object) return 0;
+  ContainerEntry entry{};
+  {
+    ContainerHashes& containers = Containers();
+    std::shared_lock lock(containers.mutex);
+    const auto found = containers.by_object.find(object);
+    if (found != containers.by_object.end()) entry = found->second;
+  }
+  if (!entry.hash) return 0;
+  const uint32_t container = ContainerAt(object, pixel);
+  if (U32(d.base, container + 4) != entry.virtual_size || U32(d.base, container + 8) != entry.physical_size ||
+      U32(d.base, PhysicalAt(object, pixel)) != entry.physical) {
+    return 0;  // not the object that was noted
+  }
+  return entry.hash;
+}
+
+}  // namespace
+
+void NoteShaderObject(const uint8_t* base, uint32_t shader, bool pixel) {
+  if (!shader) return;
+  ContainerHashes& containers = Containers();
+  const uint32_t container = ContainerAt(shader, pixel);
+  const uint32_t virtual_size = U32(base, container + 4), physical_size = U32(base, container + 8);
+  const uint32_t raw_physical = U32(base, PhysicalAt(shader, pixel));
+  uint32_t physical = raw_physical;
+  if (!physical || !virtual_size || !physical_size || virtual_size > (1u << 20) || physical_size > (1u << 20)) {
+    std::unique_lock lock(containers.mutex);
+    containers.by_object.erase(shader);  // whatever was noted here is not this object
+    return;
+  }
+  if (physical < 0x20000000u) physical = Cpu(physical);
+  std::vector<uint8_t> bytes(size_t(virtual_size) + physical_size);
+  std::memcpy(bytes.data(), GuestPtr(base, container), virtual_size);
+  std::memcpy(bytes.data() + virtual_size, GuestPtr(base, physical), physical_size);
+  std::unique_lock lock(containers.mutex);
+  containers.by_object[shader] = {XXH3_64bits(bytes.data(), bytes.size()), virtual_size, physical_size, raw_physical};
+}
+
+
+// The dirty bits of the first six registers of the 0x2000 block, RB_SURFACE_INFO .. RB_COLOR3_INFO.
+constexpr uint64_t kTargetRegisters = 0xFC00000000000000ull;
 
 void RenderStates(Device& d, uint64_t mask, uint32_t first, uint32_t shadow) {
   while (mask) {
@@ -134,25 +213,25 @@ bool BindingMatches(Device& d, uint32_t shader, uint32_t declaration, uint32_t b
   return renut::d3d::port::RebindVertexShader(d.base, d.dev, shader, declaration, binding);
 }
 
+// The program stays as registered: the load names the container and carries the fetches the declaration
+// sets (kept by the binding, see BindProgram). Matching the vertex shader to the pixel shader no longer
+// rewrites anything but the program control word.
 void PatchAndLoad(Device& d, uint32_t match_ps, uint32_t shader, uint32_t program_cntl, uint32_t declaration,
                   uint32_t vs_info, uint32_t ps_info, uint32_t binding) {
   const uint32_t info = U32(d.base, shader + (binding + 112) * 8) + shader;
-  const uint32_t bytes = U32(d.base, info + 876);
-  const uint32_t dwords = bytes >> 2;
-  const uint32_t copy = ScratchAlloc(bytes);
-  if (!copy) return;
-  const uint32_t source = Cpu(Phys(U32(d.base, info + 872) + U32(d.base, shader + 32)));
-  std::memcpy(GuestPtr(d.base, copy), GuestPtr(d.base, source), bytes);
+  const uint32_t dwords = U32(d.base, info + 876) >> 2;
+  const uint32_t address = Phys(U32(d.base, info + 872) + U32(d.base, shader + 32));
   if (match_ps && (U8(d.base, vs_info + 8) & 7) != 7) {
-    renut::d3d::port::PatchVertexShaderToPixelShader(d.base, vs_info, copy, program_cntl, ps_info);
+    port::MatchProgramControl(d.base, vs_info, program_cntl, ps_info);
   }
   const uint8_t flags = U8(d.base, d.dev + 10942);
   S8(d.base, d.dev + 10942, uint8_t((flags & 0x7F) | (match_ps ? 0x80 : 0)));
-  renut::d3d::port::PatchVertexShaderToDeclaration(d.base, shader, copy, declaration,
-                                                   GuestPtr(d.base, d.dev + 12528), binding);
+  port::VertexFetch declared[port::kMaxVertexFetches];
+  const uint32_t count =
+      port::ComputeVertexFetches(d.base, shader, declaration, GuestPtr(d.base, d.dev + 12528), binding, declared);
   S64(d.base, d.dev + 11840, U64(d.base, d.dev + 12536));
   S64(d.base, d.dev + 11832, U64(d.base, d.dev + 12528));
-  d.out.Shader(0, Phys(copy), dwords, 0);
+  d.out.Shader(0, address, dwords, NameShader(d, shader, false), declared, count, binding);
   g_counts.patched_loads.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -255,7 +334,7 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
       r20 |= 0x4000;
       const uint32_t address = Phys(U32(base, info + 40) + U32(base, ps + 24));
       const uint32_t dwords = U32(base, info + 44) >> 2;
-      d.out.Shader(1, address, dwords, 0);
+      d.out.Shader(1, address, dwords, NameShader(d, ps, true), nullptr, 0, 0);
       g_counts.shader_loads.fetch_add(1, std::memory_order_relaxed);
       uint32_t mc = U32(base, dev + 10580);
       S32(base, dev + 10536, U32(base, r28 + 24));
@@ -333,7 +412,10 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
     const uint32_t info = U32(base, vs + (uint32_t(binding) + 112) * 8) + vs;
     const uint32_t address = Phys(U32(base, info + 872) + U32(base, vs + 32));
     const uint32_t dwords = U32(base, info + 876) >> 2;
-    d.out.Shader(0, address, dwords, 0);
+    port::VertexFetch bound[port::kMaxVertexFetches];
+    const uint32_t bound_count =
+        port::BoundFetches(vs, uint32_t(binding), bound);
+    d.out.Shader(0, address, dwords, NameShader(d, vs, false), bound, bound_count, uint32_t(binding));
     S32(base, vs + uint32_t(binding) * 416 + 64, U32(base, dev + 10908));
     g_counts.shader_loads.fetch_add(1, std::memory_order_relaxed);
   };
@@ -345,8 +427,7 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
       r20 &= ~uint64_t(8);
     }
     if (r20 & (1ull << 56)) {
-      d.out.Reg(0x2001, U32(base, dev + 10372));
-      r20 &= ~(1ull << 56);
+      r20 &= ~(1ull << 56);  // (RB_COLOR_INFO: the surface's own word, see RenderStates)
     }
     if (r20 & 0x10000) {
       d.out.RegsFromGuest(base, 0x2180, dev + 10528, 2);
@@ -388,7 +469,9 @@ void Flush(Device& d, const uint64_t (&masks)[5]) {
     if (d2 & 0x1F000) RenderStates(d, (d2 << 47) & 0xF800000000000000ull, 0x2180, dev + kRegs2180);
     if (d2 & (0xFFFFull << 42)) {
       const uint64_t mask = (d2 << 6) & 0xFFFF000000000000ull;
-      RenderStates(d, mask, 0x2000, dev + kRegs2000);
+      // RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005) are the surfaces' own words, which
+      // kOpSurfaces carries: the GPU backend reads no register for its targets.
+      RenderStates(d, mask & ~kTargetRegisters, 0x2000, dev + kRegs2000);
       Surfaces(d, mask);
     }
     if (d2 & 0x000003FFFFE00000ull) {
@@ -428,7 +511,9 @@ void FlushRenderStates(Device& d) {
     }
     if (d2 & (0xFFFFull << 42)) {
       const uint64_t mask = (d2 << 6) & 0xFFFF000000000000ull;
-      RenderStates(d, mask, 0x2000, dev + kRegs2000);
+      // RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005) are the surfaces' own words, which
+      // kOpSurfaces carries: the GPU backend reads no register for its targets.
+      RenderStates(d, mask & ~kTargetRegisters, 0x2000, dev + kRegs2000);
       Surfaces(d, mask);
       d2 &= ~(0xFFFFull << 42);
     }

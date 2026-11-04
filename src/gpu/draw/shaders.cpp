@@ -30,62 +30,12 @@ void Shaders::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
-Shader* Shaders::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
-                                               const uint32_t* host_address, uint32_t dword_count) {
-  // Across frames: an address and length are the shader last found there while
-  // the guest has not written under them (see ShaderWatch). Looked up first,
-  // so a shader the game binds every frame is never hashed again.
-  ShaderWatch* watch = nullptr;
-  uint64_t watch_key = 0;
-  if (backend.swap.shader_cache_ && guest_address && dword_count && dword_count <= (64u << 10)) {
-    backend.streams.DrainWatchHits();
-    watch_key = (uint64_t(guest_address) << 32) | dword_count;
-    watch = shader_watch_memo_.Find(watch_key);
-    if (!watch) {
-      auto found = backend.streams.shader_watch_.find(watch_key);
-      if (found != backend.streams.shader_watch_.end()) {
-        watch = &found->second;
-        shader_watch_memo_.Put(watch_key, watch);
-      }
-    }
-    if (watch && watch->valid) {
-      ++backend.report.shader_cache_hits_;
-      return watch->shader;
-    }
-  }
-  // Watch first, hash second: a write that lands during the hash is a hit,
-  // drained at the next lookup, and drops the entry made below.
-  bool watched = false;
-  if (watch_key) {
-    if (!watch) {
-      watch = &backend.streams.shader_watch_[watch_key];
-      shader_watch_memo_.Put(watch_key, watch);
-    }
-    const uint32_t bytes = dword_count * 4;
-    const bool dynamic = watch->drops >= 3 && backend.swaps_ - watch->dropped_frame < 900;
-    if (!dynamic && backend.memory_->GetPhysicalHeap()->QueryRangeAccess(guest_address, guest_address + bytes - 1) ==
-                        rex::memory::PageAccess::kReadWrite) {
-      backend.memory_->EnablePhysicalMemoryAccessCallbacks(guest_address, bytes, true, false);
-      watched = true;
-    }
-  }
-  Shader* result = LoadShaderByContents(shader_type, host_address, dword_count);
-  if (watched && result) {
-    watch->shader = static_cast<HostShader*>(result);
-    watch->base = guest_address;
-    watch->bytes = dword_count * 4;
-    watch->valid = true;
-    backend.streams.IndexBlocks(backend.streams.shader_block_index_, guest_address, dword_count * 4, watch_key);
-  }
-  return result;
-}
-
 Shader* Shaders::LoadShaderByContents(xenos::ShaderType shader_type,
                                                          const uint32_t* host_address, uint32_t dword_count) {
-  // The guest binds the same few hundred shaders thousands of times a frame,
-  // and hashing the whole microcode each time was a steady few percent of
-  // this thread. Within a frame an address and length stand for the shader
-  // found there first: microcode a draw of this frame may still run is not
+  // The load of a shader nobody has a name for (the pipeline prediction's, and any the game's Direct3D
+  // builds in memory): by the hash of its microcode, which nothing watches for writes. Hashing the whole
+  // microcode each time was a steady few percent of this thread. Within a frame an address and length
+  // stand for the shader found there first: microcode a draw of this frame may still run is not
   // rewritten under it.
   if (shader_lookup_frame_ != backend.swaps_) {
     shader_lookup_.clear();
@@ -100,13 +50,82 @@ Shader* Shaders::LoadShaderByContents(xenos::ShaderType shader_type,
     return known->second.second;
   }
   uint64_t hash = XXH3_64bits(host_address, size_t(dword_count) * sizeof(uint32_t));
+  HostShader* made = FindOrMakeShader(shader_type, hash, host_address, dword_count);
+  shader_lookup_[host_address] = {dword_count, made};
+  shader_memo_.Put(memo_key, made);
+  return made;
+}
+
+Shader* Shaders::LoadShaderIdentity(xenos::ShaderType shader_type, uint64_t container, uint32_t program,
+                                    const uint32_t* host_address, uint32_t dword_count) {
+  const uint64_t identity = XXH3_64bits_withSeed(&program, sizeof(program), container) | 1;
+  const auto known = identity_shaders_.find(identity);
+  if (known != identity_shaders_.end()) {
+    ++backend.report.shader_cache_hits_;
+    return known->second;
+  }
+  // Only the first program is the one the container's entry was made for.
+  HostShader* made = FindOrMakeShader(shader_type, XXH3_64bits(host_address, size_t(dword_count) * sizeof(uint32_t)),
+                                      host_address, dword_count, program == 0 ? container : 0);
+  identity_shaders_[identity] = made;
+  return made;
+}
+
+Shader* Shaders::LoadShaderPatched(xenos::ShaderType shader_type, uint64_t hash, uint32_t program,
+                                   const uint32_t* host_address, uint32_t dword_count, const uint32_t* fetches,
+                                   uint32_t count) {
+  const size_t bytes = size_t(dword_count) * sizeof(uint32_t);
+  uint64_t cache_key = 0;
+  if (hash) {
+    cache_key = XXH3_64bits_withSeed(fetches, size_t(count) * 4 * sizeof(uint32_t), hash + program) | 1;
+    const auto known = patched_shaders_.find(cache_key);
+    if (known != patched_shaders_.end()) {
+      ++backend.report.shader_cache_hits_;
+      return known->second;
+    }
+  }
+  std::vector<uint32_t> code(host_address, host_address + dword_count);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t* fetch = fetches + size_t(i) * 4;
+    if ((uint64_t(fetch[0]) + 1) * 3 > dword_count) continue;
+    // The words are values; the guest's memory holds them big-endian.
+    for (uint32_t k = 0; k < 3; ++k) code[size_t(fetch[0]) * 3 + k] = __builtin_bswap32(fetch[1 + k]);
+  }
+  HostShader* made = FindOrMakeShader(shader_type, XXH3_64bits(code.data(), bytes), code.data(), dword_count,
+                                      hash && program == 0 ? hash : 0);
+  if (cache_key) patched_shaders_[cache_key] = made;
+  return made;
+}
+
+HostShader* Shaders::FindOrMakeShader(xenos::ShaderType shader_type, uint64_t hash, const uint32_t* host_address,
+                                      uint32_t dword_count, uint64_t container) {
+  // The same bytes under two containers are two shaders: each has its own entry.
+  if (container) hash = XXH3_64bits_withSeed(&hash, sizeof(hash), container);
   auto& shader = shaders_[hash];
   if (!shader) {
     shader = std::make_unique<HostShader>(shader_type, hash, host_address, dword_count);
     const size_t ucode_bytes = size_t(dword_count) * sizeof(uint32_t);
     shader->ucode_key = ucode::Key(host_address, ucode_bytes);
     shader->loose_key = ucode::LooseKey(host_address, ucode_bytes);
-    shader->entry = backend.pipelines.store_->Find(shader->ucode_key, shader->loose_key);
+    if (container) {
+      shader->entry = backend.pipelines.store_->FindOwn(container, shader->loose_key);
+      if (shader->entry) {
+        shader->container = container;
+        ++own_entries_;
+      } else {
+        ++key_entries_;
+        static uint32_t logged = 0;
+        if (logged < 16) {
+          ++logged;
+          const ShaderCacheEntry* by_key = backend.pipelines.store_->Find(shader->ucode_key, shader->loose_key);
+          REXLOG_INFO("Renut: Plume {} shader of container {:016X} is not the container's own microcode, found by key: "
+                      "{} dwords, key {:016X}, loose key {:016X}, the keys find container {:016X}",
+                      shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", container, dword_count,
+                      shader->ucode_key, shader->loose_key, by_key ? by_key->hash : 0);
+        }
+      }
+    }
+    if (!shader->entry) shader->entry = backend.pipelines.store_->Find(shader->ucode_key, shader->loose_key);
     if (!shader->entry && missed_.insert(hash).second && missed_.size() <= 32) {
       REXLOG_WARN("Renut: Plume has no recompiled {} shader for microcode {:016X} ({} dwords)",
                   shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash, dword_count);
@@ -120,8 +139,6 @@ Shader* Shaders::LoadShaderByContents(xenos::ShaderType shader_type,
       }
     }
   }
-  shader_lookup_[host_address] = {dword_count, shader.get()};
-  shader_memo_.Put(memo_key, shader.get());
   return shader.get();
 }
 

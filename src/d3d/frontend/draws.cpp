@@ -1,7 +1,13 @@
 // Draws, clears and resolves.
 #include "d3d/frontend/internal.h"
+#include "d3d/resources/resource.h"
 
 namespace renut::native_d3d {
+
+namespace {
+// The draw's EDRAM mode (RB_MODECONTROL, device +10580) for the flags of its record.
+uint32_t DrawMode(const uint8_t* base, uint32_t dev) { return (U32(base, dev + 10580) & 7) << kDrawModeShift; }
+}  // namespace
 
 bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, base_vertex = ctx.r5.u32;
@@ -32,7 +38,7 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
         size = (chunk & 0x00FFFFFF) | endian;
       }
       if (extent) g_counts.screen_extent.fetch_add(1, std::memory_order_relaxed);
-      d.out.Draw(kDrawPredicated | extent, viz, initiator, address, size, serial);
+      d.out.Draw(DrawMode(base, dev) | extent, viz, initiator, address, size, serial);
       g_counts.draws.fetch_add(1, std::memory_order_relaxed);
       const uint32_t left = count - chunk;
       if (!left) break;
@@ -110,7 +116,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
         size = (chunk & 0x00FFFFFF) | endian;
       }
       if (extent) g_counts.screen_extent.fetch_add(1, std::memory_order_relaxed);
-      d.out.Draw(kDrawPredicated | extent, viz, initiator, address, size, serial);
+      d.out.Draw(DrawMode(base, dev) | extent, viz, initiator, address, size, serial);
       g_counts.draws.fetch_add(1, std::memory_order_relaxed);
       const uint32_t left = count - chunk;
       if (!left) break;
@@ -135,7 +141,7 @@ bool DrawVertices(PPCContext& ctx, uint8_t* base) {
       const uint32_t chunk = SplitCount(base, primitive, count);
       d.out.Reg(0x2102, start);
       if (extent) g_counts.screen_extent.fetch_add(1, std::memory_order_relaxed);
-      d.out.Draw(kDrawPredicated | extent, viz, (chunk << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
+      d.out.Draw(DrawMode(base, dev) | extent, viz, (chunk << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
       g_counts.draws.fetch_add(1, std::memory_order_relaxed);
       const uint32_t left = count - chunk;
       if (!left) break;
@@ -171,7 +177,7 @@ bool BeginVertices(PPCContext& ctx, uint8_t* base) {
     d.out.Reg(0x2102, 0);
     const uint32_t fetch[6] = {1, 0, 1, 0, Phys(data) | 3, 0x10000002u | ((dwords << 2) & 0x03FFFFFCu)};
     d.out.Regs(0x4800 + 31 * 6, fetch, 6);
-    d.out.Draw(kDrawPredicated, VizToken(base, dev), (count << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
+    d.out.Draw(DrawMode(base, dev), VizToken(base, dev), (count << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
     g_counts.draws.fetch_add(1, std::memory_order_relaxed);
   });
   S64(base, dev + 24, U64(base, dev + 24) | 1);
@@ -217,7 +223,7 @@ bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
     const uint32_t size = (wide ? ((indices << 1) & 0x00FFFFFEu) : (indices & 0x00FFFFFFu)) | endian;
     List& list = d.out.list();
     list.indices_named = false;  // the next indexed draw names its buffer again
-    d.out.Draw(kDrawPredicated, VizToken(base, dev), initiator, Phys(index_data), size, serial);
+    d.out.Draw(DrawMode(base, dev), VizToken(base, dev), initiator, Phys(index_data), size, serial);
     g_counts.draws.fetch_add(1, std::memory_order_relaxed);
   });
   S64(base, dev + 24, U64(base, dev + 24) | 1);
@@ -271,9 +277,6 @@ bool ClearNative(PPCContext& ctx, uint8_t* base) {
     std::memcpy(&z_bits, &z, 4);
     list.words.push_back(z_bits);
     list.words.push_back(stencil);
-    // RB_SURFACE_INFO, RB_COLOR_INFO, RB_DEPTH_INFO, RB_COLOR1..3_INFO.
-    const uint32_t r = dev + kRegs2000;
-    for (uint32_t index : {0u, 1u, 3u, 4u, 5u, 2u}) list.words.push_back(U32(base, r + index * 4));
     list.words.push_back(present);
   });
   S8(base, dev + 10941, U8(base, dev + 10941) | 4);
@@ -445,14 +448,12 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     List& list = d.out.list();
     list.words.push_back(kOpResolve);
     for (int32_t v : {x0, y0, x1, y1}) list.words.push_back(uint32_t(v));
-    // RB_COPY_CONTROL .. RB_COPY_SURFACE_SLICE (0x2318-0x2323) and the
-    // surface registers RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005).
-    for (uint32_t r = 0x2318; r <= 0x2323; ++r) list.words.push_back(U32(base, dev + kRegs2300 + (r - 0x2300) * 4));
-    for (uint32_t r = 0; r < 6; ++r) list.words.push_back(U32(base, dev + kRegs2000 + r * 4));
-    // Bit 8: the capture Photo Mode's routine is making (see NativeResolve).
-    list.words.push_back(source | (renut_in_photo_capture() ? 0x100u : 0u));
+    // RB_COPY_CONTROL, RB_COPY_DEST_INFO, RB_DEPTH_CLEAR, RB_COLOR_CLEAR, RB_COLOR_CLEAR_LO.
+    for (uint32_t r : {0x2318u, 0x231Bu, 0x231Du, 0x231Eu, 0x231Fu})
+      list.words.push_back(U32(base, dev + kRegs2300 + (r - 0x2300) * 4));
+    list.words.push_back(source);
     // The destination object: the level, slice or face the copy goes to, as
-    // Direct3D's own lookup found it (3D slices interleave and stay by address).
+    // Direct3D's own lookup found it (a volume's slices interleave: no object, 0).
     const bool to_object = dimension != 2;
     list.words.push_back(to_object ? Phys(address) : 0);
     list.words.push_back(width);
@@ -471,6 +472,36 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
   S64(base, dev + 32, U64(base, dev + 32) | 0x80000);
   ctx = saved;
   return true;
+}
+
+// The title's D3DDevice (dword_82FAC7C0) and its automatic back buffer's surface (+0x39F0).
+void CapturePhoto(PPCContext& ctx, uint8_t* base) {
+  constexpr uint32_t kDevicePointer = 0x82FAC7C0, kAutoBackBuffer = 0x39F0;
+  const uint32_t photo = ctx.r3.u32;
+  ctx.r3.u64 = 0;
+  const uint32_t dev = U32(base, kDevicePointer);
+  const uint32_t back_buffer = dev ? U32(base, dev + kAutoBackBuffer) : 0;
+  if (!photo || !back_buffer || dev != MainDevice()) return;
+  // The photo is a linear 8_8_8_8 texture; its base level is where the rows go.
+  if ((U32(base, photo + 0x20) & 0x3F) != 6) return;
+  const auto level = renut::d3d::port::QuerySubresource(photo, 0, 0);
+  const uint32_t size = U32(base, back_buffer + 0x24);
+  const uint32_t width = std::min((size >> 18) + 1, level.width);
+  const uint32_t height = std::min(((size >> 3) & 0x7FFF) + 1, level.height);
+  if (!level.address || !level.row_pitch || !width || !height) return;
+  {
+    std::lock_guard lock(g_front.mutex);
+    List& list = Current(dev);
+    list.words.push_back(kOpPhoto);
+    list.words.push_back(Phys(level.address));
+    list.words.push_back(level.row_pitch);
+    list.words.push_back(width);
+    list.words.push_back(height);
+    Publish();
+  }
+  // The record runs after the draws before it; the rows are in guest memory once it has.
+  WaitForBackend(0, 5000);
+  ctx.r3.u64 = 1;
 }
 
 }  // namespace renut::native_d3d

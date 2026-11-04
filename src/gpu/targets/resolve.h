@@ -6,25 +6,32 @@ namespace renut::gpu {
 
 class GpuBackend;
 
+// What a resolve asks of the host, decoded from a record's copy words (Resolve::DecodeResolve).
+struct ResolveCopy {
+  bool depth = false;  // the source is the depth surface
+  bool clear_color = false, clear_depth = false;
+  uint32_t dest_format = 0;  // a xenos::TextureFormat; a depth copy takes the depth surface's own
+  uint32_t endian = 0;       // the destination's xenos::Endian
+  bool swap = false;         // red and blue swapped
+  uint32_t color_clear = 0, color_clear_lo = 0, depth_clear = 0;
+};
+
 struct Resolve {
   explicit Resolve(GpuBackend& owner) : backend(owner) {}
   GpuBackend& backend;
 
-  // GetResolveInfo for a rectangle that is already known (NativeResolve).
-  bool ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1, draw_util::ResolveInfo& info);
-  std::unique_ptr<RegisterFile> resolve_regs_;
-  uint32_t resolve_vertices_ = 0;
-  bool ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces);
-  // The picture Photo Mode takes: the game's capture routine (sub_82535F20, hooked in
-  // guest/game_fixes.cpp) names the resolve it is about to read with the CPU, and only
-  // that one is run, waited for and written into its tiled destination. Everything
-  // else the scene resolves stays on the GPU.
-  void ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info, uint32_t base_address, uint32_t dest_x,
-                       uint32_t dest_y, uint32_t w, uint32_t h, uint32_t pitch, uint32_t bpp, uint32_t scale = 4);
+  // The copy words of a resolve record (kOpResolve) as the host needs them; false when the record
+  // asks for something the host does not do.
+  bool DecodeResolve(const uint32_t* record, ResolveCopy& out);
+  bool ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& surfaces);
+  // The picture Photo Mode takes (kOpPhoto, from native_d3d::CapturePhoto): render target 0 as it
+  // stands after the draws before the record, run, waited for, and written into the photo texture's
+  // rows as the CPU reads a linear X8R8G8B8 texture. Everything else the scene resolves stays on the
+  // GPU.
+  void NativePhoto(const uint32_t* record);
   // Debug: appends a line to <files>/plume-resolve.log while <files>/plume-resolve-log exists.
   void LogResolveLine(const std::string& line);
-  uint32_t photo_captures_ = 0;
-  bool capture_this_resolve_ = false;
+  uint32_t photo_captures_ = 0, volume_logged_ = 0;
   void NativeResolve(const uint32_t* record);
   // Copies a rectangle of a depth target's depth into an R32_FLOAT texture, or
   // its depth and stencil into an RG32F one.

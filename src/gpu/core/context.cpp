@@ -86,7 +86,6 @@ bool GpuBackend::SetupContext() {
   REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
               swap.bc_mode_ ? "on" : "off");
   texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
-  swap.shader_cache_ = REXCVAR_GET(renut_plume_shader_cache);
   swap.key_reuse_ = REXCVAR_GET(renut_plume_key_reuse);
   REXLOG_INFO("Renut: Plume texture quality: {}",
               texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
@@ -288,9 +287,8 @@ void GpuBackend::ShutdownContext() {
   for (auto& list : streams.writebacks_) list.clear();
   shaders.shader_lookup_.clear();
   shaders.shader_memo_.Clear();
-  shaders.shader_watch_memo_.Clear();
-  streams.shader_watch_.clear();
-  streams.shader_block_index_.clear();
+  shaders.patched_shaders_.clear();
+  shaders.identity_shaders_.clear();
   shaders.shaders_.clear();
   if (timestamp_pool_ != VK_NULL_HANDLE) {
     vkDestroyQueryPool(static_cast<VulkanDevice*>(device_)->vk, timestamp_pool_, nullptr);

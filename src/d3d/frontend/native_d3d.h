@@ -31,20 +31,26 @@ namespace renut::native_d3d {
 // bits hold a count or flags.
 enum Op : uint32_t {
   kOpRegs = 1,     // [op | count << 8] first register, count values
-  kOpShader = 2,   // [op] type | physical address, dwords, two words unused
+  // [op | count << 8 | program << kShaderProgramShift] type | physical address, dwords, the shader's
+  // name (low, high; 0: none): the hash of the container the shader object was made from, `program`
+  // saying which of its programs this is. The microcode at the address is that program as created, and
+  // is never written. With no name the GPU backend reads and watches the memory itself. Then count
+  // vertex fetches of four words (instruction slot, the instruction's three words) that replace those
+  // slots of the microcode in the backend's copy (see BindProgram)
+  kOpShader = 2,
   kOpDraw = 3,     // [op | flags << 8] viz token, initiator, dma base, dma size, serial
-  kOpBin = 4,      // [op | which << 8] value: 0 mask lo, 1 mask hi, 2 select lo, 3 select hi
   kOpRun = 5,      // [op] index into List::runs
   kOpSwap = 7,     // [op] frontbuffer, width, height: D3DDevice_Swap (presenting is kOpPresent)
   // [op | flags << 8] x1, y1, x2, y2, red, green, blue, alpha, z (float bits), stencil,
-  // RB_SURFACE_INFO, RB_COLOR_INFO of targets 0-3, RB_DEPTH_INFO, present (bits 0-3 targets, 4 depth)
+  // present (bits 0-3 targets, 4 depth): the surfaces are the ones the last kOpSurfaces named
   kOpClear = 9,
-  // [op] x0, y0, x1, y1 (resolve-aligned), RB_COPY_CONTROL .. RB_COPY_SURFACE_SLICE
-  // (0x2318-0x2323), RB_SURFACE_INFO .. RB_COLOR3_INFO (0x2000-0x2005), source slot
-  // (0-3 render target, 4 depth), then the destination D3DTexture: its level 0's
-  // GPU address (0 when the copy goes to another level, slice or face), width,
-  // height, where the source rectangle's corner lands relative to it (dest point
-  // minus source corner, x and y) and its pitch in texels
+  // [op] x0, y0, x1, y1 (resolve-aligned), then the five copy words the host reads, as the device
+  // keeps them in the Xenos format: RB_COPY_CONTROL, RB_COPY_DEST_INFO, RB_DEPTH_CLEAR,
+  // RB_COLOR_CLEAR, RB_COLOR_CLEAR_LO; the source
+  // slot (0-3 render target, 4 depth; bit 8 Photo Mode's capture), then the destination
+  // D3DTexture: its level 0's GPU address (0 when the copy goes to a volume's slice), width,
+  // height, where the source rectangle's corner lands relative to it (dest point minus source
+  // corner, x and y) and its pitch in texels
   kOpResolve = 10,
   // [op | slots << 8] for each slot set (bits 0-3 render targets 0-3, 4 depth),
   // in order: the D3DSurface bound there, its +24 (RB_SURFACE_INFO), +28
@@ -76,16 +82,24 @@ enum Op : uint32_t {
   // mask (bits 0-5), where the list stands: what D3DDevice_InsertCallback asks of the GPU, without
   // the scratch registers and the interrupt handler it goes through on the console
   kOpCallback = 21,
+  // [op] the photo texture's base level (GPU address), its row pitch in bytes, the width and the
+  // height to copy: Photo Mode's capture (CapturePhoto). The GPU backend reads render target 0 back
+  // and writes it into those rows as linear X8R8G8B8 (alpha, red, green, blue in memory order).
+  kOpPhoto = 22,
 };
-constexpr uint32_t kResolveWords = 30, kClearWords = 18;
+constexpr uint32_t kResolveWords = 17, kClearWords = 12, kPhotoWords = 5;
+// Bits 17-18 of a kOpShader's first word: the program of the shader object.
+constexpr uint32_t kShaderProgramShift = 17;
 
 enum DrawFlags : uint32_t {
-  kDrawPredicated = 1,    // obeys the bin mask, as every Direct3D draw packet does
   kDrawScreenExtent = 2,  // took Direct3D's screen extent path (not reproduced)
 };
 // Bits 4-7 of a draw's flags: the engine pass (1-8, 0 for none) the draw was
 // made in, from EnginePass().
 constexpr uint32_t kDrawPassShift = 4;
+// Bits 8-10 of a draw's flags: its EDRAM mode as the device's RB_MODECONTROL holds it (4 colour and
+// depth, 5 depth only), so the backend does not read the register.
+constexpr uint32_t kDrawModeShift = 8;
 
 // The engine pass (1-8) the calling thread is drawing a model's records in, 0
 // outside one: set around sub_823A9908 (guest/game_fixes.cpp), stamped on the
@@ -127,6 +141,11 @@ void SetFilesDirectory(std::string directory);
 bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height);
 // Native sync: the GPU backend finished a published list.
 void NoteListExecuted();
+// Photo Mode's capture, BOOL sub_82535F20(D3DTexture *photo) (hooked in guest/game_fixes.cpp): the
+// frame so far goes into the photo's rows through a kOpPhoto record, and the call returns once the
+// GPU backend has written them. The original resolved the screen into a scratch texture and
+// untiled it with the CPU, which the host's resolves (kept on the GPU) left black. Sets r3.
+void CapturePhoto(PPCContext& ctx, uint8_t* base);
 // Native sync: the GPU backend is running lists or presenting (a wait
 // meanwhile is no sign of a missing record).
 void SetExecutorBusy(bool busy);
@@ -160,5 +179,23 @@ void WaitForBackend(uint32_t max_lists_ahead, uint32_t timeout_ms);
 uint32_t FenceEpoch();
 void FenceWait(uint32_t epoch, uint32_t timeout_us);
 void NotifyFenceCompleted();
+
+// The memory of the game's textures, by 4 KB page of the physical range: a count advanced when
+// Direct3D frees, makes or unlocks a texture there (d3d/resources/resource.cpp, on the game's
+// thread, after it has waited for the GPU to be done with the texture). A resolve into a texture
+// takes the count of its first page, and the resolved image is stale once the count has moved:
+// the memory is another texture's now. (The GPU backend used to hash the memory under every
+// resolved texture, each frame it was sampled, to find that out.)
+constexpr uint32_t kTextureEpochPages = 1u << 17;
+inline std::atomic<uint32_t> g_texture_epoch[kTextureEpochPages];
+inline uint32_t TextureEpochIndex(uint32_t address) {
+  return (((address & 0x1FFFFFFF) + (((address >> 20) + 0x200) & 0x1000)) >> 12) & (kTextureEpochPages - 1);
+}
+inline void BumpTextureMemory(uint32_t address) {
+  if (address) g_texture_epoch[TextureEpochIndex(address)].fetch_add(1, std::memory_order_release);
+}
+inline uint32_t TextureMemoryEpoch(uint32_t address) {
+  return g_texture_epoch[TextureEpochIndex(address)].load(std::memory_order_acquire);
+}
 
 }  // namespace renut::native_d3d

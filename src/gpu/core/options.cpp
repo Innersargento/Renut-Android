@@ -32,10 +32,6 @@ REXCVAR_DEFINE_BOOL(renut_plume_stack_wrap, true, "reNut/Plume",
                     "always clamping them to the ends of the stack. The water walks a 12-layer stack in time with a "
                     "coordinate far past the stack's end and relies on the layer index repeating; clamped, it sat on "
                     "the last layer and the waves stood still. Followed live.");
-REXCVAR_DEFINE_BOOL(renut_plume_shader_cache, true, "reNut/Plume",
-                    "Remember across frames which shader lives at a guest address and length, trusting it "
-                    "until the guest writes there (write-watched), instead of hashing the microcode of "
-                    "every shader a frame uses again");
 REXCVAR_DEFINE_BOOL(renut_plume_key_reuse, true, "reNut/Plume",
                     "Key a draw's pipeline by one hash of its vertex shader's fetch table, kept on the "
                     "shader, instead of laying every specialization constant of the table into the key "

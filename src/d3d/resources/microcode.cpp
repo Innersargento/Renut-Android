@@ -4,9 +4,14 @@
 // disassembly.
 #include "d3d/resources/microcode.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
+#include <vector>
+
 
 #include "d3d/sync/fence.h"
 #include "d3d/device/internal.h"
@@ -104,15 +109,15 @@ u32 EnsureBindingId(const Guest& g, u32 declaration) {
 // 0x821E5218: match the program's vertex fetch constants to a declaration
 // ---------------------------------------------------------------------------
 
-void PatchVertexShaderToDeclaration(uint8_t* base, u32 shader, u32 microcode, u32 declaration,
-                                    const u8* strides, u32 program) {
+u32 ComputeVertexFetches(uint8_t* base, u32 shader, u32 declaration, const u8* strides, u32 program,
+                         VertexFetch (&fetches)[kMaxVertexFetches]) {
   const Guest g{base};
   // r11: the program's container; r27: its vertex fetch count; r30: its table of
   // fetch constant words, one a fetch.
   const u32 container = shader + g.Ld(shader + (program + 0x70) * 8) + 0x368;
   const u32 count = g.Ld(container + 0x1C);
-  if (!count || count > 64)
-    return;
+  if (!count || count > kMaxVertexFetches)
+    return 0;
   const u32 table = container + (g.Ld(container + 0x18) + 9) * 4;
   // r10: the fetch constants the shader was registered with (the originals).
   const u32 originals = shader + program * 0x1A0 + 0x44;
@@ -398,98 +403,32 @@ void PatchVertexShaderToDeclaration(uint8_t* base, u32 shader, u32 microcode, u3
     }
   }
 
-  // 0x821E57E0: the patched constants go back where the table says.
-  for (u32 k = 0; k < count; ++k) {
-    const u32 target = microcode + (g.Ld(table + k * 4) & 0xFFF) * 12;
-    g.St(target, out[k].w0);
-    g.St(target + 4, out[k].w1);
-    g.St(target + 8, out[k].w2);
-  }
+  // 0x821E57E0: the original writes these back where the table says; here the caller keeps them.
+  for (u32 k = 0; k < count; ++k)
+    fetches[k] = {g.Ld(table + k * 4) & 0xFFF, out[k].w0, out[k].w1, out[k].w2};
+  return count;
 }
 
 // ---------------------------------------------------------------------------
-// 0x82656DA0 and its helpers: match the vertex shader's interpolators to a pixel shader
+// 0x82656DA0: match the vertex shader's interpolators to a pixel shader
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// 0x82656CE8: the high nibble of the pixel shader's interpolator word goes into the
-// fetch constants of the vertex shader's interpolator group.
-void SetInterpolatorFormat(const Guest& g, u32 vs, u32 microcode, u32 vs_entry, u32 ps_entry) {
-  const u32 index = g.Ld16(vs_entry) & 0xFFF;
-  u32 entry = vs + (index + Extrwi(g.Ld(vs + 0x14), 5, 22) + g.Ld(vs + 0x1C) + g.Ld(vs + 0x18) + 9) * 4;
-  for (;;) {
-    const u32 constant = microcode + (g.Ld(entry) & 0xFFF) * 12;
-    u32 w0 = g.Ld(constant);
-    w0 = Rlwimi(w0, g.Ld(ps_entry), 24, 28, 31);
-    g.St(constant, w0);
-    if (g.Ld(entry) & 0x1000)
-      break;
-    entry += 4;
-  }
-}
-
-// 0x82656C18: an unused interpolator's fetch constants become the dummy {0xC8000000, 0, 0x02000000}.
-void ClearInterpolator(const Guest& g, u32 vs, u32 microcode, u32 vs_entry) {
-  const u32 index = g.Ld16(vs_entry) & 0xFFF;
-  u32 entry = vs + (index + Extrwi(g.Ld(vs + 0x14), 5, 22) + g.Ld(vs + 0x1C) + g.Ld(vs + 0x18) + 9) * 4;
-  const u32 w0 = 0xC8000000u;
-  const u32 w2 = Rlwimi(0, 1, 25, 3, 7);
-  for (;;) {
-    const u32 constant = microcode + (g.Ld(entry) & 0xFFF) * 12;
-    g.St(constant, w0);
-    g.St(constant + 4, 0);
-    g.St(constant + 8, w2);
-    if (g.Ld(entry) & 0x1000)
-      break;
-    entry += 4;
-  }
-}
-
-}  // namespace
-
-void PatchVertexShaderToPixelShader(uint8_t* base, u32 vs, u32 microcode, u32 program_control, u32 ps) {
+void MatchProgramControl(uint8_t* base, u32 vs, u32 program_control, u32 ps) {
   const Guest g{base};
   const u32 flags = g.Ld(vs + 0x14);
   if (flags & 0x00040000u)  // already matched
     return;
   if (ps && (g.Ld(ps + 0x14) & 0x00020000u))
     return;
-  const u32 vs_outputs = Extrwi(flags, 5, 22);  // r26
-  u32 vs_entry = vs + (g.Ld(vs + 0x1C) + g.Ld(vs + 0x18) + 9) * 4;  // r31
-  u32 ps_entry = 0;                                                  // r28
-  u32 ps_inputs = 0;                                                 // r11 / r25
-  u32 ps_reserved = 0;                                               // r24
+  u32 ps_reserved = 0;  // r24
   if (ps) {
-    const u32 ps_flags = g.Ld(ps + 0x14);
-    ps_entry = ps + 0x20;
-    ps_reserved = Clrlwi(ps_flags, 27);
-    ps_inputs = Extrwi(ps_flags, 5, 22);
+    ps_reserved = Clrlwi(g.Ld(ps + 0x14), 27);
     if (ps_reserved)
       ps_reserved -= 1;
   }
-  u32 consumed = 0;  // r29
-  for (u32 remaining = ps_inputs; remaining; --remaining) {
-    const u32 wanted = g.Ld8(ps_entry + 3);  // r27
-    while (consumed < vs_outputs) {
-      if (g.Ld8(vs_entry + 3) >= wanted)
-        break;
-      ClearInterpolator(g, vs, microcode, vs_entry);
-      ++consumed;
-      vs_entry += 4;
-    }
-    if ((g.Ld(vs_entry) ^ g.Ld(ps_entry)) & 0x00000F00u)
-      SetInterpolatorFormat(g, vs, microcode, vs_entry, ps_entry);
-    vs_entry += 4;
-    ps_entry += 4;
-    ++consumed;
-  }
-  if (consumed < vs_outputs) {
-    for (u32 rest = vs_outputs - consumed; rest; --rest) {
-      ClearInterpolator(g, vs, microcode, vs_entry);
-      vs_entry += 4;
-    }
-  }
+  // The original goes on to rewrite the microcode of the interpolators the pixel shader does not
+  // read (an export cleared to a dummy) and the format of those it does; nothing but this word
+  // depends on it here.
   g.St(program_control, Insrwi(g.Ld(program_control), ps_reserved, 4, 8));
 }
 
@@ -502,7 +441,46 @@ namespace {
 constexpr u32 kDeviceStrides = 0x30F0;      // the streams' strides, a byte each (16)
 constexpr u32 kDeviceDeclStrides = 0x2E38;  // the strides the declaration was matched to
 
+// The fetches each program of each vertex shader is bound with.
+struct BoundTable {
+  std::mutex mutex;
+  std::unordered_map<u64, std::vector<VertexFetch>> programs;  // shader << 8 | program
+};
+
+BoundTable& Bound() {
+  static BoundTable table;
+  return table;
+}
+
+u64 BoundKey(u32 shader, u32 program) { return (u64(shader) << 8) | (program & 0xFF); }
+
 }  // namespace
+
+u32 BoundFetches(u32 shader, u32 program, VertexFetch (&fetches)[kMaxVertexFetches]) {
+  BoundTable& table = Bound();
+  std::lock_guard lock(table.mutex);
+  const auto found = table.programs.find(BoundKey(shader, program));
+  if (found == table.programs.end())
+    return 0;
+  const u32 count = u32(std::min<size_t>(found->second.size(), kMaxVertexFetches));
+  std::copy_n(found->second.begin(), count, fetches);
+  return count;
+}
+
+void ForgetBoundFetches(u32 shader) {
+  BoundTable& table = Bound();
+  std::lock_guard lock(table.mutex);
+  table.programs.erase(BoundKey(shader, 0));
+  table.programs.erase(BoundKey(shader, 1));
+}
+
+void BindProgram(uint8_t* base, u32 shader, u32 declaration, const u8* strides, u32 program) {
+  VertexFetch fetches[kMaxVertexFetches];
+  const u32 count = ComputeVertexFetches(base, shader, declaration, strides, program, fetches);
+  BoundTable& table = Bound();
+  std::lock_guard lock(table.mutex);
+  table.programs[BoundKey(shader, program)].assign(fetches, fetches + count);
+}
 
 bool RebindVertexShader(uint8_t* base, u32 device, u32 shader, u32 declaration, u32 program) {
   const Guest g{base};
@@ -521,9 +499,7 @@ bool RebindVertexShader(uint8_t* base, u32 device, u32 shader, u32 declaration, 
       if (FencePending(DeviceAt(base, device), fence))
         return false;
     }
-    const u32 instance = shader + g.Ld(shader + (program + 0x70) * 8);
-    PatchVertexShaderToDeclaration(base, shader, g.Ld(instance + 0x368) + g.Ld(shader + 0x20), declaration,
-                                   g.Ptr(device + kDeviceStrides), program);
+    BindProgram(base, shader, declaration, g.Ptr(device + kDeviceStrides), program);
     const u32 id = EnsureBindingId(g, declaration);
     g.St(entry + 0x28, id);
     g.St64(entry + 0x30, g.Ld64(device + kDeviceStrides));
@@ -544,9 +520,7 @@ void BindVertexShader(uint8_t* base, u32 shader, u32 declaration, u32 strides) {
   const u32 programs = (g.Ld(shader + 0x368) & 0x20) ? 2 : 1;
   u32 program_base = shader + 0x28;  // r29
   for (u32 program = 0; program < programs; ++program, program_base += 0x1A0) {
-    const u32 instance = shader + g.Ld(shader + (program + 0x70) * 8);
-    PatchVertexShaderToDeclaration(base, shader, g.Ld(instance + 0x368) + g.Ld(shader + 0x20), declaration,
-                                   stream_strides, program);
+    BindProgram(base, shader, declaration, stream_strides, program);
     std::memcpy(g.Ptr(program_base + 8), stream_strides, 16);
     g.St(program_base, EnsureBindingId(g, declaration));
   }

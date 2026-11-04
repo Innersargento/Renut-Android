@@ -23,14 +23,10 @@ enum Function : uint32_t {
 using Handler = bool (*)(PPCContext& ctx, uint8_t* base);
 
 void SetHandler(Function function, Handler handler);
+// How many calls of a function were taken (by the native front end or a handler) and how many ran
+// the recompiled original, since the start. Read by the native report.
+void CallCounts(Function function, uint64_t& taken, uint64_t& original);
 void SetShaderDumpDirectory(std::string directory);
 // Installs the plume-mode handlers (plume_d3d.cpp).
 void RegisterPlumeHandlers();
-// Set while Direct3D's predicated tiling is collapsed to one band (the host has
-// no EDRAM limit). A predicated draw then runs if it is marked for any band: the
-// game culls its objects per band, and a draw marked only for a lower band
-// would otherwise never be drawn.
-void SetSingleBinTiling(bool single);
-bool GetSingleBinTiling();
-
 }  // namespace renut::d3d

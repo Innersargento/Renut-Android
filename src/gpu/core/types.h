@@ -125,20 +125,6 @@ namespace renut::gpu {
     bool base_map = false;
   };
 
-  // LoadShader's answers this frame, by microcode address: {dwords, shader}.
-  // Across frames (renut_plume_shader_cache): the shader found at a guest
-  // address and length stays that shader until the guest writes under it. The
-  // pages are write-watched like a kept stream's, and an entry written over
-  // three times is treated as dynamic (the ring a patched shader is copied
-  // into) and goes back to hashing, unwatched.
-  struct ShaderWatch {
-    HostShader* shader = nullptr;
-    uint32_t base = 0, bytes = 0;
-    bool valid = false;
-    uint32_t drops = 0;
-    uint64_t dropped_frame = 0;
-  };
-
   // The guest bytes each traced draw's streams held when it was drawn, checked
   // again at the swap: a stream the CPU rewrote after the draw was read early.
   struct TracedStream {
@@ -157,17 +143,6 @@ namespace renut::gpu {
     float value[4];
     bool bool_word = false;
     uint32_t set = 0, clear = 0;
-  };
-
-  // MSAA off: the game still records some draws once per band mask - the
-  // screen-space shadow multiply as masks ...03 then ...0C, the water's patches
-  // as 3 then C - and with a single tile every predicated packet runs
-  // (SetSingleBinTiling), so the second copy drew the same thing over the first:
-  // shadows applied twice. A predicated draw whose whole state matches an
-  // earlier one of the frame under a mask that shares no tile with its own is
-  // that copy, and is dropped. <files>/plume-dedupe "0" turns it off.
-  struct TwinEntry {
-    uint64_t sig = 0, mask = 0, frame = UINT64_MAX;
   };
 
   // The three constant blocks a draw hands the shaders, kept between draws.

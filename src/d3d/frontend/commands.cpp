@@ -61,24 +61,6 @@ void RunCommandBuffer(PPCContext& ctx, uint8_t* base) {
   g_front.immediate_clip_known = false;
 }
 
-void SetPredication(PPCContext& ctx) {
-  auto lock = LockUnlessOwn(ctx.r3.u32);
-  Builder(Current(ctx.r3.u32)).Bin(0, ctx.r4.u32 ? ctx.r4.u32 : 0xFFFFFFFFu);
-}
-
-void SetCommandBufferPredication(PPCContext& ctx) {
-  auto lock = LockUnlessOwn(ctx.r3.u32);
-  const uint32_t lo = ctx.r4.u32, hi = ctx.r5.u32;
-  Builder b(Current(ctx.r3.u32));
-  if (!lo && !hi) {
-    b.Bin(0, 0xFFFFFFFFu);
-    b.Bin(1, 0);
-  } else {
-    b.Bin(0, lo);
-    b.Bin(1, hi);
-  }
-}
-
 void SetSurfaceClip(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32;
   auto lock = LockUnlessOwn(dev);

@@ -11,15 +11,12 @@ struct Swap {
   GpuBackend& backend;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width, uint32_t frontbuffer_height);
-  bool pred_pass_all_ = false;
-  bool band_fragpos_ = false;
   bool resolve_log_ = false;
   uint32_t adaptive_mode_ = 1;
   uint32_t bc_mode_ = 1;
   // Debug: <files>/plume-no-persist sends every stream through the ring again.
   bool keep_streams_ = true;
   bool depth_alias_ = true;
-  bool shader_cache_ = true;
   bool key_reuse_ = true;
   std::vector<TracedStream> traced_streams_;
   // Pixel shaders whose shadow-cascade constants this trace already holds.
@@ -74,7 +71,6 @@ struct Swap {
   std::unique_ptr<RenderBuffer> snap_dump_;
   uint32_t snap_dump_row_ = 0;
   std::vector<ConstOverride> const_overrides_;
-  bool twin_dedupe_ = true;
   // <files>/plume-refractfix "0" turns off the refraction sprite bounds fix.
   bool refraction_fix_ = true;
   // The game's polygon offset (PA_SU_POLY_OFFSET_*): ground decals - footprints,

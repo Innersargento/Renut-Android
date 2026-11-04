@@ -10,8 +10,6 @@ struct Lists {
   explicit Lists(GpuBackend& owner) : backend(owner) {}
   GpuBackend& backend;
 
-  uint64_t bin_select_ = 0xFFFFFFFFull;
-  uint64_t bin_mask_ = 0xFFFFFFFFull;
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
   // A write of `count` registers from `values`: the registers that already hold
@@ -22,7 +20,6 @@ struct Lists {
   void StoreConstants(uint32_t first, const uint32_t* values, uint32_t count);
   // Debug: a frame trace lists the draws the bin check drops, and
   // <files>/plume-pred-all "1" runs every predicated packet.
-  bool OnPredicatedSkip();
   bool native_presenting_ = false;
   uint64_t native_fences_ = 0, native_presents_ = 0, native_callbacks_ = 0;
   // A dword the GPU writes back (big-endian), at a GPU address.
@@ -41,6 +38,8 @@ struct Lists {
   uint64_t native_draws_ = 0, native_bad_ = 0;
   // The engine pass of the draw being issued (native_d3d::kDrawPassShift).
   uint8_t draw_pass_ = 0;
+  // The EDRAM mode of the draw being issued (native_d3d::kDrawModeShift), an xenos::EdramMode.
+  uint8_t draw_mode_ = 0;
 };
 
 }  // namespace renut::gpu

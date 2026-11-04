@@ -70,12 +70,11 @@ struct Resolved {
   uint64_t generation = 0;
   // Serial of the last resolve into it (see FindResolved).
   uint64_t written = 0;
-  // The guest memory under it when last resolved. Resolves are not written
-  // back to guest memory, so if these bytes change the CPU has put something
-  // else there (a texture streamed into freed render memory) and this image
-  // is stale.
-  uint64_t guest_hash = 0;
-  uint32_t guest_bytes = 0;
+  // The epoch of its first page of guest memory when last resolved
+  // (native_d3d::TextureMemoryEpoch). Resolves are not written back to guest memory, so once Direct3D
+  // has freed, made or unlocked a texture there the memory is another texture's (a texture
+  // streamed into freed render memory) and this image is stale.
+  uint32_t memory_epoch = 0;
   uint32_t guest_pitch = 0, guest_height = 0, guest_bpp = 0;
   uint64_t written_frame = ~0ull;
   uint64_t checked_frame = ~0ull;
@@ -99,7 +98,7 @@ struct Resolved {
   // Last written by a depth resolve.
   bool depth = false;
   // A draw has fetched this resolve (or it was presented). One that nothing ever samples is a
-  // copy the CPU reads, like Photo Mode's picture (see ReadbackResolve).
+  // copy the CPU reads, like Photo Mode's picture used to be (see NativePhoto).
   bool sampled = false;
   // Quarters of the guest's resolution it was resolved at (Target::scale of
   // the surface it came from): width and height are host pixels.
@@ -189,7 +188,6 @@ struct Stats {
   // ones whose surface was used again and got the contents copied back, and
   // the ones a full clear made unnecessary.
   uint64_t depth_aliased = 0, depth_restored = 0, depth_dropped = 0, depth_abandoned = 0;
-  uint64_t twin_skipped = 0;   // MSAA off: per-band copies of a draw already drawn
   // New pipelines by how they were made: found in the driver's cache at the
   // draw, found by a worker, or compiled (and of those, how many waited for a
   // sibling's compile of the same program); the lookups at the draw that

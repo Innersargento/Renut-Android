@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "d3d/device/internal.h"
+#include "d3d/resources/microcode.h"
 
 namespace renut::d3d::port {
 
@@ -154,6 +155,7 @@ bool SetPixelShader(Device d, u32 shader) {
 }
 
 void RegisterVertexShader(uint8_t* base, u32 shader, u32 physical) {
+  ForgetBoundFetches(shader);
   std::memset(Guest(base, shader), 0, kVertexContainer);
   Store(base, shader + 0x20, physical);
   Store(base, shader + 0, 6);  // D3DRTYPE_VERTEXSHADER

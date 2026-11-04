@@ -339,17 +339,20 @@ uint32_t Targets::FittedResolved(Resolved& r, uint32_t width, uint32_t height) {
 // Render targets per Direct3D surface (native lists). The surface object and
 // its header name the target, so two surfaces sharing EDRAM are two targets,
 // and its size is the surface's own (D3DSurface_GetDesc: +36 holds width - 1
-// from bit 18 and height - 1 from bit 3; the width is the pitch, as for the
-// EDRAM targets).
+// from bit 18 and height - 1 from bit 3). The tile-padded pitch the console keeps in EDRAM
+// (1040 for 1024) is not the target's width.
 
-Target* Targets::NativeTarget(uint32_t slot, uint32_t info_register) {
-  const ListSurface& s = native_surfaces_[slot];
-  if (!s.object) {
+Target* Targets::NativeTarget(uint32_t slot) {
+  if (!native_surfaces_[slot].object) {
     ++surface_missing_;
     return nullptr;
   }
-  if (s.info != info_register) ++surface_mismatch_;
   return SurfaceTarget(slot);
+}
+
+uint32_t Targets::SurfacePitch() const {
+  const ListSurface& s = native_surfaces_[0].object ? native_surfaces_[0] : native_surfaces_[4];
+  return s.object ? ((s.dims >> 18) & 0x3FFF) + 1 : 0;
 }
 
 Target* Targets::SurfaceTarget(uint32_t slot) {
@@ -357,23 +360,17 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
   if (!s.object) return nullptr;
   const bool depth = slot == 4;
   const uint32_t format = depth ? (s.info >> 16) & 1 : (s.info >> 16) & 0xF;
-  const uint32_t header = s.surface_info * 0x9E3779B1u ^ s.info * 0x85EBCA77u ^ s.dims * 0xC2B2AE3Du ^
+  // (The low 12 bits of `info` are the surface's place in EDRAM: nothing here depends on it.)
+  const uint32_t info = s.info & ~0xFFFu;
+  const uint32_t header = s.surface_info * 0x9E3779B1u ^ info * 0x85EBCA77u ^ s.dims * 0xC2B2AE3Du ^
                           uint32_t(depth);
   const uint64_t key = kSurfaceTargetKey | (uint64_t(header & 0x7FFFFFFFu) << 32) | s.object;
   Target& target = targets_[key];
   target.last_used = ++target_serial_;
   target.used_frame = backend.swaps_;
   if (target.texture) return &target;
-  const uint32_t pitch = s.surface_info & 0x3FFF;
-  uint32_t width = std::max({pitch, ((s.dims >> 18) & 0x3FFF) + 1, 16u});
+  uint32_t width = std::max(((s.dims >> 18) & 0x3FFF) + 1, 16u);
   uint32_t height = std::max(((((s.dims >> 3) & 0x7FFF) + 1) + 15) & ~15u, 16u);
-  // A D24S8 shadow map is its D3D surface's size, not the EDRAM pitch padded to
-  // whole tiles (1040 for 1024): the extra columns are never drawn, and sampled
-  // as a resolved texture in place (AliasDepthResolve) they would stretch the map.
-  if (depth && format == 0) {
-    const uint32_t exact = std::max(((s.dims >> 18) & 0x3FFF) + 1, 16u);
-    if (exact < width) width = exact;
-  }
   // The dynamic shadow maps are the only D24S8 depth surfaces (the scene's is
   // D24FS8) of this size: drawn at the shadow quality's fraction of it.
   uint32_t scale = 4;
@@ -402,7 +399,7 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
   target.scale = scale;
   target.layout = RenderTextureLayout::UNKNOWN;
   target.surface = s.object;
-  target.surface_info = s.info;
+  target.surface_info = s.info & ~0xFFFu;
   ++surface_created_;
   RetireFramebuffers();
   return &target;
@@ -474,18 +471,18 @@ std::string Targets::SurfaceReport() {
   size_t count = 0;
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
   std::string out = fmt::format(
-      "== surfaces: {} targets now, {} created, {} grown, {} evicted; register/surface mismatches {}, "
-      "slots without a surface {}\n== resolves: {} into their texture object, {} by address\n"
+      "== surfaces: {} targets now, {} created, {} grown, {} evicted; "
+      "slots without a surface {}\n== resolves: {} into their texture object, {} into a volume (not copied)\n"
       "== executor: fences {}, presents {}, callbacks {}, "
       "vblank waits {} ({} ms, {} timed out); streams kept by buffer {}, by window {}\n",
-      count, surface_created_, surface_grown_, surface_evicted_, surface_mismatch_, surface_missing_,
-      object_resolves_, address_resolves_count_,
+      count, surface_created_, surface_grown_, surface_evicted_, surface_missing_,
+      object_resolves_, volume_resolves_,
       backend.lists.native_fences_, backend.lists.native_presents_, backend.lists.native_callbacks_, native_waits_, native_wait_us_ / 1000,
       native_wait_timeouts_, object_streams_, window_streams_);
   for (const auto& [key, t] : targets_) {
     if (!(key & kSurfaceTargetKey)) continue;
-    out += fmt::format("   surface {:08X} {} {}x{} base {} format {} last frame {}\n", t.surface,
-                       t.depth ? "depth" : "color", t.width, t.height, t.surface_info & 0xFFF,
+    out += fmt::format("   surface {:08X} {} {}x{} format {} last frame {}\n", t.surface,
+                       t.depth ? "depth" : "color", t.width, t.height,
                        t.depth ? (t.surface_info >> 16) & 1 : (t.surface_info >> 16) & 0xF, t.used_frame);
   }
   return out;

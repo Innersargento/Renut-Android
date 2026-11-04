@@ -45,6 +45,9 @@ class HostShader : public Shader {
       : Shader(type, hash, ucode, count) {}
 
   const ShaderCacheEntry* entry = nullptr;
+  // The container of the shader object this was loaded for (0: not known), when its microcode is
+  // that container's own; `entry` is then the container's, not the first one the keys find.
+  uint64_t container = 0;
   // What the cache is keyed by, which is not this shader's own hash.
   uint64_t ucode_key = 0;
   uint64_t loose_key = 0;
@@ -95,6 +98,7 @@ class ShaderStore {
       // The fallback keeps the first container of each loose key, which is the
       // container the store answered with before the swizzle joined the key.
       by_loose_.emplace(m.loose, m.container);
+      container_loose_.emplace(m.container, m.loose);
     }
     REXLOG_INFO("Renut: Plume shader cache: {} shaders, {} microcode keys, {} MB smol-v",
                 g_shaderCacheEntryCount, by_ucode_.size(),
@@ -122,6 +126,17 @@ class ShaderStore {
   const ShaderCacheEntry* FindContainer(uint64_t hash) const {
     auto entry = by_container_.find(hash);
     return entry == by_container_.end() ? nullptr : entry->second;
+  }
+
+  // The entry of the container a shader object was made from, for microcode with that
+  // container's loose key (what the key lookups would have matched it by): the object's own
+  // container, where several share the key. Null when the container is not here (a stand-in
+  // dropped from the map, a second program) or the microcode is another's. `tag` asks for a
+  // companion form (the domain stage).
+  const ShaderCacheEntry* FindOwn(uint64_t container, uint64_t loose_hash, uint64_t tag = 0) const {
+    const auto loose = container_loose_.find(container);
+    if (loose == container_loose_.end() || loose->second != loose_hash) return nullptr;
+    return FindContainer(container ^ tag);
   }
 
   // Makes a shader's modules into `compiled`. Also used on their own by the
@@ -222,6 +237,7 @@ class ShaderStore {
   std::unordered_map<uint64_t, const ShaderCacheEntry*> by_container_;
   std::unordered_map<uint64_t, uint64_t> by_ucode_;
   std::unordered_map<uint64_t, uint64_t> by_loose_;
+  std::unordered_map<uint64_t, uint64_t> container_loose_;  // container hash -> its loose key
   std::unordered_map<const ShaderCacheEntry*, CompiledShader> compiled_;
 };
 

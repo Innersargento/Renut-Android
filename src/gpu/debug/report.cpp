@@ -99,8 +99,9 @@ void Reporting::Report() {
       backend.stats_.constant_bytes >> 20, backend.stats_.kept_hits, backend.stats_.kept_bytes_made >> 20, backend.stats_.kept_drops,
       backend.stats_.kept_unwatchable, backend.streams.kept_bytes_ >> 20, backend.streams.kept_streams_.size(), backend.stats_.band_skipped,
       backend.stats_.band_moved, backend.stats_.band_widened);
-  REXLOG_INFO("Renut: Plume shader cache ({}): {} hits, {} entries, {} dropped by writes", backend.swap.shader_cache_ ? "on" : "off",
-              shader_cache_hits_, backend.streams.shader_watch_.size(), shader_cache_drops_);
+  REXLOG_INFO("Renut: Plume shader loads by name: {} hits", shader_cache_hits_);
+  REXLOG_INFO("Renut: Plume shaders named by container: {} found their container's own entry, {} found by the keys ({} loads by identity)",
+              backend.shaders.own_entries_, backend.shaders.key_entries_, backend.shaders.identity_shaders_.size());
   if (backend.stats_.defer_windows) {
     REXLOG_INFO("Renut: Plume windows closed by: elsewhere {} ({} draws), state change {} ({}), full {} ({}), "
                 "immediate draw {} ({}), the draw's own needs {} ({})",

@@ -17,7 +17,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   } in_draw(in_issue_draw_);
   if (g_predict.queued.load(std::memory_order_relaxed)) backend.pipelines.PredictPipelines();
   const RegisterFile& regs = *backend.register_file_;
-  xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  const auto edram_mode = xenos::EdramMode(backend.lists.draw_mode_);
   if (edram_mode == xenos::EdramMode::kCopy) return true;  // resolves are records
   ++backend.stats_.draws;
   const uint32_t draw_index = backend.swap.frame_draw_++;
@@ -35,11 +35,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
 
   auto* vs = static_cast<HostShader*>(backend.active_vertex_shader());
   if (trace_ && (!vs || !vs->entry)) {
-    const auto dc = draw_util::GetNormalizedDepthControl(regs);
+    const auto dc = draw_util::GetNormalizedDepthControl(regs, edram_mode);
     Trace("dropped vs={:016X} prim={} n={} mode={} rt0={:X} ds={:X} z={}{}{} f{} colormask={:X}",
           vs ? vs->ucode_data_hash() : 0, uint32_t(prim_type), index_count, uint32_t(edram_mode),
-          uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_base),
-          uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base), dc.z_enable ? "t" : "",
+          backend.targets.native_surfaces_[0].object, backend.targets.native_surfaces_[4].object,
+          dc.z_enable ? "t" : "",
           dc.z_write_enable ? "w" : "", dc.stencil_enable ? "s" : "", uint32_t(dc.zfunc),
           regs[XE_GPU_REG_RB_COLOR_MASK]);
   }
@@ -106,7 +106,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       // have made.
       if (!vs->domain_decoded) {
         vs->domain_decoded = true;
-        vs->domain_entry = backend.pipelines.store_->FindDomain(vs->ucode_key, vs->loose_key);
+        if (vs->container) {
+          vs->domain_entry =
+              backend.pipelines.store_->FindOwn(vs->container, vs->loose_key, RENUT_DOMAIN_SHADER_HASH_TAG);
+        }
+        if (!vs->domain_entry) vs->domain_entry = backend.pipelines.store_->FindDomain(vs->ucode_key, vs->loose_key);
         if (vs->domain_entry) {
           vs->domain_compiled = backend.pipelines.store_->Build(backend.device_, vs->domain_entry, false, true);
           std::vector<LiveElement> unused;
@@ -168,14 +172,10 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
   }
   // Render targets.
-  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
-  const uint32_t pitch = surface.surface_pitch;
+  const uint32_t pitch = backend.targets.SurfacePitch();
   if (!pitch) return backend.shaders.Drop("no pitch", vs, ps);
   const uint32_t height = std::clamp<uint32_t>(regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y, 16, 4096);
   const uint32_t color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
-  static constexpr Register kColorInfo[4] = {
-      XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_COLOR1_INFO, XE_GPU_REG_RB_COLOR2_INFO,
-      XE_GPU_REG_RB_COLOR3_INFO};
   static constexpr Register kBlendControl[4] = {
       XE_GPU_REG_RB_BLENDCONTROL0, XE_GPU_REG_RB_BLENDCONTROL1, XE_GPU_REG_RB_BLENDCONTROL2,
       XE_GPU_REG_RB_BLENDCONTROL3};
@@ -186,20 +186,17 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       if ((color_mask >> (4 * i)) & 0xF) color_count = i + 1;
     }
     for (uint32_t i = 0; i < color_count; ++i) {
-      reg::RB_COLOR_INFO info;
-      info.value = regs[kColorInfo[i]];
-      colors[i] = backend.targets.NativeTarget(i, info.value);
+      colors[i] = backend.targets.NativeTarget(i);
       if (!colors[i]) {
         ++backend.stats_.no_target;
         return true;
       }
     }
   }
-  const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
+  const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs, edram_mode);
   Target* depth = nullptr;
   if (depth_control.z_enable || depth_control.stencil_enable) {
-    const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-    depth = backend.targets.NativeTarget(4, depth_info.value);
+    depth = backend.targets.NativeTarget(4);
   }
   {
     backend.targets.MatchSurfaceSizes(colors, color_count, depth);
@@ -331,16 +328,14 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                    draw_index,
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
                                    index_count, uint32_t(edram_mode), pitch, height,
-                                   regs[XE_GPU_REG_RB_COLORCONTROL], color_mask, backend.lists.bin_mask_);
-    if (packet_predicated_) line += " pred";
+                                   regs[XE_GPU_REG_RB_COLORCONTROL], color_mask, uint32_t(0));
     for (uint32_t i = 0; i < color_count; ++i) {
-      reg::RB_COLOR_INFO info;
-      info.value = regs[kColorInfo[i]];
-      line += fmt::format(" rt{}={:X}/f{}", i, uint32_t(info.color_base), uint32_t(info.color_format));
+      const auto& rt = backend.targets.native_surfaces_[i];
+      line += fmt::format(" rt{}={:X}/f{}", i, rt.object, (rt.info >> 16) & 0xF);
     }
     if (depth) {
-      line += fmt::format(" ds={:X}/f{} z={}{}{} f{}", uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base),
-                          uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format),
+      line += fmt::format(" ds={:X}/f{} z={}{}{} f{}", backend.targets.native_surfaces_[4].object,
+                          (backend.targets.native_surfaces_[4].info >> 16) & 1,
                           depth_control.z_enable ? "t" : "", depth_control.z_write_enable ? "w" : "",
                           depth_control.stencil_enable ? "s" : "", uint32_t(depth_control.zfunc));
     }
@@ -1058,27 +1053,9 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (viewport.width <= 0.f) {
     viewport = RenderViewport(0.f, 0.f, float(guest_width), float(guest_height));
   }
-  // Debug, split mode 5 (game_fixes.cpp): the band a predicated packet belongs
-  // to, for the scissor below. Only predicated packets count - the mask stays
-  // set between them. Off by default: with one tile the game predicates nearly
-  // everything to mask 3, which then means the whole screen (the particles
-  // lost their lower half to this scissor).
-  const bool band_split_scene = g_renut_scene_split_mode.load(std::memory_order_relaxed) == 5 &&
-                                !REXCVAR_GET(renut_scene_msaa) &&
-                                regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280;
-  const uint32_t draw_bands = band_split_scene && packet_predicated_ ? uint32_t(backend.lists.bin_mask_) & 0xF : 0;
-  constexpr float kBandSplit = 384.f;  // 2x MSAA at 720p: bands of 384 and 336 rows
   std::memcpy(sh + RENUT_SHARED_VIEWPORT_OFFSET, scale_offset, sizeof(scale_offset));
-  // Pixels that read their position relative to a band (renutFragPos): none
-  // but with the debug switch below.
-  float band_split = 0.f;
-  // Debug (<files>/plume-band-fragpos "1"): with scene MSAA off, pixels below
-  // row 384 of the scene read their position relative to the lower band, as
-  // the console's lower-band replay gave them.
-  if (backend.swap.band_fragpos_ && !REXCVAR_GET(renut_scene_msaa) && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280 &&
-      std::fabs(viewport.height) >= 700.f) {
-    band_split = 384.f;
-  }
+  // Pixels that read their position relative to a band (renutFragPos): none, the scene is one pass.
+  const float band_split = 0.f;
   std::memcpy(sh + RENUT_SHARED_BAND_SPLIT_OFFSET, &band_split, sizeof(band_split));
 
   // User clip planes, in the guest's clip space; the vertex shaders turn the
@@ -1185,82 +1162,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
   } while (generation != upload_generation_);
 
-  if (backend.swap.twin_dedupe_ && packet_predicated_ && !REXCVAR_GET(renut_scene_msaa)) {
-    const uint64_t tiles = backend.lists.bin_mask_ & 0xF;
-    // Only the draws seen recorded twice: screen-space rectangles (the
-    // shadow multiply) and the water's patches. Objects the game splits by
-    // band must all run, and the band jobs may draw look-alikes.
-    const bool twin_kind = prim_type == xenos::PrimitiveType::kRectangleList ||
-                           prim_type == xenos::PrimitiveType::kQuadList || patch_list;
-    if (tiles != 0 && tiles != 0xF && twin_kind) {
-      uint64_t parts[16];
-      uint32_t n = 0;
-      parts[n++] = vs->entry->hash;
-      parts[n++] = ps ? ps->entry->hash : 0;
-      parts[n++] = (uint64_t(uint32_t(prim_type)) << 32) | index_count;
-      parts[n++] = index_buffer_info ? (uint64_t(index_buffer_info->guest_base) << 8) |
-                                           uint32_t(index_buffer_info->format)
-                                     : 0;
-      // The float constants each shader reads, by value. Offsets would not do
-      // - a block lands at a new place in the ring whenever another draw's
-      // constants were placed in between - and neither would whole blocks:
-      // registers the shader never reads keep what the draw before left.
-      auto used_hash = [](HostShader* shader, const uint8_t* file) -> uint64_t {
-        if (!shader) return 0;
-        if (!shader->bool_mask_decoded) {
-          rex::string::StringBuffer disassembly;
-          shader->AnalyzeUcode(disassembly);
-          std::memcpy(shader->bool_mask, shader->constant_register_map().bool_bitmap, sizeof(shader->bool_mask));
-          shader->bool_mask_decoded = true;
-        }
-        const auto& map = shader->constant_register_map();
-        uint64_t h = 0;
-        for (uint32_t block = 0; block < 4; ++block) {
-          for (uint64_t bits = map.float_bitmap[block]; bits; bits &= bits - 1) {
-            const uint32_t index = block * 64 + uint32_t(__builtin_ctzll(bits));
-            h = XXH3_64bits_withSeed(file + index * 16, 16, h);
-          }
-        }
-        return h;
-      };
-      parts[n++] = used_hash(vs, vs_shadow_);
-      parts[n++] = used_hash(ps, ps_shadow_);
-      uint64_t sig = XXH3_64bits(parts, n * sizeof(uint64_t));
-      // The RB/PA/SC/VGT registers (blend, depth, targets, viewport, scissor,
-      // window offset) and the fetch constants (textures, vertex streams).
-      sig = XXH3_64bits_withSeed(&regs.values[0x2000], 1024 * sizeof(uint32_t), sig);
-      sig = XXH3_64bits_withSeed(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 192 * sizeof(uint32_t), sig);
-      bool twin = false;
-      for (const TwinEntry& e : twin_ring_) {
-        if (e.frame == backend.swaps_ && e.sig == sig && (e.mask & tiles) == 0) {
-          twin = true;
-          break;
-        }
-      }
-      if (twin) {
-        ++backend.stats_.twin_skipped;
-        Trace("twin of an earlier draw under mask {:X}, skipped", uint64_t(backend.lists.bin_mask_));
-        return true;
-      }
-      twin_ring_[twin_pos_++ % twin_ring_.size()] = {sig, tiles, backend.swaps_};
-    }
-  }
-
   draw_util::Scissor scissor;
-  draw_util::GetScissor(regs, scissor);
+  draw_util::GetScissor(regs, scissor, pitch);
   RenderRect scissor_rect(int32_t(scissor.offset[0]), int32_t(scissor.offset[1]),
                           int32_t(scissor.offset[0] + scissor.extent[0]),
                           int32_t(scissor.offset[1] + scissor.extent[1]));
-  // Split mode 5 only (see draw_bands): keep a band-predicated packet inside
-  // its band.
-  if (scissor_rect.bottom >= 720) {
-    if (draw_bands == 0x3) {
-      scissor_rect.bottom = std::min(scissor_rect.bottom, int32_t(kBandSplit));
-      ++backend.stats_.band_widened;
-    } else if (draw_bands == 0xC) {
-      scissor_rect.top = std::max(scissor_rect.top, int32_t(kBandSplit));
-    }
-  }
   if (trace_) {
     Trace("  viewport ({}, {}) {}x{} window ({}, {}) scissor ({}, {})-({}, {}) vte={:X}", viewport.x,
           viewport.y, viewport.width, viewport.height, window_x, window_y, scissor_rect.left,

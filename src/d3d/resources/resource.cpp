@@ -26,6 +26,7 @@
 #include <rex/system/kernel_state.h>
 
 #include "d3d/device/getters.h"
+#include "d3d/frontend/native_d3d.h"
 #include "d3d/device/internal.h"
 #include "d3d/device/retail.h"
 
@@ -203,138 +204,25 @@ u32 ResourceTypeOf(u32 resource) {
 }
 
 // ---------------------------------------------------------------------------
-// EDRAM (D3D's Edram allocator: sub_82661C38 and MarkBits 0x82661AF0)
+// EDRAM
 // ---------------------------------------------------------------------------
-
-// 0x1800 tiles of 5120 bytes, a bit each (most significant first); the word
-// after the bitmap is a sentinel the searches stop at.
-constexpr u32 kEdramTiles = 0x1800;
-constexpr u32 kEdramWords = kEdramTiles / 32;
-
-struct Edram {
-  std::mutex mutex;
-  u32 free_tiles = kEdramTiles;
-  u32 bits[kEdramWords + 1] = {};
-  Edram() { bits[kEdramWords] = 0x55555555u; }
-};
-
-Edram &EdramState() {
-  static Edram edram;
-  return edram;
-}
 
 u32 Shr(u32 value, u32 shift) {  // srw: 0 for shifts of 32 and up
   return shift >= 32 ? 0 : value >> shift;
-}
-
-void MarkBits(Edram &edram, u32 first, u32 end, bool set) {
-  const u32 first_word = first >> 5, last_word = end >> 5;
-  const u32 first_bit = first & 31, end_bit = end & 31;
-  u32 *p = edram.bits + first_word;
-  u32 *const last = edram.bits + last_word;
-  if (set) {
-    if (first_word == last_word) {
-      *p |= Shr(~0u, first_bit) & ~Shr(~0u, end_bit);
-      return;
-    }
-    *p++ |= Shr(~0u, first_bit);
-    while (p < last)
-      *p++ = ~0u;
-    *p |= ~Shr(~0u, end_bit);
-  } else {
-    if (first_word == last_word) {
-      *p &= ~(Shr(~0u, first_bit) & ~Shr(~0u, end_bit));
-      return;
-    }
-    *p++ &= ~Shr(~0u, first_bit);
-    while (p < last)
-      *p++ = 0;
-    *p &= Shr(~0u, end_bit);
-  }
 }
 
 u32 CountLeadingZeros(u32 v) {
   return v ? u32(__builtin_clz(v)) : 32;
 }
 
-// The smallest free run of at least 'tiles', or -1.
-i32 AllocateEdram(u32 tiles) {
-  Edram &edram = EdramState();
-  std::lock_guard lock(edram.mutex);
-  if (tiles > edram.free_tiles)
-    return -1;
-  const u32 *const words = edram.bits;
-  const u32 *const sentinel = edram.bits + kEdramWords;
-  u32 cursor = 0, best_start = 0, best_length = ~0u;
-  for (;;) {
-    const u32 *w = words + (cursor >> 5);
-    if (w == sentinel)
-      break;
-    u32 word = *w;
-    u32 free_bit = CountLeadingZeros(Shr(~0u, cursor & 31) & ~word);
-    if (free_bit == 32) {
-      do {
-        ++w;
-        word = *w;
-      } while (word == ~0u);
-      if (w == sentinel)
-        break;
-      free_bit = CountLeadingZeros(~word);
-    }
-    const u32 *end_word = w;
-    u32 end_bit = CountLeadingZeros(Shr(~0u, free_bit) & word);
-    if (end_bit == 32) {
-      ++end_word;
-      while (*end_word == 0)
-        ++end_word;
-      end_bit = end_word == sentinel ? 0 : CountLeadingZeros(*end_word);
-    }
-    const u32 start = u32(w - words) * 32 + free_bit;
-    const u32 length = u32(end_word - words) * 32 - start + end_bit;
-    if (!length)
-      break;
-    if (length >= tiles && length < best_length) {
-      best_start = start;
-      best_length = length;
-    }
-    cursor = start + length;
-  }
-  if (best_length == ~0u)
-    return -1;
-  edram.free_tiles -= tiles;
-  MarkBits(edram, best_start, best_start + tiles, true);
-  return i32(best_start);
-}
-
-void FreeEdram(u32 base, u32 tiles) {
-  // A range this allocator never handed out (a surface made before the native D3D took
-  // over) must not credit tiles or clear someone else's bits.
-  if (base >= kEdramTiles || tiles > kEdramTiles - base)
-    return;
-  Edram &edram = EdramState();
-  std::lock_guard lock(edram.mutex);
-  edram.free_tiles = std::min(edram.free_tiles + tiles, kEdramTiles);
-  MarkBits(edram, base, base + tiles, false);
-}
-
-
-// The EDRAM tiles a surface takes (sub_8231A808).
-u32 EdramTileCount(u32 width, u32 height, u32 format, u32 multisample) {
-  const u32 f = format & 0x3F;
-  u32 w = width, h = height;
-  if (i32(multisample) >= 1)
-    h = 2 * height;
-  if (multisample == 2)
-    w = 2 * width;
-  const u32 units = (f == 21 || f == 32 || f == 37) ? 8 : 4;
-  return ((h + 15) & ~15u) * 80 * ((w + 79) / 80) * units / 0x1400;
-}
-
+// A surface has no place in EDRAM: its base (+0x1C, bits 0-11) and its size in bytes (+0x2C) are 0.
+// Nothing reads them: the host keeps each target in its own image, found by the surface object, and
+// a resolve names the texture it fills. Making a surface never fails for lack of EDRAM.
 // D3D::SetSurfaceHeader(Width, Height, D3DFORMAT, D3DMULTISAMPLE_TYPE,
 //     const D3DSURFACE_PARAMETERS*, D3DSurface*, DWORD *pEdramTiles,
 //     DWORD *pHiZSize) [0x82655A50]
 void SetSurfaceHeader(u32 width, u32 height, u32 format, u32 multisample, u32 parameters_va,
-                      be_u32 *s, u32 &edram_tiles, u32 &hiz_size) {
+                      be_u32 *s, u32 &hiz_size) {
   u32 f = format & 0x3F;
   const bool depth = f == 22 || f == 23;
   if (f == 54)
@@ -343,7 +231,6 @@ void SetSurfaceHeader(u32 width, u32 height, u32 format, u32 multisample, u32 pa
   s[0] = 4u;            // Common: D3DRTYPE_SURFACE
   s[5] = 0xFFFF0000u;   // BaseFlush
   i32 hiz_base = -1;
-  const u32 tiles = EdramTileCount(width, height, format, multisample);
   hiz_size = 0;
   if (depth) {
     u32 w = width, h = height;
@@ -395,8 +282,7 @@ void SetSurfaceHeader(u32 width, u32 height, u32 format, u32 multisample, u32 pa
     format_flags = Insert(format_flags, color_exp_bias, 4, 6);
     s[7] = ((format_flags & 0x3FF) << 16) | (base & 0xFFF);  // +0x1C ColorInfo
   }
-  s[11] = tiles * 0x1400;  // +0x2C EDRAM size
-  edram_tiles = tiles;
+  s[11] = 0;  // +0x2C EDRAM size
 }
 
 
@@ -408,24 +294,13 @@ u32 CreateSurfaceImpl(u32 width, u32 height, u32 format, u32 multisample, u32 pa
   if (!header)
     return 0;
   auto* s = Ptr<be_u32>(header);
-  u32 tiles = 0, hiz_size = 0;
-  SetSurfaceHeader(width, height, format, multisample, parameters_va, s, tiles, hiz_size);
+  u32 hiz_size = 0;
+  SetSurfaceHeader(width, height, format, multisample, parameters_va, s, hiz_size);
   s[0] = u32(s[0]) | kCommonD3DCreated;
   if (!parameters_va) {
     const u32 f = u32(s[10]) & 0x3F;
     const bool depth = f == 22 || f == 23;
-    const i32 base = AllocateEdram(tiles);
-    if (base < 0) {
-      FreeHeader(header);
-      return 0;
-    }
-    if (u32(base) + tiles > 0x800) {
-      FreeEdram(u32(base), tiles);
-      FreeHeader(header);
-      return 0;
-    }
     s[0] = u32(s[0]) | 0x80000000u;  // owns its EDRAM
-    s[7] = Insert(s[7], u32(base), 0, 12);
     if (depth && !LoadU32(kHiZOwnerVa)) {
       StoreU32(kHiZOwnerVa, 1);
       s[8] = u32(s[8]) & 0x1FFFF;
@@ -674,6 +549,12 @@ u32 LockResource(u32 resource, u32 mip_lock, u32 base_address, u32 mip_address, 
   const u32 fence = LoadU32(fenced + ((flags & 0x1010) ? 0xC : 0x8));
   if (fence)
     WaitForFence(fence);
+  // A lock the CPU may write through (not read-only) makes the memory what the CPU puts there: a
+  // resolve that filled it is not what it holds any more (see native_d3d::BumpTextureMemory).
+  if (!(flags & 0x10)) {
+    native_d3d::BumpTextureMemory(base_address);
+    native_d3d::BumpTextureMemory(mip_address);
+  }
   // Unless the lock is read-only or no-overwrite, D3D would then queue a GPU
   // cache invalidation of the range (into the ring, or for another thread a
   // range at device +0x2E38); the host has no GPU caches over guest memory.
@@ -860,13 +741,14 @@ void DestroyGuestResource(u32 resource) {
     break;
   case 3:  // texture: base and mip data
     wait();
+    // The GPU is done with it: a resolve into it is over (see native_d3d::BumpTextureMemory).
+    native_d3d::BumpTextureMemory(u32(r[8]) & ~0xFFFu);
+    native_d3d::BumpTextureMemory(u32(r[12]) & ~0xFFFu);
     free_data(u32(r[8]) & ~0xFFFu);
     free_data(u32(r[12]) & ~0xFFFu);
     break;
   case 4:  // surface (a texture level's: nothing of its own)
     if (!(common & 0x40000000u)) {
-      if (common & 0x80000000u)
-        FreeEdram(u32(r[7]) & 0xFFF, u32(r[11]) / 0x1400);
       if (u32(r[8]) & 1)
         StoreU32(kHiZOwnerVa, 0);
     }
@@ -1382,6 +1264,8 @@ u32 D3DDevice_CreateTexture_hook(u32 width, u32 height, u32 depth, u32 levels, u
   auto *t = Ptr<be_u32>(header);
   t[8] = (u32(t[8]) & 0xFFFu) | (base & ~0xFFFu);
   t[12] = (mips & ~0xFFFu) | (u32(t[12]) & 0xFFFu);
+  native_d3d::BumpTextureMemory(base);
+  native_d3d::BumpTextureMemory(mips);
   return header;
 }
 

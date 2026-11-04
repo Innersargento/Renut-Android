@@ -25,9 +25,9 @@
 REXCVAR_DEFINE_BOOL(renut_d3d_dump_shaders, true, "reNut",
                     "Save every shader the game creates or registers (Create*Shader, "
                     "XGRegister*Shader) as a complete container, for offline recompilation");
-REXCVAR_DEFINE_BOOL(renut_single_tile, false, "reNut",
-                    "Draw the MSAA scene in one pass instead of the bands (predicated tiling) the "
-                    "Xbox 360 needs for its 10 MB of EDRAM; the game still sets up its bands");
+REXCVAR_DEFINE_BOOL(renut_count_hooks, true, "reNut",
+                    "Count, per intercepted Direct3D function, the calls the native code took and the calls that ran "
+                    "the recompiled original (a line of native-d3d.txt)");
 REXCVAR_DEFINE_INT32(renut_d3d_report_swaps, 0, "reNut",
                      "Log the most called Direct3D functions every N swaps (0 = off). Off by "
                      "default: the game polls D3D_CBlocker_Check tens of millions of times a "
@@ -45,6 +45,7 @@ constexpr const char* kNames[] = {
 
 std::array<std::atomic<uint64_t>, kFunctionCount> counts;
 std::array<std::atomic<Handler>, kFunctionCount> handlers;
+std::array<std::atomic<uint64_t>, kFunctionCount> taken_counts, original_counts;
 // renut_d3d_report_swaps, read once: every intercepted call tests it.
 std::atomic<int32_t> report_every{-1};
 
@@ -140,48 +141,8 @@ void Report() {
   REXLOG_INFO("{}", line);
 }
 
-// D3DDevice_BeginTiling(device, flags, count, rects, clear colour, clear z,
-// clear stencil): the game hands it the bands its MSAA scene is split into -
-// two of 384 rows at 1280x720 2x - and Direct3D records the scene's commands
-// and replays them once per band at EndTiling, predicated on each draw's
-// extent. On the host the surfaces are textures of any size, so one band that
-// covers them all does the same work once: ~1,500 fewer draws a frame in
-// Showdown Town. The game's own state (surfaces, MSAA mode, band rectangles)
-// is left alone; only this call sees a single band.
-void SingleTile(PPCContext& ctx, uint8_t* base) {
-  const uint32_t count = ctx.r5.u32, rects = ctx.r6.u32;
-  if (count < 2 || count > 16 || !rects || !REXCVAR_GET(renut_single_tile)) return;
-  int32_t box[4] = {INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN};
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint8_t* rect = renut::GuestPtr(base, rects + i * 16);
-    for (uint32_t k = 0; k < 4; ++k) {
-      const int32_t v = int32_t(LoadBE32(rect + k * 4));
-      box[k] = k < 2 ? std::min(box[k], v) : std::max(box[k], v);
-    }
-  }
-  static uint32_t scratch = 0;
-  if (!scratch) scratch = rex::system::kernel_memory()->SystemHeapAlloc(16, 16);
-  if (!scratch) return;
-  for (uint32_t k = 0; k < 4; ++k) {
-    const uint32_t v = uint32_t(box[k]);
-    const uint8_t bytes[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
-    std::memcpy(renut::GuestPtr(base, scratch + k * 4), bytes, 4);
-  }
-  static std::atomic<bool> logged{false};
-  if (!logged.exchange(true)) {
-    REXLOG_INFO("Renut: predicated tiling {} bands -> one pass ({},{})-({},{})", count, box[0], box[1],
-                box[2], box[3]);
-  }
-  ctx.r5.u32 = 1;
-  ctx.r6.u32 = scratch;
-  // The game still marks each object for the bands it falls in; with one band
-  // every mark has to count.
-  SetSingleBinTiling(true);
-}
-
 // Called for every intercepted function. Returns true if a handler took it.
 inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
-  if (function == kD3DDevice_BeginTiling) SingleTile(ctx, base);
   if (int32_t every = ReportEvery()) {
     counts[function].fetch_add(1, std::memory_order_relaxed);
     if (function == kD3DDevice_Swap) {
@@ -191,11 +152,14 @@ inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
       }
     }
   }
-  if (renut::native_d3d::OnEnter(function, ctx, base)) {
-    return true;
+  bool taken = renut::native_d3d::OnEnter(function, ctx, base);
+  if (!taken) {
+    Handler handler = handlers[function].load(std::memory_order_acquire);
+    taken = handler && handler(ctx, base);
   }
-  Handler handler = handlers[function].load(std::memory_order_acquire);
-  return handler && handler(ctx, base);
+  static const bool count = REXCVAR_GET(renut_count_hooks);  // read once: every call tests it
+  if (count) (taken ? taken_counts : original_counts)[function].fetch_add(1, std::memory_order_relaxed);
+  return taken;
 }
 
 }  // namespace
@@ -222,12 +186,10 @@ inline void Leave(Function function, uint32_t r3, uint32_t r4, PPCContext& ctx, 
   }
 }
 
-namespace {
-std::atomic<bool> single_bin_tiling{false};
-}  // namespace
-
-void SetSingleBinTiling(bool single) { single_bin_tiling.store(single, std::memory_order_relaxed); }
-bool GetSingleBinTiling() { return single_bin_tiling.load(std::memory_order_relaxed); }
+void CallCounts(Function function, uint64_t& taken, uint64_t& original) {
+  taken = taken_counts[function].load(std::memory_order_relaxed);
+  original = original_counts[function].load(std::memory_order_relaxed);
+}
 
 void SetHandler(Function function, Handler handler) {
   handlers[function].store(handler, std::memory_order_release);

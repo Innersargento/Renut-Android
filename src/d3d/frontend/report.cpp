@@ -65,6 +65,17 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
                      "worker runs {}\n",
                      c(g_counts.effect_records), c(g_counts.doorbells_skipped), c(g_counts.doorbells),
                      c(g_counts.worker_runs));
+  {
+    // Every intercepted function that was called: calls the front end or a handler took / calls that ran
+    // the recompiled original (the second number is what is still not native).
+    out += "== hooked functions, taken/original:";
+    for (uint32_t i = 0; i < renut::d3d::kFunctionCount; ++i) {
+      uint64_t taken = 0, original = 0;
+      renut::d3d::CallCounts(renut::d3d::Function(i), taken, original);
+      if (taken || original) out += fmt::format(" {} {}/{};", kFunctionNames[i], taken, original);
+    }
+    out += '\n';
+  }
   if (executor) out += executor();
   last_frame = frame;
   last_draws = draws;

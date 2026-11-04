@@ -138,36 +138,25 @@ bool ResetAllState(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-// sub_82658818(device, one-pass, count, extent): a command buffer recorded tiled. The
-// tile grid's size (in EDRAM tiles, by the surface's multisampling) gives each tile its
-// index (0x3338...), the surface size register its pitch in tiles, and the buffer's
-// pass its dirty bits. The caller leaves the extent's width in r6 (the original uses
-// it for both of the aligned sizes).
+// sub_82658818(device, one-pass, count, extent): a command buffer recorded tiled. The original sizes
+// the console's tile grid (in EDRAM tiles, by the surface's multisampling): each tile's index
+// (0x3338...) and the extent aligned to the tile and the band (0x3374, 0x3378). Only the tile-list
+// writers read the indices, and the lists are not built here; of the aligned extents the host keeps
+// the extent itself, which the surface-info pitch field and the check in BeginCommandBuffer compare
+// with. What stays is the device's flags and the dirty bits of the buffer's pass.
 bool SetupTileExtent(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
     return false;
-  const u32 count = ctx.r5.u32, extent = ctx.r6.u32;
+  const u32 extent = ctx.r6.u32;
   u8 flags = d.B(0x2ABF) | 0x20;
   if (ctx.r4.u32 != 0)
     flags |= 0x10;
   d.SetB(0x2ABF, flags);
-  const u32 samples = d.H(0x2880) & 3;
-  const u32 tile_height = samples == 0 ? 0x10 : 8;           // r30
-  const u32 tile_width = samples >= 2 ? 0x10 : 0x20;         // r10
-  const u32 band = samples >= 2 ? 0x28 : 0x50;               // r29
-  const u32 pitch = (tile_width + extent - 1) & ~(tile_width - 1);  // r4
-  const u32 row_tiles = pitch / tile_width;                         // r31
-  for (u32 i = 0; i < count; ++i) {
-    const u32 x = d.W(0x32C0 + 8 * i), y = d.W(0x32C4 + 8 * i);
-    d.SetW(0x3338 + 4 * i, (y / tile_height) * row_tiles + x / tile_width);
-  }
-  d.SetW(0x3374, pitch);
-  d.SetW(0x2880, Insert(d.W(0x2880), pitch, 18, 14));
+  d.SetW(0x3374, extent);
+  d.SetW(0x2880, Insert(d.W(0x2880), extent, 18, 14));
   d.SetQ(0x10, d.Q(0x10) | 0x100);
-  d.SetW(0x3378, ((band + extent - 1) / band) * band);
-  // (the original tests bit 0x20 of the flags it has just set, so only the first branch runs)
+  d.SetW(0x3378, extent);
   d.SetQ(0x28, d.Q(0x28) | 0x100);
   return true;
 }
@@ -207,28 +196,9 @@ bool ExportEnd(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-// sub_82661AF0(allocator, first, end, set): the EDRAM allocator's bitmap (at +0x20, a bit
-// a tile, the most significant first) with the tiles [first, end) marked used or free.
-bool MarkEdramBits(PPCContext& ctx, uint8_t* base) {
-  GuestFrame f(ctx, base, 0);
-  const u32 object = ctx.r3.u32, first = ctx.r4.u32, end = ctx.r5.u32;
-  const bool set = ctx.r6.u32 != 0;
-  const auto shr = [](u32 value, u32 amount) { return value >> (amount & 31); };
-  u32 p = object + 0x20 + (first >> 5) * 4;
-  const u32 last = object + 0x20 + (end >> 5) * 4;
-  const u32 head = shr(~0u, first & 31), tail = shr(~0u, end & 31);
-  if (first >> 5 == end >> 5) {
-    const u32 mask = head & ~tail;
-    f.Put(p, set ? (f.Get(p) | mask) : (f.Get(p) & ~mask));
-    return true;
-  }
-  f.Put(p, set ? (f.Get(p) | head) : (f.Get(p) & ~head));
-  for (p += 4; p < last; p += 4)
-    f.Put(p, set ? ~0u : 0u);
-  f.Put(p, set ? (f.Get(p) | ~tail) : (f.Get(p) & tail));
-  return true;
-}
-
+// sub_82661AF0(allocator, first, end, set): marked tiles [first, end) used or free in the EDRAM
+// allocator's bitmap. Nothing keeps that bitmap any more (see AllocateEdramMemory).
+bool MarkEdramBits(PPCContext&, uint8_t*) { return true; }
 
 // sub_82210138(device, ?, callback type): the end of a tiled pass. The original hands the pass's
 // lists (the tile list, the indirect ranges and the fence) to the GPU through the primary buffer,

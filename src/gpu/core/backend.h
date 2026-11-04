@@ -228,14 +228,6 @@ inline void Lists::StoreConstants(uint32_t first, const uint32_t* values, uint32
     backend.draw.MarkConstantsWritten(first + lo, hi - lo);
   }
 
-inline bool Lists::OnPredicatedSkip() {
-    if (backend.draw.trace_) {
-      std::fprintf(backend.draw.trace_, "predicated %s select=%llX mask=%llX\n", backend.swap.pred_pass_all_ ? "passed" : "skip",
-                   (unsigned long long)bin_select_, (unsigned long long)bin_mask_);
-    }
-    return backend.swap.pred_pass_all_;
-  }
-
 inline void Lists::StoreBig(uint32_t physical, uint32_t value) {
     const uint32_t big = __builtin_bswap32(value);
     std::memcpy(backend.memory_->TranslatePhysical<uint8_t*>(physical), &big, 4);
@@ -389,10 +381,10 @@ inline Resolved* Draw::FindResolved(uint32_t address) {
     for (auto& [key, r] : backend.targets.resolved_) {
       if (uint32_t(key) == address && r.texture && (!latest || r.written > latest->written)) latest = &r;
     }
-    if (latest && latest->guest_bytes && latest->checked_frame != backend.swaps_) {
+    if (latest && latest->checked_frame != backend.swaps_) {
       latest->checked_frame = backend.swaps_;
-      const uint8_t* memory = backend.memory_->TranslatePhysical<const uint8_t*>(address);
-      if (ContentHash(memory, latest->guest_bytes) != latest->guest_hash) {
+      const bool stale = native_d3d::TextureMemoryEpoch(address) != latest->memory_epoch;
+      if (stale) {
         // Something else lives here now; forget every resolve at the address.
         for (auto it = backend.targets.resolved_.begin(); it != backend.targets.resolved_.end();) {
           if (uint32_t(it->first) == address) {

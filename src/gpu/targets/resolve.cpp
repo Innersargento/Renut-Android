@@ -3,94 +3,65 @@
 
 namespace renut::gpu {
 
-bool Resolve::ResolveInfoForRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
-                                               draw_util::ResolveInfo& info) {
-  if (!resolve_regs_) resolve_regs_ = std::make_unique<RegisterFile>();
-  if (!resolve_vertices_) {
-    // Guest physical memory the SDK reads the vertices from.
-    resolve_vertices_ = rex::system::kernel_memory()->SystemHeapAlloc(64, 16, rex::memory::kSystemHeapPhysical);
-    if (!resolve_vertices_) return false;
+// Direct3D leaves the copy in the device in the Xenos formats (the destination's format and
+// endian, the clear values): the decoding that follows is all of the Xenos the host needs of a
+// resolve, which names its texture and its rectangle by D3D objects. `w` is a kOpResolve record.
+bool Resolve::DecodeResolve(const uint32_t* w, ResolveCopy& out) {
+  out = ResolveCopy{};
+  reg::RB_COPY_CONTROL control;
+  control.value = w[5];
+  if (control.copy_command != xenos::CopyCommand::kRaw && control.copy_command != xenos::CopyCommand::kConvert) {
+    REXLOG_INFO("Renut: Plume resolve with copy command {} dropped", uint32_t(control.copy_command));
+    return false;
   }
-  const uint32_t physical = backend.memory_->GetPhysicalAddress(resolve_vertices_);
-  if (physical == UINT32_MAX) return false;
-  const float vertices[6] = {float(x0), float(y0), float(x1), float(y0), float(x0), float(y1)};
-  std::memcpy(backend.memory_->TranslatePhysical<uint8_t*>(physical), vertices, sizeof(vertices));
-
-  RegisterFile& regs = *resolve_regs_;
-  std::memcpy(regs.values, backend.register_file_->values, sizeof(regs.values));
-  xenos::xe_gpu_vertex_fetch_t fetch{};
-  fetch.type = xenos::FetchConstantType::kVertex;
-  fetch.address = physical >> 2;
-  fetch.endian = xenos::Endian::kNone;
-  fetch.size = 6;
-  regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0] = fetch.dword_0;
-  regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1] = fetch.dword_1;
-  reg::PA_SU_VTX_CNTL vertex_control;
-  vertex_control.value = regs.values[XE_GPU_REG_PA_SU_VTX_CNTL];
-  vertex_control.pix_center = xenos::PixelCenter::kOGLHalf;  // no half-pixel offset to undo
-  regs.values[XE_GPU_REG_PA_SU_VTX_CNTL] = vertex_control.value;
-  reg::PA_SU_SC_MODE_CNTL mode_control;
-  mode_control.value = regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
-  mode_control.vtx_window_offset_enable = 0;
-  regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL] = mode_control.value;
-  reg::PA_SC_WINDOW_SCISSOR_TL window_tl;
-  window_tl.value = 0;
-  window_tl.window_offset_disable = 1;
-  regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] = window_tl.value;
-  reg::PA_SC_WINDOW_SCISSOR_BR window_br;
-  window_br.value = 0;
-  window_br.br_x = 8192;
-  window_br.br_y = 8192;
-  regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = window_br.value;
-  reg::PA_SC_SCREEN_SCISSOR_TL screen_tl;
-  screen_tl.value = 0;
-  regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL] = screen_tl.value;
-  reg::PA_SC_SCREEN_SCISSOR_BR screen_br;
-  screen_br.value = 0;
-  screen_br.br_x = 8192;
-  screen_br.br_y = 8192;
-  regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR] = screen_br.value;
-  return draw_util::GetResolveInfo(regs, *backend.memory_, 1, 1, false, false, info);
+  reg::RB_COPY_DEST_INFO dest_info;
+  dest_info.value = w[6];
+  const bool is_depth = control.copy_src_select >= xenos::kMaxColorRenderTargets;
+  // A depth copy is asked for in k_8_8_8_8 by Direct3D 9; the host copies the depth in the depth
+  // surface's own format.
+  // (the depth surface's format is bit 16 of its info word: 0 D24S8, 1 D24FS8)
+  const auto depth_format = xenos::DepthRenderTargetFormat((backend.targets.native_surfaces_[4].info >> 16) & 1);
+  out.dest_format = uint32_t(is_depth ? rex::graphics::DepthRenderTargetToTextureFormat(depth_format)
+                                      : xenos::TextureFormat(dest_info.copy_dest_format));
+  out.depth = is_depth;
+  out.clear_depth = control.depth_clear_enable != 0;
+  out.clear_color = !is_depth && control.color_clear_enable != 0;
+  out.endian = uint32_t(dest_info.copy_dest_endian);
+  out.swap = !is_depth && dest_info.copy_dest_swap != 0;
+  out.depth_clear = w[7];
+  out.color_clear = w[8];
+  out.color_clear_lo = w[9];
+  return true;
 }
 
-// A resolve record: the copy registers Direct3D worked out, and the
-// rectangle its copy draw would have covered.
+// A resolve record: the copy words Direct3D worked out, and the rectangle its copy draw would have
+// covered.
 void Resolve::NativeResolve(const uint32_t* w) {
   backend.recorder.FlushDeferred();
-  for (uint32_t i = 0; i < 12; ++i) backend.shaders.WriteRegister(0x2318 + i, w[5 + i]);
-  for (uint32_t i = 0; i < 6; ++i) backend.shaders.WriteRegister(0x2000 + i, w[17 + i]);
-  draw_util::ResolveInfo info;
-  if (!ResolveInfoForRect(int32_t(w[1]), int32_t(w[2]), int32_t(w[3]), int32_t(w[4]), info)) {
+  ResolveCopy copy;
+  if (!DecodeResolve(w, copy)) {
     ++backend.lists.native_bad_;
     return;
   }
-  // The source is the surface bound in the slot the resolve names; its
-  // register is RB_COLOR_INFO, _DEPTH_INFO or RB_COLOR1..3_INFO.
-  static constexpr uint32_t kRegisterOfSlot[5] = {1, 3, 4, 5, 2};
-  // Bit 8 of the source word: Photo Mode's capture routine issued this resolve
-  // (d3d/frontend/), the one copied to the CPU. Not tied to an address: the
-  // scratch texture it resolves into is built on the spot.
-  capture_this_resolve_ = (w[23] & 0x100) != 0;
-  const uint32_t slot = std::min(w[23] & 0xFFu, 4u);
+  const uint32_t slot = std::min(w[10], 4u);
   ResolveSurfaces surfaces;
-  surfaces.source = backend.targets.NativeTarget(slot, w[17 + kRegisterOfSlot[slot]]);
+  surfaces.source = backend.targets.SurfaceTarget(slot);
   surfaces.depth = backend.targets.SurfaceTarget(4);
   surfaces.x = w[1];
   surfaces.y = w[2];
   surfaces.width = w[3] > w[1] ? w[3] - w[1] : 0;
   surfaces.height = w[4] > w[2] ? w[4] - w[2] : 0;
-  surfaces.object_base = w[24];
-  surfaces.object_width = w[25];
-  surfaces.object_height = w[26];
-  surfaces.dest_dx = int32_t(w[27]);
-  surfaces.dest_dy = int32_t(w[28]);
-  surfaces.object_pitch = w[29];
-  ++(surfaces.object_base ? backend.targets.object_resolves_ : backend.targets.address_resolves_count_);
-  ExecuteResolve(info, surfaces);
-  capture_this_resolve_ = false;
+  surfaces.object_base = w[11];
+  surfaces.object_width = w[12];
+  surfaces.object_height = w[13];
+  surfaces.dest_dx = int32_t(w[14]);
+  surfaces.dest_dy = int32_t(w[15]);
+  surfaces.object_pitch = w[16];
+  ++(surfaces.object_base ? backend.targets.object_resolves_ : backend.targets.volume_resolves_);
+  ExecuteResolve(copy, surfaces);
 }
 
-bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSurfaces& surfaces) {
+bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& surfaces) {
   ++backend.stats_.resolves;
   // plume-skip bit 33554432 drops the resolve entirely. Attributing intervals
   // between timestamps proved unreliable on this tiler - the same frame read as
@@ -99,7 +70,7 @@ bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSu
   // measuring the difference does not depend on that.
   if (backend.skip_mask_ & 33554432) return true;
   if (!surfaces.width || !surfaces.height) return true;
-  const bool copying_depth = info.IsCopyingDepth();
+  const bool copying_depth = copy.depth;
   // The source is the surface the resolve names, the rectangle in its pixels:
   // the host's (a shadow map is drawn smaller than the guest thinks).
   Target* source = surfaces.source;
@@ -114,25 +85,19 @@ bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSu
   // picture is wrong; it measures what the clear-only passes cost.
   const bool skip_clears = backend.skip_mask_ & 134217728;
   const uint32_t copy_height = height;
-  backend.draw.Trace("resolve {} src=({},{}) {}x{} found={} -> {:08X} dfmt={} ({},{}) pitch={} h={} clear={}{}",
+  backend.draw.Trace("resolve {} src=({},{}) {}x{} found={} -> {:08X} dfmt={} clear={}{}",
         copying_depth ? "depth" : "color", x, y, width, height,
-        source != nullptr, uint32_t(info.copy_dest_base), uint32_t(info.copy_dest_info.copy_dest_format),
-        info.copy_dest_coordinate_info.offset_x_div_8 * 8, info.copy_dest_coordinate_info.offset_y_div_8 * 8,
-        info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32,
-        info.copy_dest_coordinate_info.height_aligned_div_32 * 32, info.IsClearingColor() ? "c" : "",
-        info.IsClearingDepth() ? "d" : "");
-  if (source && x < source->width && y < source->height &&
-      info.rb_copy_control.copy_command != xenos::CopyCommand::kNull) {
+        source != nullptr, surfaces.object_base, copy.dest_format, copy.clear_color ? "c" : "", copy.clear_depth ? "d" : "");
+  // A volume's slices interleave in memory and have no texture object of their own to fill: the
+  // copy is not made (the clears below still are). Counted by the surface report.
+  if (!surfaces.object_base && volume_logged_ < 4) {
+    ++volume_logged_;
+    REXLOG_INFO("Renut: Plume resolve into a volume's slice not copied ({}x{})", width, height);
+  }
+  if (source && surfaces.object_base && x < source->width && y < source->height) {
     uint32_t sx = x, sy = y;
     uint32_t w = std::min(width, source->width - x), h = std::min(copy_height, source->height - y);
-    const uint32_t dest_w =
-        std::max(HostCeil(source, uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32u), w);
-    const uint32_t dest_h =
-        std::max(HostCeil(source, uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) * 32u), h);
-    const uint32_t dx = HostFloor(source, info.copy_dest_coordinate_info.offset_x_div_8 * 8);
-    const uint32_t dy = HostFloor(source, info.copy_dest_coordinate_info.offset_y_div_8 * 8);
-    const auto* dest_info = rex::graphics::FormatInfo::Get(
-        xenos::TextureFormat(uint32_t(info.copy_dest_info.copy_dest_format)));
+    const auto* dest_info = rex::graphics::FormatInfo::Get(xenos::TextureFormat(copy.dest_format));
     const uint32_t dest_bpp = dest_info ? std::max(1u, dest_info->bits_per_pixel / 8) : 4;
     // Depth resolves become R32_FLOAT textures holding the depth, which is what
     // a k_24_8 / k_24_8_FLOAT fetch returns in x (shadow maps, and the scene
@@ -140,20 +105,17 @@ bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSu
     // also keep the stencil in y: the rain ripples read its water bit through
     // an 8_8_8_8 fetch of the same memory.
     const bool with_stencil =
-        copying_depth && uint32_t(info.copy_dest_info.copy_dest_format) ==
-                             uint32_t(xenos::TextureFormat::k_24_8_FLOAT);
+        copying_depth && copy.dest_format == uint32_t(xenos::TextureFormat::k_24_8_FLOAT);
     const RenderFormat dest_format =
         copying_depth ? (with_stencil ? RenderFormat::R32G32_FLOAT : RenderFormat::R32_FLOAT) : source->format;
     // The copy goes into the D3DTexture the resolve names - the level, slice
     // or face Direct3D's own lookup found - at its own size, the source corner
     // landing on the point Direct3D was given; sampled through its fetch
-    // constant. A 3D texture's slices interleave: those go by the copy's
-    // address and offset.
-    const bool to_object = surfaces.object_base != 0;
+    // constant.
     Resolved* chosen = nullptr;
     Resolved* aliased = nullptr;
     uint32_t dest_x = 0, dest_y = 0;
-    if (to_object) {
+    {
       const int32_t scale = int32_t(source->scale);
       int32_t ox = int32_t(sx) + surfaces.dest_dx * scale / 4, oy = int32_t(sy) + surfaces.dest_dy * scale / 4;
       if (ox < 0) {
@@ -180,10 +142,6 @@ bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSu
       dest_y = uint32_t(oy);
       w = dest_x < chosen->width ? std::min(w, chosen->width - dest_x) : 0;
       h = dest_y < chosen->height ? std::min(h, chosen->height - dest_y) : 0;
-    } else {
-      chosen = &backend.targets.GetResolved(info.copy_dest_base, dest_format, dest_w + dx, dest_h + dy);
-      dest_x = dx;
-      dest_y = dy;
     }
     Resolved& dest = *chosen;
     ++dest.generation;
@@ -192,14 +150,13 @@ bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSu
     dest.written = ++resolve_serial_;
     backend.targets.InvalidateResolvedLookups();
     dest.written_frame = backend.swaps_;
-    dest.guest_pitch = to_object ? std::max(surfaces.object_pitch, 32u) : dest_w;
-    dest.guest_height = to_object ? (std::max(surfaces.object_height, 1u) + 31) & ~31u : dest_h;
+    dest.guest_pitch = std::max(surfaces.object_pitch, 32u);
+    dest.guest_height = (std::max(surfaces.object_height, 1u) + 31) & ~31u;
     dest.guest_bpp = dest_bpp;
-    // Snapshot of the guest memory under the whole resolved texture.
+    // The guest memory under it, as Direct3D has left it (FindResolved).
     {
-      const uint32_t base_address = to_object ? surfaces.object_base : info.copy_dest_base;
-      dest.guest_bytes = dest.guest_pitch * dest.guest_height * dest_bpp;
-      dest.guest_hash = ContentHash(backend.memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
+      const uint32_t base_address = surfaces.object_base;
+      dest.memory_epoch = native_d3d::TextureMemoryEpoch(base_address);
       dest.checked_frame = backend.swaps_;
     }
     if (aliased) {
@@ -220,45 +177,33 @@ bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSu
       }
     }
     if (dest.texture) {
-      if (backend.swap.snap_address_ && !dest.alias && info.copy_dest_base == backend.swap.snap_address_ && ++backend.swap.snap_seen_ == backend.swap.snap_ordinal_) {
+      if (backend.swap.snap_address_ && !dest.alias && surfaces.object_base == backend.swap.snap_address_ && ++backend.swap.snap_seen_ == backend.swap.snap_ordinal_) {
         SnapshotResolved(dest);
       }
       backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
       if (dest.descriptor) {
         backend.targets.SetTexture2D(dest.descriptor, dest.texture.get());
       }
-      const uint32_t base_address = to_object ? surfaces.object_base : info.copy_dest_base;
+      const uint32_t base_address = surfaces.object_base;
       if (backend.swap.resolve_log_ && !copying_depth && w >= 64 && h >= 64) {
         LogResolveLine(fmt::format(
-            "f={} resolve {}x{} at ({},{}) -> {:08X} {} obj={}x{} pitch={} dfmt={} endian={} swap={} host_fmt={}",
-            backend.swaps_, w, h, dest_x, dest_y, base_address, to_object ? "object" : "address", surfaces.object_width,
-            surfaces.object_height, dest.guest_pitch, uint32_t(info.copy_dest_info.copy_dest_format),
-            uint32_t(info.copy_dest_info.copy_dest_endian), uint32_t(info.copy_dest_info.copy_dest_swap),
+            "f={} resolve {}x{} at ({},{}) -> {:08X} obj={}x{} pitch={} dfmt={} endian={} swap={} host_fmt={}",
+            backend.swaps_, w, h, dest_x, dest_y, base_address, surfaces.object_width,
+            surfaces.object_height, dest.guest_pitch, copy.dest_format, copy.endian, uint32_t(copy.swap),
             uint32_t(dest.format)));
-      }
-      // Only the resolve Photo Mode's capture routine issued (capture_this_resolve_): one copy
-      // to the CPU per photo, and none while playing.
-      if (capture_this_resolve_) {
-        ++photo_captures_;
-        REXLOG_INFO("Renut: Plume photo capture {}: {}x{} at ({},{}) -> {:08X} {} pitch {} bpp {} format {} depth {}",
-                    photo_captures_, w, h, dest_x, dest_y, base_address, to_object ? "object" : "address",
-                    dest.guest_pitch, dest_bpp, uint32_t(dest.format), copying_depth);
-        if (!copying_depth && w && h && base_address) {
-          ReadbackResolve(dest, info, base_address, dest_x, dest_y, w, h, dest.guest_pitch, dest_bpp, source->scale);
-        }
       }
     }
   }
 
   // Clears that ride along with the resolve.
   const RenderRect rect(int32_t(x), int32_t(y), int32_t(x + width), int32_t(y + height));
-  if (info.IsClearingColor() && source && !skip_clears) {
+  if (copy.clear_color && source && !skip_clears) {
     backend.targets.Transition(source->texture.get(), source->layout, RenderTextureLayout::COLOR_WRITE);
     std::array<Target*, 4> colors{source};
     backend.targets.SetFramebuffer(backend.targets.GetFramebuffer(colors, 1, nullptr));
     RenderColor color;
     if (source->format == RenderFormat::R8G8B8A8_UNORM) {
-      const uint32_t c = info.rb_color_clear;
+      const uint32_t c = copy.color_clear;
       color = RenderColor(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f,
                           (c >> 24) / 255.f);
     } else {
@@ -267,13 +212,13 @@ bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSu
         float v = exp ? std::ldexp(1.f + mant / 1024.f, int(exp) - 15) : std::ldexp(mant / 1024.f, -14);
         return sign ? -v : v;
       };
-      color = RenderColor(half(info.rb_color_clear >> 16), half(info.rb_color_clear & 0xFFFF),
-                          half(info.rb_color_clear_lo >> 16), half(info.rb_color_clear_lo & 0xFFFF));
+      color = RenderColor(half(copy.color_clear >> 16), half(copy.color_clear & 0xFFFF),
+                          half(copy.color_clear_lo >> 16), half(copy.color_clear_lo & 0xFFFF));
     }
     backend.recorder.L()->clearColor(0, color, &rect, 1);
     ++backend.stats_.clears;
   }
-  if (info.IsClearingDepth() && !skip_clears) {
+  if (copy.clear_depth && !skip_clears) {
     Target* depth = surfaces.depth;
     if (depth) {
       const RenderRect depth_rect(int32_t(HostFloor(depth, surfaces.x)), int32_t(HostFloor(depth, surfaces.y)),
@@ -291,7 +236,7 @@ bool Resolve::ExecuteResolve(const draw_util::ResolveInfo& info, const ResolveSu
       backend.targets.Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
       std::array<Target*, 4> none{};
       backend.targets.SetFramebuffer(backend.targets.GetFramebuffer(none, 0, depth));
-      const uint32_t d = info.rb_depth_clear;
+      const uint32_t d = copy.depth_clear;
       backend.recorder.L()->clearDepthStencil(true, true, float(d >> 8) / float(0xFFFFFF), d & 0xFF, &depth_rect, 1);
       ++backend.stats_.clears;
     }
@@ -309,79 +254,72 @@ void Resolve::LogResolveLine(const std::string& line) {
   }
 }
 
-// The CPU reads a few resolves directly: Photo Mode copies the screen into a texture,
-// waits for the copy and encodes a JPEG (and the 90x50 thumbnail) from the texels. Plume
-// keeps resolves on the GPU, so that read saw whatever the memory held - black. This runs
-// the frame so far, waits for it, and writes the pixels into guest memory the way the
-// hardware would have: 32x32 tiled, the resolve's endianness and red/blue order.
-// The fence the game waits on is recorded in the same list after the resolve, so it is
-// not signalled before this returns.
-void Resolve::ReadbackResolve(Resolved& dest, const draw_util::ResolveInfo& info,
-                                            uint32_t base_address, uint32_t dest_x, uint32_t dest_y, uint32_t w,
-                                            uint32_t h, uint32_t pitch, uint32_t bpp, uint32_t scale) {
-  if (bpp != 4 || !dest.texture || !w || !h || !base_address || !scale) return;
-  const bool rgba8 = dest.format == RenderFormat::R8G8B8A8_UNORM;
-  const bool half = dest.format == RenderFormat::R16G16B16A16_FLOAT;
-  if (!rgba8 && !half) {
-    REXLOG_INFO("Renut: Plume resolve readback skipped: host format {}", uint32_t(dest.format));
+// Photo Mode's picture: render target 0, after the draws recorded before the capture, read back
+// and written into the photo texture's rows (width x height texels of guest pixels, `pitch` bytes
+// apart) in the order the CPU keeps a linear X8R8G8B8 texel: alpha, red, green, blue. The game thread
+// waits for the list this record is in. A target drawn at a fraction of the guest's resolution is
+// written at the guest's: each guest pixel takes the host texel under it.
+void Resolve::NativePhoto(const uint32_t* w) {
+  backend.recorder.FlushDeferred();
+  const uint32_t address = w[1], pitch = w[2], width = w[3], height = w[4];
+  Target* source = backend.targets.SurfaceTarget(0);
+  if (!source || !source->texture || !source->scale || !address || !width || !height) {
+    ++backend.lists.native_bad_;
     return;
   }
+  const bool rgba8 = source->format == RenderFormat::R8G8B8A8_UNORM;
+  const bool half = source->format == RenderFormat::R16G16B16A16_FLOAT;
+  if (!rgba8 && !half) {
+    REXLOG_INFO("Renut: Plume photo capture skipped: host format {}", uint32_t(source->format));
+    return;
+  }
+  const uint32_t scale = source->scale;
+  const uint32_t host_w = std::min(source->width, HostCeil(source, width));
+  const uint32_t host_h = std::min(source->height, HostCeil(source, height));
+  if (!host_w || !host_h) return;
   const uint32_t texel = rgba8 ? 4 : 8;
-  const uint32_t row_texels = (w + 63) & ~63u;
-  auto buffer = backend.device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(row_texels) * h * texel));
+  const uint32_t row_texels = (host_w + 63) & ~63u;
+  auto buffer = backend.device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(row_texels) * host_h * texel));
   if (!buffer) return;
-  backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_SOURCE);
-  RenderBox box(int32_t(dest_x), int32_t(dest_y), int32_t(dest_x + w), int32_t(dest_y + h), 0, 1);
-  CopyTextureToBuffer(backend.recorder.L(), buffer.get(), dest.texture.get(), w, h, row_texels, 0, 0, &box);
-  backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::SHADER_READ);
+  backend.targets.Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
+  RenderBox box(0, 0, int32_t(host_w), int32_t(host_h), 0, 1);
+  CopyTextureToBuffer(backend.recorder.L(), buffer.get(), source->texture.get(), host_w, host_h, row_texels, 0, 0, &box);
   backend.targets.Flush();
   const auto* pixels = static_cast<const uint8_t*>(buffer->map());
   if (!pixels) return;
-  uint8_t* guest = backend.memory_->TranslatePhysical<uint8_t*>(base_address);
-  const bool swap_rb = info.copy_dest_info.copy_dest_swap != 0;
-  const uint32_t endian_value = uint32_t(info.copy_dest_info.copy_dest_endian);
-  const xenos::Endian endian = endian_value <= 3 ? xenos::Endian(endian_value) : xenos::Endian::k8in32;
-  auto to8 = [](uint16_t bits) -> uint32_t {
+  uint8_t* guest = backend.memory_->TranslatePhysical<uint8_t*>(address);
+  auto to8 = [](uint16_t bits) -> uint8_t {
     const uint32_t exp = (bits >> 10) & 0x1F, mant = bits & 0x3FF;
     if (bits & 0x8000) return 0;
     float v = exp ? std::ldexp(1.f + mant / 1024.f, int(exp) - 15) : std::ldexp(mant / 1024.f, -14);
     if (exp == 31) v = 1.f;
-    return uint32_t(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
+    return uint8_t(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
   };
-  uint32_t written = 0;
-  const uint32_t limit = dest.guest_bytes;
-  // A resolve drawn at a fraction of the guest's resolution is written at the
-  // guest's: each guest pixel takes the host texel under it.
-  const uint32_t guest_w = uint32_t(uint64_t(w) * 4 / scale), guest_h = uint32_t(uint64_t(h) * 4 / scale);
-  const uint32_t guest_x = uint32_t(uint64_t(dest_x) * 4 / scale), guest_y = uint32_t(uint64_t(dest_y) * 4 / scale);
+  const uint32_t guest_w = std::min(width, uint32_t(uint64_t(host_w) * 4 / scale));
+  const uint32_t guest_h = std::min(height, uint32_t(uint64_t(host_h) * 4 / scale));
   for (uint32_t gy = 0; gy < guest_h; ++gy) {
-    const uint32_t y = std::min(uint32_t(uint64_t(gy) * scale / 4), h - 1);
+    const uint32_t y = std::min(uint32_t(uint64_t(gy) * scale / 4), host_h - 1);
     const uint8_t* src = pixels + size_t(y) * row_texels * texel;
+    uint8_t* out = guest + size_t(gy) * pitch;
     for (uint32_t gx = 0; gx < guest_w; ++gx) {
-      const uint32_t x = std::min(uint32_t(uint64_t(gx) * scale / 4), w - 1);
-      uint32_t r, g, b, a;
+      const uint32_t x = std::min(uint32_t(uint64_t(gx) * scale / 4), host_w - 1);
+      uint8_t r, g, b;
       if (rgba8) {
-        r = src[x * 4], g = src[x * 4 + 1], b = src[x * 4 + 2], a = src[x * 4 + 3];
+        r = src[x * 4], g = src[x * 4 + 1], b = src[x * 4 + 2];
       } else {
         const auto* t = reinterpret_cast<const uint16_t*>(src + x * 8);
-        r = to8(t[0]), g = to8(t[1]), b = to8(t[2]), a = to8(t[3]);
+        r = to8(t[0]), g = to8(t[1]), b = to8(t[2]);
       }
-      if (swap_rb) std::swap(r, b);
-      const uint32_t native = r | (g << 8) | (b << 16) | (a << 24);
-      const uint32_t value = xenos::GpuSwap(native, endian);
-      const uint32_t at = uint32_t(gfx::texture_util::GetTiledOffset2D(int32_t(guest_x + gx), int32_t(guest_y + gy),
-                                                                         pitch, 2));
-      if (at + 4 > limit) continue;
-      std::memcpy(guest + at, &value, 4);
-      ++written;
+      out[gx * 4 + 0] = 0xFF;
+      out[gx * 4 + 1] = r;
+      out[gx * 4 + 2] = g;
+      out[gx * 4 + 3] = b;
     }
   }
   buffer->unmap();
-  // Without this the next lookup would take the changed bytes for another texture
-  // streamed into the same memory and drop the resolve.
-  dest.guest_hash = ContentHash(backend.memory_->TranslatePhysical<const uint8_t*>(base_address), dest.guest_bytes);
-  REXLOG_INFO("Renut: Plume photo capture {} ({}x{} into {:08X}, pitch {}, endian {}, swap {}, {} texels)",
-              photo_captures_, w, h, base_address, pitch, endian_value, swap_rb ? 1 : 0, written);
+  ++photo_captures_;
+  REXLOG_INFO("Renut: Plume photo capture {}: {}x{} guest texels into {:08X}, pitch {}, from a {}x{} {} target at scale {}",
+              photo_captures_, guest_w, guest_h, address, pitch, host_w, host_h, rgba8 ? "8888" : "16f", scale);
 }
 
 bool Resolve::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h,

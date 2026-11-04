@@ -71,9 +71,6 @@ REX_FUNC(sub_82265B90);  // XMemAlloc
 REX_FUNC(sub_82278528);  // CDevice::SetFence
 void __imp__sub_822052C8(PPCContext& __restrict, uint8_t*);  // InsertCallback, the original
 void __imp__sub_8228A748(PPCContext& __restrict, uint8_t*);  // SynchronizeToPresentationInterval
-// True while this guest thread is inside Photo Mode's capture routine
-// (guest/game_fixes.cpp): the resolve it issues is marked for the CPU read.
-bool renut_in_photo_capture();
 }
 
 namespace renut::native_d3d {
@@ -204,13 +201,18 @@ class Builder {
       p[2 + i] = __builtin_bswap32(v);
     }
   }
-  void Shader(uint32_t type, uint32_t physical, uint32_t dwords, uint64_t hash) {
-    uint32_t* p = Grow(5);
-    p[0] = kOpShader;
+  // `name`: the container hash of the shader object, 0 for none (then `program` is not sent).
+  // `fetches`: `count` (at most 255) vertex fetches of four words (instruction slot, the
+  // instruction's three words) the GPU backend puts over the microcode it reads at `physical`.
+  void Shader(uint32_t type, uint32_t physical, uint32_t dwords, uint64_t name, const void* fetches = nullptr,
+              uint32_t count = 0, uint32_t program = 0) {
+    uint32_t* p = Grow(5 + size_t(count) * 4);
+    p[0] = kOpShader | (count << 8) | ((program & 3) << kShaderProgramShift);
     p[1] = (physical & ~3u) | (type & 3);
     p[2] = dwords;
-    p[3] = uint32_t(hash);
-    p[4] = uint32_t(hash >> 32);
+    p[3] = uint32_t(name);
+    p[4] = uint32_t(name >> 32);
+    if (count) std::memcpy(p + 5, fetches, size_t(count) * 16);
   }
   size_t Draw(uint32_t flags, uint32_t viz, uint32_t initiator, uint32_t dma_base, uint32_t dma_size,
               uint32_t serial) {
@@ -224,10 +226,6 @@ class Builder {
     p[5] = serial;
     ++list_.draws;
     return at;
-  }
-  void Bin(uint32_t which, uint32_t value) {
-    list_.words.push_back(kOpBin | (which << 8));
-    list_.words.push_back(value);
   }
   void Run(std::shared_ptr<const List> child) {
     list_.words.push_back(kOpRun);
@@ -412,6 +410,10 @@ uint64_t PendingHiZEnable(Device& d, uint64_t mask);
 // host draws the scene in one pass.
 uint64_t PendingShaders(Device& d, uint64_t r20);
 
+// A shader object the game's Direct3D made or registered (Create*Shader, XGRegister*Shader, after
+// they ran): its container is hashed now, while it is as it was made, and kept by object.
+void NoteShaderObject(const uint8_t* base, uint32_t shader, bool pixel);
+
 // The flush every draw function begins with, over the given dirty masks
 // (all of them for a draw; the inherited ones for a command buffer's run).
 // A block's dirty word is cleared once anything of it was sent, as Direct3D
@@ -513,13 +515,6 @@ void EndCommandBuffer(PPCContext& ctx, uint8_t* base);
 // the buffer inherits goes first (dirty & the buffer's inherit masks at
 // +24..+56), then the buffer. Direct3D then marks dirty what the buffer sets.
 void RunCommandBuffer(PPCContext& ctx, uint8_t* base);
-
-// D3DDevice_SetPredication(device, mask): SET_BIN_MASK_LO, 0 meaning all.
-void SetPredication(PPCContext& ctx);
-
-// D3DDevice_SetCommandBufferPredication(device, lo, hi): SET_BIN_MASK_LO/HI,
-// both 0 meaning all.
-void SetCommandBufferPredication(PPCContext& ctx);
 
 // SetSurfaceClip (sub_82223270, under SetScissorRect and others): the
 // window scissor, written straight into the ring (0x2080-0x2082), never

@@ -1,5 +1,6 @@
 // The public entry points (native_d3d.h).
 #include "d3d/frontend/internal.h"
+#include "d3d/resources/microcode.h"
 
 namespace renut::native_d3d {
 
@@ -38,12 +39,6 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       return false;
     case kD3DDevice_RunCommandBuffer:
       RunCommandBuffer(ctx, base);
-      return false;
-    case kD3DDevice_SetPredication:
-      SetPredication(ctx);
-      return false;
-    case kD3DDevice_SetCommandBufferPredication:
-      SetCommandBufferPredication(ctx);
       return false;
     case kD3D_SetSurfaceClip:
       SetSurfaceClip(ctx, base);
@@ -119,6 +114,15 @@ void RingBufferParameters(PPCContext& ctx, uint32_t dev, uint8_t* base) {
 
 void OnLeave(uint32_t function, uint32_t r3, PPCContext& ctx, uint8_t* base) {
   if (function == renut::d3d::kD3DDevice_SetRingBufferParameters) RingBufferParameters(ctx, r3, base);
+  // A shader object the game's Direct3D made or registered, natively or by the original: its container
+  // is hashed now, while it is as it was made.
+  if (function == renut::d3d::kD3DDevice_CreateVertexShader || function == renut::d3d::kD3DDevice_CreatePixelShader ||
+      function == renut::d3d::kXGRegisterVertexShader || function == renut::d3d::kXGRegisterPixelShader) {
+    // Create* returns the object, XGRegister* names it.
+    const bool pixel = function == renut::d3d::kD3DDevice_CreatePixelShader || function == renut::d3d::kXGRegisterPixelShader;
+    const bool created = function == renut::d3d::kD3DDevice_CreateVertexShader || function == renut::d3d::kD3DDevice_CreatePixelShader;
+    NoteShaderObject(base, created ? ctx.r3.u32 : r3, pixel);
+  }
 }
 
 void TakePublished(std::vector<std::shared_ptr<const List>>& out) {

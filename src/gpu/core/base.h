@@ -96,7 +96,6 @@ REXCVAR_DECLARE(bool, renut_plume_stack_wrap);
 REXCVAR_DECLARE(int32_t, renut_plume_poly_offset_percent);
 REXCVAR_DECLARE(bool, renut_plume_decal_log);
 REXCVAR_DECLARE(int32_t, renut_plume_skip);
-REXCVAR_DECLARE(bool, renut_plume_shader_cache);
 REXCVAR_DECLARE(bool, renut_plume_key_reuse);
 REXCVAR_DECLARE(int32_t, renut_plume_fetch_spec);
 REXCVAR_DECLARE(int32_t, renut_plume_depth_strip);
@@ -113,9 +112,6 @@ REXCVAR_DECLARE(int32_t, renut_plume_shadow_quality);
 REXCVAR_DECLARE(int32_t, renut_plume_internal_resolution);
 REXCVAR_DECLARE(bool, renut_plume_precompile);
 
-// game_fixes.cpp: how the MSAA-off path treats the scene's band split
-// (<files>/plume-keep-split: 0 clear, 1 leave, 2 whole-screen projection).
-extern std::atomic<int> g_renut_scene_split_mode;
 REXCVAR_DECLARE(bool, renut_scene_msaa);
 REXCVAR_DECLARE(bool, vsync);  // the SDK's: off ticks the guest's vblank every millisecond
 

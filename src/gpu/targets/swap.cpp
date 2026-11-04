@@ -215,14 +215,6 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     poly_offset_ = poly_offset != 0;
     poly_offset_scale_ = poly_offset * 0.01f;
 
-    const bool shader_cache = REXCVAR_GET(renut_plume_shader_cache);
-    if (shader_cache != shader_cache_) {
-      REXLOG_INFO("Renut: Plume shader cache {}", shader_cache ? "on" : "off");
-      backend.streams.shader_watch_.clear();
-      backend.shaders.shader_watch_memo_.Clear();
-      backend.streams.shader_block_index_.clear();
-    }
-    shader_cache_ = shader_cache;
     const bool key_reuse = REXCVAR_GET(renut_plume_key_reuse);
     if (key_reuse != key_reuse_) {
       REXLOG_INFO("Renut: Plume pipeline key reuse {}", key_reuse ? "on" : "off");

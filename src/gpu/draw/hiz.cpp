@@ -507,7 +507,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   const float ys = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
   const float yo = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
   draw_util::Scissor scissor;
-  draw_util::GetScissor(regs, scissor);
+  draw_util::GetScissor(regs, scissor, backend.targets.SurfacePitch());
   const float left = float(scissor.offset[0]), top = float(scissor.offset[1]);
   const float right = left + float(scissor.extent[0]), bottom = top + float(scissor.extent[1]);
   // x_screen = xo + window_x + xs * x / w. All of the box left of (left - 1):

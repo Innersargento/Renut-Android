@@ -78,8 +78,6 @@ struct Streams {
                        bool* written = nullptr);
   const PatchGrid* GetPatchGrid(bool quad, uint32_t level, uint32_t patches);
   std::unordered_map<uint32_t, PatchGrid> patch_grids_;
-  std::unordered_map<uint64_t, ShaderWatch> shader_watch_;
-  std::unordered_multimap<uint32_t, uint64_t> shader_block_index_;
   // Keyed by guest base. Never overlapping: a new range swallows the ones it touches.
   std::map<uint32_t, ExportRange> exports_;
   std::array<std::vector<std::unique_ptr<RenderBuffer>>, kPlumeFramesInFlight> retired_buffers_;

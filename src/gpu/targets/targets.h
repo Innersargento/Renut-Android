@@ -14,20 +14,22 @@ struct Targets {
   // the hint GuestStream reads
   uint64_t object_streams_ = 0, window_streams_ = 0;
   std::array<ListSurface, 5> native_surfaces_{};
-  // The target of a slot's surface; `info_register` is what the register
-  // file holds for it, which must be the surface's.
-  Target* NativeTarget(uint32_t slot, uint32_t info_register);
+  // The target of a slot's surface (the last kOpSurfaces named one there); 0 when it has none.
+  Target* NativeTarget(uint32_t slot);
   Target* SurfaceTarget(uint32_t slot);
+  // The width of the bound targets' surface (render target 0's, or the depth one's without it), in
+  // pixels; 0 with no surface.
+  uint32_t SurfacePitch() const;
   // A framebuffer is as big as its first attachment: the others grow to it.
   void MatchSurfaceSizes(std::array<Target*, 4>& colors, uint32_t color_count, Target*& depth);
   bool GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height);
   void RetireFramebuffers();
   void EvictSurfaceTargets();
   std::string SurfaceReport();
-  uint64_t surface_created_ = 0, surface_grown_ = 0, surface_evicted_ = 0, surface_mismatch_ = 0;
-  // Native resolves into their texture object, and the ones that go by
-  // address (3D slices).
-  uint64_t object_resolves_ = 0, address_resolves_count_ = 0;
+  uint64_t surface_created_ = 0, surface_grown_ = 0, surface_evicted_ = 0;
+  // Native resolves into their texture object, and the ones into a volume's slice, which have none
+  // and are not copied.
+  uint64_t object_resolves_ = 0, volume_resolves_ = 0;
   uint64_t surface_missing_ = 0;
   // Quarters of the guest's resolution the dynamic shadow maps (depth D24S8
   // surfaces of 640 px and more) are drawn at: 4, 3 or 2.

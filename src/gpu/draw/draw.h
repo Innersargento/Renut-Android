@@ -16,7 +16,6 @@ struct Draw {
   bool constants_written_[2][kConstantChunks] = {{true, true, true, true}, {true, true, true, true}};
   // Whether the draw being run came from a predicated packet: the draws come
   // from the native lists, which carry no such packet, so this stays false.
-  bool packet_predicated_ = false;
   std::array<BufferRange, 18> native_streams_{};
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
@@ -52,8 +51,6 @@ struct Draw {
   // culling (7 when left out); 8 draws a point list's sprite coordinate; 16
   // and 32 whiten textures (see the shared block).
   uint32_t debug_mode_ = 7;
-  std::array<TwinEntry, 128> twin_ring_{};
-  uint32_t twin_pos_ = 0;
   template <typename... Args>
   void Trace(fmt::format_string<Args...> format, Args&&... args);
   std::unique_ptr<RenderShader> rect_list_gs_;

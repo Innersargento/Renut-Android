@@ -14,11 +14,6 @@ void Lists::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) 
 
 // A draw record.
 void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
-  if ((flags & native_d3d::kDrawPredicated) &&
-      !((bin_select_ & bin_mask_) != 0 || (bin_mask_ != 0 && renut::d3d::GetSingleBinTiling())) &&
-      !OnPredicatedSkip()) {
-    return;
-  }
   backend.shaders.WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator);
   reg::VGT_DRAW_INITIATOR draw;
   draw.value = initiator;
@@ -44,6 +39,7 @@ void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, ui
   if (viz.viz_query_ena && viz.kill_pix_post_hi_z) return;
   ++native_draws_;
   draw_pass_ = uint8_t((flags >> native_d3d::kDrawPassShift) & 0xF);
+  draw_mode_ = uint8_t((flags >> native_d3d::kDrawModeShift) & 7);
   backend.draw.IssueDraw(draw.prim_type, draw.num_indices, indexed ? &info : nullptr,
             xenos::IsMajorModeExplicit(draw.major_mode, draw.prim_type));
   draw_pass_ = 0;
@@ -84,30 +80,37 @@ bool Lists::RunNative(uint32_t until) {
         break;
       }
       case native_d3d::kOpShader: {
+        const uint32_t fetch_count = (w[0] >> 8) & 0xFF;
+        const uint32_t program = (w[0] >> native_d3d::kShaderProgramShift) & 3;
+        if (f.pos + 5 + size_t(fetch_count) * 4 > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
         const auto type = xenos::ShaderType(w[1] & 3);
         const uint32_t address = w[1] & ~3u, dwords = w[2];
-        Shader* shader = backend.shaders.LoadShader(type, address, backend.memory_->TranslatePhysical<const uint32_t*>(address), dwords);
+        const auto* ucode = backend.memory_->TranslatePhysical<const uint32_t*>(address);
+        const uint64_t hash = uint64_t(w[3]) | uint64_t(w[4]) << 32;
+        Shader* shader;
+        if (fetch_count && dwords) {
+          shader = backend.shaders.LoadShaderPatched(type, hash, program, ucode, dwords, w + 5, fetch_count);
+        } else if (hash && dwords) {
+          shader = backend.shaders.LoadShaderIdentity(type, hash, program, ucode, dwords);
+        } else {
+          shader = backend.shaders.LoadShaderByContents(type, ucode, dwords);
+        }
         if (type == xenos::ShaderType::kVertex) {
           active_vertex_shader_ = shader;
         } else {
           active_pixel_shader_ = shader;
         }
-        f.pos += 5;
+        f.pos += 5 + size_t(fetch_count) * 4;
         break;
       }
       case native_d3d::kOpDraw:
         f.pos += 6;
         NativeDraw(w[0] >> 8, w[2], w[3], w[4]);
         break;
-      case native_d3d::kOpBin: {
-        const uint32_t which = w[0] >> 8, value = w[1];
-        if (which == 0) bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | value;
-        if (which == 1) bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) | (uint64_t(value) << 32);
-        if (which == 2) bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | value;
-        if (which == 3) bin_select_ = (bin_select_ & 0xFFFFFFFFull) | (uint64_t(value) << 32);
-        f.pos += 2;
-        break;
-      }
       case native_d3d::kOpRun: {
         std::shared_ptr<const native_d3d::List> child = w[1] < f.list->runs.size() ? f.list->runs[w[1]] : nullptr;
         f.pos += 2;
@@ -134,6 +137,15 @@ bool Lists::RunNative(uint32_t until) {
         }
         f.pos += native_d3d::kClearWords;
         NativeClear(w);
+        break;
+      case native_d3d::kOpPhoto:
+        if (f.pos + native_d3d::kPhotoWords > words.size()) {
+          ++native_bad_;
+          f.pos = words.size();
+          break;
+        }
+        f.pos += native_d3d::kPhotoWords;
+        backend.resolve.NativePhoto(w);
         break;
       case native_d3d::kOpFence:
         if (f.pos + 4 > words.size()) {
@@ -301,7 +313,7 @@ void Lists::NativeEffects(const uint32_t* pairs, uint32_t count) {
 void Lists::NativeClear(const uint32_t* w) {
   backend.recorder.FlushDeferred();
   if (backend.skip_mask_ & 134217728) return;
-  const uint32_t flags = w[0] >> 8, present = w[17];
+  const uint32_t flags = w[0] >> 8, present = w[11];
   const int32_t x1 = int32_t(w[1]), y1 = int32_t(w[2]), x2 = int32_t(w[3]), y2 = int32_t(w[4]);
   float color[4], z;
   std::memcpy(color, w + 5, sizeof(color));
@@ -319,7 +331,7 @@ void Lists::NativeClear(const uint32_t* w) {
   std::array<Target*, 4> cleared{};
   for (uint32_t i = 0; i < 4; ++i) {
     if (!((flags >> i) & 1) || !((present >> i) & 1)) continue;
-    Target* target = backend.targets.NativeTarget(i, w[12 + i]);
+    Target* target = backend.targets.NativeTarget(i);
     if (!target || std::find(cleared.begin(), cleared.end(), target) != cleared.end()) continue;
     cleared[i] = target;
     const RenderRect rect = clip(*target);
@@ -331,7 +343,7 @@ void Lists::NativeClear(const uint32_t* w) {
   }
   const bool clear_depth = flags & 0x10, clear_stencil = flags & 0x20;
   if ((clear_depth || clear_stencil) && (present & 0x10)) {
-    if (Target* depth = backend.targets.NativeTarget(4, w[16])) {
+    if (Target* depth = backend.targets.NativeTarget(4)) {
       const RenderRect rect = clip(*depth);
       if (rect.right > rect.left && rect.bottom > rect.top) {
         // A surface whose image went to a depth resolve (AliasDepthResolve): a

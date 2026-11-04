@@ -110,26 +110,15 @@ REX_HOOK_RAW(sub_8223FD48) {
   __imp__sub_8223FD48(ctx, base);
 }
 
-// Photo Mode's capture routine @ 0x82535F20 (r3 the destination texture). It
-// resolves the screen into a scratch texture, waits for the copy, and converts
-// that texture's memory into the photo's with the CPU (XGCopySurface); the game
-// then encodes its JPEG from those texels. Resolves stay on the GPU here, so
-// without help the picture is black. While the routine runs, the resolve it
-// issues is the one the CPU is about to read: native_d3d marks that record
-// (renut_in_photo_capture) and Plume copies that one resolve and no other. A
-// routine that is never called, or a resolve outside it, copies nothing - the
-// cost while playing is zero.
-namespace {
-thread_local bool in_photo_capture = false;
-}
-
-extern "C" bool renut_in_photo_capture() { return in_photo_capture; }
-
-extern "C" void __imp__sub_82535F20(PPCContext& __restrict, uint8_t*);
+// Photo Mode's capture routine @ 0x82535F20, BOOL (D3DTexture *photo): the shot, and the pause
+// menu's backdrop. It resolves the screen into a scratch texture, waits for the copy and untiles
+// that texture's memory into the photo's with the CPU (XGCopySurface); the game then encodes its
+// JPEG from those texels. Resolves stay on the GPU here, so that read saw nothing: a black
+// picture. Done as reNut PC does it: the render target is read back into the photo's rows by the
+// GPU backend (native_d3d::CapturePhoto), with no scratch texture and no resolve. A routine that is
+// never called costs nothing while playing.
 REX_HOOK_RAW(sub_82535F20) {
-  in_photo_capture = true;
-  __imp__sub_82535F20(ctx, base);
-  in_photo_capture = false;
+  renut::native_d3d::CapturePhoto(ctx, base);
 }
 
 // Scene changes: the game's own loading screen stays up until the new scene's
@@ -342,28 +331,18 @@ REX_HOOK_RAW(sub_8222A990) {
 // instead broke the whole picture: not every predicated packet uses a band
 // projection.
 extern "C" void __imp__sub_823B18C8(PPCContext& __restrict, uint8_t*);
-// How the MSAA-off path treats the band split (debug: <files>/plume-keep-split,
-// set by Plume): 0 clears the split flag, 1 leaves everything alone, 2 gives the
-// band jobs the whole-screen projection, 5 is 2 plus a scissor to each band
-// (wrong: with one tile the game predicates almost everything to mask 3).
-std::atomic<int> g_renut_scene_split_mode{2};
 REX_HOOK_RAW(sub_823B18C8) {
-  const int mode = g_renut_scene_split_mode.load(std::memory_order_relaxed);
-  if (!REXCVAR_GET(renut_scene_msaa) && (mode == 0 || mode == 2 || mode == 5)) {
+  if (!REXCVAR_GET(renut_scene_msaa)) {
     const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(renut::GuestPtr(base, ctx.r3.u32 + 40)));
     auto* split = reinterpret_cast<uint32_t*>(renut::GuestPtr(base, scene + 44));
     if (scene && *split == __builtin_bswap32(1)) {
-      if (mode == 0) {
-        *split = 0;
-      } else {
-        // The view's matrices: +128 whole screen, +192 upper band, +256 lower.
-        const uint32_t view = __builtin_bswap32(*reinterpret_cast<uint32_t*>(renut::GuestPtr(base, ctx.r3.u32 + 52)));
-        uint8_t* block = renut::GuestPtr(base, scene + (view << 9));
-        std::memcpy(block + 192, block + 128, 64);
-        std::memcpy(block + 256, block + 128, 64);
-      }
+      // The view's matrices: +128 whole screen, +192 upper band, +256 lower.
+      const uint32_t view = __builtin_bswap32(*reinterpret_cast<uint32_t*>(renut::GuestPtr(base, ctx.r3.u32 + 52)));
+      uint8_t* block = renut::GuestPtr(base, scene + (view << 9));
+      std::memcpy(block + 192, block + 128, 64);
+      std::memcpy(block + 256, block + 128, 64);
       static std::atomic<bool> logged{false};
-      if (!logged.exchange(true)) REXLOG_INFO("Renut: scene {:08X} band split mode {}", scene, mode);
+      if (!logged.exchange(true)) REXLOG_INFO("Renut: scene {:08X} band jobs given the whole-screen projection", scene);
     }
   }
   __imp__sub_823B18C8(ctx, base);

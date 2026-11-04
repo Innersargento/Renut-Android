@@ -11,8 +11,6 @@ struct Shaders {
   GpuBackend& backend;
 
   std::unordered_map<uint32_t, uint32_t> extended_register_values_;
-  Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
-                          const uint32_t* host_address, uint32_t dword_count);
   // Register writes. The shader constants (ALU, fetch, boolean and loop,
   // 0x4000-0x4927) have no side effects in the base class, and the guest
   // writes thousands of them a frame through one virtual call each: those
@@ -24,8 +22,31 @@ struct Shaders {
   bool Drop(const char* reason, const HostShader* vs, const HostShader* ps);
   Shader* LoadShaderByContents(xenos::ShaderType shader_type, const uint32_t* host_address,
                                     uint32_t dword_count);
+  // A vertex shader load with fetches (kOpShader): the microcode at host_address with the
+  // fetches' slots replaced, which is what the guest's own binding used to leave in memory. The
+  // shader made is the one for those bytes, so everything downstream sees what it always did.
+  // `fetches`: count x {slot, word 0, 1, 2} as the front end read them.
+  // `hash` is the hash of the container the shader object was made from (`program` of it), or 0
+  // when the front end does not know the object: not of these bytes, which are the program as
+  // created and never written.
+  Shader* LoadShaderPatched(xenos::ShaderType shader_type, uint64_t hash, uint32_t program,
+                            const uint32_t* host_address, uint32_t dword_count, const uint32_t* fetches,
+                            uint32_t count);
+  // A load named by identity, no fetches: the shader made of the bytes the first time the
+  // container's program is seen, found by it after that.
+  Shader* LoadShaderIdentity(xenos::ShaderType shader_type, uint64_t container, uint32_t program,
+                             const uint32_t* host_address, uint32_t dword_count);
+  std::unordered_map<uint64_t, HostShader*> identity_shaders_;
+  // (the microcode's hash, the fetches) -> the shader they make; the microcode behind a hash is
+  // not written, so it holds.
+  std::unordered_map<uint64_t, HostShader*> patched_shaders_;
+  // `container`: the container of the shader object (0: unknown). One shader per container for the
+  // same bytes, and its entry the container's own when the keys agree (ShaderStore::FindOwn).
+  HostShader* FindOrMakeShader(xenos::ShaderType shader_type, uint64_t hash, const uint32_t* host_address,
+                               uint32_t dword_count, uint64_t container = 0);
+  // Entries found by the container / by the keys, for loads that named a container.
+  uint32_t own_entries_ = 0, key_entries_ = 0;
   std::unordered_map<uint64_t, std::unique_ptr<HostShader>> shaders_;
-  LookupMemo<ShaderWatch, 12> shader_watch_memo_;
   std::unordered_map<const uint32_t*, std::pair<uint32_t, HostShader*>> shader_lookup_;
   // In front of shader_lookup_, by address and length; cleared with it.
   LookupMemo<HostShader, 12> shader_memo_;

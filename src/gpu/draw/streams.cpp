@@ -120,19 +120,10 @@ void Streams::DrainWatchHits() {
     auto drop_kept = [&](KeptStream& kept) {
       if (kept.valid && touches(kept.base, kept.base + kept.size)) DropKept(kept);
     };
-    auto drop_shader = [&](ShaderWatch& entry) {
-      if (entry.valid && touches(entry.base, entry.base + entry.bytes)) {
-        entry.valid = false;
-        ++entry.drops;
-        entry.dropped_frame = backend.swaps_;
-        ++backend.report.shader_cache_drops_;
-      }
-    };
     if (last - first > 1024) {
       // A huge range: every one is looked at.
       for (auto& [key, texture] : backend.targets.guest_textures_) drop_texture(texture);
       for (auto& [key, kept] : kept_streams_) drop_kept(kept);
-      for (auto& [key, entry] : shader_watch_) drop_shader(entry);
       continue;
     }
     for (uint32_t block = first; block <= last; ++block) {
@@ -146,17 +137,6 @@ void Streams::DrainWatchHits() {
         auto found = kept_streams_.find(it->second);
         if (found != kept_streams_.end()) drop_kept(found->second);
       }
-      auto shaders = shader_block_index_.equal_range(block);
-      for (auto it = shaders.first; it != shaders.second; ++it) {
-        auto found = shader_watch_.find(it->second);
-        if (found != shader_watch_.end()) drop_shader(found->second);
-      }
-    }
-  }
-  if (shader_block_index_.size() > 200000) {
-    shader_block_index_.clear();
-    for (auto& [key, entry] : shader_watch_) {
-      if (entry.valid) IndexBlocks(shader_block_index_, entry.base, entry.bytes, key);
     }
   }
   // Entries of what is gone pile up: rebuilt from what is live.
@@ -597,8 +577,13 @@ bool Streams::CommitConstants(uint8_t* shadow, const void* source, size_t size,
     ++backend.stats_.constants_reused;
     return true;
   }
+  // A block with a flag is flagged because StoreConstants saw a register take a new value, so its
+  // bytes are not the ones placed: no comparison to tell. (Only a value that went back between two
+  // draws would be found equal, and costs one more copy.) Blocks with no flag - the shared ones, built
+  // per draw - still compare.
+  const bool flagged = written && *written;
   if (written) *written = false;
-  if (offset != UINT64_MAX && !(backend.skip_mask_ & 4194304) && std::memcmp(shadow, source, size) == 0) {
+  if (!flagged && offset != UINT64_MAX && !(backend.skip_mask_ & 4194304) && std::memcmp(shadow, source, size) == 0) {
     ++backend.stats_.constants_reused;
     return true;
   }
