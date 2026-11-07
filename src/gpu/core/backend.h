@@ -348,10 +348,11 @@ inline Resolved* Draw::FindResolved(uint32_t address) {
       backend.resolved_lookup_frame_ = backend.swaps_;
       ++backend.resolved_lookup_serial_;
     }
-    // Direct-mapped by address, valid for this frame and this serial: a map
-    // that was emptied every frame was two hash lookups a sampled slot.
-    ResolvedLookup& cached = backend.resolved_lookup_[(address >> 12) & (kResolvedLookupSize - 1)];
-    if (cached.serial == backend.resolved_lookup_serial_ && cached.address == address) return cached.value;
+    // Two ways by a mix of the address, valid for this frame and this serial: a map that was emptied every
+    // frame was two hash lookups a sampled slot.
+    ResolvedLookup* ways = &backend.resolved_lookup_[ResolvedLookupPair(address)];
+    if (ways[0].serial == backend.resolved_lookup_serial_ && ways[0].address == address) return ways[0].value;
+    if (ways[1].serial == backend.resolved_lookup_serial_ && ways[1].address == address) return ways[1].value;
     Resolved* latest = nullptr;
     for (auto& [key, r] : backend.targets.resolved_) {
       if (uint32_t(key) == address && r.texture && (!latest || r.written > latest->written)) latest = &r;
@@ -377,12 +378,23 @@ inline Resolved* Draw::FindResolved(uint32_t address) {
       }
     }
     if (latest) latest->sampled = true;
-    cached = {address, backend.resolved_lookup_serial_, latest};
+    ways[1] = ways[0];
+    ways[0] = {address, backend.resolved_lookup_serial_, latest};
     if (backend.swap.resolve_log_ && latest) backend.resolve.LogResolveLine(fmt::format("f={} sampled {:08X}", backend.swaps_, address));
     return latest;
   }
 
 inline void Targets::InvalidateResolvedLookups() { ++backend.resolved_lookup_serial_; }
+
+// A resolve (or a texture made for one) changes the answer for its own address only: the other cached
+// addresses stay valid, where a bump of the serial made every sampled slot of the draws that followed walk the
+// map again.
+inline void Targets::InvalidateResolvedAddress(uint32_t address) {
+  ResolvedLookup* ways = &backend.resolved_lookup_[ResolvedLookupPair(address)];
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (ways[i].address == address) ways[i].serial = 0;
+  }
+}
 
 // Debug dumps of a built pipeline (RENUT_PIPELINE_STATS, RENUT_PIPELINE_IR), in shaders.cpp.
 void LogPipelineStatistics(RenderPipeline& pipeline, const HostShader* vs, const HostShader* ps);

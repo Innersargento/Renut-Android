@@ -109,6 +109,12 @@ void Reporting::Report() {
               backend.stats_.resolve_class[0], double(backend.stats_.resolve_class_px[0]) / 1e6, backend.stats_.resolve_class[1],
               double(backend.stats_.resolve_class_px[1]) / 1e6, backend.stats_.resolve_class[2],
               double(backend.stats_.resolve_class_px[2]) / 1e6, backend.stats_.depth_direct);
+  if (backend.targets.msaa_samples_ > 1) {
+    REXLOG_INFO("Renut: Plume MSAA (up to {}x): colour resolves averaged {}, depth resolves from sample 0 {} (not made {}), "
+                "draws dropped for mixed sample counts {}",
+                backend.targets.msaa_samples_, backend.stats_.msaa_color_resolves, backend.stats_.msaa_depth_resolves,
+                backend.stats_.msaa_depth_skipped, backend.stats_.msaa_mismatch);
+  }
   REXLOG_INFO("Renut: Plume shader loads by name: {} hits", shader_cache_hits_);
   REXLOG_INFO("Renut: Plume shaders named by container: {} found their container's own entry, {} found by the keys ({} loads by identity)",
               backend.shaders.own_entries_, backend.shaders.key_entries_, backend.shaders.identity_shaders_.size());

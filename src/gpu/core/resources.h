@@ -25,6 +25,9 @@ struct Target {
   // height are host pixels; the guest's viewport, scissor, clears and resolve
   // rectangles are scaled by this).
   uint32_t scale = 4;
+  // Samples per pixel of the image (the MSAA type of the surface the game made, within renut_msaa and what the device
+  // draws): its colour is resolved by resolveTextureRegion and its depth by depth_resolve_ms.comp, never copied.
+  uint32_t samples = 1;
   // A depth resolve took this target's image for its texture (AliasDepthResolve):
   // the key of the resolve holding it and the image itself, so a draw that uses
   // the surface again without clearing all of it gets the contents copied back.
@@ -208,6 +211,9 @@ struct Stats {
   // clears that rode along.
   uint64_t resolves_color = 0, resolves_depth = 0, resolves_aliased = 0, resolves_unread = 0;
   uint64_t resolves_redundant = 0;
+  // Draws dropped because the targets of the pass had different sample counts, and the multisampled colour
+  // and depth resolves.
+  uint64_t msaa_mismatch = 0, msaa_color_resolves = 0, msaa_depth_resolves = 0, msaa_depth_skipped = 0;
   // Depth resolves with stencil done by the compute pass (Resolve::ResolveDepthStencil).
   uint64_t depth_direct = 0;
   // The fate of each copy when the next resolve into the same texture replaced it: never read, read only while

@@ -257,6 +257,20 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
   }
   if (!color_count && !depth) return backend.shaders.Drop("no color or depth", vs, ps);
+  // The samples of the pass: every attachment of a framebuffer has the same count (a pass bound to the scene's MSAA
+  // colour and the single-sample depth, or the other way round, would be invalid Vulkan).
+  const uint32_t pass_samples = color_count ? colors[0]->samples : depth->samples;
+  {
+    bool mixed = depth && depth->samples != pass_samples;
+    for (uint32_t i = 1; i < color_count; ++i) mixed |= colors[i]->samples != pass_samples;
+    if (mixed) {
+      if (++backend.stats_.msaa_mismatch <= 4) {
+        REXLOG_WARN("Renut: Plume draw dropped: its targets have different sample counts (color {}, depth {})",
+                    color_count ? colors[0]->samples : 0, depth ? depth->samples : 0);
+      }
+      return true;
+    }
+  }
   // Debug (plume-bind 16): drop depth-only draws - the shadow casters - to
   // price them.
   if ((backend.recorder.bind_skip_ & 16) && !color_count) return true;
@@ -525,9 +539,10 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                   color_control.alpha_func != xenos::CompareFunction::kAlways;
   // Alpha to coverage (N&B's grass and foliage) has no samples to cover
   // without MSAA; like a single-sample A2C, keep the fragments at or above
-  // half coverage.
+  // half coverage. With samples, the pipeline covers them by the alpha.
   const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(backend.skip_mask_ & 4096);
-  bool alpha_test = ps && (alpha_test_enabled || alpha_to_mask);
+  const bool coverage_mask = alpha_to_mask && pass_samples > 1 && backend.targets.msaa_a2c_;
+  bool alpha_test = ps && (alpha_test_enabled || (alpha_to_mask && !coverage_mask));
   float alpha_ref = alpha_test_enabled ? regs.alpha_ref : 0.5f;
   // The pixel shaders only clip(alpha - ref), i.e. pass at alpha >= ref. N&B's
   // alpha tests are GREATER (97% of the traced ones, mostly against 0) and
@@ -1149,16 +1164,17 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // The refraction sprites (PS A8DCAC79: the swim splash, the wake) look up the
   // scene copy at the screen position plus a distortion, with the row clamped
   // to [c5.y, c5.z] - the part of the screen the tile being drawn covers. With
-  // one tile (MSAA off) the game leaves (c5.y, c5.z) = (1, 0): the minimum
+  // one tile (always now, MSAA or not) the game leaves (c5.y, c5.z) = (1, 0): the minimum
   // above the maximum pins every lookup to the top row, and the splash came out
   // as blocks of the sky's blue or the cliff's brown. The bounds are put in
-  // order for this draw only; the register goes back afterwards.
+  // order for this draw only; the register goes back afterwards. Only for this shader: the water reads the same
+  // register as (offset, scale) and wants the game's (0, 1, 0, 0) (a hook of the tile setup that rewrote it for every
+  // draw broke the water's refraction).
   constexpr uint64_t kRefractionSpritePs = 0xA8DCAC7963881F1Cull;
   constexpr uint32_t kRefractionBoundsAt = DrawState::kPixelConstants + 5 * 4;
   float refraction_saved[4] = {};
   bool refraction_fixed = false;
-  if (backend.swap.refraction_fix_ && ps && ps->entry && ps->entry->hash == kRefractionSpritePs &&
-      !REXCVAR_GET(renut_scene_msaa)) {
+  if (backend.swap.refraction_fix_ && ps && ps->entry && ps->entry->hash == kRefractionSpritePs) {
     float* bounds = reinterpret_cast<float*>(&backend.state_.float_constants[kRefractionBoundsAt]);
     if (bounds[1] > bounds[2]) {
       std::memcpy(refraction_saved, bounds, sizeof(refraction_saved));
@@ -1391,6 +1407,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   }
   key_bytes.Put(uint8_t((depth != nullptr) | (depth_enabled << 1) | (depth_write << 2)));
   key_bytes.Put(depth_control.zfunc);
+  // Only multisampled draws add a byte, so the keys of the others stay as they were.
+  if (pass_samples > 1) key_bytes.Put(uint8_t(pass_samples | (coverage_mask << 4)));
   // Only stencil draws add bytes, so the cached pipelines of every other draw
   // keep their keys. The reference and masks are dynamic: the game changes
   // them from draw to draw, and keying on them made thousands of pipelines.
@@ -1478,6 +1496,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     HashCombine(interface_key, color_count);
     for (uint32_t i = 0; i < color_count; ++i) HashCombine(interface_key, colors[i]->format);
     HashCombine(interface_key, depth ? depth->format : RenderFormat::UNKNOWN);
+    HashCombine(interface_key, pass_samples);
     for (const auto& e : input_elements) {
       HashCombine(interface_key, e.location);
       HashCombine(interface_key, e.format);
@@ -1531,6 +1550,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       desc.stencilFrontFace = stencil_front;
       desc.stencilBackFace = stencil_back;
     }
+    desc.multisampling.sampleCount = pass_samples;
+    desc.alphaToCoverageEnabled = coverage_mask;
     desc.renderTargetCount = color_count;
     for (uint32_t i = 0; i < color_count; ++i) {
       desc.renderTargetFormat[i] = colors[i]->format;

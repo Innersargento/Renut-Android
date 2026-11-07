@@ -24,10 +24,18 @@
 #include "plume/frame_pacing.h"
 #include "plume/plume_gpu.h"
 
-REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut",
-                    "Keep the game's MSAA scene surfaces, which the Xbox 360 renders in two "
-                    "or four bands (predicated tiling) with every draw sent once per band. "
-                    "Off: one pass, no MSAA - the host never resolved the samples anyway");
+// The old switch for the game's own MSAA, which renders the scene in two or four bands (predicated tiling) with
+// every draw sent once per band. Still defined so that an older renut.toml and the launch intent parse; the scene
+// is now always one band, and renut_msaa picks its samples.
+REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut", "Deprecated: renut_msaa replaces it");
+REXCVAR_DEFINE_BOOL(renut_band_fix, true, "reNut",
+                    "Give the scene's band jobs the whole-screen projection (the scene is one band, so nothing "
+                    "predicates the jobs of the other bands away). Off to test whether the game still needs it");
+REXCVAR_DEFINE_INT32(renut_msaa, 0, "reNut/Plume",
+                     "Multisampling of the scene, drawn in one band (no predicated tiling): 0 off, 1 2x, 2 4x. "
+                     "The game's MSAA surfaces are kept at the screen's size and the host resolves their samples "
+                     "(colour averaged, depth from the first sample). Read when the game starts")
+    .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_fps_target, 30, "reNut/Plume",
                      "Frame rate the game is held to: 30 is its own, 31-240 presents "
                      "immediately and paces to that rate, 0 is unlimited. Changes live from the sidebar "
@@ -53,19 +61,25 @@ void ApplyConfiguredTarget() {
 namespace {
 
 // The game's MSAA mode (0 none, 1 2x, 2 4x), read by the scene surface setup
-// (sub_823ED2A8) and the tile count (sub_8222A990).
+// (sub_823ED2A8), the tile count (sub_8222A990) and the surface chooser (sub_823ED260).
 constexpr uint32_t kSceneMsaaMode = 0x82F9EC18;
+// The scene's surfaces (sub_823ED2A8): colour and depth with the mode's samples, then the single-sample
+// pair the post-processing draws into.
+constexpr uint32_t kSceneColorMsaa = 0x82F9EB38, kSceneDepthMsaa = 0x82F9EB44;
 
-void ForceSceneSinglePass(uint8_t* base) {
-  if (REXCVAR_GET(renut_scene_msaa)) return;
+// The mode is the player's choice, whatever the game's own setting holds (its default is 2x).
+uint32_t SceneMsaaMode() { return uint32_t(std::clamp(REXCVAR_GET(renut_msaa), 0, 2)); }
+
+void ApplySceneMsaa(uint8_t* base) {
   auto* mode = reinterpret_cast<uint32_t*>(renut::GuestPtr(base, kSceneMsaaMode));
-  if (*mode != 0) {
+  const uint32_t wanted = __builtin_bswap32(SceneMsaaMode());
+  if (*mode != wanted) {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true)) {
-      REXLOG_INFO("Renut: scene MSAA mode {} -> none: one pass instead of predicated tiling",
-                  __builtin_bswap32(*mode));
+      REXLOG_INFO("Renut: scene MSAA mode {} -> {}: one band, no predicated tiling", __builtin_bswap32(*mode),
+                  SceneMsaaMode());
     }
-    *mode = 0;  // zero reads the same in either byte order
+    *mode = wanted;
   }
 }
 
@@ -304,16 +318,83 @@ REX_HOOK_RAW(sub_8238A418) {
 // one sample per pixel either way.
 extern "C" void __imp__sub_823ED2A8(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(sub_823ED2A8) {
-  ForceSceneSinglePass(base);
+  ApplySceneMsaa(base);
   __imp__sub_823ED2A8(ctx, base);
 }
 
-// Tile count @ 0x8222A990, asked each frame by the tiling code: keep it on the
-// same single band the surfaces were sized for.
-extern "C" void __imp__sub_8222A990(PPCContext& __restrict, uint8_t*);
+// Tile count @ 0x8222A990, asked each frame by the tiling code: always one band, the screen's size, with
+// whatever samples the mode gives its surfaces (the console needs 2 or 4 bands for 2x or 4x because its 10 MB
+// of EDRAM cannot hold them; the host has no EDRAM). With the count at 1 the game sizes the MSAA surfaces to
+// the whole screen, picks them in its scene begin (sub_8227B808) and leaves the tile table alone.
 REX_HOOK_RAW(sub_8222A990) {
-  ForceSceneSinglePass(base);
-  __imp__sub_8222A990(ctx, base);
+  ApplySceneMsaa(base);
+  ctx.r3.u64 = 1;
+}
+
+// The surface chooser @ 0x823ED260 (0 none, else the MSAA type of the scene's surfaces).
+extern "C" void __imp__sub_823ED260(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_823ED260) {
+  ApplySceneMsaa(base);
+  __imp__sub_823ED260(ctx, base);
+}
+
+// The scene's end @ 0x8227A9F0 (IDB sub_8227D5F0). With a tile count above 1 it resolves the scene, ends the tiling and then puts the
+// game's own pair back with SetRenderTarget / SetDepthStencilSurface (0x82F9EB40 / EB48, the single-sample pair the bloom
+// composite and the interface are drawn into, and the picture that is shown comes from). With one tile it only resolves, and
+// leaves bound whatever the scene used: the MSAA pair, so that everything after the scene drew into the surface the
+// composite is not in. The same restore is done here.
+extern "C" void __imp__sub_8227A9F0(PPCContext& __restrict, uint8_t*);
+extern "C" void sub_8227AB68(PPCContext& __restrict, uint8_t*);  // D3DDevice_SetRenderTarget
+extern "C" void sub_8227AF40(PPCContext& __restrict, uint8_t*);  // D3DDevice_SetDepthStencilSurface
+constexpr uint32_t kPostColor = 0x82F9EB40, kPostDepth = 0x82F9EB48, kDevicePointer = 0x82FAC7C0;
+REX_HOOK_RAW(sub_8227A9F0) {
+  const uint32_t sp = ctx.r1.u32;
+  __imp__sub_8227A9F0(ctx, base);
+  if (!SceneMsaaMode()) return;
+  const uint32_t device = GuestWord(base, kDevicePointer);
+  const uint32_t color = GuestWord(base, kPostColor), depth = GuestWord(base, kPostDepth);
+  if (!device || !color || !depth) return;
+  PPCContext call = ctx;
+  call.r1.u32 = sp;
+  call.r3.u32 = device;
+  call.r4.u32 = 0;
+  call.r5.u32 = color;
+  sub_8227AB68(call, base);
+  call = ctx;
+  call.r1.u32 = sp;
+  call.r3.u32 = device;
+  call.r4.u32 = depth;
+  sub_8227AF40(call, base);
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1) < 3) REXLOG_INFO("Renut: scene ended; the device back on the single-sample pair {:08X} / {:08X}", color, depth);
+}
+
+// The pass begin @ 0x823DBEB8 (r3 the job, r4 the device, r5 no_tiling, r6 use_table), where a scene job's
+// command buffer starts: with a tile count of 1 it binds the single-sample pair (0x82F9EB40 / EB48) whatever
+// the mode, which would draw the scene without the samples. After it, the MSAA pair takes their place, as the
+// scene begin (sub_8227B808) does for the direct path. The jobs that ask for no tiling (post-processing) stay
+// on the single-sample pair.
+extern "C" void __imp__sub_823DBEB8(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_823DBEB8) {
+  const uint32_t device = ctx.r4.u32, no_tiling = ctx.r5.u32;
+  const uint32_t sp = ctx.r1.u32;
+  __imp__sub_823DBEB8(ctx, base);
+  if (no_tiling || !SceneMsaaMode()) return;
+  const uint32_t color = GuestWord(base, kSceneColorMsaa), depth = GuestWord(base, kSceneDepthMsaa);
+  if (!device || !color || !depth) return;
+  PPCContext call = ctx;
+  call.r1.u32 = sp;
+  call.r3.u32 = device;
+  call.r4.u32 = 0;
+  call.r5.u32 = color;
+  sub_8227AB68(call, base);
+  call = ctx;
+  call.r1.u32 = sp;
+  call.r3.u32 = device;
+  call.r4.u32 = depth;
+  sub_8227AF40(call, base);
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true)) REXLOG_INFO("Renut: scene jobs bound to the MSAA surfaces {:08X} / {:08X}", color, depth);
 }
 
 // Scene view job @ 0x823B18C8 (r3 the job; +40 its scene, +80 its band). The
@@ -332,12 +413,12 @@ REX_HOOK_RAW(sub_8222A990) {
 // projection.
 extern "C" void __imp__sub_823B18C8(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(sub_823B18C8) {
-  if (!REXCVAR_GET(renut_scene_msaa)) {
-    const uint32_t scene = __builtin_bswap32(*reinterpret_cast<uint32_t*>(renut::GuestPtr(base, ctx.r3.u32 + 40)));
-    auto* split = reinterpret_cast<uint32_t*>(renut::GuestPtr(base, scene + 44));
-    if (scene && *split == __builtin_bswap32(1)) {
+  {
+    const uint32_t scene = GuestWord(base, ctx.r3.u32 + 40);
+    const uint32_t split_flag = scene ? GuestWord(base, scene + 44) : 0;
+    const uint32_t view = GuestWord(base, ctx.r3.u32 + 52);
+    if (REXCVAR_GET(renut_band_fix) && scene && split_flag == 1) {
       // The view's matrices: +128 whole screen, +192 upper band, +256 lower.
-      const uint32_t view = __builtin_bswap32(*reinterpret_cast<uint32_t*>(renut::GuestPtr(base, ctx.r3.u32 + 52)));
       uint8_t* block = renut::GuestPtr(base, scene + (view << 9));
       std::memcpy(block + 192, block + 128, 64);
       std::memcpy(block + 256, block + 128, 64);

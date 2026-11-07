@@ -81,6 +81,16 @@ bool Patches::CreateDepthResolvePipeline() {
       return false;
     }
   }
+  // The multisampled variant is optional: without it a multisampled depth is not resolved.
+  module_info.codeSize = sizeof(k_depth_resolve_ms_comp);
+  module_info.pCode = k_depth_resolve_ms_comp;
+  if (vkCreateShaderModule(vk_device, &module_info, nullptr, &dres_ms_module_) == VK_SUCCESS) {
+    pipeline_info.stage.module = dres_ms_module_;
+    if (vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &dres_ms_pipeline_) !=
+        VK_SUCCESS) {
+      dres_ms_pipeline_ = VK_NULL_HANDLE;
+    }
+  }
   dres_failed_ = false;
   return true;
 }
@@ -105,6 +115,10 @@ void Patches::DestroyDepthResolve() {
     dres_used_[i] = 0;
   }
   if (dres_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, dres_pipeline_, nullptr);
+  if (dres_ms_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, dres_ms_pipeline_, nullptr);
+  if (dres_ms_module_ != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, dres_ms_module_, nullptr);
+  dres_ms_pipeline_ = VK_NULL_HANDLE;
+  dres_ms_module_ = VK_NULL_HANDLE;
   if (dres_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, dres_layout_, nullptr);
   if (dres_set_layout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(vk_device, dres_set_layout_, nullptr);
   if (dres_module_ != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, dres_module_, nullptr);

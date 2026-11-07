@@ -134,6 +134,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       // shadow maps) is not copied: see AliasDepthResolve. Anything else - the
       // scene's depth with its stencil, a part of a surface - copies as before.
       if (backend.swap.depth_alias_ && copying_depth && !with_stencil && source->depth && source->texture &&
+          source->samples == 1 &&
           !(backend.skip_mask_ & (268435456 | 536870912)) && sx == 0 && sy == 0 && ox == 0 && oy == 0 &&
           w == source->width && h == source->height && object_w == w && object_h == h) {
         aliased = backend.targets.AliasDepthResolve(*source, surfaces.object_base);
@@ -181,7 +182,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
     dest.scale = source->scale;
     dest.depth = copying_depth;
     dest.written = ++resolve_serial_;
-    backend.targets.InvalidateResolvedLookups();
+    backend.targets.InvalidateResolvedAddress(surfaces.object_base);
     dest.written_frame = backend.swaps_;
     dest.guest_pitch = std::max(surfaces.object_pitch, 32u);
     dest.guest_height = (std::max(surfaces.object_height, 1u) + 31) & ~31u;
@@ -199,12 +200,23 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       ++backend.stats_.resolves_depth;
       backend.stats_.resolve_px_depth += uint64_t(w) * h;
       const bool packed = with_stencil && dest.format == dest_format;
+      const bool multisampled = source->samples > 1;
       // The scene's depth with its stencil: one compute pass into the texture, when the device allows it; the
-      // staging buffers otherwise.
-      if (!(packed && backend.swap.depth_direct_ && dest.format == RenderFormat::R32G32_FLOAT &&
+      // staging buffers otherwise. A multisampled image cannot go through them (a buffer copy takes one sample
+      // per texel): only the compute pass, which reads its first sample, resolves it.
+      if (!(packed && (backend.swap.depth_direct_ || multisampled) && dest.format == RenderFormat::R32G32_FLOAT &&
             ResolveDepthStencil(*source, sx, sy, w, h, dest.texture.get(), dest.layout, dest_x, dest_y))) {
-        backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
-        CopyDepth(*source, sx, sy, w, h, dest.texture.get(), dest_x, dest_y, packed);
+        if (multisampled) {
+          if (++backend.stats_.msaa_depth_skipped <= 4) {
+            REXLOG_WARN("Renut: Plume multisampled depth resolve not made (stencil {}, pipeline {})", packed,
+                        backend.patches.dres_ms_pipeline_ != VK_NULL_HANDLE);
+          }
+        } else {
+          backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
+          CopyDepth(*source, sx, sy, w, h, dest.texture.get(), dest_x, dest_y, packed);
+        }
+      } else if (multisampled) {
+        ++backend.stats_.msaa_depth_resolves;
       }
     } else if (dest.texture && w && h) {
       ++backend.stats_.resolves_color;
@@ -214,10 +226,19 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       // plume-skip bit 268435456 keeps the resolve's barriers and pass breaks
       // but drops the copies themselves, colour and depth (see CopyDepth).
       if (!(backend.skip_mask_ & 268435456)) {
-        RenderBox box(int32_t(sx), int32_t(sy), int32_t(sx + w), int32_t(sy + h), 0, 1);
-        backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
-                                 RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
-                                 dest_y, 0, &box);
+        if (source->samples > 1) {
+          // The samples averaged into the texture (what the console's resolve does with the copy sample select
+          // the game leaves: a colour resolve takes them all).
+          const RenderRect region(int32_t(sx), int32_t(sy), int32_t(sx + w), int32_t(sy + h));
+          backend.recorder.L()->resolveTextureRegion(dest.texture.get(), dest_x, dest_y, source->texture.get(), &region,
+                                                     RenderResolveMode::AVERAGE);
+          ++backend.stats_.msaa_color_resolves;
+        } else {
+          RenderBox box(int32_t(sx), int32_t(sy), int32_t(sx + w), int32_t(sy + h), 0, 1);
+          backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
+                                   RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
+                                   dest_y, 0, &box);
+        }
       }
     }
     dest.last_copy = !aliased && dest.texture && w && h;
@@ -348,7 +369,22 @@ void Resolve::NativePhoto(const uint32_t* w) {
   if (!buffer) return;
   backend.targets.Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
   RenderBox box(0, 0, int32_t(host_w), int32_t(host_h), 0, 1);
-  CopyTextureToBuffer(backend.recorder.L(), buffer.get(), source->texture.get(), host_w, host_h, row_texels, 0, 0, &box);
+  RenderTexture* readable = source->texture.get();
+  // A multisampled target cannot be copied to a buffer: its samples are averaged into a single-sample image first
+  // (kept until the flush below has run).
+  std::unique_ptr<RenderTexture> averaged;
+  RenderTextureLayout averaged_layout = RenderTextureLayout::UNKNOWN;
+  if (source->samples > 1) {
+    averaged = backend.device_->createTexture(RenderTextureDesc::Texture2D(host_w, host_h, 1, source->format));
+    if (!averaged) return;
+    backend.targets.Transition(averaged.get(), averaged_layout, RenderTextureLayout::COPY_DEST);
+    const RenderRect region(0, 0, int32_t(host_w), int32_t(host_h));
+    backend.recorder.L()->resolveTextureRegion(averaged.get(), 0, 0, source->texture.get(), &region,
+                                               RenderResolveMode::AVERAGE);
+    backend.targets.Transition(averaged.get(), averaged_layout, RenderTextureLayout::COPY_SOURCE);
+    readable = averaged.get();
+  }
+  CopyTextureToBuffer(backend.recorder.L(), buffer.get(), readable, host_w, host_h, row_texels, 0, 0, &box);
   backend.targets.Flush();
   const auto* pixels = static_cast<const uint8_t*>(buffer->map());
   if (!pixels) return;
@@ -479,6 +515,8 @@ bool Resolve::ResolveDepthStencil(Target& source, uint32_t x, uint32_t y, uint32
   if (backend.skip_mask_ & (268435456 | 536870912)) return false;
   Patches& patches = backend.patches;
   if (!patches.CreateDepthResolvePipeline()) return false;
+  const VkPipeline pipeline = source.samples > 1 ? patches.dres_ms_pipeline_ : patches.dres_pipeline_;
+  if (pipeline == VK_NULL_HANDLE) return false;
   auto* src = static_cast<VulkanTexture*>(source.texture.get());
   auto* dst = static_cast<VulkanTexture*>(dest);
   const uint32_t slot = backend.slot_;
@@ -530,7 +568,7 @@ bool Resolve::ResolveDepthStencil(Target& source, uint32_t x, uint32_t y, uint32
   dest_layout = RenderTextureLayout::GENERAL;
   backend.targets.bound_framebuffer_ = nullptr;
   VkCommandBuffer cb = static_cast<VulkanCommandList*>(backend.recorder.L())->vk;
-  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, patches.dres_pipeline_);
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
   vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, patches.dres_layout_, 0, 1, &set, 0, nullptr);
   const int32_t push[6] = {int32_t(x), int32_t(y), int32_t(dest_x), int32_t(dest_y), int32_t(w), int32_t(h)};
   vkCmdPushConstants(cb, patches.dres_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);

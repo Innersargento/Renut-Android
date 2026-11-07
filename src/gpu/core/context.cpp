@@ -93,6 +93,12 @@ bool GpuBackend::SetupContext() {
   REXLOG_INFO("Renut: Plume shadow map resolution: {}/4 of the guest's", targets.shadow_scale_);
   targets.internal_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_internal_resolution), 0, 2));
   REXLOG_INFO("Renut: Plume internal resolution: {}/4 of the guest's", targets.internal_scale_);
+  {
+    const int32_t msaa = std::clamp(REXCVAR_GET(renut_msaa), 0, 2);
+    targets.msaa_samples_ = msaa == 1 ? 2u : msaa == 2 ? 4u : 1u;
+    targets.msaa_a2c_ = REXCVAR_GET(renut_msaa_a2c);
+    REXLOG_INFO("Renut: Plume scene MSAA: {}", msaa == 0 ? "off" : msaa == 1 ? "up to 2x" : "up to 4x");
+  }
   // One slice per frame in flight, after the permanent allocations.
   const uint64_t upload_bytes = upload_slice_size_ * kPlumeFramesInFlight + 4096;
   draw.upload_ = device_->createBuffer(RenderBufferDesc::UploadBuffer(

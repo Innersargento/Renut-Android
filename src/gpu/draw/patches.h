@@ -22,6 +22,9 @@ struct Patches {
   VkDescriptorSetLayout dres_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout dres_layout_ = VK_NULL_HANDLE;
   VkPipeline dres_pipeline_ = VK_NULL_HANDLE;
+  // The same for a multisampled source (depth_resolve_ms.comp: sample 0 of each aspect); made with the first one.
+  VkShaderModule dres_ms_module_ = VK_NULL_HANDLE;
+  VkPipeline dres_ms_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool dres_pool_[kPlumeFramesInFlight] = {};
   std::vector<VkImageView> dres_views_[kPlumeFramesInFlight];
   uint32_t dres_used_[kPlumeFramesInFlight] = {};

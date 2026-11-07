@@ -38,6 +38,9 @@ struct Targets {
   uint32_t shadow_scale_ = 4;
   // The same for the scene's own 1280x720 colour and depth surfaces.
   uint32_t internal_scale_ = 4;
+  // The most samples a surface gets (renut_msaa): 1 off, 2 or 4.
+  uint32_t msaa_samples_ = 1;
+  bool msaa_a2c_ = true;  // renut_msaa_a2c
   uint64_t texture_budget_ = 0;
   void BeginFrame();
   void EvictIdleTextures();
@@ -116,6 +119,7 @@ struct Targets {
       retired_framebuffer_slots_;
   static uint64_t ResolvedKey(uint32_t address, RenderFormat format);
   void InvalidateResolvedLookups();
+  void InvalidateResolvedAddress(uint32_t address);
   uint64_t target_serial_ = 0;
   std::unordered_map<uint64_t, GuestTexture> guest_textures_;
   // the slot IssueDraw is resolving, for LayoutOf and GetGuestTexture

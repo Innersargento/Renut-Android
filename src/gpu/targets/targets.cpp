@@ -387,8 +387,29 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
   }
   const RenderFormat rf = depth ? RenderFormat::D32_FLOAT_S8_UINT
                                 : ColorFormat(xenos::ColorRenderTargetFormat(format));
-  target.texture = backend.device_->createTexture(depth ? RenderTextureDesc::DepthTarget(width, height, rf)
-                                                : RenderTextureDesc::ColorTarget(width, height, rf));
+  // The surface's MSAA type (bits 16-17 of its RB_SURFACE_INFO word: 0 none, 1 2x, 2 4x), within the option and
+  // what the device draws in this format.
+  uint32_t samples = 1;
+  if (msaa_samples_ > 1) {
+    const uint32_t type = (s.surface_info >> 16) & 3;
+    samples = std::min(type == 1 ? 2u : type == 2 ? 4u : 1u, msaa_samples_);
+    const RenderSampleCounts supported = backend.device_->getSampleCountsSupported(rf);
+    while (samples > 1 && !(supported & samples)) samples >>= 1;
+  }
+  auto make = [&](uint32_t count) {
+    const RenderMultisampling multisampling{RenderSampleCounts(count)};
+    return backend.device_->createTexture(depth ? RenderTextureDesc::DepthTarget(width, height, rf, multisampling)
+                                                : RenderTextureDesc::ColorTarget(width, height, rf, multisampling));
+  };
+  target.texture = make(samples);
+  // The device refused the multisampled image (a format it cannot draw and sample with that many samples): one
+  // sample, and the game's surface is resolved as it was before.
+  if (samples > 1 && !static_cast<VulkanTexture*>(target.texture.get())->vk) {
+    REXLOG_WARN("Renut: Plume {}x multisampled {} {}x{} not created; single-sample instead", samples,
+                depth ? "depth" : "color", width, height);
+    samples = 1;
+    target.texture = make(1);
+  }
   if (!target.texture) {
     targets_.erase(key);
     return nullptr;
@@ -398,6 +419,7 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
   target.height = height;
   target.depth = depth;
   target.scale = scale;
+  target.samples = samples;
   target.layout = RenderTextureLayout::UNKNOWN;
   target.surface = s.object;
   target.surface_info = s.info & ~0xFFFu;
@@ -419,8 +441,10 @@ bool Targets::GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height)
   width = std::max(width, target.width);
   height = std::max(height, target.height);
   if (width == target.width && height == target.height) return true;
-  auto texture = backend.device_->createTexture(target.depth ? RenderTextureDesc::DepthTarget(width, height, target.format)
-                                                     : RenderTextureDesc::ColorTarget(width, height, target.format));
+  const RenderMultisampling multisampling(RenderSampleCounts(target.samples));
+  auto texture = backend.device_->createTexture(
+      target.depth ? RenderTextureDesc::DepthTarget(width, height, target.format, multisampling)
+                   : RenderTextureDesc::ColorTarget(width, height, target.format, multisampling));
   if (!texture) return false;
   if (target.texture) retired_slots_[backend.slot_].push_back(std::move(target.texture));
   target.texture = std::move(texture);
@@ -492,6 +516,7 @@ std::string Targets::SurfaceReport() {
     out += fmt::format("   surface {:08X} {} {}x{} format {} last frame {}\n", t.surface,
                        t.depth ? "depth" : "color", t.width, t.height,
                        t.depth ? (t.surface_info >> 16) & 1 : (t.surface_info >> 16) & 0xF, t.used_frame);
+    if (t.samples > 1) out.insert(out.size() - 1, fmt::format(" x{} samples", t.samples));
   }
   return out;
 }
@@ -560,7 +585,7 @@ void Targets::SetFramebuffer(RenderFramebuffer* framebuffer) {
 
 Resolved& Targets::GetResolved(uint32_t address, RenderFormat format, uint32_t width,
                                              uint32_t height) {
-  InvalidateResolvedLookups();
+  InvalidateResolvedAddress(address);
   Resolved& resolved = resolved_[ResolvedKey(address, format)];
   if (resolved.texture && resolved.format == format && resolved.width >= width &&
       resolved.height >= height) {
@@ -637,7 +662,7 @@ Resolved* Targets::AliasDepthResolve(Target& source, uint32_t address) {
       return nullptr;
     }
   }
-  InvalidateResolvedLookups();
+  InvalidateResolvedAddress(address);
   RetireSwizzled(r);
   if (r.texture) {
     // An alias of another size: its descriptor stays, the image goes.

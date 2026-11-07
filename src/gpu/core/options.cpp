@@ -105,6 +105,9 @@ REXCVAR_DEFINE_INT32(renut_plume_internal_resolution, 0, "reNut/Plume",
                      "the guest's 1280x720. The scene's colour and depth surfaces are drawn smaller, resolved "
                      "smaller and shown stretched. Read at start.")
     .range(0, 2);
+REXCVAR_DEFINE_BOOL(renut_msaa_a2c, true, "reNut/Plume",
+                    "With MSAA, draws that ask for alpha to coverage get it from the pipeline (their alpha covers samples) "
+                    "instead of the alpha test that discards below half. Off: the alpha test, as without MSAA. Read at start.");
 REXCVAR_DEFINE_BOOL(renut_plume_precompile, true, "reNut/Plume",
                     "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                     "next start; a scene load waits until they are built. Not in low-memory mode, which only "

@@ -26,6 +26,8 @@ final class RuntimeOptions {
     static final String SHADOW_QUALITY = "renut_plume_shadow_quality";
     /** 0 full, 1 three quarters, 2 half: the resolution the scene is drawn at (gpu). */
     static final String INTERNAL_RESOLUTION = "renut_plume_internal_resolution";
+    /** 0 off, 1 2x, 2 4x: the samples of the scene's single band (gpu); read when the game starts. */
+    static final String MSAA = "renut_msaa";
 
     /**
      * The frame rate the game is held to (frame_pacing.h): 30 is its own, 31-240 a rate of the
@@ -102,7 +104,8 @@ final class RuntimeOptions {
         }
         if (!(fps || BOOLEANS.contains(key) && (value.equals("true") || value.equals("false"))
             || key.equals("log_level") && LEVELS.contains(value)
-            || (key.equals(TEXTURE_QUALITY) || key.equals(SHADOW_QUALITY) || key.equals(INTERNAL_RESOLUTION))
+            || (key.equals(TEXTURE_QUALITY) || key.equals(SHADOW_QUALITY) || key.equals(INTERNAL_RESOLUTION)
+                || key.equals(MSAA))
                 && (value.equals("0") || value.equals("1") || value.equals("2"))
             || key.equals(CHEAT_SKIN) && java.util.Arrays.asList(SKINS).contains(value)))
             throw new IllegalArgumentException("Opção inválida: " + key);

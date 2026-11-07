@@ -113,7 +113,8 @@ REXCVAR_DECLARE(int32_t, renut_plume_shadow_quality);
 REXCVAR_DECLARE(int32_t, renut_plume_internal_resolution);
 REXCVAR_DECLARE(bool, renut_plume_precompile);
 
-REXCVAR_DECLARE(bool, renut_scene_msaa);
+REXCVAR_DECLARE(bool, renut_msaa_a2c);
+REXCVAR_DECLARE(int32_t, renut_msaa);  // game_fixes.cpp: scene multisampling, 0 off, 1 2x, 2 4x
 REXCVAR_DECLARE(bool, vsync);  // the SDK's: off ticks the guest's vblank every millisecond
 
 namespace renut::gpu {

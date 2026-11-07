@@ -440,6 +440,12 @@ namespace renut::gpu {
   };
 
   inline constexpr uint32_t kResolvedLookupSize = 1024;
+  // The lookup is two ways wide and indexed by a mix of the address: the plain low bits of a page number
+  // put two shadow maps (0x1A73B000 and 0x19F3B000) in one slot, and every draw that sampled both evicted the
+  // other and walked the whole resolved map. Returns the even slot of the pair.
+  inline uint32_t ResolvedLookupPair(uint32_t address) {
+    return (((address >> 12) * 0x9E3779B1u) >> 22) & ~1u;
+  }
 
   // Object identity (files/plume-objkeys): what the six words of a texture
   // fetch constant - the D3D texture's header as the guest bound it - resolved

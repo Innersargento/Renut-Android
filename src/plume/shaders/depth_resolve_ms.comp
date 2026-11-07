@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// depth_resolve.comp for a multisampled depth and stencil image: the Xbox 360 resolves a depth surface by
+// taking one sample (the first), never by averaging them, so the texel read is sample 0 of each aspect.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2DMS depth_image;
+layout(set = 0, binding = 1) uniform utexture2DMS stencil_image;
+layout(set = 0, binding = 2, rg32f) uniform writeonly image2D out_image;
+
+layout(push_constant) uniform Push {
+    ivec2 src_offset;
+    ivec2 dst_offset;
+    ivec2 size;
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= p.size.x || c.y >= p.size.y) return;
+    float depth = texelFetch(depth_image, p.src_offset + c, 0).r;
+    float stencil = float(texelFetch(stencil_image, p.src_offset + c, 0).r) / 255.0;
+    imageStore(out_image, p.dst_offset + c, vec4(depth, stencil, 0.0, 0.0));
+}

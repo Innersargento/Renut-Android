@@ -40,10 +40,10 @@ struct Resolve {
   // its depth and stencil into an RG32F one.
   bool CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
                  uint32_t dest_x, uint32_t dest_y, bool with_stencil);
-  // The same for a depth target's depth and stencil into an RG32F texture made with the storage flag, in one
-  // compute pass (depth_resolve.comp) that reads the two aspects as sampled images. False, with nothing
-  // recorded, when the pipeline or a view could not be made: the caller then uses CopyDepth. On success the
-  // source is left in SHADER_READ and `dest_layout` is GENERAL.
+  // The same as CopyDepth for a depth target's depth and stencil into an RG32F texture made with the storage
+  // flag, in one compute pass (depth_resolve.comp) that reads the two aspects as sampled images. False, with
+  // nothing recorded, when the pipeline or a view could not be made: the caller then uses CopyDepth. On success
+  // the source is left in SHADER_READ and `dest_layout` is GENERAL.
   bool ResolveDepthStencil(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
                            RenderTextureLayout& dest_layout, uint32_t dest_x, uint32_t dest_y);
   std::unique_ptr<RenderBuffer> depth_staging_;
