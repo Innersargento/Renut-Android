@@ -116,6 +116,7 @@ void Targets::BeginFrame() {
   backend.stats_.slot_wait_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                                       std::chrono::steady_clock::now() - wait_start)
                                       .count());
+  backend.patches.ReleaseDepthResolveSlot(backend.slot_);
   backend.profiling.ReadTimestamps(backend.slot_);
   backend.profiling.ReadPairTimestamps(backend.slot_);
   backend.census.BeginSlot(backend.slot_);
@@ -449,6 +450,12 @@ void Targets::MatchSurfaceSizes(std::array<Target*, 4>& colors, uint32_t color_c
   if (depth && !GrowSurfaceTarget(*depth, width, height)) depth = nullptr;
 }
 
+void Targets::ForgetResolveSource(const Target* target) {
+  for (auto& [key, r] : resolved_) {
+    if (r.last_src == target) r.last_src = nullptr;
+  }
+}
+
 // Targets of surfaces not drawn to for ten seconds go (a released surface's
 // object is reused for another).
 void Targets::EvictSurfaceTargets() {
@@ -457,6 +464,7 @@ void Targets::EvictSurfaceTargets() {
   for (auto it = targets_.begin(); it != targets_.end();) {
     if ((it->first & kSurfaceTargetKey) && it->second.used_frame + 600 < backend.swaps_) {
       if (it->second.texture) retired_slots_[backend.slot_].push_back(std::move(it->second.texture));
+      ForgetResolveSource(&it->second);
       it = targets_.erase(it);
       ++surface_evicted_;
       evicted = true;
@@ -493,6 +501,8 @@ RenderFramebuffer* Targets::GetFramebuffer(const std::array<Target*, 4>& colors,
   // What SetFramebuffer labels the next pass with.
   color_count_of_pass_ = color_count;
   depth_of_pass_ = depth != nullptr;
+  for (uint32_t i = 0; i < color_count; ++i) ++colors[i]->writes;
+  if (depth) ++depth->writes;
   // The same attachments as the draw before: the same framebuffer, without
   // hashing them or asking the map.
   const RenderTexture* images[5] = {};
@@ -560,7 +570,9 @@ Resolved& Targets::GetResolved(uint32_t address, RenderFormat format, uint32_t w
   uint32_t h = std::max(height, resolved.format == format ? resolved.height : 0u);
   RetireSwizzled(resolved);
   RetireTexture(resolved.texture, resolved.descriptor);
-  resolved.texture = backend.device_->createTexture(RenderTextureDesc::Texture2D(w, h, 1, format));
+  // A depth resolve with its stencil is written by a compute pass (Resolve::ResolveDepthStencil).
+  resolved.texture = backend.device_->createTexture(RenderTextureDesc::Texture2D(
+      w, h, 1, format, format == RenderFormat::R32G32_FLOAT ? RenderTextureFlag::STORAGE : RenderTextureFlag::NONE));
   resolved.format = format;
   resolved.width = w;
   resolved.height = h;

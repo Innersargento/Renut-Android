@@ -47,6 +47,8 @@ void Resolve::NativeResolve(const uint32_t* w) {
   ResolveSurfaces surfaces;
   surfaces.source = backend.targets.SurfaceTarget(slot);
   surfaces.depth = backend.targets.SurfaceTarget(4);
+  surfaces.slot = slot;
+  for (uint32_t i = 0; i < native_d3d::kResolveTraceWords; ++i) surfaces.trace[i] = w[17 + i];
   surfaces.x = w[1];
   surfaces.y = w[2];
   surfaces.width = w[3] > w[1] ? w[3] - w[1] : 0;
@@ -144,6 +146,37 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       h = dest_y < chosen->height ? std::min(h, chosen->height - dest_y) : 0;
     }
     Resolved& dest = *chosen;
+    // What the last resolve left here was never sampled: a copy nobody read (or one the host could have
+    // skipped). Not counted for the first resolve into a texture.
+    const bool unread = dest.written != 0 && !dest.sampled;
+    // The same pixels again: nothing was drawn or cleared into the source since the last resolve into this
+    // texture from it, the rectangle and the place in the texture are the same, and so is the kind.
+    const bool redundant = dest.written != 0 && !aliased && dest.last_src == source &&
+                           dest.last_src_surface == source->surface && dest.last_src_writes == source->writes &&
+                           dest.last_rect[0] == sx && dest.last_rect[1] == sy && dest.last_rect[2] == w &&
+                           dest.last_rect[3] == h && dest.last_dest[0] == dest_x && dest.last_dest[1] == dest_y &&
+                           dest.last_depth == copying_depth;
+    if (redundant) ++backend.stats_.resolves_redundant;
+    dest.last_src = source;
+    dest.last_src_surface = source->surface;
+    dest.last_src_writes = source->writes;
+    dest.last_rect[0] = sx, dest.last_rect[1] = sy, dest.last_rect[2] = w, dest.last_rect[3] = h;
+    dest.last_dest[0] = dest_x, dest.last_dest[1] = dest_y;
+    dest.last_depth = copying_depth;
+    if (unread) ++backend.stats_.resolves_unread;
+    // What became of the copy this one replaces (see Resolved::last_copy).
+    if (dest.written != 0 && dest.last_copy) {
+      const uint32_t kind = !dest.sampled ? 0u : dest.read_dirty ? 2u : 1u;
+      ++backend.stats_.resolve_class[kind];
+      backend.stats_.resolve_class_px[kind] += dest.last_px;
+      if (backend.swap.resolve_log_) {
+        static const char* const names[3] = {"unread", "alias_ok", "needs_copy"};
+        LogResolveLine(fmt::format("f={} class {} {}px of the copy at {:08X} made by trace={:X},{:X},{:X}", backend.swaps_,
+                                   names[kind], dest.last_px, surfaces.object_base, dest.last_trace[0],
+                                   dest.last_trace[1], dest.last_trace[2]));
+      }
+    }
+    dest.sampled = false;
     ++dest.generation;
     dest.scale = source->scale;
     dest.depth = copying_depth;
@@ -161,10 +194,21 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
     }
     if (aliased) {
       // Nothing to copy: the texture is the surface's own image.
+      ++backend.stats_.resolves_aliased;
     } else if (dest.texture && copying_depth && w && h) {
-      backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
-      CopyDepth(*source, sx, sy, w, h, dest.texture.get(), dest_x, dest_y, with_stencil && dest.format == dest_format);
+      ++backend.stats_.resolves_depth;
+      backend.stats_.resolve_px_depth += uint64_t(w) * h;
+      const bool packed = with_stencil && dest.format == dest_format;
+      // The scene's depth with its stencil: one compute pass into the texture, when the device allows it; the
+      // staging buffers otherwise.
+      if (!(packed && backend.swap.depth_direct_ && dest.format == RenderFormat::R32G32_FLOAT &&
+            ResolveDepthStencil(*source, sx, sy, w, h, dest.texture.get(), dest.layout, dest_x, dest_y))) {
+        backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
+        CopyDepth(*source, sx, sy, w, h, dest.texture.get(), dest_x, dest_y, packed);
+      }
     } else if (dest.texture && w && h) {
+      ++backend.stats_.resolves_color;
+      backend.stats_.resolve_px_color += uint64_t(w) * h;
       backend.targets.Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
       backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
       // plume-skip bit 268435456 keeps the resolve's barriers and pass breaks
@@ -176,6 +220,10 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
                                  dest_y, 0, &box);
       }
     }
+    dest.last_copy = !aliased && dest.texture && w && h;
+    dest.read_dirty = false;
+    dest.last_px = uint64_t(w) * h;
+    for (uint32_t i = 0; i < 3; ++i) dest.last_trace[i] = surfaces.trace[2 + i];
     if (dest.texture) {
       if (backend.swap.snap_address_ && !dest.alias && surfaces.object_base == backend.swap.snap_address_ && ++backend.swap.snap_seen_ == backend.swap.snap_ordinal_) {
         SnapshotResolved(dest);
@@ -185,17 +233,26 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
         backend.targets.SetTexture2D(dest.descriptor, dest.texture.get());
       }
       const uint32_t base_address = surfaces.object_base;
-      if (backend.swap.resolve_log_ && !copying_depth && w >= 64 && h >= 64) {
+      if (backend.swap.resolve_log_) {
+        // One line per resolve: what it is, where from (the target and its scale), where to, what rode
+        // along, and whether the last one into the same texture was ever read.
         LogResolveLine(fmt::format(
-            "f={} resolve {}x{} at ({},{}) -> {:08X} obj={}x{} pitch={} dfmt={} endian={} swap={} host_fmt={}",
-            backend.swaps_, w, h, dest_x, dest_y, base_address, surfaces.object_width,
+            "f={} resolve {} {}x{} at ({},{}) from slot {} target {}x{} s{} -> {:08X} obj={}x{} pitch={} dfmt={} "
+            "endian={} swap={} host_fmt={} how={} clear={}{} prev_unread={} redundant={} trace={:X},{:X},{:X},{:X},{:X},{:X},{:X},{:X}",
+            backend.swaps_, copying_depth ? "depth" : "color", w, h, dest_x, dest_y, surfaces.slot,
+            source->width, source->height, source->scale, base_address, surfaces.object_width,
             surfaces.object_height, dest.guest_pitch, copy.dest_format, copy.endian, uint32_t(copy.swap),
-            uint32_t(dest.format)));
+            uint32_t(dest.format), aliased ? "alias" : (dest.texture && w && h ? "copy" : "none"),
+            copy.clear_color ? "c" : "", copy.clear_depth ? "d" : "", unread ? 1 : 0, redundant ? 1 : 0,
+            surfaces.trace[0], surfaces.trace[1], surfaces.trace[2], surfaces.trace[3], surfaces.trace[4],
+            surfaces.trace[5], surfaces.trace[6], surfaces.trace[7]));
       }
     }
   }
 
   // Clears that ride along with the resolve.
+  if (copy.clear_color) ++backend.stats_.resolve_clear_color;
+  if (copy.clear_depth) ++backend.stats_.resolve_clear_depth;
   const RenderRect rect(int32_t(x), int32_t(y), int32_t(x + width), int32_t(y + height));
   if (copy.clear_color && source && !skip_clears) {
     backend.targets.Transition(source->texture.get(), source->layout, RenderTextureLayout::COLOR_WRITE);
@@ -245,13 +302,21 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
 }
 
 void Resolve::LogResolveLine(const std::string& line) {
-  if (backend.miss_dump_directory_.empty()) return;
+  log_buffer_ += line;
+  log_buffer_ += '\n';
+}
+
+void Resolve::FlushResolveLog() {
+  if (log_buffer_.empty() || backend.miss_dump_directory_.empty()) {
+    log_buffer_.clear();
+    return;
+  }
   const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
   if (FILE* file = std::fopen((root + "/plume-resolve.log").c_str(), "a")) {
-    std::fputs(line.c_str(), file);
-    std::fputc('\n', file);
+    std::fwrite(log_buffer_.data(), 1, log_buffer_.size(), file);
     std::fclose(file);
   }
+  log_buffer_.clear();
 }
 
 // Photo Mode's picture: render target 0, after the draws recorded before the capture, read back
@@ -405,6 +470,74 @@ bool Resolve::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint
                            RenderTextureCopyLocation::PlacedFootprint(depth_staging_.get(),
                                                                       RenderFormat::R32_FLOAT, w, h, 1, w),
                            dest_x, dest_y);
+  return true;
+}
+
+bool Resolve::ResolveDepthStencil(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
+                                  RenderTextureLayout& dest_layout, uint32_t dest_x, uint32_t dest_y) {
+  // The debug skips of CopyDepth keep their meaning there.
+  if (backend.skip_mask_ & (268435456 | 536870912)) return false;
+  Patches& patches = backend.patches;
+  if (!patches.CreateDepthResolvePipeline()) return false;
+  auto* src = static_cast<VulkanTexture*>(source.texture.get());
+  auto* dst = static_cast<VulkanTexture*>(dest);
+  const uint32_t slot = backend.slot_;
+  if (!src || !dst || src->imageView == VK_NULL_HANDLE || dst->imageView == VK_NULL_HANDLE ||
+      patches.dres_used_[slot] >= Patches::kDresSets || !w || !h) {
+    return false;
+  }
+  VkDevice vk_device = static_cast<VulkanDevice*>(backend.device_)->vk;
+  // The stencil aspect needs a view of its own (Plume's is the depth one); it and the set live until the slot's
+  // frame has finished.
+  VkImageViewCreateInfo view_info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view_info.image = src->vk;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = src->imageFormat;
+  view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+  view_info.subresourceRange.levelCount = 1;
+  view_info.subresourceRange.layerCount = 1;
+  VkImageView stencil_view = VK_NULL_HANDLE;
+  if (vkCreateImageView(vk_device, &view_info, nullptr, &stencil_view) != VK_SUCCESS) return false;
+  patches.dres_views_[slot].push_back(stencil_view);
+  VkDescriptorSetAllocateInfo alloc = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  alloc.descriptorPool = patches.dres_pool_[slot];
+  alloc.descriptorSetCount = 1;
+  alloc.pSetLayouts = &patches.dres_set_layout_;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  if (vkAllocateDescriptorSets(vk_device, &alloc, &set) != VK_SUCCESS) return false;
+  ++patches.dres_used_[slot];
+  VkDescriptorImageInfo images[3] = {};
+  images[0] = {VK_NULL_HANDLE, src->imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  images[1] = {VK_NULL_HANDLE, stencil_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  images[2] = {VK_NULL_HANDLE, dst->imageView, VK_IMAGE_LAYOUT_GENERAL};
+  VkWriteDescriptorSet writes[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[i].pImageInfo = &images[i];
+  }
+  vkUpdateDescriptorSets(vk_device, 3, writes, 0, nullptr);
+  // The barriers end any open render pass, and name the compute stage so that the dispatch waits for them
+  // (Targets::Transition's are for the graphics ones).
+  backend.recorder.L()->barriers(RenderBarrierStage::COMPUTE,
+                                 RenderTextureBarrier(source.texture.get(), RenderTextureLayout::SHADER_READ));
+  backend.recorder.L()->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(dest, RenderTextureLayout::GENERAL));
+  backend.stats_.barriers += 2;
+  source.layout = RenderTextureLayout::SHADER_READ;
+  dest_layout = RenderTextureLayout::GENERAL;
+  backend.targets.bound_framebuffer_ = nullptr;
+  VkCommandBuffer cb = static_cast<VulkanCommandList*>(backend.recorder.L())->vk;
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, patches.dres_pipeline_);
+  vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, patches.dres_layout_, 0, 1, &set, 0, nullptr);
+  const int32_t push[6] = {int32_t(x), int32_t(y), int32_t(dest_x), int32_t(dest_y), int32_t(w), int32_t(h)};
+  vkCmdPushConstants(cb, patches.dres_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+  vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+  // The compute layout's push constants may disturb the graphics ones.
+  backend.targets.pushed_constants_[0] = backend.targets.pushed_constants_[1] = backend.targets.pushed_constants_[2] = UINT64_MAX;
+  ++backend.stats_.depth_direct;
   return true;
 }
 

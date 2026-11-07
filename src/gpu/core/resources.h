@@ -17,6 +17,9 @@ struct Target {
   // was last used in.
   uint32_t surface = 0, surface_info = 0;
   uint64_t used_frame = 0;
+  // Draws and clears that picked this target as an attachment (Targets::GetFramebuffer): a resolve whose
+  // source has the same count as at the last resolve into the same texture copies the same pixels again.
+  uint64_t writes = 0;
   // Quarters of the guest's resolution the host draws it at: 4 is the guest's
   // size, less is a shadow map under the shadow quality option (width and
   // height are host pixels; the guest's viewport, scissor, clears and resolve
@@ -53,6 +56,10 @@ constexpr uint64_t kSurfaceTargetKey = 1ull << 63;
 struct ResolveSurfaces {
   Target* source = nullptr;
   Target* depth = nullptr;
+  // Which of the surface slots the source is (for the resolve log).
+  uint32_t slot = 0;
+  // The host return addresses of the call that made the resolve (the resolve log), as offsets.
+  uint32_t trace[native_d3d::kResolveTraceWords] = {};
   uint32_t x = 0, y = 0, width = 0, height = 0;
   // The destination texture object's level 0 (GPU address, 0 if the copy goes
   // elsewhere), its size and pitch, and where the source corner lands in it.
@@ -107,6 +114,22 @@ struct Resolved {
   // resolved whole is sampled in place (AliasDepthResolve). `format` is then the
   // depth format, and the views and the fitted copy are made accordingly.
   bool alias = false;
+  // What the last resolve into it was made from (to count a resolve that repeats it: ExecuteResolve). The
+  // pointer is only compared, never followed.
+  const Target* last_src = nullptr;
+  uint32_t last_src_surface = 0;
+  uint64_t last_src_writes = 0;
+  uint32_t last_rect[4] = {};  // source x, y, w, h
+  uint32_t last_dest[2] = {};
+  bool last_depth = false;
+  // How the copy that last filled it was used, to tell a resolve that could have been the target's own image
+  // (read only while the source stayed as it was) from one that needs the copy: whether it was a copy at all,
+  // its pixels and the three nearest host return addresses of its caller, and whether a draw read it after the
+  // source had been drawn into again (or while that same draw wrote the source).
+  bool last_copy = false;
+  bool read_dirty = false;
+  uint64_t last_px = 0;
+  uint32_t last_trace[3] = {};
 };
 
 struct GuestTexture {
@@ -180,6 +203,17 @@ struct Stats {
   // kept streams the guest wrote over.
   uint64_t kept_hits = 0, kept_bytes_made = 0, kept_drops = 0, kept_unwatchable = 0;
   uint64_t band_skipped = 0, band_moved = 0, band_widened = 0;
+  // Resolves by what became of them: copies of colour and of depth (and the pixels they moved), depth maps
+  // taken in place, resolves into a texture nothing had sampled since the last one wrote it, and the
+  // clears that rode along.
+  uint64_t resolves_color = 0, resolves_depth = 0, resolves_aliased = 0, resolves_unread = 0;
+  uint64_t resolves_redundant = 0;
+  // Depth resolves with stencil done by the compute pass (Resolve::ResolveDepthStencil).
+  uint64_t depth_direct = 0;
+  // The fate of each copy when the next resolve into the same texture replaced it: never read, read only while
+  // its source was untouched, read after the source changed (and pixels of each).
+  uint64_t resolve_class[3] = {}, resolve_class_px[3] = {};
+  uint64_t resolve_px_color = 0, resolve_px_depth = 0, resolve_clear_color = 0, resolve_clear_depth = 0;
   // Draws that waited in a window, the windows, and the pipeline changes
   // those windows had in game order against the order they were recorded in.
   uint64_t deferred_draws = 0, defer_windows = 0, defer_binds_before = 0, defer_binds_after = 0;

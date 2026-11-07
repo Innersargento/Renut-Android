@@ -17,6 +17,10 @@ REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
                      "exact except for depth ties; measured 11/10: -37% pipeline binds, -3% GPU cycles, "
                      "image unchanged)")
     .range(0, 2);
+REXCVAR_DEFINE_BOOL(renut_plume_depth_resolve_shader, true, "reNut/Plume",
+                    "The depth (and stencil) of a scene depth resolve goes into its RG32F texture in one compute pass "
+                    "that reads the depth image, instead of through staging buffers (image to buffer, a packing pass, "
+                    "buffer to image). Off: the staging path");
 REXCVAR_DEFINE_INT32(renut_plume_hiz, 2, "reNut/Plume",
                      "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
                      "lies wholly outside the view frustum, the scissor or an enabled user clip plane (docs/performance/HIZ.md)");

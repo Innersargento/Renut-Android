@@ -1,12 +1,21 @@
 // IssueSwap: the guest frame's present.
 #include "gpu/core/internal.h"
 
+#include <unistd.h>
+
 namespace renut::gpu {
 
 void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
   ExecutorBusy busy;
+  // <files>/plume-resolve-log turns the resolve log on (checked once a second): every resolve, with
+  // where it came from, where it went and whether the last one into the same texture was read.
+  if (backend.swaps_ % 60 == 0 && !backend.miss_dump_directory_.empty()) {
+    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
+    resolve_log_ = access((root + "/plume-resolve-log").c_str(), F_OK) == 0;
+    native_d3d::g_resolve_trace.store(resolve_log_, std::memory_order_relaxed);
+  }
   // Everything the lists hold for this frame, before it is shown (from the
   // ring's swap; a present the lists hold has run what came before it).
   if (!backend.lists.native_presenting_) backend.lists.RunNative(UINT32_MAX);
@@ -27,6 +36,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     backend.resolve.LogResolveLine(fmt::format("f={} swap front={:08X} {}x{} found={}", backend.swaps_, frontbuffer_ptr, frontbuffer_width,
                                frontbuffer_height, found != nullptr));
   }
+  backend.resolve.FlushResolveLog();
   if (found && found->texture) {
     Resolved& r = *found;
     backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);

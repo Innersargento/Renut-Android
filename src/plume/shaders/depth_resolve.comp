@@ -1,0 +1,28 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// A depth resolve with its stencil, straight into the RG32F texture a fetch of a Xenos k_24_8_FLOAT surface
+// reads: x the depth (the D32_SFLOAT aspect) and y the stencil over 255 (the S8 aspect), which is what an
+// 8_8_8_8 fetch finds in its first channel (N&B's rain ripples keep only the water pixels by that stencil
+// bit). It replaces the trip through staging buffers and depth_stencil_pack.comp: the two aspects are read as
+// sampled images and the texels written once.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D depth_image;
+layout(set = 0, binding = 1) uniform utexture2D stencil_image;
+layout(set = 0, binding = 2, rg32f) uniform writeonly image2D out_image;
+
+layout(push_constant) uniform Push {
+    ivec2 src_offset;
+    ivec2 dst_offset;
+    ivec2 size;
+} p;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= p.size.x || c.y >= p.size.y) return;
+    float depth = texelFetch(depth_image, p.src_offset + c, 0).r;
+    float stencil = float(texelFetch(stencil_image, p.src_offset + c, 0).r) / 255.0;
+    imageStore(out_image, p.dst_offset + c, vec4(depth, stencil, 0.0, 0.0));
+}

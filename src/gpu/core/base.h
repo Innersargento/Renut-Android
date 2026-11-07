@@ -90,6 +90,7 @@ extern "C" uint64_t renut_audio_silent_frames();
 REXCVAR_DECLARE(int32_t, renut_plume_pipeline_lookup_ms);
 REXCVAR_DECLARE(int32_t, renut_plume_bool_spec);
 REXCVAR_DECLARE(int32_t, renut_plume_defer_draws);
+REXCVAR_DECLARE(bool, renut_plume_depth_resolve_shader);
 REXCVAR_DECLARE(int32_t, renut_plume_hiz);
 REXCVAR_DECLARE(bool, renut_plume_zero_census);
 REXCVAR_DECLARE(bool, renut_plume_stack_wrap);

@@ -311,6 +311,14 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (fetch.type != xenos::FetchConstantType::kTexture) continue;
     sampler_descriptor[slot] = backend.textures.GetSampler(fetch);
     Resolved* found = FindResolved(fetch.base_address << 12);
+    if (found && found->last_src && !found->read_dirty) {
+      // Read after its source was drawn into again, or by a draw that is drawing into that source itself:
+      // a texture that was the source's own image would not do for this read.
+      const Target* from = found->last_src;
+      bool writes_it = from->writes != found->last_src_writes || from == depth;
+      for (uint32_t i = 0; i < color_count && !writes_it; ++i) writes_it = colors[i] == from;
+      if (writes_it) found->read_dirty = true;
+    }
     if (found && found->descriptor) {
       Resolved& r = *found;
       if (backend.swap.depth_dump_ps_ && !backend.swap.depth_dump_ && r.depth && !r.alias && r.texture && ps &&

@@ -25,6 +25,8 @@ struct Targets {
   bool GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height);
   void RetireFramebuffers();
   void EvictSurfaceTargets();
+  // A resolved texture remembers the target it was made from by address only; forget one that is going.
+  void ForgetResolveSource(const Target* target);
   std::string SurfaceReport();
   uint64_t surface_created_ = 0, surface_grown_ = 0, surface_evicted_ = 0;
   // Native resolves into their texture object, and the ones into a volume's slice, which have none

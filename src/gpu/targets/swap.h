@@ -12,6 +12,7 @@ struct Swap {
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width, uint32_t frontbuffer_height);
   bool resolve_log_ = false;
+  bool depth_direct_ = true;
   uint32_t adaptive_mode_ = 1;
   uint32_t bc_mode_ = 1;
   // Debug: <files>/plume-no-persist sends every stream through the ring again.

@@ -88,7 +88,13 @@ enum Op : uint32_t {
   // and writes it into those rows as linear X8R8G8B8 (alpha, red, green, blue in memory order).
   kOpPhoto = 22,
 };
-constexpr uint32_t kResolveWords = 17, kClearWords = 12, kPhotoWords = 5;
+// A resolve record ends with kResolveTraceWords host return addresses (offsets into the runtime library) of the
+// call that made it, for the resolve log only: the recompiled code never sets the guest link register, so the
+// host stack is what names the game function. Zeros unless g_resolve_trace is set (the GPU backend sets it
+// while <files>/plume-resolve-log exists).
+constexpr uint32_t kResolveTraceWords = 8;
+extern std::atomic<bool> g_resolve_trace;
+constexpr uint32_t kResolveWords = 17 + kResolveTraceWords, kClearWords = 12, kPhotoWords = 5;
 // Bits 17-18 of a kOpShader's first word: the program of the shader object.
 constexpr uint32_t kShaderProgramShift = 17;
 

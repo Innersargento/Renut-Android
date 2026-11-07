@@ -129,6 +129,7 @@ bool GpuBackend::SetupContext() {
   for (auto& list : lists_) list = queue_->createCommandList();
   targets.list_ = lists_[0].get();
   swap.defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
+  swap.depth_direct_ = REXCVAR_GET(renut_plume_depth_resolve_shader);
   report.hiz_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2));
   census.Init();
   swap.fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));
@@ -301,6 +302,7 @@ void GpuBackend::ShutdownContext() {
   draw.upload_.reset();
   {
     VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+    patches.DestroyDepthResolve();
     if (patches.pack_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, patches.pack_pipeline_, nullptr);
     if (pack_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, pack_layout_, nullptr);
     if (pack_module_ != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, pack_module_, nullptr);

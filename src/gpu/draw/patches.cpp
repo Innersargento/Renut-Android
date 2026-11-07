@@ -30,6 +30,91 @@ bool Patches::CreatePackPipeline() {
   return true;
 }
 
+bool Patches::CreateDepthResolvePipeline() {
+  if (dres_pipeline_ != VK_NULL_HANDLE) return true;
+  if (dres_failed_) return false;
+  dres_failed_ = true;
+  VkDevice vk_device = static_cast<VulkanDevice*>(backend.device_)->vk;
+  VkShaderModuleCreateInfo module_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  module_info.codeSize = sizeof(k_depth_resolve_comp);
+  module_info.pCode = k_depth_resolve_comp;
+  if (vkCreateShaderModule(vk_device, &module_info, nullptr, &dres_module_) != VK_SUCCESS) return false;
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  set_info.bindingCount = 3;
+  set_info.pBindings = bindings;
+  if (vkCreateDescriptorSetLayout(vk_device, &set_info, nullptr, &dres_set_layout_) != VK_SUCCESS) return false;
+  VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
+  VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout_info.setLayoutCount = 1;
+  layout_info.pSetLayouts = &dres_set_layout_;
+  layout_info.pushConstantRangeCount = 1;
+  layout_info.pPushConstantRanges = &range;
+  if (vkCreatePipelineLayout(vk_device, &layout_info, nullptr, &dres_layout_) != VK_SUCCESS) return false;
+  VkComputePipelineCreateInfo pipeline_info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  pipeline_info.stage.module = dres_module_;
+  pipeline_info.stage.pName = "main";
+  pipeline_info.layout = dres_layout_;
+  if (vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &dres_pipeline_) != VK_SUCCESS) {
+    dres_pipeline_ = VK_NULL_HANDLE;
+    return false;
+  }
+  VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * kDresSets},
+                                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kDresSets}};
+  for (uint32_t i = 0; i < kPlumeFramesInFlight; ++i) {
+    VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.maxSets = kDresSets;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = sizes;
+    if (vkCreateDescriptorPool(vk_device, &pool_info, nullptr, &dres_pool_[i]) != VK_SUCCESS) {
+      dres_pool_[i] = VK_NULL_HANDLE;
+      vkDestroyPipeline(vk_device, dres_pipeline_, nullptr);
+      dres_pipeline_ = VK_NULL_HANDLE;
+      return false;
+    }
+  }
+  dres_failed_ = false;
+  return true;
+}
+
+// The slot's frame is over (its fence was waited for): the views and sets it made go.
+void Patches::ReleaseDepthResolveSlot(uint32_t slot) {
+  if (dres_views_[slot].empty() && !dres_used_[slot]) return;
+  VkDevice vk_device = static_cast<VulkanDevice*>(backend.device_)->vk;
+  for (VkImageView view : dres_views_[slot]) vkDestroyImageView(vk_device, view, nullptr);
+  dres_views_[slot].clear();
+  if (dres_pool_[slot] != VK_NULL_HANDLE) vkResetDescriptorPool(vk_device, dres_pool_[slot], 0);
+  dres_used_[slot] = 0;
+}
+
+void Patches::DestroyDepthResolve() {
+  VkDevice vk_device = static_cast<VulkanDevice*>(backend.device_)->vk;
+  for (uint32_t i = 0; i < kPlumeFramesInFlight; ++i) {
+    for (VkImageView view : dres_views_[i]) vkDestroyImageView(vk_device, view, nullptr);
+    dres_views_[i].clear();
+    if (dres_pool_[i] != VK_NULL_HANDLE) vkDestroyDescriptorPool(vk_device, dres_pool_[i], nullptr);
+    dres_pool_[i] = VK_NULL_HANDLE;
+    dres_used_[i] = 0;
+  }
+  if (dres_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(vk_device, dres_pipeline_, nullptr);
+  if (dres_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(vk_device, dres_layout_, nullptr);
+  if (dres_set_layout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(vk_device, dres_set_layout_, nullptr);
+  if (dres_module_ != VK_NULL_HANDLE) vkDestroyShaderModule(vk_device, dres_module_, nullptr);
+  dres_pipeline_ = VK_NULL_HANDLE;
+  dres_layout_ = VK_NULL_HANDLE;
+  dres_set_layout_ = VK_NULL_HANDLE;
+  dres_module_ = VK_NULL_HANDLE;
+  dres_failed_ = false;
+}
+
 bool Patches::CreatePatchPipelines() {
   if (patch_pipelines_[1] != VK_NULL_HANDLE) return true;
   if (patch_pipelines_failed_) return false;

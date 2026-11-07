@@ -99,6 +99,16 @@ void Reporting::Report() {
       backend.stats_.constant_bytes >> 20, backend.stats_.kept_hits, backend.stats_.kept_bytes_made >> 20, backend.stats_.kept_drops,
       backend.stats_.kept_unwatchable, backend.streams.kept_bytes_ >> 20, backend.streams.kept_streams_.size(), backend.stats_.band_skipped,
       backend.stats_.band_moved, backend.stats_.band_widened);
+  REXLOG_INFO("Renut: Plume resolves: color copies {} ({:.1f} Mpx), depth copies {} ({:.1f} Mpx), depth in place {}, "
+              "{} into a texture nothing had sampled since the last one, {} repeating the last one into the same texture from an untouched source, clears with them: color {} depth {}",
+              backend.stats_.resolves_color, double(backend.stats_.resolve_px_color) / 1e6, backend.stats_.resolves_depth,
+              double(backend.stats_.resolve_px_depth) / 1e6, backend.stats_.resolves_aliased, backend.stats_.resolves_unread,
+              backend.stats_.resolves_redundant, backend.stats_.resolve_clear_color, backend.stats_.resolve_clear_depth);
+  REXLOG_INFO("Renut: Plume resolve copies by what became of them: never read {} ({:.1f} Mpx), read only while the source was "
+              "untouched {} ({:.1f} Mpx), read after the source was drawn again {} ({:.1f} Mpx); depth with stencil by compute pass {}",
+              backend.stats_.resolve_class[0], double(backend.stats_.resolve_class_px[0]) / 1e6, backend.stats_.resolve_class[1],
+              double(backend.stats_.resolve_class_px[1]) / 1e6, backend.stats_.resolve_class[2],
+              double(backend.stats_.resolve_class_px[2]) / 1e6, backend.stats_.depth_direct);
   REXLOG_INFO("Renut: Plume shader loads by name: {} hits", shader_cache_hits_);
   REXLOG_INFO("Renut: Plume shaders named by container: {} found their container's own entry, {} found by the keys ({} loads by identity)",
               backend.shaders.own_entries_, backend.shaders.key_entries_, backend.shaders.identity_shaders_.size());

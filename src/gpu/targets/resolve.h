@@ -31,12 +31,21 @@ struct Resolve {
   void NativePhoto(const uint32_t* record);
   // Debug: appends a line to <files>/plume-resolve.log while <files>/plume-resolve-log exists.
   void LogResolveLine(const std::string& line);
+  // The lines wait here and are written once a frame (Swap::IssueSwap), not one file open each.
+  std::string log_buffer_;
+  void FlushResolveLog();
   uint32_t photo_captures_ = 0, volume_logged_ = 0;
   void NativeResolve(const uint32_t* record);
   // Copies a rectangle of a depth target's depth into an R32_FLOAT texture, or
   // its depth and stencil into an RG32F one.
   bool CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
                  uint32_t dest_x, uint32_t dest_y, bool with_stencil);
+  // The same for a depth target's depth and stencil into an RG32F texture made with the storage flag, in one
+  // compute pass (depth_resolve.comp) that reads the two aspects as sampled images. False, with nothing
+  // recorded, when the pipeline or a view could not be made: the caller then uses CopyDepth. On success the
+  // source is left in SHADER_READ and `dest_layout` is GENERAL.
+  bool ResolveDepthStencil(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
+                           RenderTextureLayout& dest_layout, uint32_t dest_x, uint32_t dest_y);
   std::unique_ptr<RenderBuffer> depth_staging_;
   // The stencil half of a k_24_8_FLOAT resolve (CopyDepth): the S8 aspect,
   // then depth_stencil_pack.comp joining both into RG32F texels.
