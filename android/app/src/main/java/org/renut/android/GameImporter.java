@@ -82,6 +82,7 @@ final class GameImporter {
             }
             progress.update(Language.s(R.string.imp_verify), 0.99);
             GameFiles.requireEuropean(xex);
+            GameCover.ensure(context, xex);
             if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException(Language.s(R.string.import_cancelled));
             String previous = activeFolder(files);
             GameFiles.atomicWrite(new File(files, "active-game.txt"), stage.getName() + "/data");

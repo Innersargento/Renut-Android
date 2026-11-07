@@ -356,6 +356,13 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         try{RuntimeOptions.set(this,RuntimeOptions.VSYNC,Boolean.toString(on));}
         catch(java.io.IOException e){Toast.makeText(this,Language.s(R.string.toml_save_failed,e.getMessage()),Toast.LENGTH_SHORT).show();}
     }
+    /** The graphics page's options: the saved value, and a change that reaches the running renderer now and renut.toml. */
+    public String uiGraphicsOption(String key,String fallback){return RuntimeOptions.get(this,key,fallback);}
+    public void uiSetGraphicsOption(String key,String value){
+        if(loaded)nativeSetCvar(key,value);
+        try{RuntimeOptions.set(this,key,value);}
+        catch(java.io.IOException e){Toast.makeText(this,Language.s(R.string.toml_save_failed,e.getMessage()),Toast.LENGTH_SHORT).show();}
+    }
     public boolean uiFpsVisible(){return fpsWanted;}
     public void uiSetFpsVisible(boolean visible){
         if(fps==null)return;

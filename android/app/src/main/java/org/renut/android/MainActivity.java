@@ -40,10 +40,22 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         getWindow().setNavigationBarColor(Color.rgb(16,10,6));
         refresh();
         ComposeScreens.showMain(this);
+        ensureCover();
         // Only on a fresh launch of the launcher: leaving the game (back, or "Sair para o
         // menu principal") resumes this activity instead of creating it, so the launcher
         // stays reachable to turn the option off.
         if(state==null&&!getIntent().getBooleanExtra("noAutoStart",false)&&uiAutoStart()&&hasGame())startGame();
+    }
+    /** A game imported before the cover was read at import time: read it now, off the main thread. */
+    private void ensureCover(){
+        if(!hasGame()||GameCover.file(this).isFile())return;
+        new Thread(()->{
+            try{
+                String name=new String(Files.readAllBytes(new File(getFilesDir(),"active-game.txt").toPath()),java.nio.charset.StandardCharsets.UTF_8).trim();
+                File[] list=new File(getFilesDir(),name).listFiles((d,n)->n.equalsIgnoreCase("default.xex"));
+                if(list!=null&&list.length>0){GameCover.ensure(this,list[0]);runOnUiThread(this::refresh);}
+            }catch(IOException ignored){}
+        }).start();
     }
     private boolean hasGame(){
         try{

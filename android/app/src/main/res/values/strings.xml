@@ -32,7 +32,6 @@
     <string name="saves_exported">Saves exportados.</string>
     <string name="saves_failed_title">Falha nos saves</string>
     <string name="play_eyebrow">RENUT / JOGAR</string>
-    <string name="play_title">Pronto para jogar?</string>
     <string name="play_subtitle">Sua aventura continua de onde você parou.</string>
     <string name="play_state_full">Jogo completo</string>
     <string name="play_state_xex">Só o XEX importado</string>
@@ -104,9 +103,7 @@
     <string name="settings_fps_value">%1$d FPS</string>
     <string name="settings_fps_original">%1$d FPS (original)</string>
     <string name="settings_fps_unlimited">Ilimitado</string>
-    <string name="settings_fps_target_note">30 é o ritmo original do jogo. Acima disso o jogo apresenta sem esperar o vblank e é mantido na taxa escolhida; no fim da barra não há limite, nem o da frequência da tela. Muda na hora, e pode alterar o ritmo de partes do jogo.</string>
     <string name="settings_vsync">VSync</string>
-    <string name="settings_vsync_note">Apresenta pela sincronização vertical da tela. Desligado, os quadros saem sem esperar o refresh (pode haver tearing).</string>
     <string name="settings_controls">Controles</string>
     <string name="settings_show_controls">Mostrar controles na tela</string>
     <string name="settings_external">Controles externos e jogadores</string>
@@ -135,11 +132,11 @@
     <string name="msaa_off">Desligado</string>
     <string name="msaa_2x">2x</string>
     <string name="msaa_4x">4x</string>
-    <string name="settings_msaa_note">Suaviza as bordas da cena em uma só faixa, sem o tiling do Xbox 360. Custa desempenho, 4x mais que 2x.</string>
     <string name="settings_shadow_quality">Qualidade das sombras</string>
     <string name="shadow_quality_full">Completa</string>
     <string name="shadow_quality_medium">Média · 3/4</string>
     <string name="shadow_quality_low">Baixa · 1/2</string>
+    <string name="shadow_quality_none">Nenhuma</string>
     <string name="settings_temp">Temperatura</string>
     <string name="layout_title">Editar layout</string>
     <string name="layout_edit_button">Editar layout…</string>
@@ -219,6 +216,11 @@
     <string name="menu_controllers">Controles e jogadores</string>
     <string name="menu_controllers_count">%1$d conectado(s)</string>
     <string name="menu_controllers_two">2 jogadores</string>
+    <string name="menu_graphics">Gráficos</string>
+    <string name="menu_graphics_hint">Resolução, sombras, MSAA, VSync</string>
+    <string name="credits_title">Sobre e créditos</string>
+    <string name="credits_github">Código no GitHub</string>
+    <string name="credits_body">reNut para PC por masterspike52 (a recompilação do jogo, seus hooks e documentação), com ajuda de SolarCookies, ValcomDrifty, OlieGamerTV e XephyrCraft. Usa RexGlue SDK, Plume, XenosRecomp (hedge-dev), libadrenotools e liblinkernsbypass (bylaws) e libucontext. Banjo-Kazooie: Nuts &amp; Bolts pertence à Rare e à Microsoft; este app não contém nada do jogo.</string>
     <string name="menu_exit">Sair do jogo</string>
     <string name="menu_ach_none">A lista é lida do seu jogo na primeira vez em que ele inicia. Ela aparece aqui depois dessa primeira partida.</string>
     <string name="ctrl_title">Controles externos</string>

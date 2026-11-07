@@ -23,6 +23,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -57,6 +58,9 @@ import androidx.compose.material.icons.filled.SportsEsports
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Vibration
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -92,6 +96,8 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
@@ -163,7 +169,7 @@ class WelcomeModel {
  * RuntimeActivity (Java) drives it; Compose observes the state below.
  */
 class GameMenu internal constructor(private val activity: RuntimeActivity) {
-    internal enum class Page { Main, Achievements, Controllers }
+    internal enum class Page { Main, Achievements, Controllers, Graphics }
 
     var isOpen by mutableStateOf(false); private set
     var isPaused by mutableStateOf(false); private set
@@ -390,11 +396,11 @@ private val NAV_ENTRIES = listOf(
         value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
     }
     // Read from the game on its first launch; until then the card shows a placeholder.
-    val cover = remember(stamp) {
-        runCatching { BitmapFactory.decodeFile(java.io.File(activity.filesDir, "achievements/title.png").path)?.asImageBitmap() }.getOrNull()
+    val cover = remember(stamp, state, GameCover.file(activity).lastModified()) {
+        runCatching { BitmapFactory.decodeFile(GameCover.file(activity).path)?.asImageBitmap() }.getOrNull()
     }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        item { Header(stringResource(R.string.play_eyebrow), stringResource(R.string.play_title), stringResource(R.string.play_subtitle)) }
+        item { Header(stringResource(R.string.play_eyebrow), "", stringResource(R.string.play_subtitle)) }
         item {
             Card(colors = CardDefaults.cardColors(containerColor = Color.Transparent), shape = RoundedCornerShape(24.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(
@@ -459,6 +465,23 @@ private val NAV_ENTRIES = listOf(
             Panel(stringResource(R.string.play_panel_open)) {
                 ToggleRow(stringResource(R.string.play_autostart), autoStart, !busy) { activity.uiSetAutoStart(it) }
                 Text(stringResource(R.string.play_autostart_note), color = Muted, fontSize = 12.sp)
+            }
+        }
+        item { CreditsPanel() }
+    }
+}
+
+/** The end of the Play page: where the code lives and who made it possible. */
+@Composable private fun CreditsPanel() {
+    val links = LocalUriHandler.current
+    Panel(stringResource(R.string.credits_title)) {
+        Text(stringResource(R.string.credits_body), color = Muted, fontSize = 12.sp)
+        // The GitHub mark below the text; it opens the same page as the button.
+        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            IconButton(onClick = { runCatching { links.openUri("https://github.com/Innersargento/Renut-Android") } },
+                modifier = Modifier.size(56.dp)) {
+                Icon(painterResource(R.drawable.ic_github), stringResource(R.string.credits_github), tint = Text,
+                    modifier = Modifier.size(36.dp))
             }
         }
     }
@@ -704,8 +727,8 @@ private val SKIN_LABELS = listOf(
     val ir3Mode = activity.uiIr3Mode()
     val turnip = remember(driver) { activity.uiDriverIsTurnip() }
     val logLevel = activity.uiRuntimeOption("log_level", "info")
-    val noShadows = activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true"
     val sustained = activity.uiRuntimeOption("renut_adpf", "true") == "true"
+    var noShadows by remember { mutableStateOf(activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true") }
     val vsyncOn = activity.uiRuntimeOption(RuntimeOptions.VSYNC, "true") == "true"
     val textureLevels = listOf(stringResource(R.string.texture_quality_full), stringResource(R.string.texture_quality_half),
         stringResource(R.string.texture_quality_quarter))
@@ -713,7 +736,7 @@ private val SKIN_LABELS = listOf(
         mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
     }
     val shadowLevels = listOf(stringResource(R.string.shadow_quality_full), stringResource(R.string.shadow_quality_medium),
-        stringResource(R.string.shadow_quality_low))
+        stringResource(R.string.shadow_quality_low), stringResource(R.string.shadow_quality_none))
     var shadowQuality by remember {
         mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.SHADOW_QUALITY, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
     }
@@ -753,11 +776,9 @@ private val SKIN_LABELS = listOf(
                 FpsTargetSlider(RuntimeOptions.fpsTarget(activity), !busy, onLive = {}) {
                     activity.uiSetRuntimeOption(RuntimeOptions.FPS_TARGET, it.toString())
                 }
-                Text(stringResource(R.string.settings_fps_target_note), color = Muted, fontSize = 12.sp)
                 ToggleRow(stringResource(R.string.settings_vsync), vsyncOn, !busy) {
                     activity.uiSetRuntimeOption(RuntimeOptions.VSYNC, it.toString())
                 }
-                Text(stringResource(R.string.settings_vsync_note), color = Muted, fontSize = 12.sp)
             }
         }
         item {
@@ -813,15 +834,16 @@ private val SKIN_LABELS = listOf(
                     msaa = level
                     activity.uiSetRuntimeOption(RuntimeOptions.MSAA, level.toString())
                 }
-                Text(stringResource(R.string.settings_msaa_note), color = Muted, fontSize = 12.sp)
-                SingleChoiceSelector(stringResource(R.string.settings_shadow_quality), shadowLevels[shadowQuality],
-                    shadowLevels, !busy) { choice ->
+                // The last level is "none": the no-shadows switch, so one list says it all.
+                SingleChoiceSelector(stringResource(R.string.settings_shadow_quality),
+                    shadowLevels[if (noShadows) 3 else shadowQuality], shadowLevels, !busy) { choice ->
                     val level = shadowLevels.indexOf(choice).coerceAtLeast(0)
-                    shadowQuality = level
-                    activity.uiSetRuntimeOption(RuntimeOptions.SHADOW_QUALITY, level.toString())
-                }
-                ToggleRow(stringResource(R.string.settings_no_shadows), noShadows, !busy) {
-                    activity.uiSetRuntimeOption("renut_plume_no_shadows", it.toString())
+                    noShadows = level == 3
+                    activity.uiSetRuntimeOption("renut_plume_no_shadows", noShadows.toString())
+                    if (level < 3) {
+                        shadowQuality = level
+                        activity.uiSetRuntimeOption(RuntimeOptions.SHADOW_QUALITY, level.toString())
+                    }
                 }
                 ToggleRow(stringResource(R.string.settings_adpf), sustained, !busy) {
                     activity.uiSetRuntimeOption("renut_adpf", it.toString())
@@ -857,7 +879,7 @@ private val SKIN_LABELS = listOf(
 @Composable private fun Header(eyebrow: String, title: String, subtitle: String) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(eyebrow, color = Accent, fontWeight = FontWeight.Bold, fontSize = 12.sp, letterSpacing = 1.sp)
-        Text(title, color = Text, fontWeight = FontWeight.Bold, fontSize = 32.sp)
+        if (title.isNotEmpty()) Text(title, color = Text, fontWeight = FontWeight.Bold, fontSize = 32.sp)
         Text(subtitle, color = Muted, fontSize = 14.sp)
     }
 }
@@ -1051,6 +1073,7 @@ private val SidebarWidth = 360.dp
                     GameMenu.Page.Main -> SidebarMain(activity, menu)
                     GameMenu.Page.Achievements -> SidebarAchievements(activity, menu)
                     GameMenu.Page.Controllers -> SidebarControllers(activity, menu)
+                    GameMenu.Page.Graphics -> SidebarGraphics(activity, menu)
                 }
             }
         }
@@ -1062,7 +1085,6 @@ private val SidebarWidth = 360.dp
     var fpsVisible by remember { mutableStateOf(activity.uiFpsVisible()) }
     var tempVisible by remember { mutableStateOf(activity.uiTempVisible()) }
     var rumbleOn by remember { mutableStateOf(activity.uiRumbleEnabled()) }
-    var vsyncOn by remember { mutableStateOf(activity.uiVsync()) }
     // The summary line is read from the files the runtime keeps, off the main thread.
     val snapshot by produceState<Achievements.Snapshot?>(null) {
         value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
@@ -1088,6 +1110,9 @@ private val SidebarWidth = 360.dp
         SidebarItem(Icons.Default.Gamepad, stringResource(R.string.menu_controllers), padSummary(activity), chevron = true) {
             menu.page = GameMenu.Page.Controllers
         }
+        SidebarItem(Icons.Default.Palette, stringResource(R.string.menu_graphics), stringResource(R.string.menu_graphics_hint), chevron = true) {
+            menu.page = GameMenu.Page.Graphics
+        }
         SidebarToggle(Icons.Default.Vibration, stringResource(R.string.ctrl_rumble), rumbleOn) {
             rumbleOn = it
             activity.uiSetRumble(it)
@@ -1096,15 +1121,11 @@ private val SidebarWidth = 360.dp
             controlsVisible = it
             activity.uiSetGameControlsVisible(it)
         }
-        SidebarToggle(Icons.Default.Speed, stringResource(R.string.settings_fps), fpsVisible) {
+        SidebarToggle(Icons.Default.Visibility, stringResource(R.string.settings_fps), fpsVisible) {
             fpsVisible = it
             activity.uiSetFpsVisible(it)
         }
         SidebarFpsTarget(activity)
-        SidebarToggle(Icons.Default.Speed, stringResource(R.string.settings_vsync), vsyncOn) {
-            vsyncOn = it
-            activity.uiSetVsync(it)
-        }
         SidebarToggle(Icons.Default.Thermostat, stringResource(R.string.settings_temp), tempVisible) {
             tempVisible = it
             activity.uiSetTempVisible(it)
@@ -1178,6 +1199,72 @@ private val SidebarWidth = 360.dp
     }
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         PlayersPanel(activity) { activity.uiControllersChanged() }
+    }
+}
+
+/** The sidebar's graphics page: every option is a cvar the renderer follows at its next frame, and is saved. */
+@Composable private fun ColumnScope.SidebarGraphics(activity: RuntimeActivity, menu: GameMenu) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = { menu.page = GameMenu.Page.Main }) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.menu_back), tint = Text)
+        }
+        Text(stringResource(R.string.menu_graphics), Modifier.weight(1f), color = Text, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+        IconButton(onClick = { menu.close() }) { Icon(Icons.Default.Close, stringResource(R.string.menu_close), tint = Muted) }
+    }
+    fun level(key: String) = (activity.uiGraphicsOption(key, "0").toIntOrNull() ?: 0).coerceIn(0, 2)
+    var vsyncOn by remember { mutableStateOf(activity.uiVsync()) }
+    var noShadows by remember { mutableStateOf(activity.uiGraphicsOption("renut_plume_no_shadows", "false") == "true") }
+    var textureQuality by remember { mutableStateOf(level(RuntimeOptions.TEXTURE_QUALITY)) }
+    var resolution by remember { mutableStateOf(level(RuntimeOptions.INTERNAL_RESOLUTION)) }
+    var msaa by remember { mutableStateOf(level(RuntimeOptions.MSAA)) }
+    var shadowQuality by remember { mutableStateOf(level(RuntimeOptions.SHADOW_QUALITY)) }
+    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SidebarToggle(Icons.Default.Sync, stringResource(R.string.settings_vsync), vsyncOn) {
+            vsyncOn = it
+            activity.uiSetVsync(it)
+        }
+        SidebarChoice(stringResource(R.string.settings_internal_resolution), resolution,
+            listOf(R.string.internal_resolution_full, R.string.internal_resolution_three_quarters, R.string.internal_resolution_half)) {
+            resolution = it
+            activity.uiSetGraphicsOption(RuntimeOptions.INTERNAL_RESOLUTION, it.toString())
+        }
+        SidebarChoice(stringResource(R.string.settings_msaa), msaa,
+            listOf(R.string.msaa_off, R.string.msaa_2x, R.string.msaa_4x)) {
+            msaa = it
+            activity.uiSetGraphicsOption(RuntimeOptions.MSAA, it.toString())
+        }
+        SidebarChoice(stringResource(R.string.settings_texture_quality), textureQuality,
+            listOf(R.string.texture_quality_full, R.string.texture_quality_half, R.string.texture_quality_quarter)) {
+            textureQuality = it
+            activity.uiSetGraphicsOption(RuntimeOptions.TEXTURE_QUALITY, it.toString())
+        }
+        SidebarChoice(stringResource(R.string.settings_shadow_quality), if (noShadows) 3 else shadowQuality,
+            listOf(R.string.shadow_quality_full, R.string.shadow_quality_medium, R.string.shadow_quality_low,
+                R.string.shadow_quality_none)) {
+            noShadows = it == 3
+            activity.uiSetGraphicsOption("renut_plume_no_shadows", noShadows.toString())
+            if (it < 3) {
+                shadowQuality = it
+                activity.uiSetGraphicsOption(RuntimeOptions.SHADOW_QUALITY, it.toString())
+            }
+        }
+    }
+}
+
+/** A titled row of chips for the sidebar: one of a few levels, applied as soon as it is picked. */
+@Composable private fun SidebarChoice(title: String, selected: Int, labels: List<Int>, onSelect: (Int) -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF2A1C11)).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(title, color = Text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+        // Scrolls sideways, so a level past the edge (the last shadow level) can be reached.
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            labels.forEachIndexed { index, label ->
+                FilterChip(selected = selected == index, onClick = { onSelect(index) },
+                    label = { Text(stringResource(label), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) })
+            }
+        }
     }
 }
 

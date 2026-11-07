@@ -32,7 +32,6 @@
     <string name="saves_exported">存档已导出。</string>
     <string name="saves_failed_title">存档操作失败</string>
     <string name="play_eyebrow">RENUT / 开始游戏</string>
-    <string name="play_title">准备好开始了吗？</string>
     <string name="play_subtitle">你的冒险将从上次停下的地方继续。</string>
     <string name="play_state_full">完整游戏</string>
     <string name="play_state_xex">仅导入了 XEX</string>
@@ -104,9 +103,7 @@
     <string name="settings_fps_value">%1$d FPS</string>
     <string name="settings_fps_original">%1$d FPS（原版）</string>
     <string name="settings_fps_unlimited">不限制</string>
-    <string name="settings_fps_target_note">30 为游戏原版节奏。高于 30 时，游戏不再等待垂直消隐并保持在所选帧率；滑块末端完全不限制，也不受屏幕刷新率约束。更改立即生效，可能会改变游戏部分内容的节奏。</string>
     <string name="settings_vsync">垂直同步</string>
-    <string name="settings_vsync_note">通过屏幕的垂直同步呈现画面。关闭后，画面不再等待刷新（可能出现撕裂）。</string>
     <string name="settings_controls">控制</string>
     <string name="settings_show_controls">显示屏幕控制按键</string>
     <string name="settings_external">外接手柄与玩家</string>
@@ -135,11 +132,11 @@
     <string name="msaa_off">关闭</string>
     <string name="msaa_2x">2x</string>
     <string name="msaa_4x">4x</string>
-    <string name="settings_msaa_note">在单个区块中平滑场景边缘，不使用 Xbox 360 的分块渲染。会降低性能，4x 比 2x 更耗性能。</string>
     <string name="settings_shadow_quality">阴影质量</string>
     <string name="shadow_quality_full">完整</string>
     <string name="shadow_quality_medium">中 · 3/4</string>
     <string name="shadow_quality_low">低 · 1/2</string>
+    <string name="shadow_quality_none">无</string>
     <string name="settings_temp">温度</string>
     <string name="layout_title">编辑布局</string>
     <string name="layout_edit_button">编辑布局…</string>
@@ -219,6 +216,11 @@
     <string name="menu_controllers">手柄与玩家</string>
     <string name="menu_controllers_count">已连接 %1$d 个</string>
     <string name="menu_controllers_two">双人模式</string>
+    <string name="menu_graphics">图形</string>
+    <string name="menu_graphics_hint">分辨率、阴影、MSAA、垂直同步</string>
+    <string name="credits_title">关于与致谢</string>
+    <string name="credits_github">GitHub 源代码</string>
+    <string name="credits_body">PC 版 reNut 由 masterspike52 制作（游戏的重编译、钩子与文档），SolarCookies、ValcomDrifty、OlieGamerTV 和 XephyrCraft 提供了帮助。使用 RexGlue SDK、Plume、XenosRecomp (hedge-dev)、libadrenotools 与 liblinkernsbypass (bylaws) 以及 libucontext。Banjo-Kazooie: Nuts &amp; Bolts 归 Rare 与 Microsoft 所有；本应用不含任何游戏内容。</string>
     <string name="menu_exit">退出游戏</string>
     <string name="menu_ach_none">该列表会在游戏首次启动时从游戏中读取，首局结束后会显示在这里。</string>
     <string name="ctrl_title">外接手柄</string>
