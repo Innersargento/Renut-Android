@@ -40,7 +40,6 @@ struct Targets {
   uint32_t internal_scale_ = 4;
   // The most samples a surface gets (renut_msaa): 1 off, 2 or 4.
   uint32_t msaa_samples_ = 1;
-  bool msaa_a2c_ = true;  // renut_msaa_a2c
   uint64_t texture_budget_ = 0;
   void BeginFrame();
   void EvictIdleTextures();

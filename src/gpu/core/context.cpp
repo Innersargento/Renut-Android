@@ -96,7 +96,6 @@ bool GpuBackend::SetupContext() {
   {
     const int32_t msaa = std::clamp(REXCVAR_GET(renut_msaa), 0, 2);
     targets.msaa_samples_ = msaa == 1 ? 2u : msaa == 2 ? 4u : 1u;
-    targets.msaa_a2c_ = REXCVAR_GET(renut_msaa_a2c);
     REXLOG_INFO("Renut: Plume scene MSAA: {}", msaa == 0 ? "off" : msaa == 1 ? "up to 2x" : "up to 4x");
   }
   // One slice per frame in flight, after the permanent allocations.
@@ -135,7 +134,6 @@ bool GpuBackend::SetupContext() {
   for (auto& list : lists_) list = queue_->createCommandList();
   targets.list_ = lists_[0].get();
   swap.defer_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2));
-  swap.depth_direct_ = REXCVAR_GET(renut_plume_depth_resolve_shader);
   report.hiz_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2));
   census.Init();
   swap.fetch_spec_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1));

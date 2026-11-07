@@ -24,13 +24,6 @@
 #include "plume/frame_pacing.h"
 #include "plume/plume_gpu.h"
 
-// The old switch for the game's own MSAA, which renders the scene in two or four bands (predicated tiling) with
-// every draw sent once per band. Still defined so that an older renut.toml and the launch intent parse; the scene
-// is now always one band, and renut_msaa picks its samples.
-REXCVAR_DEFINE_BOOL(renut_scene_msaa, false, "reNut", "Deprecated: renut_msaa replaces it");
-REXCVAR_DEFINE_BOOL(renut_band_fix, true, "reNut",
-                    "Give the scene's band jobs the whole-screen projection (the scene is one band, so nothing "
-                    "predicates the jobs of the other bands away). Off to test whether the game still needs it");
 REXCVAR_DEFINE_INT32(renut_msaa, 0, "reNut/Plume",
                      "Multisampling of the scene, drawn in one band (no predicated tiling): 0 off, 1 2x, 2 4x. "
                      "The game's MSAA surfaces are kept at the screen's size and the host resolves their samples "
@@ -417,7 +410,7 @@ REX_HOOK_RAW(sub_823B18C8) {
     const uint32_t scene = GuestWord(base, ctx.r3.u32 + 40);
     const uint32_t split_flag = scene ? GuestWord(base, scene + 44) : 0;
     const uint32_t view = GuestWord(base, ctx.r3.u32 + 52);
-    if (REXCVAR_GET(renut_band_fix) && scene && split_flag == 1) {
+    if (scene && split_flag == 1) {
       // The view's matrices: +128 whole screen, +192 upper band, +256 lower.
       uint8_t* block = renut::GuestPtr(base, scene + (view << 9));
       std::memcpy(block + 192, block + 128, 64);

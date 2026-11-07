@@ -90,7 +90,6 @@ extern "C" uint64_t renut_audio_silent_frames();
 REXCVAR_DECLARE(int32_t, renut_plume_pipeline_lookup_ms);
 REXCVAR_DECLARE(int32_t, renut_plume_bool_spec);
 REXCVAR_DECLARE(int32_t, renut_plume_defer_draws);
-REXCVAR_DECLARE(bool, renut_plume_depth_resolve_shader);
 REXCVAR_DECLARE(int32_t, renut_plume_hiz);
 REXCVAR_DECLARE(bool, renut_plume_zero_census);
 REXCVAR_DECLARE(bool, renut_plume_stack_wrap);
@@ -113,7 +112,6 @@ REXCVAR_DECLARE(int32_t, renut_plume_shadow_quality);
 REXCVAR_DECLARE(int32_t, renut_plume_internal_resolution);
 REXCVAR_DECLARE(bool, renut_plume_precompile);
 
-REXCVAR_DECLARE(bool, renut_msaa_a2c);
 REXCVAR_DECLARE(int32_t, renut_msaa);  // game_fixes.cpp: scene multisampling, 0 off, 1 2x, 2 4x
 REXCVAR_DECLARE(bool, vsync);  // the SDK's: off ticks the guest's vblank every millisecond
 

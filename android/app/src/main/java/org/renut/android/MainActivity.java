@@ -74,7 +74,6 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
         i.putExtra("showControls",getPreferences(0).getBoolean("showControls",true));
         boolean turnip=uiDriverIsTurnip();
         i.putExtra("oneUiFix",turnip&&getPreferences(0).getBoolean("oneui",true));
-        i.putExtra("sceneMsaa",false);
         i.putExtra("tuDebug",turnip?getPreferences(0).getString("tuDebug",""):"");
         i.putExtra("ir3Debug",turnip?getPreferences(0).getString("ir3Debug",""):"");
         startActivity(i);

@@ -235,7 +235,7 @@ static void validateFibers() {
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activity, jstring directory,
     jobject surface,jstring hooks,jstring driverDirectory,jstring driverLibrary,jboolean launch,
-    jboolean oneUiFix,jboolean sceneMsaa,jstring tuDebug,jstring ir3Debug) {
+    jboolean oneUiFix,jstring tuDebug,jstring ir3Debug) {
   const char* chars = env->GetStringUTFChars(directory, nullptr);
   if (!chars) return nullptr;
   std::filesystem::path root(chars);
@@ -261,9 +261,6 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       note(cheats.empty() ? std::string("Cheats: desligados") : "Cheats: " + cheats);
     }
     note("Renderizador: Plume");
-    // So does its MSAA choice.
-    rex::cvar::SetFlagByName("renut_scene_msaa", sceneMsaa ? "true" : "false");
-    note(std::string("MSAA: ") + (sceneMsaa ? "ativado" : "desativado"));
     note("RexGlue 0.10.0 / ARM64: biblioteca carregada.");
     size_t mappings = 0;
     while (PPCFuncMappings[mappings].host) ++mappings;

@@ -541,7 +541,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // without MSAA; like a single-sample A2C, keep the fragments at or above
   // half coverage. With samples, the pipeline covers them by the alpha.
   const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(backend.skip_mask_ & 4096);
-  const bool coverage_mask = alpha_to_mask && pass_samples > 1 && backend.targets.msaa_a2c_;
+  const bool coverage_mask = alpha_to_mask && pass_samples > 1;
   bool alpha_test = ps && (alpha_test_enabled || (alpha_to_mask && !coverage_mask));
   float alpha_ref = alpha_test_enabled ? regs.alpha_ref : 0.5f;
   // The pixel shaders only clip(alpha - ref), i.e. pass at alpha >= ref. N&B's

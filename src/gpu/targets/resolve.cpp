@@ -204,7 +204,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       // The scene's depth with its stencil: one compute pass into the texture, when the device allows it; the
       // staging buffers otherwise. A multisampled image cannot go through them (a buffer copy takes one sample
       // per texel): only the compute pass, which reads its first sample, resolves it.
-      if (!(packed && (backend.swap.depth_direct_ || multisampled) && dest.format == RenderFormat::R32G32_FLOAT &&
+      if (!(packed && dest.format == RenderFormat::R32G32_FLOAT &&
             ResolveDepthStencil(*source, sx, sy, w, h, dest.texture.get(), dest.layout, dest_x, dest_y))) {
         if (multisampled) {
           if (++backend.stats_.msaa_depth_skipped <= 4) {

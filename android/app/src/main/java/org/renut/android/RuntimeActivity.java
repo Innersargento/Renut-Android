@@ -40,7 +40,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private ScrollView results;
     private boolean started, graphics, launch;
     private volatile boolean loaded, cancelled;
-    private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,boolean launch,boolean oneUiFix,boolean sceneMsaa,String tuDebug,String ir3Debug);
+    private native String nativeValidate(String filesDirectory,Surface surface,String hooks,String directory,String library,boolean launch,boolean oneUiFix,String tuDebug,String ir3Debug);
     private static native void nativeStop();
     private static native void nativeBackground();
     private static native boolean nativeSetPaused(boolean paused);
@@ -481,7 +481,6 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 report=nativeValidate(getFilesDir().getAbsolutePath(),target,getApplicationInfo().nativeLibraryDir,
                     getIntent().getStringExtra("driverDir"),getIntent().getStringExtra("driverLib"),
                     launch,getIntent().getBooleanExtra("oneUiFix",true),
-                    getIntent().getBooleanExtra("sceneMsaa",false),
                     getIntent().getStringExtra("tuDebug"),getIntent().getStringExtra("ir3Debug"));
             }catch(Throwable e){
                 report=Language.s(R.string.runtime_start_failed,String.valueOf(e));
