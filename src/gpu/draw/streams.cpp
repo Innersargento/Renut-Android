@@ -21,7 +21,7 @@ bool Streams::UploadGuest(uint32_t address, uint32_t size, xenos::Endian endian,
   if (!address || !size || size > (32u << 20)) return false;
   uint64_t key = (uint64_t(address) << 32) ^ (uint64_t(size) << 2) ^ uint64_t(endian);
   auto found = uploaded_streams_.find(key);
-  if (found != uploaded_streams_.end() && !(backend.skip_mask_ & 256)) {
+  if (found != uploaded_streams_.end()) {
     offset = found->second;
     return true;
   }
@@ -573,7 +573,7 @@ bool Streams::CommitConstants(uint8_t* shadow, const void* source, size_t size,
                                             uint64_t& offset, bool* written) {
   // Nothing written into the block since it was last placed: the same bytes,
   // without comparing them.
-  if (offset != UINT64_MAX && written && !*written && !(backend.skip_mask_ & 4194304)) {
+  if (offset != UINT64_MAX && written && !*written) {
     ++backend.stats_.constants_reused;
     return true;
   }
@@ -583,7 +583,7 @@ bool Streams::CommitConstants(uint8_t* shadow, const void* source, size_t size,
   // per draw - still compare.
   const bool flagged = written && *written;
   if (written) *written = false;
-  if (!flagged && offset != UINT64_MAX && !(backend.skip_mask_ & 4194304) && std::memcmp(shadow, source, size) == 0) {
+  if (!flagged && offset != UINT64_MAX && std::memcmp(shadow, source, size) == 0) {
     ++backend.stats_.constants_reused;
     return true;
   }

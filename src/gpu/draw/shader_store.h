@@ -176,7 +176,7 @@ class ShaderStore {
     // host writes them every draw) instead of specialization constants: one
     // pipeline for every combination of them a scene shows was most of what a
     // first visit compiled. A module of another shape keeps them specialized.
-    if (REXCVAR_GET(renut_plume_bool_spec) == 0) {
+    {
       std::vector<uint32_t> dynamic = renut::MakeBooleansDynamic(spirv, 4, 8, RENUT_SHARED_BOOLEANS_OFFSET / 16,
                                                                  RENUT_SPEC_BOOLS_BASE);
       if (!dynamic.empty()) {

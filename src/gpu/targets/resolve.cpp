@@ -48,7 +48,6 @@ void Resolve::NativeResolve(const uint32_t* w) {
   surfaces.source = backend.targets.SurfaceTarget(slot);
   surfaces.depth = backend.targets.SurfaceTarget(4);
   surfaces.slot = slot;
-  for (uint32_t i = 0; i < native_d3d::kResolveTraceWords; ++i) surfaces.trace[i] = w[17 + i];
   surfaces.x = w[1];
   surfaces.y = w[2];
   surfaces.width = w[3] > w[1] ? w[3] - w[1] : 0;
@@ -65,12 +64,6 @@ void Resolve::NativeResolve(const uint32_t* w) {
 
 bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& surfaces) {
   ++backend.stats_.resolves;
-  // plume-skip bit 33554432 drops the resolve entirely. Attributing intervals
-  // between timestamps proved unreliable on this tiler - the same frame read as
-  // 83% resolve or 89% between-passes depending only on which side of the
-  // pass-closing barrier the mark sat. Removing a category of work and
-  // measuring the difference does not depend on that.
-  if (backend.skip_mask_ & 33554432) return true;
   if (!surfaces.width || !surfaces.height) return true;
   const bool copying_depth = copy.depth;
   // The source is the surface the resolve names, the rectangle in its pixels:
@@ -83,9 +76,6 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
   const uint32_t width = HostCeil(source, surfaces.x + surfaces.width) - x;
   const uint32_t height = HostCeil(source, surfaces.y + surfaces.height) - y;
   if (!width || !height) return true;
-  // plume-skip bit 134217728 drops every clear, these and Direct3D's. The
-  // picture is wrong; it measures what the clear-only passes cost.
-  const bool skip_clears = backend.skip_mask_ & 134217728;
   const uint32_t copy_height = height;
   backend.draw.Trace("resolve {} src=({},{}) {}x{} found={} -> {:08X} dfmt={} clear={}{}",
         copying_depth ? "depth" : "color", x, y, width, height,
@@ -135,7 +125,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       // scene's depth with its stencil, a part of a surface - copies as before.
       if (backend.swap.depth_alias_ && copying_depth && !with_stencil && source->depth && source->texture &&
           source->samples == 1 &&
-          !(backend.skip_mask_ & (268435456 | 536870912)) && sx == 0 && sy == 0 && ox == 0 && oy == 0 &&
+          sx == 0 && sy == 0 && ox == 0 && oy == 0 &&
           w == source->width && h == source->height && object_w == w && object_h == h) {
         aliased = backend.targets.AliasDepthResolve(*source, surfaces.object_base);
         chosen = aliased;
@@ -170,12 +160,6 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       const uint32_t kind = !dest.sampled ? 0u : dest.read_dirty ? 2u : 1u;
       ++backend.stats_.resolve_class[kind];
       backend.stats_.resolve_class_px[kind] += dest.last_px;
-      if (backend.swap.resolve_log_) {
-        static const char* const names[3] = {"unread", "alias_ok", "needs_copy"};
-        LogResolveLine(fmt::format("f={} class {} {}px of the copy at {:08X} made by trace={:X},{:X},{:X}", backend.swaps_,
-                                   names[kind], dest.last_px, surfaces.object_base, dest.last_trace[0],
-                                   dest.last_trace[1], dest.last_trace[2]));
-      }
     }
     dest.sampled = false;
     ++dest.generation;
@@ -223,28 +207,23 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       backend.stats_.resolve_px_color += uint64_t(w) * h;
       backend.targets.Transition(source->texture.get(), source->layout, RenderTextureLayout::COPY_SOURCE);
       backend.targets.Transition(dest.texture.get(), dest.layout, RenderTextureLayout::COPY_DEST);
-      // plume-skip bit 268435456 keeps the resolve's barriers and pass breaks
-      // but drops the copies themselves, colour and depth (see CopyDepth).
-      if (!(backend.skip_mask_ & 268435456)) {
-        if (source->samples > 1) {
-          // The samples averaged into the texture (what the console's resolve does with the copy sample select
-          // the game leaves: a colour resolve takes them all).
-          const RenderRect region(int32_t(sx), int32_t(sy), int32_t(sx + w), int32_t(sy + h));
-          backend.recorder.L()->resolveTextureRegion(dest.texture.get(), dest_x, dest_y, source->texture.get(), &region,
-                                                     RenderResolveMode::AVERAGE);
-          ++backend.stats_.msaa_color_resolves;
-        } else {
-          RenderBox box(int32_t(sx), int32_t(sy), int32_t(sx + w), int32_t(sy + h), 0, 1);
-          backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
-                                   RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
-                                   dest_y, 0, &box);
-        }
+      if (source->samples > 1) {
+        // The samples averaged into the texture (what the console's resolve does with the copy sample select
+        // the game leaves: a colour resolve takes them all).
+        const RenderRect region(int32_t(sx), int32_t(sy), int32_t(sx + w), int32_t(sy + h));
+        backend.recorder.L()->resolveTextureRegion(dest.texture.get(), dest_x, dest_y, source->texture.get(), &region,
+                                                   RenderResolveMode::AVERAGE);
+        ++backend.stats_.msaa_color_resolves;
+      } else {
+        RenderBox box(int32_t(sx), int32_t(sy), int32_t(sx + w), int32_t(sy + h), 0, 1);
+        backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.texture.get()),
+                                 RenderTextureCopyLocation::Subresource(source->texture.get()), dest_x,
+                                 dest_y, 0, &box);
       }
     }
     dest.last_copy = !aliased && dest.texture && w && h;
     dest.read_dirty = false;
     dest.last_px = uint64_t(w) * h;
-    for (uint32_t i = 0; i < 3; ++i) dest.last_trace[i] = surfaces.trace[2 + i];
     if (dest.texture) {
       if (backend.swap.snap_address_ && !dest.alias && surfaces.object_base == backend.swap.snap_address_ && ++backend.swap.snap_seen_ == backend.swap.snap_ordinal_) {
         SnapshotResolved(dest);
@@ -254,20 +233,6 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
         backend.targets.SetTexture2D(dest.descriptor, dest.texture.get());
       }
       const uint32_t base_address = surfaces.object_base;
-      if (backend.swap.resolve_log_) {
-        // One line per resolve: what it is, where from (the target and its scale), where to, what rode
-        // along, and whether the last one into the same texture was ever read.
-        LogResolveLine(fmt::format(
-            "f={} resolve {} {}x{} at ({},{}) from slot {} target {}x{} s{} -> {:08X} obj={}x{} pitch={} dfmt={} "
-            "endian={} swap={} host_fmt={} how={} clear={}{} prev_unread={} redundant={} trace={:X},{:X},{:X},{:X},{:X},{:X},{:X},{:X}",
-            backend.swaps_, copying_depth ? "depth" : "color", w, h, dest_x, dest_y, surfaces.slot,
-            source->width, source->height, source->scale, base_address, surfaces.object_width,
-            surfaces.object_height, dest.guest_pitch, copy.dest_format, copy.endian, uint32_t(copy.swap),
-            uint32_t(dest.format), aliased ? "alias" : (dest.texture && w && h ? "copy" : "none"),
-            copy.clear_color ? "c" : "", copy.clear_depth ? "d" : "", unread ? 1 : 0, redundant ? 1 : 0,
-            surfaces.trace[0], surfaces.trace[1], surfaces.trace[2], surfaces.trace[3], surfaces.trace[4],
-            surfaces.trace[5], surfaces.trace[6], surfaces.trace[7]));
-      }
     }
   }
 
@@ -275,7 +240,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
   if (copy.clear_color) ++backend.stats_.resolve_clear_color;
   if (copy.clear_depth) ++backend.stats_.resolve_clear_depth;
   const RenderRect rect(int32_t(x), int32_t(y), int32_t(x + width), int32_t(y + height));
-  if (copy.clear_color && source && !skip_clears) {
+  if (copy.clear_color && source) {
     backend.targets.Transition(source->texture.get(), source->layout, RenderTextureLayout::COLOR_WRITE);
     std::array<Target*, 4> colors{source};
     backend.targets.SetFramebuffer(backend.targets.GetFramebuffer(colors, 1, nullptr));
@@ -296,7 +261,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
     backend.recorder.L()->clearColor(0, color, &rect, 1);
     ++backend.stats_.clears;
   }
-  if (copy.clear_depth && !skip_clears) {
+  if (copy.clear_depth) {
     Target* depth = surfaces.depth;
     if (depth) {
       const RenderRect depth_rect(int32_t(HostFloor(depth, surfaces.x)), int32_t(HostFloor(depth, surfaces.y)),
@@ -320,24 +285,6 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
     }
   }
   return true;
-}
-
-void Resolve::LogResolveLine(const std::string& line) {
-  log_buffer_ += line;
-  log_buffer_ += '\n';
-}
-
-void Resolve::FlushResolveLog() {
-  if (log_buffer_.empty() || backend.miss_dump_directory_.empty()) {
-    log_buffer_.clear();
-    return;
-  }
-  const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
-  if (FILE* file = std::fopen((root + "/plume-resolve.log").c_str(), "a")) {
-    std::fwrite(log_buffer_.data(), 1, log_buffer_.size(), file);
-    std::fclose(file);
-  }
-  log_buffer_.clear();
 }
 
 // Photo Mode's picture: render target 0, after the draws recorded before the capture, read back
@@ -453,9 +400,6 @@ bool Resolve::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint
   ++backend.stats_.barriers;
   source.layout = RenderTextureLayout::COPY_SOURCE;
   backend.targets.bound_framebuffer_ = nullptr;
-  // plume-skip bit 536870912 keeps that barrier and drops the round trip
-  // through the staging buffer, to price it; 268435456 drops every copy.
-  if (backend.skip_mask_ & (268435456 | 536870912)) return true;
   VkCommandBuffer cb = static_cast<VulkanCommandList*>(backend.recorder.L())->vk;
   VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
@@ -511,8 +455,6 @@ bool Resolve::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint
 
 bool Resolve::ResolveDepthStencil(Target& source, uint32_t x, uint32_t y, uint32_t w, uint32_t h, RenderTexture* dest,
                                   RenderTextureLayout& dest_layout, uint32_t dest_x, uint32_t dest_y) {
-  // The debug skips of CopyDepth keep their meaning there.
-  if (backend.skip_mask_ & (268435456 | 536870912)) return false;
   Patches& patches = backend.patches;
   if (!patches.CreateDepthResolvePipeline()) return false;
   const VkPipeline pipeline = source.samples > 1 ? patches.dres_ms_pipeline_ : patches.dres_pipeline_;

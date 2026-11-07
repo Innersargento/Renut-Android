@@ -59,10 +59,8 @@ constexpr uint64_t kSurfaceTargetKey = 1ull << 63;
 struct ResolveSurfaces {
   Target* source = nullptr;
   Target* depth = nullptr;
-  // Which of the surface slots the source is (for the resolve log).
+  // Which of the surface slots the source is.
   uint32_t slot = 0;
-  // The host return addresses of the call that made the resolve (the resolve log), as offsets.
-  uint32_t trace[native_d3d::kResolveTraceWords] = {};
   uint32_t x = 0, y = 0, width = 0, height = 0;
   // The destination texture object's level 0 (GPU address, 0 if the copy goes
   // elsewhere), its size and pitch, and where the source corner lands in it.
@@ -132,7 +130,6 @@ struct Resolved {
   bool last_copy = false;
   bool read_dirty = false;
   uint64_t last_px = 0;
-  uint32_t last_trace[3] = {};
 };
 
 struct GuestTexture {

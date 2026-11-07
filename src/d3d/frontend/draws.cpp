@@ -2,24 +2,9 @@
 #include "d3d/frontend/internal.h"
 #include "d3d/resources/resource.h"
 
-#include <dlfcn.h>
-#include <unwind.h>
-
 namespace renut::native_d3d {
 
-std::atomic<bool> g_resolve_trace{false};
-
 namespace {
-struct HostTrace {
-  uint32_t count = 0;
-  uintptr_t ip[kResolveTraceWords] = {};
-};
-_Unwind_Reason_Code HostTraceFrame(struct _Unwind_Context* context, void* arg) {
-  auto* trace = static_cast<HostTrace*>(arg);
-  if (trace->count >= kResolveTraceWords) return _URC_END_OF_STACK;
-  trace->ip[trace->count++] = uintptr_t(_Unwind_GetIP(context));
-  return _URC_NO_REASON;
-}
 // The draw's EDRAM mode (RB_MODECONTROL, device +10580) for the flags of its record.
 uint32_t DrawMode(const uint8_t* base, uint32_t dev) { return (U32(base, dev + 10580) & 7) << kDrawModeShift; }
 }  // namespace
@@ -476,15 +461,6 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
     list.words.push_back(uint32_t(px - rx1));
     list.words.push_back(uint32_t(py - ry1));
     list.words.push_back(pitch);
-    // Who asked for it, as host return addresses (see kResolveTraceWords).
-    HostTrace trace;
-    if (g_resolve_trace.load(std::memory_order_relaxed)) _Unwind_Backtrace(HostTraceFrame, &trace);
-    for (uint32_t i = 0; i < kResolveTraceWords; ++i) {
-      Dl_info info;
-      list.words.push_back(i < trace.count && dladdr(reinterpret_cast<void*>(trace.ip[i]), &info)
-                               ? uint32_t(trace.ip[i] - uintptr_t(info.dli_fbase))
-                               : 0u);
-    }
   });
   // What the copy leaves in the device: the texture's fence, and the state it
   // would have clobbered marked for the next draw (harmless on the host).

@@ -10,11 +10,6 @@
 // its interrupt, the ring and the GPU backend behind it. The SDK has no
 // part in it (RuntimeConfig::graphics is null); the three Vd exports that
 // reach it are overridden in kernel_overrides.cpp.
-REXCVAR_DEFINE_BOOL(renut_stub_vsync_thread, true, "reNut",
-                    "No \"GPU VSync\" thread: with the frame pacer holding the game (presentation always "
-                    "immediate) nothing needs the emulated vertical blank to tick between swaps, so the vblank "
-                    "counter and the device's clock words are brought up to date when a swap or a callback "
-                    "reaches the GPU backend. Off: the thread ticks them 60 times a second, as before");
 REXCVAR_DECLARE(bool, renut_pace_original_fps);
 
 namespace renut::gpu {
@@ -38,7 +33,7 @@ class PlumeGpu {
     // The frame pacer makes every swap immediate when the game's own 30 FPS is paced too
     // (renut_pace_original_fps); then the vertical blank only has a clock to keep, which TickVblank
     // does at the swaps. Otherwise a swap can be queued behind a vblank and the thread must deliver it.
-    stub_vsync_ = REXCVAR_GET(renut_stub_vsync_thread) && REXCVAR_GET(renut_pace_original_fps);
+    stub_vsync_ = REXCVAR_GET(renut_pace_original_fps);
     if (stub_vsync_) {
       REXLOG_INFO("Renut: no GPU VSync thread (the vblank clock is kept at the swaps)");
       return true;

@@ -29,11 +29,6 @@ struct Resolve {
   // rows as the CPU reads a linear X8R8G8B8 texture. Everything else the scene resolves stays on the
   // GPU.
   void NativePhoto(const uint32_t* record);
-  // Debug: appends a line to <files>/plume-resolve.log while <files>/plume-resolve-log exists.
-  void LogResolveLine(const std::string& line);
-  // The lines wait here and are written once a frame (Swap::IssueSwap), not one file open each.
-  std::string log_buffer_;
-  void FlushResolveLog();
   uint32_t photo_captures_ = 0, volume_logged_ = 0;
   void NativeResolve(const uint32_t* record);
   // Copies a rectangle of a depth target's depth into an R32_FLOAT texture, or

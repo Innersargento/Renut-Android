@@ -294,7 +294,6 @@ bool Lists::RunNative(uint32_t until) {
 // cleared.
 void Lists::NativeClear(const uint32_t* w) {
   backend.recorder.FlushDeferred();
-  if (backend.skip_mask_ & 134217728) return;
   const uint32_t flags = w[0] >> 8, present = w[11];
   const int32_t x1 = int32_t(w[1]), y1 = int32_t(w[2]), x2 = int32_t(w[3]), y2 = int32_t(w[4]);
   float color[4], z;

@@ -117,10 +117,6 @@ void Targets::BeginFrame() {
                                       std::chrono::steady_clock::now() - wait_start)
                                       .count());
   backend.patches.ReleaseDepthResolveSlot(backend.slot_);
-  backend.profiling.ReadTimestamps(backend.slot_);
-  backend.profiling.ReadPairTimestamps(backend.slot_);
-  backend.census.BeginSlot(backend.slot_);
-  backend.skip_mask_ = uint32_t(REXCVAR_GET(renut_plume_skip));
   backend.streams.ApplyWritebacks(backend.slot_);
   list_ = backend.lists_[backend.slot_].get();
   slice_base_ = slice_origin_ + uint64_t(backend.slot_) * backend.upload_slice_size_;
@@ -160,25 +156,6 @@ void Targets::BeginFrame() {
     EvictIdleTextures();
   }
   StartList();
-  // Only here, never from Flush: a mid-frame flush keeps recording into the
-  // same range, and resetting it would drop what the first submission wrote.
-  pass_marks_[backend.slot_].clear();
-  backend.profiling.timestamps_used_ = 0;
-  if (backend.timestamp_pool_ != VK_NULL_HANDLE) {
-    vkCmdResetQueryPool(static_cast<VulkanCommandList*>(backend.recorder.L())->vk, backend.timestamp_pool_,
-                        backend.slot_ * kMaxTimestamps, kMaxTimestamps);
-    backend.profiling.WriteTimestamp();
-  }
-  backend.census.ResetSlot(backend.slot_);
-  pair_capture_ = false;
-  backend.profiling.pair_used_ = 0;
-  backend.profiling.pair_marks_[backend.slot_].clear();
-  if (backend.pair_pool_ != VK_NULL_HANDLE && backend.swap.pairprof_frames_left_ > 0) {
-    vkCmdResetQueryPool(static_cast<VulkanCommandList*>(backend.recorder.L())->vk, backend.pair_pool_, backend.slot_ * kPairQueries,
-                        kPairQueries);
-    pair_capture_ = true;
-    --backend.swap.pairprof_frames_left_;
-  }
 }
 
 // Resets the per-frame state that lives in the ring slice and opens the list.
@@ -252,10 +229,6 @@ void Targets::Transition(RenderTexture* texture, RenderTextureLayout& current,
     // On a tiler the pass's fragment work runs at vkCmdEndRenderPass, which
     // this barrier just triggered - so the mark belongs here, after it, for the
     // interval since the pass opened to be that pass's own cost.
-    PassMark mark;
-    mark.resolve = 1;
-    pass_marks_[backend.slot_].push_back(mark);
-    backend.profiling.WriteTimestamp();
   }
   bound_framebuffer_ = nullptr;  // barriers end the render pass
 }
@@ -572,14 +545,6 @@ void Targets::SetFramebuffer(RenderFramebuffer* framebuffer) {
     // the first draw, so the mark lands between the two.
     backend.recorder.L()->setFramebuffer(framebuffer);
     bound_framebuffer_ = framebuffer;
-    ++backend.report.rec_stats_.passes;
-    PassMark mark;
-    mark.width = framebuffer->getWidth();
-    mark.height = framebuffer->getHeight();
-    mark.colors = recorder ? emit_colors_ : color_count_of_pass_;
-    mark.depth = recorder ? emit_depth_ : depth_of_pass_;
-    pass_marks_[backend.slot_].push_back(mark);
-    backend.profiling.WriteTimestamp();
   }
 }
 

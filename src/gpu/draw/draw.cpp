@@ -3,11 +3,6 @@
 
 namespace renut::gpu {
 
-// plume-skip bits that only change a draw's own state (no depth test, no culling,
-// no alpha to mask, no timestamps): they keep Hi-Z and the draw windows, so the
-// zero-sample census can be compared with them on and off.
-constexpr uint32_t kStateOnlySkipBits = 1024 | 131072 | 4096 | 67108864;
-
 const Draw::OutputState& Draw::Output() {
   const DrawState& st = backend.state_;
   const uint32_t words[OutputState::kWords] = {st.blend_control0.value,       st.blend_control123[0].value,
@@ -100,7 +95,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (vs) {
       auto* ps_miss = static_cast<HostShader*>(backend.active_pixel_shader());
       const uint64_t ps_hash = ps_miss && ps_miss->entry ? ps_miss->entry->hash : 0;
-      ++backend.report.missed_draws_[vs->ucode_data_hash()];
       if (missed_pairs_.insert(vs->ucode_data_hash() ^ ps_hash).second && missed_pairs_.size() <= 48) {
         REXLOG_INFO("Renut: Plume missing VS {:016X} with PS {:016X}, mode {}, prim {}, {} indices",
                     vs->ucode_data_hash(), ps_hash, uint32_t(edram_mode), uint32_t(prim_type), index_count);
@@ -205,7 +199,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // dropped draw would have fetched are fetched by the draws that remain: only
   // mesh draws (triangles through a vertex model) are ever dropped, never the
   // full-screen passes that read the scene's copies.
-  if (backend.report.hiz_mode_ && !trace_ && !(backend.skip_mask_ & ~kStateOnlySkipBits) && !backend.recorder.bind_skip_ && !sync_draws_ && !patch_list && !rect_list &&
+  if (backend.hiz.mode_ && !trace_ && !backend.recorder.bind_skip_ && !sync_draws_ && !patch_list && !rect_list &&
       !point_list && vs->compiled && (!debug_shader_ || (vs->entry->hash != debug_shader_ &&
                                                           (!ps || ps->entry->hash != debug_shader_)))) {
     // One call in 16 is timed (the clock reads are a cost of their own).
@@ -316,8 +310,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     return shader->texture_mask;
   };
   uint32_t used_slots = slots_of(vs) | slots_of(ps);
-  // Debug: go back to binding every slot, to compare against a capture.
-  if (backend.skip_mask_ & 1048576) used_slots = ~0u;
   for (uint32_t remaining = used_slots; remaining;) {
     const uint32_t slot = uint32_t(__builtin_ctz(remaining));
     remaining &= remaining - 1;
@@ -504,13 +496,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // exports, point sizes and clip planes), and what an earlier draw left in the
   // others keeps the second half the same from draw to draw.
   uint8_t* sh = shared_built_;
-  // plume-skip bit 16777216 points every fetch at the 1x1 white texture in
-  // slot 0: the sampling instructions stay, the texture bandwidth goes.
-  if (backend.skip_mask_ & 16777216) {
-    std::memset(texture_descriptor, 0, sizeof(texture_descriptor));
-    std::memset(cube_descriptor, 0, sizeof(cube_descriptor));
-    std::memset(stack_descriptor, 0, sizeof(stack_descriptor));
-  }
   // plume-debug-shader mode 16 points every 2D fetch but slot 0 at white, 32
   // only slot 0: which texture of a draw takes its output away.
   if (debug_shader_ && (vs->entry->hash == debug_shader_ || (ps && ps->entry->hash == debug_shader_))) {
@@ -540,7 +525,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // Alpha to coverage (N&B's grass and foliage) has no samples to cover
   // without MSAA; like a single-sample A2C, keep the fragments at or above
   // half coverage. With samples, the pipeline covers them by the alpha.
-  const bool alpha_to_mask = color_control.alpha_to_mask_enable && !(backend.skip_mask_ & 4096);
+  const bool alpha_to_mask = color_control.alpha_to_mask_enable;
   const bool coverage_mask = alpha_to_mask && pass_samples > 1;
   bool alpha_test = ps && (alpha_test_enabled || (alpha_to_mask && !coverage_mask));
   float alpha_ref = alpha_test_enabled ? regs.alpha_ref : 0.5f;
@@ -910,23 +895,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // every mesh with half-float positions. One recompiled without it gets the
     // difference remapped (see FetchRemap).
     if (location < RENUT_INPUT_REMAP_COUNT) input_remap[location] = element->remap;
-    // Debug: plume-skip bit 512 reverses every 16-bit pair a second time, the
-    // old behaviour.
-    if (IsSixteenBitFormat(element->format) && (backend.skip_mask_ & 512)) {
-      // Debug: the old behaviour, reversing the 16-bit pairs a second time.
-      int which = -1;
-      switch (element->usage) {
-        case 5: which = 0; break;   // TEXCOORD
-        case 3: which = 1; break;   // NORMAL
-        case 7: which = 2; break;   // BINORMAL
-        case 6: which = 3; break;   // TANGENT
-        case 1: which = 4; break;   // BLENDWEIGHT
-        case 0: which = 5; break;   // POSITION
-        case 2: which = 6; break;   // BLENDINDICES
-        default: break;
-      }
-      if (which >= 0) swapped[which] |= 1u << element->usage_index;
-    }
   }
   if (sync_draws_ && !patch_list && vs->compiled && sync_diag_[vs->entry->hash]++ < 1) {
     // One line per vertex shader: what its fetches can reach, for finding the
@@ -1042,20 +1010,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       Trace("  live{} stream={} format={} flags={} stride={} remap={:X} offset={} scale={}", k,
             entry[0] & 0xFF, (entry[0] >> 8) & 0xFF, entry[0] >> 16, entry[1] & 0xFFFF, entry[1] >> 16,
             entry[2], scale);
-    }
-  }
-  if (backend.skip_mask_) {
-    bool skinned = false, half_position = false;
-    for (const LiveElement& e : vs->elements) {
-      skinned |= e.usage == 2;
-      half_position |= e.usage == 0 && e.format == 32;
-    }
-    const int32_t base = int32_t(regs.base_vertex);
-    if (((backend.skip_mask_ & 1) && int_inputs) || ((backend.skip_mask_ & 2) && packed_inputs) ||
-        ((backend.skip_mask_ & 4) && skinned) || ((backend.skip_mask_ & 8) && half_position) ||
-        ((backend.skip_mask_ & 16) && quad_list) || ((backend.skip_mask_ & 32) && base != 0) ||
-        ((backend.skip_mask_ & 64) && !skinned) || ((backend.skip_mask_ & 128) && zero_used)) {
-      return true;
     }
   }
   if (backend.swap.skin_log_) {
@@ -1249,7 +1203,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   const auto raster = regs.raster;
   const bool polygonal = draw_util::IsPrimitivePolygonal(false, prim_type);
   RenderCullMode cull = RenderCullMode::NONE;
-  if (polygonal && !(backend.skip_mask_ & 131072)) {
+  if (polygonal) {
     if (raster.cull_front && raster.cull_back) return backend.shaders.Drop("culls both faces", vs, ps);
     if (raster.cull_front) cull = RenderCullMode::FRONT;
     else if (raster.cull_back) cull = RenderCullMode::BACK;
@@ -1263,7 +1217,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     alpha_test = false;
   }
   const bool depth_enabled =
-      depth && depth_control.z_enable && !(backend.skip_mask_ & 1024) && !(debug_draw && (debug_mode_ & 1));
+      depth && depth_control.z_enable && !(debug_draw && (debug_mode_ & 1));
   const bool depth_write = depth_enabled && depth_control.z_write_enable;
   // Polygon offset, converted like the Xenia Vulkan path does: the constant is
   // a fraction of the depth range, times 2^24 for a float depth target (Vulkan
@@ -1484,30 +1438,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     key_bytes.Put(s.stride);
   }
   const uint64_t key = key_bytes.Hash();
-  // What a pipeline must agree on with the draw for another one to stand in
-  // for it without faulting: attachments, primitive and vertex input. Only the
-  // plume-skip bit below uses it.
-  uint64_t interface_key = 0;
-  if (backend.skip_mask_ & 262144) {
-    HashCombine(interface_key, topology);
-    HashCombine(interface_key, rect_list);
-    HashCombine(interface_key, point_list);
-    HashCombine(interface_key, patch_list);
-    HashCombine(interface_key, color_count);
-    for (uint32_t i = 0; i < color_count; ++i) HashCombine(interface_key, colors[i]->format);
-    HashCombine(interface_key, depth ? depth->format : RenderFormat::UNKNOWN);
-    HashCombine(interface_key, pass_samples);
-    for (const auto& e : input_elements) {
-      HashCombine(interface_key, e.location);
-      HashCombine(interface_key, e.format);
-      HashCombine(interface_key, e.slotIndex);
-      HashCombine(interface_key, e.alignedByteOffset);
-    }
-    for (const auto& s : input_slots) {
-      HashCombine(interface_key, s.index);
-      HashCombine(interface_key, s.stride);
-    }
-  }
   std::unique_ptr<RenderPipeline>* pipeline_node = pipeline_memo_.Find(key);
   if (!pipeline_node) {
     pipeline_node = &backend.pipelines.pipelines_[key];
@@ -1602,7 +1532,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         auto found = standins_.find(family);
         if (found == standins_.end()) return false;
         standin = found->second;
-        ++backend.report.drops_[{"pipeline stand-in", vs->entry->hash, ps ? ps->entry->hash : 0, false}];
         return true;
       };
       // A draw that goes without its pipeline says so to the job, which
@@ -1708,10 +1637,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                          std::chrono::steady_clock::now() - pipeline_start)
                                          .count());
       ++backend.stats_.pipelines;
-    }
-    if (pipeline && getenv("RENUT_PIPELINE_STATS")) LogPipelineStatistics(*pipeline, vs, ps);
-    if (pipeline && getenv("RENUT_PIPELINE_IR")) {
-      DumpPipelineInternals(*pipeline, vs, ps, backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/')));
     }
     if (!pipeline && !standin) {
       REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
@@ -1833,7 +1758,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   pk.pass_colors = backend.targets.color_count_of_pass_;
   pk.pass_depth = backend.targets.depth_of_pass_;
   pk.pipeline = standin ? standin : pipeline.get();
-  pk.interface_key = interface_key;
   pk.vs_hash = vs->entry->hash ^ (uint64_t(rel_constants_mode_ >= 10 ? rel_variant : 0) << 60);
   pk.ps_hash = ps ? ps->entry->hash : 0;
   if (backend.swap.trail_) {
@@ -1882,9 +1806,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   pk.constant_offsets[kRelBinding] = pk.constant_offsets[kRelBinding + 1] =
       uint32_t(vs_all_offset_ != UINT64_MAX ? vs_all_offset_ : unused_ps_offset);
   pk.viewport = viewport;
-  // plume-skip bit 8388608 scissors every draw to one pixel: vertex work and
-  // binning stay, fragment work goes. What is left is the per-draw cost.
-  if (backend.skip_mask_ & 8388608) scissor_rect = RenderRect(0, 0, 1, 1);
   // A shadow map drawn at a fraction of the guest's resolution (see Target).
   if (extent && extent->scale != 4) {
     const float fraction = float(extent->scale) / 4.f;
@@ -1965,20 +1886,14 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     Trace("{}", line);
   }
-  // plume-skip bit 1073741824 records everything but the draw itself: the
-  // state, pipeline and constant changes are all that reach the GPU.
   backend.stats_.vertices += vertex_count;
   if (rect_list || point_list) ++backend.stats_.gs_draws;
   if (patch_list) {
     ++backend.stats_.patch_draws;
     backend.stats_.patch_vertices += vertex_count;
   }
-  // plume-skip bit 2147483648 submits only each draw's first triangle: the
-  // per-draw state and setup stay, the vertex work goes.
-  const uint32_t draw_count = (backend.skip_mask_ & 2147483648u) ? std::min(vertex_count, 3u) : vertex_count;
-  if (backend.skip_mask_ & 1073741824) {
-    pk.kind = DrawPacket::Kind::kNone;
-  } else if (indexed) {
+  const uint32_t draw_count = vertex_count;
+  if (indexed) {
     // The ring is bound whole and each draw starts at its own indices, which
     // Allocate aligns to 256 bytes - one binding for every draw of the list.
     const uint32_t index_size = index_format == RenderFormat::R32_UINT ? 4 : 2;
@@ -2016,7 +1931,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // order.
   bool defer = false;
   uint64_t window_signature = 0;
-  if (backend.swap.defer_mode_ && !sync_draws_ && !trace_ && !(backend.skip_mask_ & ~kStateOnlySkipBits) && !backend.recorder.bind_skip_ && !debug_draw && !patch_list &&
+  if (backend.swap.defer_mode_ && !sync_draws_ && !trace_ && !backend.recorder.bind_skip_ && !debug_draw && !patch_list &&
       !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && depth_write) {
     const xenos::CompareFunction zf = depth_control.zfunc;
     const bool strict = zf == xenos::CompareFunction::kLess || zf == xenos::CompareFunction::kLessEqual ||
@@ -2049,37 +1964,6 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       HashCombine(window_signature, stencil_enabled ? uint32_t(stencil_ref_mask.stencilwritemask) : 0u);
       HashCombine(window_signature, uint32_t(edram_mode));
     }
-  }
-  if (backend.census.active_ && pk.kind != DrawPacket::Kind::kNone) {
-    CensusSignature sig;
-    sig.vs = pk.vs_hash;
-    sig.ps = pk.ps_hash;
-    sig.depth_control = depth_control.value;
-    sig.stencil = stencil_ref_mask.value;
-    sig.stencil_bf = regs.stencil_ref_mask_bf.value;
-    sig.raster = raster.value;
-    sig.color_control = color_control.value;
-    const float census_alpha_ref = regs.alpha_ref;
-    std::memcpy(&sig.alpha_ref, &census_alpha_ref, 4);
-    sig.clip = regs.clip_cntl.value;
-    sig.color_mask = color_mask;
-    sig.viewport_w = uint32_t(std::fabs(viewport.width));
-    sig.viewport_h = uint32_t(std::fabs(viewport.height));
-    sig.scissor_w = uint32_t(scissor_rect.right - scissor_rect.left);
-    sig.scissor_h = uint32_t(scissor_rect.bottom - scissor_rect.top);
-    sig.prim = uint32_t(prim_type);
-    sig.kind = uint32_t(pk.kind);
-    sig.count_log2 = pk.count ? 32 - uint32_t(__builtin_clz(pk.count)) : 0;
-    bool any_blend = false;
-    for (uint32_t i = 0; i < color_count; ++i) any_blend = any_blend || blends[i].blendEnabled;
-    sig.flags = (color_pass ? Census::kColorPass : 0) | (alpha_test ? Census::kAlphaTest : 0) |
-                (alpha_to_mask ? Census::kAlphaToMask : 0) | (stencil_enabled ? Census::kStencil : 0) |
-                (depth_enabled ? Census::kDepth : 0) | (depth_write ? Census::kDepthWrite : 0) |
-                (any_blend ? Census::kBlend : 0) |
-                ((raster.poly_offset_front_enable || raster.poly_offset_back_enable) ? Census::kBias : 0) |
-                ((vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) ? Census::kMemExport : 0) |
-                (defer ? Census::kDeferred : 0);
-    pk.census_query = backend.census.Assign(sig);
   }
   if (defer) {
     if (!backend.recorder.deferred_.empty() && deferred_signature_ != window_signature) backend.recorder.FlushDeferred(1);

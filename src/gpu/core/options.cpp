@@ -6,49 +6,9 @@ REXCVAR_DEFINE_INT32(renut_plume_pipeline_lookup_ms, 4, "reNut/Plume",
                      "new pipelines it already has, so their draws appear at once; past it they go to the "
                      "workers. 0 leaves every new pipeline to the workers.")
     .range(0, 33);
-REXCVAR_DEFINE_INT32(renut_plume_bool_spec, 0, "reNut/Plume",
-                     "How shaders see the Xenos boolean registers: 0 read from the shared block every draw "
-                     "(about a quarter of the pipelines to compile), 1 as specialization constants (a "
-                     "pipeline per combination of the bits a pair of shaders tests)")
-    .range(0, 1);
-REXCVAR_DEFINE_INT32(renut_plume_defer_draws, 2, "reNut/Plume",
-                     "Record draws in windows grouped by pipeline: 0 off, 1 depth-only draws (the shadow "
-                     "maps), 2 also opaque colour draws that test and write depth (reordering them is "
-                     "exact except for depth ties; measured 11/10: -37% pipeline binds, -3% GPU cycles, "
-                     "image unchanged)")
-    .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_plume_hiz, 2, "reNut/Plume",
                      "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
                      "lies wholly outside the view frustum, the scissor or an enabled user clip plane (docs/performance/HIZ.md)");
-REXCVAR_DEFINE_INT32(renut_plume_skip, 0, "reNut/Plume",
-                     "Debug: the plume-skip bits (see the skip_mask_ tests in src/gpu), e.g. 1024 no depth test, "
-                     "131072 no culling, 4096 no alpha to mask. Other bits also turn off Hi-Z and the draw windows. "
-                     "Followed live.");
-REXCVAR_DEFINE_BOOL(renut_plume_zero_census, false, "reNut/Plume",
-                    "Debug: run every draw inside an occlusion query and sum the draws that leave no sample by their "
-                    "state, into <files>/plume-zero-census.txt every 300 frames and when turned off. Followed live.");
-REXCVAR_DEFINE_BOOL(renut_plume_stack_wrap, true, "reNut/Plume",
-                    "Address a stacked texture's layers as its fetch constant says (repeat, mirror, clamp) instead of "
-                    "always clamping them to the ends of the stack. The water walks a 12-layer stack in time with a "
-                    "coordinate far past the stack's end and relies on the layer index repeating; clamped, it sat on "
-                    "the last layer and the waves stood still. Followed live.");
-REXCVAR_DEFINE_BOOL(renut_plume_key_reuse, true, "reNut/Plume",
-                    "Key a draw's pipeline by one hash of its vertex shader's fetch table, kept on the "
-                    "shader, instead of laying every specialization constant of the table into the key "
-                    "each draw");
-REXCVAR_DEFINE_INT32(renut_plume_fetch_spec, 1, "reNut/Plume",
-                     "Give each vertex shader's live vertex fetch table to the driver as specialization "
-                     "constants, so that the format switches of its fetch sites fold away: 0 off, 1 on")
-    .range(0, 1);
-REXCVAR_DEFINE_INT32(renut_plume_depth_strip, 1, "reNut/Plume",
-                     "Draw depth-only draws (no fragment shader: the shadow maps) with a vertex shader "
-                     "that has lost its interpolant outputs, which nothing reads: 0 off, 1 on")
-    .range(0, 1);
-REXCVAR_DEFINE_INT32(renut_plume_rel_constants, 2, "reNut/Plume",
-                     "How a vertex shader's relative constant reads (a0, aL: skinning matrices) are served: "
-                     "0 by the file's four blocks, 1 by the whole file as one block, 2 by that block "
-                     "declared too large for the driver to promote into the constant file")
-    .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_plume_adaptive_patches, 1, "reNut/Plume",
                      "Tessellate adaptive triangle patches (the water) at the levels the game works out for "
                      "each edge, a patch off screen being one triangle, instead of every patch at the draw's "

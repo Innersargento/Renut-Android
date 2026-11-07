@@ -368,12 +368,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   // vtx_w0_fmt set is the usual case: the shader's W is W, not 1/W.
   if (clip.clip_disable || vte.vtx_xy_fmt || vte.vtx_z_fmt || !vte.vtx_w0_fmt || !vte.vport_x_scale_ena ||
       !vte.vport_x_offset_ena || !vte.vport_y_scale_ena || !vte.vport_y_offset_ena) {
-    // Which states, for the report: one draw in 16 is enough, and a hash map
-    // insert on each of them was a cost of its own.
-    if ((backend.stats_.hiz_why[3]++ & 15) == 0) {
-      backend.report.hiz_clip_states_[(uint64_t(vte.value) << 32) | clip.value] += 16;
-    }
-    return false;
+    return ++backend.stats_.hiz_why[3], false;
   }
   if (regs.sq_vs_const.base != 0) return ++backend.stats_.hiz_why[4], false;
 
@@ -386,9 +381,6 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   if (!entry->model || !entry->model->valid) {
     ++backend.stats_.hiz_no_model[kind];
     ++backend.stats_.hiz_why_model[kind][entry->model ? uint32_t(entry->model->why) % 12 : 0];
-    // Counted on the entry; the report ranks them (no hash map on this path).
-    ++entry->nomodel_draws;
-    entry->vs_hash = vs.entry ? vs.entry->hash : 0;
     return false;
   }
   renut::hiz::Model& model = *entry->model;
@@ -412,7 +404,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
   // seldom wholly outside: it counts as cold sooner and is sampled less often.
   const bool heavy = model.vid_indexed();
   const uint32_t cold_period = heavy ? 16 : 8;
-  if (backend.swap.hiz_skip_ && backend.report.hiz_mode_ == 2) {
+  if (backend.swap.hiz_skip_ && backend.hiz.mode_ == 2) {
     const uint64_t index_word = index_info && index_info->guest_base
                                     ? (uint64_t(index_info->guest_base) << 32) | index_count
                                     : uint64_t(index_count);
@@ -437,13 +429,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     }
   }
   const auto stage_b = hiz_stage_timing_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-  const uint64_t made_before = backend.stats_.hiz_boxes_made, made_us_before = backend.stats_.hiz_box_us;
   const HizBox* box = HizBoxFor(model, fetch, index_info, index_count, base_vertex);
-  if (backend.stats_.hiz_boxes_made != made_before) {
-    ++entry->boxes_made;
-    entry->box_us += backend.stats_.hiz_box_us - made_us_before;
-    entry->vs_hash = vs.entry ? vs.entry->hash : 0;
-  }
   if (hiz_stage_timing_) {
     backend.stats_.hiz_stage_ns[1] += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                 std::chrono::steady_clock::now() - stage_b).count());
@@ -662,7 +648,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     if (reason == 2) ++backend.stats_.hiz_clip_plane[kind];
   }
   if (cold_slot) cold_slot->culled += sampled_cold ? cold_period : 1;
-  return backend.report.hiz_mode_ >= 2;
+  return backend.hiz.mode_ >= 2;
 }
 
 }  // namespace renut::gpu

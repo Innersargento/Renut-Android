@@ -179,50 +179,6 @@ namespace renut::gpu {
   // recorded. The slot also owns the slice of the upload ring that list reads
   // from and the host resources it retired, all released together once the
   // renderer's fence for that slot has been waited on.
-  // GPU time per render pass, from Vulkan timestamps written at every pass
-  // boundary. setFramebuffer ends the active pass before it binds the new one
-  // and the pass only reopens at the next draw, so those points are outside a
-  // render pass - which is where a timestamp on a tiler means anything. Read
-  // back once the slot's fence has been waited on, so nothing stalls for it.
-  inline constexpr uint32_t kMaxTimestamps = 512;
-
-  struct PassMark {
-    uint32_t width = 0, height = 0, colors = 0, draws = 0;
-    bool depth = false;
-    // A resolve's copies run between two framebuffer marks, so without a mark
-    // of their own their cost is charged to whatever pass preceded them.
-    // 1 = the barrier that ends the open pass, 2 = the copies themselves.
-    uint8_t resolve = 0;
-  };
-
-  struct PassTotal {
-    uint64_t ns = 0, passes = 0, draws = 0;
-  };
-
-  // Where the GPU's time goes, per (vertex, pixel) shader pair. Debug only:
-  // <files>/plume-pairprof holds "<mode> <frames>" and is consumed when read.
-  // The next `frames` frames get two timestamps around every draw - from before
-  // its state changes to after the draw call - and the sums per pair are
-  // written to <files>/plume-pairprof.txt once the last of them has been read
-  // back. Mode 1 stamps the top of the pipe, which reads the command
-  // processor's clock without waiting for the GPU: when the GPU is the
-  // bottleneck the processor stalls on whichever draw cannot be taken in, so
-  // the spans add up to throughput cost with the draws still overlapping. Mode
-  // 2 stamps the bottom, which drains the pipe at both ends and so measures each
-  // draw alone, latency included. The per-pass timestamps above are separate.
-  inline constexpr uint32_t kPairQueries = 32768;
-
-  struct PairMark {
-    uint64_t vs = 0, ps = 0;
-    uint32_t count = 0;
-    uint8_t colors = 0, depth = 0, kind = 0, switched = 0;
-  };
-
-  struct PairTotal {
-    uint64_t ns = 0, draws = 0, vertices = 0, switches = 0;
-    uint8_t colors = 0, depth = 0;
-  };
-
   // Deferred draws. IssueDraw gathers what the Vulkan calls of a draw need into
   // a packet. A draw that cannot change the picture when it is reordered
   // against its neighbours waits in a window, and the window is recorded
@@ -244,7 +200,6 @@ namespace renut::gpu {
     uint32_t pass_colors = 0;
     bool pass_depth = false;
     RenderPipeline* pipeline = nullptr;
-    uint64_t interface_key = 0;
     bool blend_constants = false;
     bool stencil = false;
     float blend_factor[4] = {};
@@ -268,8 +223,6 @@ namespace renut::gpu {
     // The device address and size of each of the 17 streams the shaders read by address.
     uint64_t stream_addr[17] = {};
     uint32_t stream_size[17] = {};
-    // renut_plume_zero_census: the draw's occlusion query.
-    uint32_t census_query = UINT32_MAX;
   };
 
   // The draws recorded last, for the report a lost device prints (see
@@ -318,13 +271,6 @@ namespace renut::gpu {
   struct HizModelEntry {
     std::shared_ptr<renut::hiz::Model> model;
     bool validated = false;
-    // Draws of this entry that had no model since the last report, and the
-    // shader they came from (for the report's ranking).
-    uint64_t nomodel_draws = 0;
-    uint64_t vs_hash = 0;
-    // Boxes made for draws of this entry, and the time they took (us), since the
-    // last report: a shader whose draws keep making boxes is a churn source.
-    uint64_t boxes_made = 0, box_us = 0;
   };
 
   // An object-space box of the fetched element over the vertices a draw reads,
@@ -377,12 +323,6 @@ namespace renut::gpu {
   };
 
   inline constexpr size_t kRecBatch = 48;
-
-  // What EmitDraw counts: written by the recorder, folded into stats_ at the
-  // report (after a sync).
-  struct RecStats {
-    uint64_t drawn = 0, pipeline_binds = 0, passes = 0;
-  };
 
   struct RecWorker {
     std::thread thread;

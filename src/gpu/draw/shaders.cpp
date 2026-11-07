@@ -34,7 +34,6 @@ Shader* Shaders::LoadShaderIdentity(xenos::ShaderType shader_type, uint64_t cont
   const uint64_t identity = XXH3_64bits_withSeed(&program, sizeof(program), container) | 1;
   const auto known = identity_shaders_.find(identity);
   if (known != identity_shaders_.end()) {
-    ++backend.report.shader_cache_hits_;
     return known->second;
   }
   // Only the first program is the one the container's entry was made for.
@@ -53,8 +52,7 @@ Shader* Shaders::LoadShaderPatched(xenos::ShaderType shader_type, uint64_t hash,
     cache_key = XXH3_64bits_withSeed(fetches, size_t(count) * 4 * sizeof(uint32_t), hash + program) | 1;
     const auto known = patched_shaders_.find(cache_key);
     if (known != patched_shaders_.end()) {
-      ++backend.report.shader_cache_hits_;
-      return known->second;
+        return known->second;
     }
   }
   std::vector<uint32_t> code(host_address, host_address + dword_count);
@@ -115,93 +113,10 @@ HostShader* Shaders::FindOrMakeShader(xenos::ShaderType shader_type, uint64_t ha
   return shader.get();
 }
 
-// Debug (RENUT_PIPELINE_STATS in plume-env): what the driver's compiler made of
-// each stage - instructions, registers, preamble and so on - one line per
-// executable, to see what a draw of the guest's shaders costs.
-void LogPipelineStatistics(RenderPipeline& pipeline, const HostShader* vs, const HostShader* ps) {
-  auto* vulkan = static_cast<VulkanGraphicsPipeline*>(&pipeline);
-  VkDevice device = vulkan->device->vk;
-  if (!vkGetPipelineExecutablePropertiesKHR || !vkGetPipelineExecutableStatisticsKHR) return;
-  VkPipelineInfoKHR info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
-  info.pipeline = vulkan->vk;
-  uint32_t count = 0;
-  if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, nullptr) != VK_SUCCESS) return;
-  std::vector<VkPipelineExecutablePropertiesKHR> executables(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
-  vkGetPipelineExecutablePropertiesKHR(device, &info, &count, executables.data());
-  for (uint32_t i = 0; i < count; ++i) {
-    VkPipelineExecutableInfoKHR executable = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
-    executable.pipeline = vulkan->vk;
-    executable.executableIndex = i;
-    uint32_t stat_count = 0;
-    vkGetPipelineExecutableStatisticsKHR(device, &executable, &stat_count, nullptr);
-    std::vector<VkPipelineExecutableStatisticKHR> stats(stat_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
-    vkGetPipelineExecutableStatisticsKHR(device, &executable, &stat_count, stats.data());
-    std::string line = fmt::format("Renut: Plume stats vs={:016X} ps={:016X} {}:", vs && vs->entry ? vs->entry->hash : 0,
-                                   ps && ps->entry ? ps->entry->hash : 0, executables[i].name);
-    for (const auto& stat : stats) {
-      switch (stat.format) {
-        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: line += fmt::format(" [{}]={}", stat.name, stat.value.b32); break;
-        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: line += fmt::format(" [{}]={}", stat.name, stat.value.i64); break;
-        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: line += fmt::format(" [{}]={}", stat.name, stat.value.u64); break;
-        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: line += fmt::format(" [{}]={}", stat.name, stat.value.f64); break;
-        default: break;
-      }
-    }
-    REXLOG_INFO("{}", line);
-  }
-}
-
-// Debug (RENUT_PIPELINE_IR in plume-env, "all" or a list of shader hashes):
-// the driver's internal representations of each stage - final NIR and the
-// ir3 assembly with its preamble - written to <dir>/ir/<vs>_<ps>.txt.
-void DumpPipelineInternals(RenderPipeline& pipeline, const HostShader* vs, const HostShader* ps,
-                           const std::string& dir) {
-  const char* filter = getenv("RENUT_PIPELINE_IR");
-  if (!filter || dir.empty() || !vkGetPipelineExecutableInternalRepresentationsKHR) return;
-  const uint64_t vs_hash = vs && vs->entry ? vs->entry->hash : 0;
-  const uint64_t ps_hash = ps && ps->entry ? ps->entry->hash : 0;
-  if (std::strcmp(filter, "all") != 0 && !std::strstr(filter, fmt::format("{:016X}", vs_hash).c_str()) &&
-      !std::strstr(filter, fmt::format("{:016X}", ps_hash).c_str())) {
-    return;
-  }
-  auto* vulkan = static_cast<VulkanGraphicsPipeline*>(&pipeline);
-  VkDevice device = vulkan->device->vk;
-  VkPipelineInfoKHR info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
-  info.pipeline = vulkan->vk;
-  uint32_t count = 0;
-  if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, nullptr) != VK_SUCCESS) return;
-  std::vector<VkPipelineExecutablePropertiesKHR> executables(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
-  vkGetPipelineExecutablePropertiesKHR(device, &info, &count, executables.data());
-  renutMakeDirectory(dir + "/ir");
-  FILE* file = std::fopen(fmt::format("{}/ir/{:016X}_{:016X}.txt", dir, vs_hash, ps_hash).c_str(), "w");
-  if (!file) return;
-  for (uint32_t i = 0; i < count; ++i) {
-    VkPipelineExecutableInfoKHR executable = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
-    executable.pipeline = vulkan->vk;
-    executable.executableIndex = i;
-    uint32_t ir_count = 0;
-    vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable, &ir_count, nullptr);
-    std::vector<VkPipelineExecutableInternalRepresentationKHR> irs(
-        ir_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
-    vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable, &ir_count, irs.data());
-    std::vector<std::vector<char>> text(ir_count);
-    for (uint32_t j = 0; j < ir_count; ++j) {
-      text[j].resize(irs[j].dataSize + 1, 0);
-      irs[j].pData = text[j].data();
-    }
-    vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable, &ir_count, irs.data());
-    for (uint32_t j = 0; j < ir_count; ++j) {
-      std::fprintf(file, "==== %s: %s ====\n%s\n", executables[i].name, irs[j].name, text[j].data());
-    }
-  }
-  std::fclose(file);
-}
-
 bool Shaders::Drop(const char* reason, const HostShader* vs, const HostShader* ps) {
   const uint64_t vs_hash = vs && vs->entry ? vs->entry->hash : 0;
   const uint64_t ps_hash = ps && ps->entry ? ps->entry->hash : 0;
   const bool exports = vs && vs->entry && (vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT);
-  ++backend.report.drops_[{reason, vs_hash, ps_hash, exports}];
   backend.draw.Trace("dropped ({}) vs={:016X} ps={:016X}{}", reason, vs_hash, ps_hash, exports ? " memexport" : "");
   return true;
 }

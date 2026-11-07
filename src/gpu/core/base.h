@@ -88,18 +88,9 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 extern "C" uint64_t renut_audio_silent_frames();
 
 REXCVAR_DECLARE(int32_t, renut_plume_pipeline_lookup_ms);
-REXCVAR_DECLARE(int32_t, renut_plume_bool_spec);
-REXCVAR_DECLARE(int32_t, renut_plume_defer_draws);
 REXCVAR_DECLARE(int32_t, renut_plume_hiz);
-REXCVAR_DECLARE(bool, renut_plume_zero_census);
-REXCVAR_DECLARE(bool, renut_plume_stack_wrap);
 REXCVAR_DECLARE(int32_t, renut_plume_poly_offset_percent);
 REXCVAR_DECLARE(bool, renut_plume_decal_log);
-REXCVAR_DECLARE(int32_t, renut_plume_skip);
-REXCVAR_DECLARE(bool, renut_plume_key_reuse);
-REXCVAR_DECLARE(int32_t, renut_plume_fetch_spec);
-REXCVAR_DECLARE(int32_t, renut_plume_depth_strip);
-REXCVAR_DECLARE(int32_t, renut_plume_rel_constants);
 REXCVAR_DECLARE(int32_t, renut_plume_adaptive_patches);
 REXCVAR_DECLARE(int32_t, renut_plume_water_tess_percent);
 REXCVAR_DECLARE(int32_t, renut_plume_shadow_min_indices);

@@ -2,7 +2,6 @@
 // The GPU backend: the lists of d3d/frontend/, executed on Plume. It owns the subsystems.
 #include "gpu/draw/pipelines.h"
 #include "gpu/draw/streams.h"
-#include "gpu/debug/profiling.h"
 #include "gpu/targets/targets.h"
 #include "gpu/targets/textures.h"
 #include "gpu/draw/shaders.h"
@@ -10,11 +9,9 @@
 #include "gpu/draw/draw.h"
 #include "gpu/exec/recorder.h"
 #include "gpu/draw/hiz.h"
-#include "gpu/debug/census.h"
 #include "gpu/targets/resolve.h"
 #include "gpu/draw/patches.h"
 #include "gpu/targets/swap.h"
-#include "gpu/debug/report.h"
 
 namespace renut::gpu {
 
@@ -77,8 +74,6 @@ class GpuBackend final {
   RenderDevice* device_ = nullptr;
   RenderCommandQueue* queue_ = nullptr;
   std::string miss_dump_directory_;
-  // Debug: <files>/plume-skip holds a bit mask of draw kinds to drop (see IssueDraw).
-  uint32_t skip_mask_ = 0;
   std::unique_ptr<RenderPipelineLayout> layout_;
   std::unique_ptr<RenderDescriptorSet> set_2d_, set_3d_, set_cube_, set_samplers_;
   std::array<std::unique_ptr<RenderSampler>, kMaxSamplers> samplers_;
@@ -95,9 +90,6 @@ class GpuBackend final {
   VkDescriptorPool constants_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet constants_set_ = VK_NULL_HANDLE;
   bool CreateConstantBuffers();
-  VkQueryPool timestamp_pool_ = VK_NULL_HANDLE;
-  // per slot: two per draw
-  VkQueryPool pair_pool_ = VK_NULL_HANDLE;
   bool trail_device_default_ = false;
   std::array<std::unique_ptr<RenderCommandList>, kPlumeFramesInFlight> lists_;
   uint32_t slot_ = kPlumeFramesInFlight - 1;
@@ -115,7 +107,6 @@ class GpuBackend final {
   // The subsystems.
   Pipelines pipelines{*this};
   Streams streams{*this};
-  Profiling profiling{*this};
   Targets targets{*this};
   Textures textures{*this};
   Shaders shaders{*this};
@@ -123,11 +114,9 @@ class GpuBackend final {
   Draw draw{*this};
   Recorder recorder{*this};
   HiZ hiz{*this};
-  Census census{*this};
   Resolve resolve{*this};
   Patches patches{*this};
   Swap swap{*this};
-  Reporting report{*this};
 };
 
 
@@ -258,7 +247,7 @@ inline RenderCommandList* Recorder::L() {
 inline bool Recorder::OnRecorder() const { return std::this_thread::get_id() == rec_thread_id_; }
 
 inline bool Recorder::RecActive() const {
-    return backend.swap.rec_enabled_ && !backend.targets.pair_capture_ && !backend.draw.sync_draws_ && sync_every_ <= 1 && !backend.draw.trace_;
+    return backend.swap.rec_enabled_ && !backend.draw.sync_draws_ && sync_every_ <= 1 && !backend.draw.trace_;
   }
 
 inline std::shared_ptr<PipelineJob> Pipelines::TakeUrgentJob() {
@@ -380,7 +369,6 @@ inline Resolved* Draw::FindResolved(uint32_t address) {
     if (latest) latest->sampled = true;
     ways[1] = ways[0];
     ways[0] = {address, backend.resolved_lookup_serial_, latest};
-    if (backend.swap.resolve_log_ && latest) backend.resolve.LogResolveLine(fmt::format("f={} sampled {:08X}", backend.swaps_, address));
     return latest;
   }
 
@@ -395,10 +383,5 @@ inline void Targets::InvalidateResolvedAddress(uint32_t address) {
     if (ways[i].address == address) ways[i].serial = 0;
   }
 }
-
-// Debug dumps of a built pipeline (RENUT_PIPELINE_STATS, RENUT_PIPELINE_IR), in shaders.cpp.
-void LogPipelineStatistics(RenderPipeline& pipeline, const HostShader* vs, const HostShader* ps);
-void DumpPipelineInternals(RenderPipeline& pipeline, const HostShader* vs, const HostShader* ps,
-                           const std::string& dir);
 
 }  // namespace renut::gpu

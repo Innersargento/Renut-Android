@@ -9,13 +9,6 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
   ExecutorBusy busy;
-  // <files>/plume-resolve-log turns the resolve log on (checked once a second): every resolve, with
-  // where it came from, where it went and whether the last one into the same texture was read.
-  if (backend.swaps_ % 60 == 0 && !backend.miss_dump_directory_.empty()) {
-    const std::string root = backend.miss_dump_directory_.substr(0, backend.miss_dump_directory_.rfind('/'));
-    resolve_log_ = access((root + "/plume-resolve-log").c_str(), F_OK) == 0;
-    native_d3d::g_resolve_trace.store(resolve_log_, std::memory_order_relaxed);
-  }
   // Everything the lists hold for this frame, before it is shown (from the
   // ring's swap; a present the lists hold has run what came before it).
   if (!backend.lists.native_presenting_) backend.lists.RunNative(UINT32_MAX);
@@ -32,11 +25,6 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   backend.resolve.FlushImagesForNextFrame();
   RenderTexture* source = nullptr;
   Resolved* found = backend.draw.FindResolved(frontbuffer_ptr);
-  if (resolve_log_) {
-    backend.resolve.LogResolveLine(fmt::format("f={} swap front={:08X} {}x{} found={}", backend.swaps_, frontbuffer_ptr, frontbuffer_width,
-                               frontbuffer_height, found != nullptr));
-  }
-  backend.resolve.FlushResolveLog();
   if (found && found->texture) {
     Resolved& r = *found;
     backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
@@ -85,11 +73,6 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   }
   backend.streams.RecordWritebacks();
   // FlushImagesForNextFrame already closed any open pass with its barriers.
-  backend.profiling.WriteTimestamp();
-  backend.profiling.timestamp_count_[backend.slot_] = backend.profiling.timestamps_used_;
-  backend.profiling.pair_count_[backend.slot_] = backend.profiling.pair_used_;
-  backend.profiling.pair_pending_[backend.slot_] = backend.targets.pair_capture_;
-  backend.targets.pair_capture_ = false;
   backend.recorder.L()->end();
   backend.recorder.list_open_ = false;
   const auto submit_start = std::chrono::steady_clock::now();
@@ -209,15 +192,9 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   if (!backend.draw.pending_pipelines_.empty()) backend.pipelines.ReapPipelines();
   backend.draw.lookup_spent_us_ = 0;
   pipeline_frame_.store(backend.swaps_, std::memory_order_relaxed);
-  // Every switch is a cvar, read here each frame (no file is touched): a change
-  // takes effect at the next swap.
+  // The settings that can change while the game runs are cvars, read here each
+  // frame (no file is touched): a change takes effect at the next swap.
   {
-    const int defer = std::clamp(REXCVAR_GET(renut_plume_defer_draws), 0, 2);
-    if (uint32_t(defer) != defer_mode_) {
-      REXLOG_INFO("Renut: Plume deferred draws mode {} (0 off, 1 depth-only, 2 opaque colour too)", defer);
-    }
-    defer_mode_ = uint32_t(defer);
-
     const int poly_offset = std::clamp(REXCVAR_GET(renut_plume_poly_offset_percent), 0, 1600);
     if ((poly_offset != 0) != poly_offset_ || poly_offset * 0.01f != poly_offset_scale_) {
       REXLOG_INFO("Renut: Plume polygon offset {} x{}", poly_offset ? "on" : "off", poly_offset * 0.01f);
@@ -225,26 +202,11 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     poly_offset_ = poly_offset != 0;
     poly_offset_scale_ = poly_offset * 0.01f;
 
-    const bool key_reuse = REXCVAR_GET(renut_plume_key_reuse);
-    if (key_reuse != key_reuse_) {
-      REXLOG_INFO("Renut: Plume pipeline key reuse {}", key_reuse ? "on" : "off");
-      // Keys made the other way name different pipelines: the memos go, the
-      // pipelines are found again (or made) under the new keys.
-      backend.draw.pipeline_memo_.Clear();
-    }
-    key_reuse_ = key_reuse;
-
     const int hiz = std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2);
-    if (uint32_t(hiz) != backend.report.hiz_mode_) {
+    if (uint32_t(hiz) != backend.hiz.mode_) {
       REXLOG_INFO("Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor/clip plane)", hiz);
     }
-    backend.report.hiz_mode_ = uint32_t(hiz);
-
-    const int fetch_spec = std::clamp(REXCVAR_GET(renut_plume_fetch_spec), 0, 1);
-    if (uint32_t(fetch_spec) != fetch_spec_mode_) {
-      REXLOG_INFO("Renut: Plume live fetch table as specialization constants {}", fetch_spec ? "on" : "off");
-    }
-    fetch_spec_mode_ = uint32_t(fetch_spec);
+    backend.hiz.mode_ = uint32_t(hiz);
 
     const int bc = std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1);
     if (uint32_t(bc) != bc_mode_) {
@@ -263,18 +225,6 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                   quality == 0 ? "full" : quality == 1 ? "half" : "quarter");
       backend.texture_quality_ = uint32_t(quality);
     }
-
-    const int rel = std::clamp(REXCVAR_GET(renut_plume_rel_constants), 0, 2);
-    if (uint32_t(rel) != backend.draw.rel_constants_mode_) {
-      REXLOG_INFO("Renut: Plume relative vertex constants mode {} (0 four blocks, 1 one block, 2 one block loaded)", rel);
-    }
-    backend.draw.rel_constants_mode_ = uint32_t(rel);
-
-    const int depth_strip = std::clamp(REXCVAR_GET(renut_plume_depth_strip), 0, 1);
-    if (uint32_t(depth_strip) != depth_strip_mode_) {
-      REXLOG_INFO("Renut: Plume depth-only draws without vertex outputs {}", depth_strip ? "on" : "off");
-    }
-    depth_strip_mode_ = uint32_t(depth_strip);
 
     const int adaptive = std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1);
     if (uint32_t(adaptive) != adaptive_mode_) {
@@ -307,8 +257,6 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       ++it;
     }
   }
-  if (backend.swaps_ % 300 == 1) backend.report.Report();
-  if (backend.swaps_ % 15 == 3) backend.report.ReportMemory();
   backend.targets.BeginFrame();
 }
 
