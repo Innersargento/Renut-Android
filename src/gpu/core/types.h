@@ -332,6 +332,12 @@ namespace renut::gpu {
   struct HizBox {
     bool valid = false;
     float lo[4] = {}, hi[4] = {};
+    // Instanced models: the distinct values of the address register over the
+    // draw's vertex indices, and one vertex index for each (the model's
+    // coefficients are a function of a0 alone). Zero for the usual model.
+    static constexpr uint32_t kMaxVariants = 8;
+    uint32_t variants = 0;
+    uint32_t variant_vid[kMaxVariants] = {};
     uint32_t vertex_base = 0, vertex_size = 0, index_base = 0, index_size = 0;
     uint32_t first_vertex = 0, last_vertex = 0;
     uint64_t checksum = 0;

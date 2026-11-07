@@ -67,6 +67,23 @@ struct Model {
   uint16_t coeff[4][5] = {};
   // The number of float constants the program reads (for statistics).
   uint32_t constants_read = 0;
+
+  // Instanced meshes (particles, grass, effect quads): the shader derives, from
+  // the vertex index alone, the index of the element it fetches (the instance)
+  // and the address register a0 that picks the corner's matrix out of the
+  // constants. The coefficients above are then a function of a0, and a0 of the
+  // vertex index; both are evaluated with VidScalars / Evaluate(..., vid).
+  // Zero for the usual model, whose element index is the vertex index itself.
+  uint16_t index_node = 0;  // element index (before rounding) as a function of the vertex index
+  uint16_t a0_node = 0;     // a0 as a function of the vertex index
+  // The nodes the two above are made of, in evaluation order, and the constant
+  // components they read (a box made with them depends on those values).
+  std::vector<uint16_t> vid_order;
+  std::vector<uint16_t> vid_consts;
+  // The nodes the coefficients (and the two above) need, in evaluation order: the
+  // program computes much more than the position (normals, texture coordinates).
+  std::vector<uint16_t> eval_order;
+  bool vid_indexed() const { return index_node || a0_node; }
 };
 
 // Symbolically executes `ucode` (vertex shader microcode in host order, dword
@@ -77,7 +94,12 @@ std::shared_ptr<Model> BuildModel(const uint32_t* ucode, size_t dwords, const ui
 // Evaluates the model's coefficients with the float constants of `constants`
 // (the register file's vertex constant block, 4 floats per register, indexed by
 // register + `base`). out[o][j] as Model::coeff.
-void Evaluate(const Model& model, const float* constants, uint32_t base, float out[4][5]);
+void Evaluate(const Model& model, const float* constants, uint32_t base, float out[4][5], float vid = 0.f);
+
+// For an instanced model: the element index and a0 the shader computes for
+// vertex index `vid`. False when they are not finite or a0 is out of range.
+bool VidScalars(const Model& model, const float* constants, uint32_t base, float vid, uint32_t* element,
+                int32_t* a0);
 
 // One vertex's fetched element as the model reads it: out[0..3] = x, y, z, w
 // (only the components in model.fetch.used_mask are set). `memory` is the base

@@ -15,7 +15,11 @@ namespace xenos = rex::graphics::xenos;
 
 namespace {
 
-enum Op : uint8_t { kZero, kImm, kConst, kAdd, kMul, kNeg, kAbs };
+// kOpVid: the vertex index. kOpFloor: floor(a). kOpRoundA: the address register
+// from a value, clamp(floor(a + imm), -256, 255) (imm 0.5 rounds, 0 floors).
+// kOpConstRel: the constant component a (register * 4 + component) of the
+// register shifted by the address register in node b.
+enum Op : uint8_t { kZero, kImm, kConst, kAdd, kMul, kNeg, kAbs, kOpVid, kOpFloor, kOpRoundA, kOpConstRel };
 
 constexpr size_t kMaxNodes = 4000;
 constexpr uint32_t kMaxControlSteps = 3000;
@@ -27,8 +31,13 @@ constexpr uint32_t kMaxControlSteps = 3000;
 // fetched element, kRel a constant addressed by a0/aL (the address register's
 // own origin in the bits above 4), kNonlin anything else.
 enum Src : uint8_t { kVid = 1, kFetch = 2, kRel = 4, kNonlin = 8 };
+// `vid` marks a value that is a function of the vertex index (and constants),
+// never of a fetched element: its k[0] is the expression. It may be floored,
+// rounded into the address register, or be the fetch index; it may not reach
+// the position directly.
 struct Val {
   bool taint = false;
+  bool vid = false;
   uint8_t src = 0;
   uint16_t k[5] = {};
 };
@@ -67,6 +76,20 @@ class Builder {
   uint16_t Abs(uint16_t a) {
     if (!a) return 0;
     return Make(kAbs, a, 0, 0.f, (uint64_t(kAbs) << 56) ^ a);
+  }
+  uint16_t Vid() { return Make(kOpVid, 0, 0, 0.f, uint64_t(kOpVid) << 56); }
+  uint16_t Floor(uint16_t a) {
+    if (!a) return 0;
+    return Make(kOpFloor, a, 0, 0.f, (uint64_t(kOpFloor) << 56) ^ a);
+  }
+  uint16_t RoundA(uint16_t a, float imm) {
+    if (!a) return 0;
+    return Make(kOpRoundA, a, 0, imm, (uint64_t(kOpRoundA) << 56) ^ (uint64_t(a) << 8) ^ (imm != 0.f));
+  }
+  uint16_t ConstRel(uint32_t index_component, uint16_t a0) {
+    if (!a0) return Const(index_component);
+    return Make(kOpConstRel, uint16_t(index_component), a0, 0.f,
+                (uint64_t(kOpConstRel) << 56) ^ (uint64_t(index_component) << 20) ^ a0);
   }
 
  private:
@@ -117,8 +140,20 @@ class Executor {
     for (auto& r : temps_)
       for (auto& v : r) v = Val{};
     // r0.x holds the vertex index.
-    temps_[0][0] = Taint(kVid);
+    vid_node_ = builder.Vid();
+    {
+      Val v;
+      v.vid = true;
+      v.src = kVid;
+      v.k[0] = vid_node_;
+      temps_[0][0] = v;
+    }
     a0_src_ = 0;
+    a0_known_ = false;
+    a0_node_ = 0;
+    a0_used_ = false;
+    a0_used_node_ = 0;
+    index_node_ = 0;
     for (auto& p : position_) p = Taint(kNonlin);
     position_written_ = 0;
     last_full_ = {};
@@ -133,8 +168,18 @@ class Executor {
   std::vector<FetchInstance> fetches;  // filled by the collecting run
   Val position_[4];
   uint32_t position_written_ = 0;
+  // The address register used for relative constants (one value of it per
+  // vertex index), and the symbolic fetch's index when it is not the vertex index.
+  uint16_t a0_used_node_ = 0;
+  bool a0_used_ = false;
+  uint16_t index_node_ = 0;
 
  private:
+  uint16_t vid_node_ = 0;
+  // The address register as a function of the vertex index, when the last write
+  // to it was one.
+  bool a0_known_ = false;
+  uint16_t a0_node_ = 0;
   const uint32_t* ucode_;
   size_t dwords_;
   const uint32_t* bools_;
@@ -166,12 +211,22 @@ class Executor {
   Val VAdd(const Val& a, const Val& b) {
     if (a.taint || b.taint) return Taint(uint8_t(a.src | b.src));
     Val r;
+    if (a.vid || b.vid) {
+      // A function of the vertex index, with a partner that is not a fetched element.
+      if (!Independent(a) || !Independent(b)) return Taint(uint8_t(a.src | b.src | kVid | kNonlin));
+      r.vid = true;
+      r.src = kVid;
+      r.k[0] = builder.Add(a.k[0], b.k[0]);
+      return r;
+    }
     for (int i = 0; i < 5; ++i) r.k[i] = builder.Add(a.k[i], b.k[i]);
     return r;
   }
   Val VNeg(const Val& a) {
     if (a.taint) return a;
     Val r;
+    r.vid = a.vid;
+    r.src = a.src;
     for (int i = 0; i < 5; ++i) r.k[i] = builder.Neg(a.k[i]);
     return r;
   }
@@ -179,12 +234,30 @@ class Executor {
     if (a.taint) return a;
     if (!Independent(a)) return Taint(kNonlin);
     Val r;
+    r.vid = a.vid;
+    r.src = a.src;
     r.k[0] = builder.Abs(a.k[0]);
+    return r;
+  }
+  Val VFloor(const Val& a) {
+    if (a.taint) return Taint(uint8_t(a.src | kNonlin));
+    if (!Independent(a)) return Taint(kNonlin);
+    Val r;
+    r.vid = a.vid;
+    r.src = a.src;
+    r.k[0] = builder.Floor(a.k[0]);
     return r;
   }
   Val VMul(const Val& a, const Val& b) {
     if (a.taint || b.taint) return Taint(uint8_t(a.src | b.src));
     Val r;
+    if (a.vid || b.vid) {
+      if (!Independent(a) || !Independent(b)) return Taint(uint8_t(a.src | b.src | kVid | kNonlin));
+      r.vid = true;
+      r.src = kVid;
+      r.k[0] = builder.Mul(a.k[0], b.k[0]);
+      return r;
+    }
     if (Independent(b)) {
       for (int i = 0; i < 5; ++i) r.k[i] = builder.Mul(a.k[i], b.k[0]);
       return r;
@@ -196,8 +269,28 @@ class Executor {
     return Taint(kNonlin);
   }
   static bool Same(const Val& a, const Val& b) {
-    if (a.taint || b.taint) return false;
+    if (a.taint || b.taint || a.vid != b.vid) return false;
     return std::memcmp(a.k, b.k, sizeof(a.k)) == 0;
+  }
+
+  // A constant addressed by the address register: known when a0 was last set
+  // from the vertex index and every addressed read uses that one value.
+  Val AddressedConst(bool a0_relative, uint32_t reg, uint32_t component) {
+    if (a0_relative && a0_known_ && (!a0_used_ || a0_used_node_ == a0_node_)) {
+      a0_used_ = true;
+      a0_used_node_ = a0_node_;
+      return ConstVal(builder.ConstRel((reg & 0xFF) * 4 + component, a0_node_));
+    }
+    return Taint(uint8_t(kRel | (a0_src_ << 4)));
+  }
+  // Sets the address register from a value (MAXA and friends).
+  void SetA0(const Val& x, float imm) {
+    if (!x.taint && Independent(x)) {
+      a0_known_ = true;
+      a0_node_ = builder.RoundA(x.k[0], imm);
+    } else {
+      a0_known_ = false;
+    }
   }
 
   // Source operand i (1..3) as four components, swizzled, negated, absolute.
@@ -216,7 +309,7 @@ class Executor {
         for (int c = 0; c < 4; ++c) base[c] = temps_[index][c];
       }
     } else if (alu.src_const_is_addressed(i)) {
-      for (auto& v : base) v = Taint(uint8_t(kRel | (a0_src_ << 4)));
+      for (int c = 0; c < 4; ++c) base[c] = AddressedConst(alu.is_const_address_register_relative(), reg, c);
     } else {
       for (int c = 0; c < 4; ++c) base[c] = ConstVal(builder.Const((reg & 0xFF) * 4 + c));
     }
@@ -293,9 +386,13 @@ class Executor {
         pred_known_ = false;
         for (auto& v : vr) v = Taint(from_operands());
         break;
+      case ucode::AluVectorOpcode::kFloor:
+        for (int i = 0; i < 4; ++i) vr[i] = VFloor(a[i]);
+        break;
       case ucode::AluVectorOpcode::kMaxA:
         // The address register is set from component w.
         a0_src_ = uint8_t(a[3].src & ~kNonlin);
+        SetA0(a[3], 0.5f);
         for (auto& v : vr) v = Taint(from_operands());
         break;
       default:
@@ -325,7 +422,7 @@ class Executor {
           for (int k = 0; k < 4; ++k) base[k] = temps_[index][k];
         }
       } else if (alu.src_const_is_addressed(3)) {
-        for (auto& v : base) v = Taint(uint8_t(kRel | (a0_src_ << 4)));
+        for (int k = 0; k < 4; ++k) base[k] = AddressedConst(alu.is_const_address_register_relative(), reg, k);
       } else {
         for (int k = 0; k < 4; ++k) base[k] = ConstVal(builder.Const((reg & 0xFF) * 4 + k));
       }
@@ -340,7 +437,8 @@ class Executor {
       const uint32_t swizzle = alu.src_swizzle(3);
       Val k;
       if (alu.src_const_is_addressed(3)) {
-        k = Taint(uint8_t(kRel | (a0_src_ << 4)));
+        k = AddressedConst(alu.is_const_address_register_relative(), alu.src_reg(3),
+                           ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, 3));
       } else {
         k = ConstVal(builder.Const((alu.src_reg(3) & 0xFF) * 4 +
                                    ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, 3)));
@@ -377,8 +475,10 @@ class Executor {
       case ucode::AluScalarOpcode::kMaxAs:
       case ucode::AluScalarOpcode::kMaxAsf:
         a0_src_ = uint8_t(so[0].src & ~kNonlin);
+        SetA0(so[0], sop == ucode::AluScalarOpcode::kMaxAs ? 0.5f : 0.f);
         prev_ = Taint(uint8_t(so[0].src | so[1].src | kNonlin));
         break;
+      case ucode::AluScalarOpcode::kFloors: prev_ = VFloor(so[0]); break;
       case ucode::AluScalarOpcode::kSetpEq:
       case ucode::AluScalarOpcode::kSetpNe:
       case ucode::AluScalarOpcode::kSetpGt:
@@ -483,6 +583,16 @@ class Executor {
       return;
     }
     const bool symbolic = int(id) == target_;
+    if (symbolic) {
+      // The index register, before the destination can overwrite it: when it holds
+      // a function of the vertex index other than the index itself (the instance
+      // number of an instanced mesh), the model records it.
+      const uint32_t reg = last_full_.src();
+      if (!last_full_.is_src_relative() && reg < 128) {
+        const Val& index = temps_[reg][last_full_.src_swizzle() & 3];
+        if (!index.taint && index.vid && Independent(index) && index.k[0] != vid_node_) index_node_ = index.k[0];
+      }
+    }
     uint32_t used = 0;
     for (uint32_t i = 0; i < 4; ++i) {
       Val v;
@@ -694,6 +804,10 @@ std::shared_ptr<Model> BuildModel(const uint32_t* ucode_words, size_t dwords, co
       if (exec.position_[o].taint) {
         ok = false;
         worst |= exec.position_[o].src;
+      } else if (exec.position_[o].vid) {
+        // The position itself a function of the vertex index.
+        ok = false;
+        worst |= kVid;
       } else if (exec.position_[o].k[1] || exec.position_[o].k[2] || exec.position_[o].k[3] || exec.position_[o].k[4]) {
         dependent = true;
       }
@@ -709,6 +823,73 @@ std::shared_ptr<Model> BuildModel(const uint32_t* ucode_words, size_t dwords, co
     uint32_t reads = 0;
     for (const auto& n : model->nodes) reads += n.op == kConst;
     model->constants_read = reads;
+    {
+      // Only the nodes the position's coefficients, the element index and a0 reach.
+      std::vector<uint8_t> reach(model->nodes.size(), 0);
+      std::vector<uint16_t> pending;
+      for (int o = 0; o < 4; ++o)
+        for (int j = 0; j < 5; ++j) pending.push_back(model->coeff[o][j]);
+      if (exec.index_node_) pending.push_back(exec.index_node_);
+      if (exec.a0_used_ && exec.a0_used_node_) pending.push_back(exec.a0_used_node_);
+      while (!pending.empty()) {
+        const uint16_t at = pending.back();
+        pending.pop_back();
+        if (reach[at]) continue;
+        reach[at] = 1;
+        const Model::Node& n = model->nodes[at];
+        switch (n.op) {
+          case kAdd:
+          case kMul: pending.push_back(n.a), pending.push_back(n.b); break;
+          case kNeg:
+          case kAbs:
+          case kOpFloor:
+          case kOpRoundA: pending.push_back(n.a); break;
+          case kOpConstRel: pending.push_back(n.b); break;
+          default: break;
+        }
+      }
+      for (size_t i = 0; i < reach.size(); ++i)
+        if (reach[i]) model->eval_order.push_back(uint16_t(i));
+    }
+    model->index_node = exec.index_node_;
+    model->a0_node = exec.a0_used_ ? exec.a0_used_node_ : 0;
+    if (model->vid_indexed()) {
+      // The nodes the element index and a0 are made of (operands come before the
+      // nodes that use them), and the constants they read.
+      std::vector<uint8_t> needed(model->nodes.size(), 0);
+      std::vector<uint16_t> stack;
+      if (model->index_node) stack.push_back(model->index_node);
+      if (model->a0_node) stack.push_back(model->a0_node);
+      while (!stack.empty()) {
+        const uint16_t at = stack.back();
+        stack.pop_back();
+        if (needed[at]) continue;
+        needed[at] = 1;
+        const Model::Node& n = model->nodes[at];
+        switch (n.op) {
+          case kAdd:
+          case kMul: stack.push_back(n.a), stack.push_back(n.b); break;
+          case kNeg:
+          case kAbs:
+          case kOpFloor:
+          case kOpRoundA: stack.push_back(n.a); break;
+          case kOpConstRel: stack.push_back(n.b); break;
+          default: break;
+        }
+      }
+      for (size_t i = 0; i < needed.size(); ++i) {
+        if (!needed[i]) continue;
+        model->vid_order.push_back(uint16_t(i));
+        if (model->nodes[i].op == kConst) model->vid_consts.push_back(model->nodes[i].a);
+        // A relative constant in these nodes would make the box depend on a
+        // value that is not hashed with it.
+        if (model->nodes[i].op == kOpConstRel) {
+          model->valid = false;
+          model->why = Why::kRelative;
+          return model;
+        }
+      }
+    }
     return model;
   }
   // None of the candidates worked: where the unknown in the position came from.
@@ -731,28 +912,62 @@ std::shared_ptr<Model> BuildModel(const uint32_t* ucode_words, size_t dwords, co
   return model;
 }
 
-void Evaluate(const Model& model, const float* constants, uint32_t base, float out[4][5]) {
+namespace {
+
+// One node's value; `values` holds the ones before it.
+inline float NodeValue(const Model::Node& n, const float* values, const float* constants, uint32_t base,
+                       float vid) {
+  switch (n.op) {
+    case kZero: return 0.f;
+    case kImm: return n.imm;
+    case kConst: {
+      const uint32_t reg = n.a >> 2, comp = n.a & 3;
+      return constants[(size_t(reg) + base) * 4 + comp];
+    }
+    case kAdd: return values[n.a] + values[n.b];
+    case kMul: return values[n.a] * values[n.b];
+    case kNeg: return -values[n.a];
+    case kAbs: return std::fabs(values[n.a]);
+    case kOpVid: return vid;
+    case kOpFloor: return std::floor(values[n.a]);
+    case kOpRoundA: return std::min(255.f, std::max(-256.f, std::floor(values[n.a] + n.imm)));
+    case kOpConstRel: {
+      // The register shifted by a0, kept inside the vertex constant file.
+      const int32_t shifted = int32_t(n.a >> 2) + int32_t(values[n.b]);
+      const uint32_t reg = uint32_t(std::min(255, std::max(0, shifted)));
+      return constants[(size_t(reg) + base) * 4 + (n.a & 3)];
+    }
+    default: return 0.f;
+  }
+}
+
+}  // namespace
+
+void Evaluate(const Model& model, const float* constants, uint32_t base, float out[4][5], float vid) {
   thread_local std::vector<float> values;
   values.resize(model.nodes.size());
-  for (size_t i = 0; i < model.nodes.size(); ++i) {
-    const Model::Node& n = model.nodes[i];
-    switch (n.op) {
-      case kZero: values[i] = 0.f; break;
-      case kImm: values[i] = n.imm; break;
-      case kConst: {
-        const uint32_t reg = n.a >> 2, comp = n.a & 3;
-        values[i] = constants[(size_t(reg) + base) * 4 + comp];
-        break;
-      }
-      case kAdd: values[i] = values[n.a] + values[n.b]; break;
-      case kMul: values[i] = values[n.a] * values[n.b]; break;
-      case kNeg: values[i] = -values[n.a]; break;
-      case kAbs: values[i] = std::fabs(values[n.a]); break;
-      default: values[i] = 0.f; break;
-    }
+  for (uint16_t i : model.eval_order) {
+    values[i] = NodeValue(model.nodes[i], values.data(), constants, base, vid);
   }
   for (int o = 0; o < 4; ++o)
     for (int j = 0; j < 5; ++j) out[o][j] = values[model.coeff[o][j]];
+}
+
+bool VidScalars(const Model& model, const float* constants, uint32_t base, float vid, uint32_t* element,
+                int32_t* a0) {
+  thread_local std::vector<float> values;
+  values.resize(model.nodes.size());
+  for (uint16_t i : model.vid_order) {
+    values[i] = NodeValue(model.nodes[i], values.data(), constants, base, vid);
+  }
+  float index = model.index_node ? values[model.index_node] : vid;
+  if (model.fetch.index_rounded) index += 0.5f;
+  index = std::floor(index);
+  const float shift = model.a0_node ? values[model.a0_node] : 0.f;
+  if (!std::isfinite(index) || !std::isfinite(shift) || index < 0.f || index > 16777216.f) return false;
+  *element = uint32_t(index);
+  *a0 = int32_t(shift);
+  return true;
 }
 
 bool FetchVertex(const FetchDesc& f, const uint8_t* memory, uint32_t address_dwords, uint32_t size_dwords,
