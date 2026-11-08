@@ -152,6 +152,8 @@ struct GuestTexture {
   bool bc_blocked = false;
   // Guest mips below the host image's top level (max dimension and quality).
   uint32_t skip = 0;
+  // Stacked textures: halvings of the pixels on the CPU (a stack without mips under texture quality).
+  uint32_t shrink = 0;
 };
 
 // Bytes a 2D guest texture takes on the host, its mip chain included.

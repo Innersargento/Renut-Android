@@ -62,6 +62,7 @@ void Targets::EvictIdleTextures() {
   for (auto* map : {&backend.textures.guest_stacks_, &backend.textures.guest_volumes_}) {
     for (auto it = map->begin(); it != map->end();) {
       if (!idle(it->second.checked_frame, limit_3d)) { ++it; continue; }
+      if (it->second.view) retired_views_[backend.slot_].push_back(std::move(it->second.view));
       if (it->second.texture) retired_slots_[backend.slot_].push_back(std::move(it->second.texture));
       if (it->second.descriptor) retired_3d_descriptor_slots_[backend.slot_].push_back(it->second.descriptor);
       it = map->erase(it);

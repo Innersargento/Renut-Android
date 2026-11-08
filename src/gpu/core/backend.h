@@ -68,6 +68,8 @@ class GpuBackend final {
   uint32_t max_texture_dim_ = 0;
   // BC textures: the device samples them, and files/plume-bc / the cvar want them.
   bool bc_supported_ = false;
+  // Bit n (BcKind n): the device makes a 3D image of that block format (the stacked terrain textures).
+  uint32_t bc3d_mask_ = 0;
   // 0 full, 1 half, 2 quarter: mips of a mip-filtered 2D texture not kept on the host.
   uint32_t texture_quality_ = 0;
   void* watch_handle_ = nullptr;

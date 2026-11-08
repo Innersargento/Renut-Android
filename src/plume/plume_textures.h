@@ -46,8 +46,13 @@ uint32_t BcBlockBytes(BcKind kind);
 // The level's blocks as rows of `blocks_x` blocks, untiled and byte-swapped,
 // in `blocks` (blocks_x * blocks_y * BcBlockBytes bytes). False when the level
 // does not fit the guest memory it was located in.
+// `slice` picks an array slice of a stacked texture (DecodeTextureLevel's).
 bool CopyTextureLevelBlocks(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch, const TextureLevel& level,
-                            const uint8_t* data, std::vector<uint8_t>& blocks);
+                            const uint8_t* data, std::vector<uint8_t>& blocks, uint32_t slice = 0);
+// The same for the base level of a 2D texture addressed the way DecodeTexture2D
+// does (a cube map's faces), at the size the fetch constant names.
+bool CopyTexture2DBlocks(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch, const uint8_t* data,
+                         std::vector<uint8_t>& blocks);
 
 // Bytes the base level of the texture spans in guest memory (for hashing).
 uint32_t TextureBaseSpan(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch);

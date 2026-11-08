@@ -78,6 +78,22 @@ bool GpuBackend::SetupContext() {
     VkPhysicalDeviceFeatures features{};
     vkGetPhysicalDeviceFeatures(static_cast<VulkanDevice*>(device_)->physicalDevice, &features);
     bc_supported_ = features.textureCompressionBC == VK_TRUE;
+    // A 3D image of a block format is not a given (the stacked textures need one): asked per
+    // format, with the usage Plume gives every texture.
+    if (bc_supported_) {
+      const VkPhysicalDevice physical = static_cast<VulkanDevice*>(device_)->physicalDevice;
+      const VkFormat formats[] = {VK_FORMAT_UNDEFINED,        VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+                                  VK_FORMAT_BC2_UNORM_BLOCK,  VK_FORMAT_BC3_UNORM_BLOCK,
+                                  VK_FORMAT_BC4_UNORM_BLOCK,  VK_FORMAT_BC5_UNORM_BLOCK};
+      for (uint32_t kind = 1; kind < 6; ++kind) {
+        VkImageFormatProperties props{};
+        const VkResult result = vkGetPhysicalDeviceImageFormatProperties(
+            physical, formats[kind], VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, &props);
+        if (result == VK_SUCCESS && props.maxExtent.depth >= 32) bc3d_mask_ |= 1u << kind;
+      }
+      REXLOG_INFO("Renut: Plume BC 3D images (BC1..BC5 mask): {:#x}", bc3d_mask_);
+    }
     // ARM's vendor id.
     trail_device_default_ = static_cast<VulkanDevice*>(device_)->physicalDeviceProperties.vendorID == 0x13B5;
     swap.trail_ = trail_device_default_;
