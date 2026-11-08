@@ -473,6 +473,52 @@ void Targets::EvictSurfaceTargets() {
   if (evicted) RetireFramebuffers();
 }
 
+// The internal resolution, the shadow map size and the MSAA option are cvars the menu changes while the game
+// runs: when one differs from what the targets were made with, every surface target goes and is made again
+// the next time it is drawn to (the game redraws its surfaces every frame).
+void Targets::RefreshQuality() {
+  const uint32_t shadow = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
+  const uint32_t internal = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_internal_resolution), 0, 2));
+  const int32_t msaa = std::clamp(REXCVAR_GET(renut_msaa), 0, 2);
+  const uint32_t samples = msaa == 1 ? 2u : msaa == 2 ? 4u : 1u;
+  if (shadow == shadow_scale_ && internal == internal_scale_ && samples == msaa_samples_) return;
+  REXLOG_INFO("Renut: Plume quality changed: shadow maps {}/4, scene {}/4, up to {}x samples; surface targets rebuilt",
+              shadow, internal, samples);
+  shadow_scale_ = shadow;
+  internal_scale_ = internal;
+  msaa_samples_ = samples;
+  bool dropped = false;
+  for (auto it = targets_.begin(); it != targets_.end();) {
+    if (it->first & kSurfaceTargetKey) {
+      if (it->second.texture) retired_slots_[backend.slot_].push_back(std::move(it->second.texture));
+      ForgetResolveSource(&it->second);
+      it = targets_.erase(it);
+      dropped = true;
+    } else {
+      ++it;
+    }
+  }
+  if (dropped) RetireFramebuffers();
+  // The resolved textures never shrink (GetResolved keeps one that is big enough), so after a step down the
+  // frame the game presents would still be the old size with the new picture in its corner. They go too and
+  // are made again, at the right size, by the next resolves (the game resolves the scene every frame).
+  for (auto& [key, r] : resolved_) {
+    RetireSwizzled(r);
+    RetireTexture(r.texture, r.descriptor);
+    RetireTexture(r.fitted, r.fitted_descriptor);
+    r.fitted_width = r.fitted_height = 0;
+    r.fitted_generation = UINT64_MAX;
+    r.width = r.height = 0;
+    r.written = 0;
+    r.alias = false;
+    r.sampled = false;
+    r.last_src = nullptr;
+    r.layout = RenderTextureLayout::UNKNOWN;
+  }
+  InvalidateResolvedLookups();
+  ++object_epoch_;
+}
+
 std::string Targets::SurfaceReport() {
   size_t count = 0;
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;

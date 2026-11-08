@@ -25,6 +25,8 @@ struct Targets {
   bool GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height);
   void RetireFramebuffers();
   void EvictSurfaceTargets();
+  // Follows the quality cvars (resolution, shadow maps, MSAA) while the game runs; called once a frame.
+  void RefreshQuality();
   // A resolved texture remembers the target it was made from by address only; forget one that is going.
   void ForgetResolveSource(const Target* target);
   std::string SurfaceReport();

@@ -226,6 +226,9 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       backend.texture_quality_ = uint32_t(quality);
     }
 
+    backend.targets.RefreshQuality();
+    backend.no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
+
     const int adaptive = std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1);
     if (uint32_t(adaptive) != adaptive_mode_) {
       REXLOG_INFO("Renut: Plume adaptive patches {}", adaptive ? "on" : "off");
