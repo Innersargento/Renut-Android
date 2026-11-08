@@ -285,6 +285,7 @@ void GpuBackend::ShutdownContext() {
   shaders.shader_memo_.Clear();
   shaders.patched_shaders_.clear();
   shaders.identity_shaders_.clear();
+  shaders.identity_memo_.Clear();
   shaders.shaders_.clear();
   if (draw.upload_) draw.upload_->unmap();
   draw.upload_.reset();

@@ -128,6 +128,8 @@ constexpr uint32_t kPrimitiveSplit = 0x82004EB8;
 
 // Every native draw's serial (the draw record's last word, for traces).
 inline std::atomic<uint32_t> g_draw_serial{0};
+// The draw record's last word: the counter, or with g_draw_callers the id of the call's host stack.
+uint32_t DrawSerial();
 
 // Calls per Direct3D function, for the report.
 inline std::array<std::atomic<uint64_t>, renut::d3d::kFunctionCount> g_calls{};

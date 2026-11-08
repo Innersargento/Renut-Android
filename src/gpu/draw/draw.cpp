@@ -109,6 +109,12 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     return true;
   }
   if (!color_pass) ps = nullptr;
+  CallerStat* caller = caller_id_ ? &caller_stats_[caller_id_] : nullptr;
+  if (caller) {
+    ++caller->draws;
+    caller->indices += index_count;
+    caller->depth_only += !color_pass;
+  }
   if (!vs->compiled) vs->compiled = backend.pipelines.store_->Build(backend.device_, vs->entry, true, true);
   if (ps && !ps->compiled) ps->compiled = backend.pipelines.store_->Build(backend.device_, ps->entry, false);
   if (!vs->compiled || (ps && !ps->compiled)) {
@@ -207,7 +213,16 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     backend.hiz.hiz_stage_timing_ = timed;
     std::chrono::steady_clock::time_point cull_start;
     if (timed) cull_start = std::chrono::steady_clock::now();
+    const uint64_t no_model_before = backend.stats_.hiz_no_model[color_pass ? 1 : 0];
     const bool dropped = backend.hiz.HizCullDraw(*vs, prim_type, index_count, index_buffer_info, color_pass);
+    if (caller) {
+      ++caller->hiz_tested;
+      caller->hiz_no_model += backend.stats_.hiz_no_model[color_pass ? 1 : 0] != no_model_before;
+      if (dropped) {
+        ++caller->hiz_dropped;
+        caller->hiz_dropped_indices += index_count;
+      }
+    }
     if (timed) {
       backend.stats_.hiz_cull_ns += 16 * uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               std::chrono::steady_clock::now() - cull_start).count());
@@ -1128,7 +1143,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   constexpr uint32_t kRefractionBoundsAt = DrawState::kPixelConstants + 5 * 4;
   float refraction_saved[4] = {};
   bool refraction_fixed = false;
-  if (backend.swap.refraction_fix_ && ps && ps->entry && ps->entry->hash == kRefractionSpritePs) {
+  if (backend.swap.refraction_fix_ && ps && ps->entry_hash == kRefractionSpritePs) {
     float* bounds = reinterpret_cast<float*>(&backend.state_.float_constants[kRefractionBoundsAt]);
     if (bounds[1] > bounds[2]) {
       std::memcpy(refraction_saved, bounds, sizeof(refraction_saved));
@@ -1216,8 +1231,15 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     cull = RenderCullMode::NONE;
     alpha_test = false;
   }
-  const bool depth_enabled =
-      depth && depth_control.z_enable && !(debug_draw && (debug_mode_ & 1));
+  // A forward depth test (LESS, LESS_EQUAL) under a reversed viewport (z scale < 0, offset 1: depth = 1 - z): the
+  // scene's depth is cleared to 0 and tested GREATER*, so such a test cannot pass anywhere in a buffer in that
+  // convention. The loading screen's gear (the Pong ball: LESS_EQUAL, z 0.001 -> 0.999) is drawn so, in the scene's
+  // 1280x720 depth, and never appeared; the console's EDRAM gave it what it needed. The test is left off for it.
+  const bool forward_on_reversed = ui_depth_fix_ && regs.vport_z_scale < 0.f &&
+                                   (depth_control.zfunc == xenos::CompareFunction::kLess ||
+                                    depth_control.zfunc == xenos::CompareFunction::kLessEqual);
+  const bool depth_enabled = depth && depth_control.z_enable && !forward_on_reversed &&
+                             !(debug_draw && (debug_mode_ & 1));
   const bool depth_write = depth_enabled && depth_control.z_write_enable;
   // Polygon offset, converted like the Xenia Vulkan path does: the constant is
   // a fraction of the depth range, times 2^24 for a float depth target (Vulkan
@@ -1297,9 +1319,15 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     return shader->bool_mask;
   };
   // A shader that reads them from the shared block adds none.
-  const CompiledShader* vs_module = patch_list ? vs->domain_compiled : vs->compiled;
-  const uint32_t* vs_bools = vs_module && vs_module->dynamic_bools ? nullptr : bools_of(vs);
-  const uint32_t* ps_bools = ps && ps->compiled && ps->compiled->dynamic_bools ? nullptr : bools_of(ps);
+  // (the answer for the shader's own compiled form is kept on the shader: it was two dependent loads a draw)
+  auto dynamic_bools = [](HostShader* shader) {
+    if (shader->dynamic_bools_cache < 0 && shader->compiled) shader->dynamic_bools_cache = shader->compiled->dynamic_bools;
+    return shader->dynamic_bools_cache > 0;
+  };
+  const CompiledShader* vs_module = patch_list ? vs->domain_compiled : nullptr;
+  const bool vs_dynamic = patch_list ? vs_module && vs_module->dynamic_bools : dynamic_bools(vs);
+  const uint32_t* vs_bools = vs_dynamic ? nullptr : bools_of(vs);
+  const uint32_t* ps_bools = ps && dynamic_bools(ps) ? nullptr : bools_of(ps);
   for (uint32_t word = 0; word < 8 && (vs_bools || ps_bools); ++word) {
     const uint32_t tested = (vs_bools ? vs_bools[word] : 0) | (ps_bools ? ps_bools[word] : 0);
     const uint32_t value = regs.bools[word] & tested;

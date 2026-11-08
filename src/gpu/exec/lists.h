@@ -29,7 +29,7 @@ struct Lists {
   // marker `until` (consumed; returns true), never past another marker.
   bool RunNative(uint32_t until);
   void NativeWrite(uint32_t first, const uint32_t* values, uint32_t count);
-  void NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size);
+  void NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size, uint32_t serial);
   void NativeClear(const uint32_t* record);
   std::vector<NativeFrame> native_stack_;
   std::deque<std::shared_ptr<const native_d3d::List>> native_queue_;

@@ -15,7 +15,7 @@ void Lists::NativeWrite(uint32_t first, const uint32_t* values, uint32_t count) 
 }
 
 // A draw record.
-void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
+void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, uint32_t dma_size, uint32_t serial) {
   DrawState& state = backend.state_;
   state.draw_initiator.value = initiator;
   const bits::VGT_DRAW_INITIATOR draw = state.draw_initiator;
@@ -41,9 +41,11 @@ void Lists::NativeDraw(uint32_t flags, uint32_t initiator, uint32_t dma_base, ui
   ++native_draws_;
   draw_pass_ = uint8_t((flags >> native_d3d::kDrawPassShift) & 0xF);
   draw_mode_ = uint8_t((flags >> native_d3d::kDrawModeShift) & 7);
+  backend.draw.caller_id_ = backend.draw.caller_trace_ && (serial & 0x80000000u) ? serial : 0;
   backend.draw.IssueDraw(draw.prim_type, draw.num_indices, indexed ? &info : nullptr,
             xenos::IsMajorModeExplicit(draw.major_mode, draw.prim_type));
   draw_pass_ = 0;
+  backend.draw.caller_id_ = 0;
 }
 
 bool Lists::RunNative(uint32_t until) {
@@ -63,7 +65,9 @@ bool Lists::RunNative(uint32_t until) {
     const std::vector<uint32_t>& words = f.list->words;
     if (f.pos >= words.size()) {
       native_stack_.pop_back();
-      if (native_stack_.empty()) native_d3d::NoteListExecuted();
+      if (native_stack_.empty()) {
+        native_d3d::NoteListExecuted();
+      }
       continue;
     }
     const uint32_t* w = words.data() + f.pos;
@@ -110,7 +114,7 @@ bool Lists::RunNative(uint32_t until) {
       }
       case native_d3d::kOpDraw:
         f.pos += 6;
-        NativeDraw(w[0] >> 8, w[2], w[3], w[4]);
+        NativeDraw(w[0] >> 8, w[2], w[3], w[4], w[5]);
         break;
       case native_d3d::kOpRun: {
         std::shared_ptr<const native_d3d::List> child = w[1] < f.list->runs.size() ? f.list->runs[w[1]] : nullptr;

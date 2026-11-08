@@ -69,6 +69,8 @@ struct Draw {
   // culling (7 when left out); 8 draws a point list's sprite coordinate; 16
   // and 32 whiten textures (see the shared block).
   uint32_t debug_mode_ = 7;
+  // renut_plume_ui_depth_fix (read each frame).
+  bool ui_depth_fix_ = true;
   template <typename... Args>
   void Trace(fmt::format_string<Args...> format, Args&&... args);
   std::unique_ptr<RenderShader> rect_list_gs_;
@@ -116,6 +118,15 @@ struct Draw {
   std::vector<DeferredSlot> deferred_slots_, flushing_slots_, draw_slots_;
   uint64_t deferred_signature_ = 0;
   bool in_issue_draw_ = false;
+  // renut_plume_draw_callers: the id of the game call that made the draw being issued (0: none) and the
+  // counts by id, printed by Swap::ReportCallers.
+  struct CallerStat {
+    uint64_t draws = 0, depth_only = 0, indices = 0;
+    uint64_t hiz_tested = 0, hiz_no_model = 0, hiz_dropped = 0, hiz_dropped_indices = 0;
+  };
+  bool caller_trace_ = false;
+  uint32_t caller_id_ = 0;
+  std::unordered_map<uint32_t, CallerStat> caller_stats_;
   // renut_plume_decal_log: the states of polygon-offset draws already logged.
   std::unordered_set<uint64_t> bias_log_seen_;
   uint64_t bias_log_draws_ = 0, bias_log_applied_ = 0, bias_log_next_ = 0;

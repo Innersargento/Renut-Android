@@ -140,6 +140,10 @@ REX_HOOK_RAW(sub_82535F20) {
 namespace {
 
 thread_local uint32_t pending_scene_ref = 0;
+// A scene was asked for and has not been opened yet (set by sub_822BC0D8, cleared where the scene starts).
+std::atomic<bool> g_scene_loading{false};
+// The game's main thread, as the scene hooks see it; the pump draws, so only this thread runs it.
+thread_local bool t_game_main = false;
 // A scene was asked for since the boot (sub_822BC0D8).
 std::atomic<bool> scene_asked_since_boot{false};
 
@@ -167,6 +171,8 @@ REX_HOOK_RAW(sub_822BC0D8) {
   uint32_t scene = asset * 0x9E3779B1u ^ ref;
   if (!scene) scene = 1;
   renut::PlumeSceneRequested(scene, asset, ref);
+  t_game_main = true;
+  g_scene_loading.store(true, std::memory_order_relaxed);
   scene_asked_since_boot = true;
   __imp__sub_822BC0D8(ctx, base);
 }
@@ -207,6 +213,7 @@ void StoreGuestWord(uint8_t* base, uint32_t address, uint32_t value) {
 extern "C" void __imp__sub_8229B330(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(sub_8229B330) {
   const uint32_t scene = ctx.r3.u32;
+  t_game_main = true;
   if (GuestWord(base, scene + 52) != 0) {
     __imp__sub_8229B330(ctx, base);
     return;
@@ -222,6 +229,7 @@ REX_HOOK_RAW(sub_8229B330) {
     in_scene_update = false;
     if (GuestWord(base, scene + 52)) {
       renut::PlumeSceneOpened(pipeline_hold);
+      g_scene_loading.store(false, std::memory_order_relaxed);
       pipeline_hold = false;
     }
     return;
@@ -237,6 +245,7 @@ REX_HOOK_RAW(sub_8229B330) {
   }
   if (GuestWord(base, scene + 52)) {  // started all the same
     renut::PlumeSceneOpened(pipeline_hold);
+      g_scene_loading.store(false, std::memory_order_relaxed);
     pipeline_hold = false;
   } else if (GuestWord(base, scene + 16) == 2 && !pipeline_hold) {
     pipeline_hold = true;
@@ -254,13 +263,87 @@ REX_HOOK_RAW(sub_8229B330) {
 // the game wait for it and never come back. Not at the boot, whose logo the
 // starting scene draws itself. The GPU backend turns the predictions into
 // pipelines meanwhile from its own loop, with no frame to wait for.
+// The game's stall pump, sub_8223C650 (no arguments): what the loader calls while it waits (an asset open, an
+// allocation, a lock: meInternalAlloc, assetManOpenParams, assetDbBundleLoadBundle through sub_82235E68) to keep the
+// loading screen going. At most every 33 ms it updates and draws one frame of the
+// loading screen and swaps; it returns at once when no loading screen is up, or while it is itself running
+// (dword_82FAAFFC). Two places here run it: the hold below, and the game's own wait (sub_821E04F0, the
+// WaitForSingleObject of the engine's job system) while a scene loads: that wait does not pump, and a world build
+// that sits in it (the main thread's tick, 22 s without one frame on the S23) left the loading screen standing still.
+extern "C" REX_FUNC(sub_8223C650);
+extern "C" void __imp__sub_821E04F0(PPCContext& __restrict, uint8_t*);
+REXCVAR_DEFINE_BOOL(renut_pump_loading_hold, true, "reNut/Plume",
+                    "While a scene start is held for its pipelines, call the game's own stall pump so the loading "
+                    "screen keeps animating (the Pong's ball) instead of standing still.");
+REXCVAR_DEFINE_BOOL(renut_pump_loading_waits, true, "reNut/Plume",
+                    "While a scene loads, the main thread's waits of the game's job system (sub_821E04F0) are cut into "
+                    "16 ms slices and the game's stall pump runs between them, so the loading screen draws frames "
+                    "during the world build as it does on a disc.");
+
+namespace {
+
+thread_local bool t_in_pump = false;
+thread_local std::chrono::steady_clock::time_point t_last_pump;
+constexpr uint32_t kPumpStopFlag = 0x82FAB13A;  // set: the pump never returns (a swap loop)
+
+// One run of the game's stall pump on this thread, with the caller's registers kept.
+void RunPump(PPCContext& ctx, uint8_t* base) {
+  if (t_in_pump || *renut::GuestPtr(base, kPumpStopFlag) != 0) return;
+  const PPCContext saved = ctx;
+  t_last_pump = std::chrono::steady_clock::now();
+  t_in_pump = true;
+  sub_8223C650(ctx, base);
+  t_in_pump = false;
+  ctx = saved;
+}
+
+}  // namespace
+
+// WaitForSingleObject(handle r3, timeout in ms r4 (-1: none), alertable r5) -> status r3 (0x102: timed out).
+REX_HOOK_RAW(sub_821E04F0) {
+  const uint32_t timeout = ctx.r4.u32;
+  if (!t_game_main || t_in_pump || timeout == 0 || !g_scene_loading.load(std::memory_order_relaxed) ||
+      !REXCVAR_GET(renut_pump_loading_waits)) {
+    __imp__sub_821E04F0(ctx, base);
+    return;
+  }
+  const PPCContext entry = ctx;
+  const auto start = std::chrono::steady_clock::now();
+  for (;;) {
+    const uint64_t elapsed =
+        uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+    uint32_t slice = 16;
+    if (timeout != 0xFFFFFFFFu) {
+      if (elapsed >= timeout) {
+        ctx = entry;
+        ctx.r4.u32 = 0;
+        __imp__sub_821E04F0(ctx, base);  // a last look, which also leaves the registers as the original does
+        return;
+      }
+      slice = uint32_t(std::min<uint64_t>(slice, timeout - elapsed));
+    }
+    ctx = entry;
+    ctx.r4.u32 = slice;
+    __imp__sub_821E04F0(ctx, base);
+    if (ctx.r3.u32 != 0x102) {
+      // Signalled (or failed): as the original, but a wait that comes back at once is no reason to skip the frame the
+      // pump owes (it keeps its own 33 ms between frames; this only spares the calls).
+      if (std::chrono::steady_clock::now() - t_last_pump >= std::chrono::milliseconds(20)) RunPump(ctx, base);
+      return;
+    }
+    RunPump(ctx, base);
+  }
+}
+
 extern "C" void __imp__sub_822BBE58(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(sub_822BBE58) {
   if (in_scene_update && ctx.r4.u32 != 0 && scene_asked_since_boot.load()) {
     const auto start = std::chrono::steady_clock::now();
     uint32_t polls = 0;
+    const bool pump = REXCVAR_GET(renut_pump_loading_hold);
     while (!renut::PlumeSceneReady()) {
       ++polls;
+      if (pump) RunPump(ctx, base);
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (polls) {

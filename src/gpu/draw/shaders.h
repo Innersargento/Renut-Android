@@ -30,6 +30,8 @@ struct Shaders {
   Shader* LoadShaderIdentity(xenos::ShaderType shader_type, uint64_t container, uint32_t program,
                              const uint32_t* host_address, uint32_t dword_count);
   std::unordered_map<uint64_t, HostShader*> identity_shaders_;
+  // In front of identity_shaders_ (a load for nearly every shader bind of every draw).
+  LookupMemo<HostShader, 12> identity_memo_;
   // (the microcode's hash, the fetches) -> the shader they make; the microcode behind a hash is
   // not written, so it holds.
   std::unordered_map<uint64_t, HostShader*> patched_shaders_;

@@ -5,6 +5,39 @@
 
 namespace renut::gpu {
 
+namespace {
+// renut_plume_draw_callers: the callers of the last 600 frames with the most draws, then the table starts
+// again. The frames are offsets into the runtime library (tools/draw_callers.py).
+void ReportCallers(Draw& draw) {
+  std::vector<std::pair<uint32_t, Draw::CallerStat>> rows(draw.caller_stats_.begin(), draw.caller_stats_.end());
+  draw.caller_stats_.clear();
+  std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+  Draw::CallerStat total;
+  for (const auto& [id, s] : rows) {
+    total.draws += s.draws;
+    total.depth_only += s.depth_only;
+    total.indices += s.indices;
+    total.hiz_tested += s.hiz_tested;
+    total.hiz_no_model += s.hiz_no_model;
+    total.hiz_dropped += s.hiz_dropped;
+    total.hiz_dropped_indices += s.hiz_dropped_indices;
+  }
+  REXLOG_INFO("Renut: Plume callers: {} distinct, {} draws ({} depth-only), {} indices, hiz tested {} no-model {} dropped {} ({} indices)",
+              rows.size(), total.draws, total.depth_only, total.indices, total.hiz_tested, total.hiz_no_model,
+              total.hiz_dropped, total.hiz_dropped_indices);
+  for (size_t i = 0; i < rows.size() && i < 40; ++i) {
+    const auto& [id, s] = rows[i];
+    uint32_t frames[native_d3d::kCallerFrames] = {};
+    native_d3d::CallerFrames(id, frames);
+    std::string text;
+    for (uint32_t f : frames) text += fmt::format(" {:X}", f);
+    REXLOG_INFO("Renut: Plume caller {:08X}: draws {} depth-only {} indices {} hiz tested {} no-model {} dropped {} ({} indices) frames{}",
+                id, s.draws, s.depth_only, s.indices, s.hiz_tested, s.hiz_no_model, s.hiz_dropped,
+                s.hiz_dropped_indices, text);
+  }
+}
+}  // namespace
+
 void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   auto* renderer = PlumeRenderer::Get();
@@ -202,6 +235,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     poly_offset_ = poly_offset != 0;
     poly_offset_scale_ = poly_offset * 0.01f;
 
+    backend.draw.ui_depth_fix_ = REXCVAR_GET(renut_plume_ui_depth_fix);
     const int hiz = std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2);
     if (uint32_t(hiz) != backend.hiz.mode_) {
       REXLOG_INFO("Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor/clip plane)", hiz);
@@ -227,8 +261,24 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     }
 
     backend.targets.RefreshQuality();
+    // The pipelines compiled since the last write go to disk (cheap when none are new, and at most
+    // every 15 s otherwise): the process is usually killed, not shut down, and what only a pause saves
+    // is compiled again at the next launch, which is what holds the loading screens.
+    SavePlumePipelineCache();
     backend.no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
-
+    {
+      const bool callers = REXCVAR_GET(renut_plume_draw_callers);
+      backend.draw.caller_trace_ = callers;
+      native_d3d::g_draw_callers.store(callers, std::memory_order_relaxed);
+      static uint64_t next_report = 0;
+      if (callers && backend.swaps_ >= next_report) {
+        if (next_report) ReportCallers(backend.draw);
+        next_report = backend.swaps_ + 600;
+      } else if (!callers) {
+        next_report = 0;
+        backend.draw.caller_stats_.clear();
+      }
+    }
     const int adaptive = std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1);
     if (uint32_t(adaptive) != adaptive_mode_) {
       REXLOG_INFO("Renut: Plume adaptive patches {}", adaptive ? "on" : "off");

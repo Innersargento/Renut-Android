@@ -32,14 +32,18 @@ Shader* Shaders::LoadShaderByContents(xenos::ShaderType shader_type,
 Shader* Shaders::LoadShaderIdentity(xenos::ShaderType shader_type, uint64_t container, uint32_t program,
                                     const uint32_t* host_address, uint32_t dword_count) {
   const uint64_t identity = XXH3_64bits_withSeed(&program, sizeof(program), container) | 1;
+  // The shaders are never erased but with the whole table (Shutdown), which clears the memo too.
+  if (HostShader* memo = identity_memo_.Find(identity)) return memo;
   const auto known = identity_shaders_.find(identity);
   if (known != identity_shaders_.end()) {
+    identity_memo_.Put(identity, known->second);
     return known->second;
   }
   // Only the first program is the one the container's entry was made for.
   HostShader* made = FindOrMakeShader(shader_type, XXH3_64bits(host_address, size_t(dword_count) * sizeof(uint32_t)),
                                       host_address, dword_count, program == 0 ? container : 0);
   identity_shaders_[identity] = made;
+  identity_memo_.Put(identity, made);
   return made;
 }
 
@@ -97,6 +101,7 @@ HostShader* Shaders::FindOrMakeShader(xenos::ShaderType shader_type, uint64_t ha
       }
     }
     if (!shader->entry) shader->entry = backend.pipelines.store_->Find(shader->ucode_key, shader->loose_key);
+    if (shader->entry) shader->entry_hash = shader->entry->hash;
     if (!shader->entry && missed_.insert(hash).second && missed_.size() <= 32) {
       REXLOG_WARN("Renut: Plume has no recompiled {} shader for microcode {:016X} ({} dwords)",
                   shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash, dword_count);

@@ -3,6 +3,7 @@
 
 namespace renut::gpu {
 
+
 void HiZ::HizIndexBox(uint64_t key, const HizBox& box) {
   auto add = [&](uint32_t base, uint32_t size) {
     if (!size) return;
@@ -15,7 +16,8 @@ void HiZ::HizIndexBox(uint64_t key, const HizBox& box) {
   // Entries of dropped boxes pile up; rebuilt from the live ones now and then.
   if (hiz_box_blocks_.size() > 400000) {
     hiz_box_blocks_.clear();
-    for (const auto& [k, b] : hiz_boxes_) {
+    for (const auto& [k, slot] : hiz_boxes_) {
+      const HizBox& b = hiz_pool_[slot];
       if (b.vertex_size) {
         for (uint32_t block = b.vertex_base >> 16; block <= (b.vertex_base + b.vertex_size - 1) >> 16; ++block) {
           hiz_box_blocks_.emplace(block, k);
@@ -33,35 +35,41 @@ void HiZ::HizIndexBox(uint64_t key, const HizBox& box) {
 // The guest wrote [start, start + length): the boxes made from any of it go.
 void HiZ::HizDropBoxes(uint32_t start, uint32_t length) {
   if (!length) return;
-  // Only a box that goes can leave a pointer behind in hiz_front_, so the
-  // generation moves only then: a guest write that touches no box (most of them
-  // are textures and streams) used to empty the whole front each time.
+  // An erased box moves its slot's generation on, which ends the front entries
+  // that name it and no others.
   size_t erased = 0;
   const uint32_t first = start >> 16, last = uint32_t((uint64_t(start) + length - 1) >> 16);
   if (last - first > 4096) {
     // A huge range: cheaper to look at every box.
     for (auto it = hiz_boxes_.begin(); it != hiz_boxes_.end();) {
-      const HizBox& box = it->second;
+      const HizBox& box = hiz_pool_[it->second];
       const bool hit = (box.vertex_size && box.vertex_base < uint64_t(start) + length &&
                         start < box.vertex_base + box.vertex_size) ||
                        (box.index_size && box.index_base < uint64_t(start) + length &&
                         start < box.index_base + box.index_size);
-      if (hit) ++erased;
-      it = hit ? hiz_boxes_.erase(it) : std::next(it);
+      if (hit) {
+        ++erased;
+        HizRelease(it->second);
+        it = hiz_boxes_.erase(it);
+      } else {
+        ++it;
+      }
     }
   } else {
     for (uint32_t block = first; block <= last; ++block) {
       auto range = hiz_box_blocks_.equal_range(block);
       for (auto it = range.first; it != range.second;) {
-        erased += hiz_boxes_.erase(it->second);
+        auto box = hiz_boxes_.find(it->second);
+        if (box != hiz_boxes_.end()) {
+          HizRelease(box->second);
+          hiz_boxes_.erase(box);
+          ++erased;
+        }
         it = hiz_box_blocks_.erase(it);
       }
     }
   }
-  if (erased) {
-    ++hiz_box_generation_;
-    backend.stats_.hiz_box_drops += erased;
-  }
+  if (erased) backend.stats_.hiz_box_drops += erased;
 }
 
 HizModelEntry* HiZ::HizModelFor(HostShader& vs) {
@@ -198,10 +206,12 @@ const HizBox* HiZ::HizBoxFor(
   }
   hiz_last_box_key_ = key;
   HizFront& front = hiz_front_[key & (hiz_front_.size() - 1)];
-  if (front.key == key && front.generation == hiz_box_generation_ && front.box &&
-      backend.swaps_ - front.box->checked_frame < 30) {
-    ++backend.stats_.hiz_box_hits;
-    return front.box->valid ? front.box : nullptr;
+  if (front.gen && front.key == key) {
+    const HizBox& fb = hiz_pool_[front.slot];
+    if (fb.gen == front.gen && backend.swaps_ - fb.checked_frame < 30) {
+      ++backend.stats_.hiz_box_hits;
+      return fb.valid ? &fb : nullptr;
+    }
   }
 
   const uint8_t* memory = backend.memory_->TranslatePhysical<const uint8_t*>(0);
@@ -219,22 +229,23 @@ const HizBox* HiZ::HizBoxFor(
   };
   auto found = hiz_boxes_.find(key);
   if (found != hiz_boxes_.end()) {
-    HizBox& box = found->second;
+    const uint32_t slot = found->second;
+    HizBox& box = hiz_pool_[slot];
     // The write watch drops a box when the guest writes under it; the sample of
     // its bytes is a second line, looked at every 30 frames rather than at every draw.
     if (backend.swaps_ - box.checked_frame < 30) {
       ++backend.stats_.hiz_box_hits;
-      front = {key, &box, hiz_box_generation_};
+      front = {key, slot, box.gen};
       return box.valid ? &box : nullptr;
     }
     if (checksum_of(box) == box.checksum) {
       box.checked_frame = backend.swaps_;
       ++backend.stats_.hiz_box_hits;
-      front = {key, &box, hiz_box_generation_};
+      front = {key, slot, box.gen};
       return box.valid ? &box : nullptr;
     }
+    HizRelease(slot);
     hiz_boxes_.erase(found);
-    ++hiz_box_generation_;
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -261,10 +272,11 @@ const HizBox* HiZ::HizBoxFor(
     }
     box.checksum = checksum_of(box);
     box.checked_frame = backend.swaps_;
-    const HizBox* stored = &hiz_boxes_.emplace(key, box).first->second;
+    const uint32_t slot = HizTake(box);
+    hiz_boxes_[key] = slot;
     HizIndexBox(key, box);
-    front = {key, stored, hiz_box_generation_};
-    return valid ? stored : nullptr;
+    front = {key, slot, box.gen};
+    return valid ? &hiz_pool_[slot] : nullptr;
   };
   if (!box.vertex_size || uint64_t(box.vertex_base) + box.vertex_size > 0x20000000ull ||
       (indexed && (uint64_t(box.index_base) + box.index_size > 0x20000000ull || !index_count))) {

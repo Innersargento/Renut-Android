@@ -288,6 +288,9 @@ namespace renut::gpu {
     uint32_t first_vertex = 0, last_vertex = 0;
     uint64_t checksum = 0;
     uint64_t checked_frame = 0;
+    // Of its pool slot (HiZ::hiz_pool_): moves on when the box goes, which is
+    // what tells a front entry that its box is gone.
+    uint32_t gen = 1;
   };
 
   // How often draws of a mesh (all of its instances together) were found outside
@@ -300,12 +303,14 @@ namespace renut::gpu {
   };
 
   // A direct-mapped front for hiz_boxes_: the same mesh and index range come
-  // back draw after draw and frame after frame. Entries die with a generation
-  // bump whenever a box is erased.
+  // back draw after draw and frame after frame. An entry names its box by pool
+  // slot and the slot's generation: erasing one box ends only that box's entries
+  // (a global generation emptied the whole front at every guest write that hit
+  // any box, tens of times a frame).
   struct HizFront {
     uint64_t key = 0;
-    const HizBox* box = nullptr;
-    uint32_t generation = 0;
+    uint32_t slot = 0;
+    uint32_t gen = 0;  // 0: empty (a slot's generation starts at 1)
   };
 
   // ---- Recording thread (files/plume-recthread) ----

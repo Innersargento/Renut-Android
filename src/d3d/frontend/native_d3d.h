@@ -142,6 +142,15 @@ void SetFilesDirectory(std::string directory);
 bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height);
 // Native sync: the GPU backend finished a published list.
 void NoteListExecuted();
+// Draw callers, for finding the game's own culling and draw loops (cvar renut_plume_draw_callers). While
+// g_draw_callers is set, a draw record's serial word is a caller id (bit 31 set) instead of a counter: a hash
+// of the host return addresses of the call, walked down the frame pointers, which the recompiled code does
+// not leave in the guest link register. The backend counts draws and Hi-Z culls by id and prints them with
+// the frames (CallerFrames); tools/draw_callers.py names the frames with the unstripped library.
+constexpr uint32_t kCallerFrames = 10;
+extern std::atomic<bool> g_draw_callers;
+// The frames of caller `id` as offsets into the runtime library (0: outside it or past the stack's end).
+bool CallerFrames(uint32_t id, uint32_t (&frames)[kCallerFrames]);
 // Photo Mode's capture, BOOL sub_82535F20(D3DTexture *photo) (hooked in guest/game_fixes.cpp): the
 // frame so far goes into the photo's rows through a kOpPhoto record, and the call returns once the
 // GPU backend has written them. The original resolved the screen into a scratch texture and

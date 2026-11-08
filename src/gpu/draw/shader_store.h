@@ -44,28 +44,33 @@ class HostShader : public Shader {
   HostShader(xenos::ShaderType type, uint64_t hash, const uint32_t* ucode, size_t count)
       : Shader(type, hash, ucode, count) {}
 
+  // What every draw reads of a shader, kept together so it costs one cache line and not a chase
+  // through entry and compiled: entry's hash (0 without one), whether the compiled form reads the
+  // booleans from the shared block (-1: not known yet, `compiled` was null), the texture slots.
   const ShaderCacheEntry* entry = nullptr;
+  uint64_t entry_hash = 0;
+  CompiledShader* compiled = nullptr;
+  int8_t dynamic_bools_cache = -1;
+  bool texture_mask_decoded = false;
+  bool bool_mask_decoded = false;
+  bool elements_decoded = false;
+  // Texture fetch constants this shader reads; ~0 until TextureMask ran.
+  uint32_t texture_mask = 0;
+  // Boolean registers the control flow tests, a bit per register in words of
+  // 32; the pipeline is specialized on these (RENUT_SPEC_BOOLS_BASE).
+  uint32_t bool_mask[8] = {};
   // The container of the shader object this was loaded for (0: not known), when its microcode is
   // that container's own; `entry` is then the container's, not the first one the keys find.
   uint64_t container = 0;
   // What the cache is keyed by, which is not this shader's own hash.
   uint64_t ucode_key = 0;
   uint64_t loose_key = 0;
-  // Texture fetch constants this shader reads; ~0 until TextureMask ran.
-  uint32_t texture_mask = 0;
-  bool texture_mask_decoded = false;
-  // Boolean registers the control flow tests, a bit per register in words of
-  // 32; the pipeline is specialized on these (RENUT_SPEC_BOOLS_BASE).
-  uint32_t bool_mask[8] = {};
-  bool bool_mask_decoded = false;
-  CompiledShader* compiled = nullptr;
   // Vertex shaders: the input layout decoded from this variant's vfetches.
   std::vector<LiveElement> elements;
   // Fetches the shader indexes with a computed register (vfetchLive): slot k
   // of the shared fetch table, as uint4 {stream | format << 8 | flags << 16,
   // stride, offset, exp scale bits}.
   std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> live_fetches;
-  bool elements_decoded = false;
   // The same microcode recompiled as the domain stage of a tessellated draw.
   // It reads its control points by patch index, so every one of its fetches is
   // a live fetch and the table differs from the vertex form's.

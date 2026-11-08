@@ -2,17 +2,79 @@
 #include "d3d/frontend/internal.h"
 #include "d3d/resources/resource.h"
 
+#include <dlfcn.h>
+
+#include <array>
+#include <mutex>
+#include <unordered_map>
+
 namespace renut::native_d3d {
+
+std::atomic<bool> g_draw_callers{false};
 
 namespace {
 // The draw's EDRAM mode (RB_MODECONTROL, device +10580) for the flags of its record.
 uint32_t DrawMode(const uint8_t* base, uint32_t dev) { return (U32(base, dev + 10580) & 7) << kDrawModeShift; }
+
+struct CallerTable {
+  std::mutex mutex;
+  std::unordered_map<uint32_t, std::array<uint32_t, kCallerFrames>> frames;
+};
+CallerTable& Callers() {
+  static CallerTable table;
+  return table;
+}
 }  // namespace
+
+bool CallerFrames(uint32_t id, uint32_t (&frames)[kCallerFrames]) {
+  CallerTable& table = Callers();
+  std::lock_guard<std::mutex> lock(table.mutex);
+  const auto found = table.frames.find(id);
+  if (found == table.frames.end()) return false;
+  for (uint32_t i = 0; i < kCallerFrames; ++i) frames[i] = found->second[i];
+  return true;
+}
+
+// Walks the frame pointers (the recompiled game functions are ordinary host functions with frames, which is
+// what the profiler's call chains used). Each frame is its return address as an offset into the runtime
+// library; the draw's id is a hash of them, and the first time a thread sees an id it files the frames.
+__attribute__((noinline)) uint32_t DrawSerial() {
+  if (!g_draw_callers.load(std::memory_order_relaxed)) return g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+  static const uintptr_t library = [] {
+    Dl_info info;
+    return dladdr(reinterpret_cast<void*>(&DrawSerial), &info) ? uintptr_t(info.dli_fbase) : uintptr_t(0);
+  }();
+  uint32_t frames[kCallerFrames] = {};
+  uint32_t hash = 2166136261u;
+  auto* fp = static_cast<uintptr_t*>(__builtin_frame_address(0));
+  uintptr_t previous = 0;
+  for (uint32_t n = 0; n < kCallerFrames && fp; ++n) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(fp);
+    // A frame pointer must be aligned, above the last one and near it; anything else ends the walk.
+    if ((at & 15) || at <= previous || (previous && at - previous > (1u << 20))) break;
+    const uintptr_t lr = fp[1];
+    previous = at;
+    fp = reinterpret_cast<uintptr_t*>(fp[0]);
+    frames[n] = library && lr > library && lr - library < 0x20000000u ? uint32_t(lr - library) : 0u;
+    hash = (hash ^ frames[n]) * 16777619u;
+  }
+  const uint32_t id = hash | 0x80000000u;
+  thread_local std::array<uint32_t, 512> filed{};
+  uint32_t& slot = filed[id & 511];
+  if (slot != id) {
+    CallerTable& table = Callers();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    auto& entry = table.frames[id];
+    for (uint32_t i = 0; i < kCallerFrames; ++i) entry[i] = frames[i];
+    slot = id;
+  }
+  return id;
+}
 
 bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, base_vertex = ctx.r5.u32;
   const uint32_t first = ctx.r6.u32, total = ctx.r7.u32;
-  const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
   Capture(ctx, base, dev, [&](Device& d) {
     FlushAll(d);
@@ -53,7 +115,7 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
 bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, base_vertex = ctx.r5.u32;
   const uint32_t first = ctx.r6.u32, total = ctx.r7.u32;
-  const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
   Capture(ctx, base, dev, [&](Device& d) {
     const uint32_t ib = U32(base, dev + kIndexBuffer);
@@ -130,7 +192,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
 
 bool DrawVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, first = ctx.r5.u32, total = ctx.r6.u32;
-  const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
   Capture(ctx, base, dev, [&](Device& d) {
     FlushAll(d);
@@ -155,7 +217,7 @@ bool DrawVertices(PPCContext& ctx, uint8_t* base) {
 
 bool BeginVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
-  const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
   g_counts.begin_vertices.fetch_add(1, std::memory_order_relaxed);
   const uint32_t dwords = (count * stride) >> 2;
@@ -195,7 +257,7 @@ bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
   const bool wide = format & 4;
   const uint32_t vertex_dwords = (vertices * stride) >> 2;
   const uint32_t index_dwords = wide ? indices : (indices + 1) >> 1;
-  const uint32_t serial = g_draw_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
   g_counts.indexed_up.fetch_add(1, std::memory_order_relaxed);
   const uint32_t vertex_data = ScratchAlloc(vertex_dwords * 4), index_data = ScratchAlloc(index_dwords * 4);

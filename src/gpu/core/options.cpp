@@ -28,6 +28,14 @@ REXCVAR_DEFINE_BOOL(renut_plume_decal_log, false, "reNut/Plume",
 REXCVAR_DEFINE_BOOL(renut_plume_no_shadows, false, "reNut/Plume",
                     "Drop the shadow casters (depth-only draws into the shadow maps): the scene is drawn "
                     "without shadows.");
+REXCVAR_DEFINE_BOOL(renut_plume_draw_callers, false, "reNut/Plume",
+                    "Debug: tag each draw with the host stack of the game code that made it, and log every 600 "
+                    "frames the callers with the most draws and Hi-Z culls (tools/draw_callers.py names them). "
+                    "Followed live; slows the game a little while on.");
+REXCVAR_DEFINE_BOOL(renut_plume_ui_depth_fix, true, "reNut/Plume",
+                    "A draw that tests depth LESS or LESS_EQUAL under a reversed viewport (z scale -1, offset 1) is drawn "
+                    "without the depth test: the scene's depth is cleared to 0 and tested GREATER, so such a test never "
+                    "passes (the loading screen's spinning gear). Followed live.");
 REXCVAR_DEFINE_INT32(renut_plume_water_tess_percent, 100, "reNut/Plume",
                      "Percent of the game's tessellation level the water grid uses (100 = as the game sets it).")
     .range(10, 100);
