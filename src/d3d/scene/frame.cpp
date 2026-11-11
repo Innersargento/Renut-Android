@@ -31,9 +31,9 @@ REX_FUNC(sub_822052C8);  // D3D::InsertCallback
 __attribute__((weak)) void sub_82222F20(PPCContext& __restrict, uint8_t*);  // the viewport from floats
 __attribute__((weak)) void sub_826593F8(PPCContext& __restrict, uint8_t*);  // gamma ramp -> table
 __attribute__((weak)) void sub_82659490(PPCContext& __restrict, uint8_t*);  // PWL gamma -> table
-__attribute__((weak)) void sub_82D0827C(PPCContext& __restrict, uint8_t*);  // the device type
+__attribute__((weak)) void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
 __attribute__((weak)) void sub_8265F3B0(PPCContext& __restrict, uint8_t*);  // scaler fit
-__attribute__((weak)) void sub_82D08BAC(PPCContext& __restrict, uint8_t*);  // the video scaler call
+__attribute__((weak)) void __imp__VdCallGraphicsNotificationRoutines(PPCContext& __restrict, uint8_t*);  // the video scaler call
 __attribute__((weak)) void sub_82654FD8(PPCContext& __restrict, uint8_t*);  // export fence packet
 __attribute__((weak)) void sub_82655130(PPCContext& __restrict, uint8_t*);  // export fence packet, end
 }
@@ -118,7 +118,7 @@ bool Present(PPCContext& ctx, uint8_t* base) {
 // D3DDevice_SetScalerParameters(device, parameters): the scaler's rectangles are
 // fitted to the source size, stored in the device and handed to the video kernel.
 bool SetScalerParameters(PPCContext& ctx, uint8_t* base) {
-  if (!sub_8265F3B0 || !sub_82D08BAC)
+  if (!sub_8265F3B0 || !__imp__VdCallGraphicsNotificationRoutines)
     return false;
   Frame f(ctx, base, 0x100);
   Device d = DeviceAt(base, ctx.r3.u32);
@@ -155,7 +155,7 @@ bool SetScalerParameters(PPCContext& ctx, uint8_t* base) {
   StoreBE16(f.G(packet + 4), u16(d.W(0x5428)));
   StoreBE16(f.G(packet + 6), u16(d.W(0x542C)));
   std::memcpy(f.G(packet + 8), f.G(local), 0x38);
-  f.Call(sub_82D08BAC, {1, packet});
+  f.Call(__imp__VdCallGraphicsNotificationRoutines, {1, packet});
   return true;
 }
 
@@ -270,6 +270,7 @@ bool EndExport(PPCContext& ctx, uint8_t* base) {
 // rectangles, one over the render target (or depth surface), or over the tiling extent
 // while the device is tiling with the same targets it was bound with.
 bool ClearF(PPCContext& ctx, uint8_t* base) {
+  MirrorClearColorF(ctx, base);
   Frame f(ctx, base, 0x70);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
@@ -303,6 +304,7 @@ bool ClearF(PPCContext& ctx, uint8_t* base) {
 // 1 + b / 2^23 and scaled by 2^23 / 255 less its offset (reNut's PC build, d3d/hooks/draw.cpp,
 // has the same constants).
 bool Clear(PPCContext& ctx, uint8_t* base) {
+  MirrorClearColor(ctx);
   Frame f(ctx, base, 0xA0);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)

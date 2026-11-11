@@ -211,7 +211,7 @@ bool BeginCommandBuffer(PPCContext& ctx, uint8_t* base) {
     d.SetW(13188, 0);
     d.SetW(12720, 2);
     if (flags & 0x40) {
-      f.Call(sub_82658818, {dev, (flags >> 7) & 1, count});
+      f.Call(sub_82658818, {dev, (flags >> 7) & 1, count, extent_x, extent_y});
       g.SetW(buffer + kBufferFlags, g.W(buffer + kBufferFlags) | 0x20000);
     }
   }

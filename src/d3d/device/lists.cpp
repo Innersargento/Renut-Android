@@ -30,13 +30,7 @@ REX_FUNC(sub_822108B8);  // CDevice::CreateInvalidateBuffer
 REX_FUNC(sub_822052C8);  // D3D::InsertCallback
 REX_FUNC(sub_82278528);  // CDevice::SetFence
 REX_FUNC(sub_821F7C18);  // room in the ring
-__attribute__((weak)) void sub_82D081FC(PPCContext& __restrict, uint8_t*);  // kernel: enter
-__attribute__((weak)) void sub_82D082DC(PPCContext& __restrict, uint8_t*);  // kernel: lock
-__attribute__((weak)) void sub_82D082EC(PPCContext& __restrict, uint8_t*);  // kernel: unlock
-__attribute__((weak)) void sub_82D08BBC(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82D083BC(PPCContext& __restrict, uint8_t*);  // kernel: the ring capture
-__attribute__((weak)) void sub_82D083CC(PPCContext& __restrict, uint8_t*);  // kernel: leave
-__attribute__((weak)) void sub_82D08B3C(PPCContext& __restrict, uint8_t*);  // kernel: display mode change
+__attribute__((weak)) void __imp__VdQueryVideoMode(PPCContext& __restrict, uint8_t*);  // kernel: display mode change
 
 REX_FUNC(sub_8228F558);  // CDevice::BlockOnFence
 REX_FUNC(sub_8227AF40);  // D3DDevice_SetDepthStencilSurface
@@ -46,11 +40,9 @@ REX_FUNC(sub_8222F410);  // D3DDevice_SetTexture
 REX_FUNC(sub_82658988);  // D3DDevice_SetScreenExtentQueryMode
 REX_FUNC(sub_82220B20);  // D3DDevice_SetShaderGPRAllocation
 __attribute__((weak)) void sub_822399D8(PPCContext& __restrict, uint8_t*);  // the game's XMemFree
-__attribute__((weak)) void sub_82D0827C(PPCContext& __restrict, uint8_t*);  // the device type
+__attribute__((weak)) void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
 __attribute__((weak)) void sub_82660E00(PPCContext& __restrict, uint8_t*);  // the device's trace flush
 
-__attribute__((weak)) void sub_82D0836C(PPCContext& __restrict, uint8_t*);  // lock, returns the state
-__attribute__((weak)) void sub_82D0824C(PPCContext& __restrict, uint8_t*);  // unlock with the state
 }
 
 namespace renut::d3d::port {
@@ -92,30 +84,7 @@ bool StartTilingLists(PPCContext& ctx, uint8_t* base) {
 
 
 
-// sub_82657978(fence, list, mask): every resource a command buffer's list names gets the
-// fence (and the read fence when the entry says so); a nested buffer's list is walked too.
-void StampFences(const GuestFrame& f, u32 fence, u32 list, u32 mask) {
-  if (mask == 0)
-    mask = 0xFFFFFFFFu;
-  for (; list; list = f.Get(list)) {
-    u32 count = f.Get(list + 4);
-    for (u32 entry = list + 8; count; --count, entry += 8) {
-      const u32 resource = f.Get(entry) << 2;
-      if (!resource)
-        continue;
-      if (f.Get(entry + 4) & mask)
-        f.Put(resource + 8, fence);
-      if (f.Get(entry) & 0x40000000u)
-        f.Put(resource + 0xC, fence);
-      if ((f.Get(resource) & 0xF) == 9) {
-        if (const u32 nested = f.Get(resource + 0x70))
-          StampFences(f, fence, nested, mask);
-      }
-    }
-  }
-}
-
-
+// (sub_82657978, StampFences, is a no-op in the front end: the native Run stamps nothing.)
 
 // sub_8229A260(device, format): the packet that tells the display the front buffer's
 // format. The ring is a stub (nothing reads it), so no packet is written.
@@ -138,12 +107,11 @@ bool ResetAllState(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-// sub_82658818(device, one-pass, count, extent): a command buffer recorded tiled. The original sizes
-// the console's tile grid (in EDRAM tiles, by the surface's multisampling): each tile's index
-// (0x3338...) and the extent aligned to the tile and the band (0x3374, 0x3378). Only the tile-list
-// writers read the indices, and the lists are not built here; of the aligned extents the host keeps
-// the extent itself, which the surface-info pitch field and the check in BeginCommandBuffer compare
-// with. What stays is the device's flags and the dirty bits of the buffer's pass.
+// sub_82658818(device, one-pass, count, extent_x): a command buffer recorded tiled (the caller passes
+// the tiles' X extent in r6, as the original reads it; only the width is used). The original sizes the
+// console's tile grid by the surface's multisampling: the tile and band widths, each tile's index
+// (0x3338...), the extent aligned to the tile (0x3374, also the surface-info pitch field) and to the
+// band (0x3378, which BeginCommandBuffer compares with the surface pitch). Done as the original does.
 bool SetupTileExtent(PPCContext& ctx, uint8_t* base) {
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
@@ -153,10 +121,24 @@ bool SetupTileExtent(PPCContext& ctx, uint8_t* base) {
   if (ctx.r4.u32 != 0)
     flags |= 0x10;
   d.SetB(0x2ABF, flags);
-  d.SetW(0x3374, extent);
-  d.SetW(0x2880, Insert(d.W(0x2880), extent, 18, 14));
+  // The surface's samples (the low bits of the halfword at +0x2880): tile height, tile width, band width.
+  const u32 samples = (d.W(0x2880) >> 16) & 3;
+  const u32 tile_height = samples == 0 ? 16 : 8;
+  const u32 tile_width = samples <= 1 ? 32 : 16;
+  const u32 band = samples <= 1 ? 80 : 40;
+  const u32 aligned = (extent + tile_width - 1) & ~(tile_width - 1);
+  const u32 tiles_x = aligned / tile_width;
+  // Each tile's index in the grid (the tile origins BeginCommandBuffer left at 0x32C0, 8 bytes each).
+  for (u32 i = 0, count = ctx.r5.u32; i < count; ++i) {
+    const u32 x = d.W(0x32C0 + 8 * i), y = d.W(0x32C0 + 8 * i + 4);
+    d.SetW(0x3338 + 4 * i, y / tile_height * tiles_x + x / tile_width);
+  }
+  d.SetW(0x3374, aligned);
+  d.SetW(0x2880, Insert(d.W(0x2880), aligned, 18, 14));
   d.SetQ(0x10, d.Q(0x10) | 0x100);
-  d.SetW(0x3378, extent);
+  d.SetW(0x3378, (extent + band - 1) / band * band);
+  // (The original clears bit 8 of +0x28 for a depth-only target when the flag set above is clear, which
+  // it never is here.)
   d.SetQ(0x28, d.Q(0x28) | 0x100);
   return true;
 }
@@ -255,18 +237,7 @@ bool EmitSurfaceState(PPCContext& ctx, uint8_t* base) {
 
 // --- Device set-up and tear-down helpers ---------------------------------------
 
-// sub_82659E18(node): a list of side buffers (each { ?, ?, data, next }) freed from the tail.
-void FreeSideBuffers(const GuestFrame& f, u32 node) {
-  if (!node)
-    return;
-  FreeSideBuffers(f, f.Get(node + 0xC));
-  f.Put(node + 0xC, 0);
-  f.Call(sub_822399D8, {f.Get(node + 8), 0xB1800000u});
-  f.Call(sub_822399D8, {node, 0x24800000u});
-}
-
-
-
+// (sub_82659E18, FreeSideBuffers, stays the original: it only frees the game's side buffers.)
 
 // sub_82663208(device): the register shadow back to its power-on values. (The original also
 // writes the same into the GPU's registers through the ring.)
@@ -403,7 +374,7 @@ bool SwapNotify(PPCContext& ctx, uint8_t* base) {
   const bool callbacks = (d.W(0x5420) & 0x40000000u) != 0;
   if (callbacks && scan_format == 0 && !(d.B(0x2ABD) & 2))
     return false;  // 0x8265C4B8 builds the callback's context
-  if ((changes & 8) && !sub_82D08B3C)
+  if ((changes & 8) && !__imp__VdQueryVideoMode)
     return false;
   u32 context = ctx.r6.u32;  // r30
   d.SetW(0x54B0, ctx.r7.u32);
@@ -414,7 +385,7 @@ bool SwapNotify(PPCContext& ctx, uint8_t* base) {
   const u32 extra = f.Get(ctx.r1.u32 + 0x54);
   d.SetW(0x54C4, extra);
   if (changes & 8)
-    f.Call(sub_82D08B3C, {d.va + 0x54C8});
+    f.Call(__imp__VdQueryVideoMode, {d.va + 0x54C8});
   if (!callbacks)
     return true;
   std::memset(f.G(f.sp + 0x54), 0, 0x18);

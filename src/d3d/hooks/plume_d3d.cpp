@@ -35,33 +35,29 @@ float LoadBEFloat(const uint8_t* p) {
   return value;
 }
 
+}  // namespace
+
+// Called by the native Clear and ClearF (scene/frame.cpp), which are the handlers of those calls.
 // D3DDevice_Clear(device, count, rects, flags, D3DCOLOR color, z, stencil)
-bool Clear(PPCContext& ctx, uint8_t*) {
+void MirrorClearColor(PPCContext& ctx) {
   if (auto* renderer = PlumeRenderer::Get(); renderer && (ctx.r6.u32 & ~kClearDepthStencil)) {
     uint32_t argb = ctx.r7.u32;
     renderer->SetClearColor(((argb >> 16) & 0xFF) / 255.f, ((argb >> 8) & 0xFF) / 255.f,
                             (argb & 0xFF) / 255.f, (argb >> 24) / 255.f);
   }
-  return false;
 }
 
 // D3DDevice_ClearF(device, flags, rect, const D3DVECTOR4* color, z, stencil)
-bool ClearF(PPCContext& ctx, uint8_t* base) {
+void MirrorClearColorF(PPCContext& ctx, uint8_t* base) {
   if (auto* renderer = PlumeRenderer::Get();
       renderer && (ctx.r4.u32 & ~kClearDepthStencil) && ctx.r6.u32) {
     const uint8_t* color = GuestPtr(base, ctx.r6.u32);
     renderer->SetClearColor(LoadBEFloat(color), LoadBEFloat(color + 4), LoadBEFloat(color + 8),
                             LoadBEFloat(color + 12));
   }
-  return false;
 }
 
-
-}  // namespace
-
 void RegisterPlumeHandlers() {
-  SetHandler(kD3DDevice_Clear, Clear);
-  SetHandler(kD3DDevice_ClearF, ClearF);
   // Layer 1a of the native Direct3D port: the state setters (d3d/device/).
   port::RegisterStateHandlers();
 }

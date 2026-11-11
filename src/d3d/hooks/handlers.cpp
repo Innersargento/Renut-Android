@@ -47,7 +47,7 @@ __attribute__((weak)) void sub_822399D8(PPCContext& __restrict, uint8_t*);  // t
 // What the device's creation and the ring call; weak, and the handlers decline when one is missing.
 __attribute__((weak)) void sub_82265B90(PPCContext& __restrict, uint8_t*);  // the game's XMemAlloc
 __attribute__((weak)) void sub_822402A8(PPCContext& __restrict, uint8_t*);  // the calling thread's id
-__attribute__((weak)) void sub_82D0827C(PPCContext& __restrict, uint8_t*);  // the device type
+__attribute__((weak)) void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
 __attribute__((weak)) void sub_82657160(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82663208(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_826597C8(PPCContext& __restrict, uint8_t*);  // D3D::InitializeApiState
@@ -691,10 +691,10 @@ bool MiscGetDeviceCaps(PPCContext& ctx, uint8_t* base) {
 }
 
 bool MiscGetResourceDevice(PPCContext& ctx, uint8_t* base) {
-  if (!sub_82D0827C)
+  if (!__imp__KeGetCurrentProcessType)
     return false;
   GameCall game{&ctx, base};
-  GetResourceDevice(base, RunGame(&game, sub_82D0827C, 0), ctx.r4.u32);
+  GetResourceDevice(base, RunGame(&game, __imp__KeGetCurrentProcessType, 0), ctx.r4.u32);
   return true;
 }
 

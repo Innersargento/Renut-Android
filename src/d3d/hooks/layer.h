@@ -38,4 +38,7 @@ void CallCounts(Function function, uint64_t& taken, uint64_t& original);
 void SetShaderDumpDirectory(std::string directory);
 // Installs the plume-mode handlers (plume_d3d.cpp).
 void RegisterPlumeHandlers();
+// The clear colour of D3DDevice_Clear / ClearF, for the renderer to show while no frame has been resolved.
+void MirrorClearColor(PPCContext& ctx);
+void MirrorClearColorF(PPCContext& ctx, uint8_t* base);
 }  // namespace renut::d3d
