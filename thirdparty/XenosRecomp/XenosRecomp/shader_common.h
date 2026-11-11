@@ -835,6 +835,22 @@ void renutExportDword(uint address, uint value, uint endian)
     }
 }
 
+// Whether a whole element of `bytes` at `address` lies inside one of the ranges
+// of this draw. reNut PC stores an element only when it fits (`address + bytes
+// <= stream end`); testing the start alone let an element that straddles the
+// end of a pool write its tail into whatever lies after it.
+bool renutExportFits(uint address, uint bytes)
+{
+    for (uint i = 0; i < RENUT_EXPORT_RANGE_COUNT; ++i)
+    {
+        uint4 range = renutSharedU4(RENUT_SHARED_EXPORT_OFFSET + i * 16);
+        uint at = address - range.x;
+        if (at < range.y && bytes <= range.y - at)
+            return true;
+    }
+    return false;
+}
+
 // A float to half precision, rounded to nearest even. f32tof16 becomes
 // packHalf2x16, whose rounding is the driver's choice, and Turnip truncates:
 // state a shader reads, updates and exports again every frame - the falling
@@ -933,6 +949,8 @@ void renutMemExport(float4 eA, float4 eM0, float4 eM1, float4 eM2, float4 eM3, f
             continue;
         float4 v = swapRedBlue ? eM[k].zyxw : eM[k];
         uint address = base + ((index + k) << bytesLog2);
+        if (!renutExportFits(address, 1u << bytesLog2))
+            continue;
         switch (kind)
         {
         case 0:

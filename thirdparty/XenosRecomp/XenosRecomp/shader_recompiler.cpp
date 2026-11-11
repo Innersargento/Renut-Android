@@ -870,19 +870,17 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                 // relative-addressing bit that applies is the one for that
                 // slot, which the old "always const0Relative" reading got
                 // backwards on N&B's mad/mul-with-two-constants forms.
+                // The scalar half's operands are source 3 (SCALAR_0/1) and its own constant
+                // (SCALAR_CONSTANT_0): they come after sources 1 and 2, so they take slot 1 when
+                // either of those read a constant - as the vector operands do. Reading slot 0 for
+                // them (the old default) dropped the relative flag of, for example, the spawner's
+                // "setp_gt p0, c[134 + a0].w" next to a "mul r7, c252, r7", and the whole draw then
+                // tested set 0's c134.w for every parameter set.
                 uint32_t constSlot = 0;
-                switch (operand)
-                {
-                case VECTOR_1:
-                    constSlot = instr.src1Select ? 0 : 1;
-                    break;
-                case VECTOR_2:
-                    constSlot = (instr.src1Select && instr.src2Select) ? 0 : 1;
-                    break;
-                default:
-                    constSlot = 0;
-                    break;
-                }
+                if (operand > VECTOR_0 && !instr.src1Select)
+                    ++constSlot;
+                if (operand > VECTOR_1 && !instr.src2Select)
+                    ++constSlot;
 
                 const bool relative = (constSlot == 0) ? bool(instr.const0Relative) : bool(instr.const1Relative);
 
