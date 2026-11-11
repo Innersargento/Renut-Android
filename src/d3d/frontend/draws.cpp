@@ -76,7 +76,7 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t first = ctx.r6.u32, total = ctx.r7.u32;
   const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
-  Capture(ctx, base, dev, [&](Device& d) {
+  CaptureDraw(ctx, base, dev, [&](Device& d) {
     FlushAll(d);
     const uint32_t ib = U32(base, dev + kIndexBuffer);
     Indices(d, ib);
@@ -88,7 +88,7 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
     uint32_t start = first, count = total;
     while (true) {
       const uint32_t chunk = SplitCount(base, primitive, count);
-      d.out.StateWord(RENUT_STATE_WORD(base_vertex), base_vertex);
+      d.out.BaseVertex(base_vertex);
       uint32_t initiator = (chunk << 16) | (primitive & 0x3F);
       uint32_t address, size;
       if (wide) {
@@ -99,9 +99,9 @@ bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base) {
         address = Phys(start * 2 + ib_base);
         size = (chunk & 0x00FFFFFF) | endian;
       }
-      if (extent) g_counts.screen_extent.fetch_add(1, std::memory_order_relaxed);
+      if (extent) Bump(g_counts.screen_extent);
       d.out.Draw(DrawMode(base, dev) | extent, viz, initiator, address, size, serial);
-      g_counts.draws.fetch_add(1, std::memory_order_relaxed);
+      Bump(g_counts.draws);
       const uint32_t left = count - chunk;
       if (!left) break;
       const uint32_t overlap = U32(base, kPrimitiveSplit + primitive * 8 + 4);
@@ -117,7 +117,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t first = ctx.r6.u32, total = ctx.r7.u32;
   const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
-  Capture(ctx, base, dev, [&](Device& d) {
+  CaptureDraw(ctx, base, dev, [&](Device& d) {
     const uint32_t ib = U32(base, dev + kIndexBuffer);
     S32(base, dev + 10612, (U32(base, dev + 10612) & ~3u) | 1);
     S64(base, dev + 24, U64(base, dev + 24) | (1ull << 50));
@@ -156,7 +156,7 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
     const uint32_t extent = (U8(base, dev + 10940) & 1) ? kDrawScreenExtent : 0;
     uint32_t start = first, count = total;
     while (true) {
-      d.out.StateWord(RENUT_STATE_WORD(base_vertex), base_vertex);
+      d.out.BaseVertex(base_vertex);
       uint32_t chunk = count;
       if (count > 65535) {
         const uint32_t divisor = U32(base, kTessSplit + primitive * 8);
@@ -177,9 +177,9 @@ bool DrawIndexedTessellatedVertices(PPCContext& ctx, uint8_t* base) {
         address = Phys(start * 2 + ib_base);
         size = (chunk & 0x00FFFFFF) | endian;
       }
-      if (extent) g_counts.screen_extent.fetch_add(1, std::memory_order_relaxed);
+      if (extent) Bump(g_counts.screen_extent);
       d.out.Draw(DrawMode(base, dev) | extent, viz, initiator, address, size, serial);
-      g_counts.draws.fetch_add(1, std::memory_order_relaxed);
+      Bump(g_counts.draws);
       const uint32_t left = count - chunk;
       if (!left) break;
       const uint32_t overlap = U32(base, kTessSplit + primitive * 8 + 4);
@@ -194,17 +194,17 @@ bool DrawVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, first = ctx.r5.u32, total = ctx.r6.u32;
   const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
-  Capture(ctx, base, dev, [&](Device& d) {
+  CaptureDraw(ctx, base, dev, [&](Device& d) {
     FlushAll(d);
     const uint32_t viz = VizToken(base, dev);
     const uint32_t extent = (U8(base, dev + 10940) & 1) ? kDrawScreenExtent : 0;
     uint32_t start = first, count = total;
     while (true) {
       const uint32_t chunk = SplitCount(base, primitive, count);
-      d.out.StateWord(RENUT_STATE_WORD(base_vertex), start);
-      if (extent) g_counts.screen_extent.fetch_add(1, std::memory_order_relaxed);
+      d.out.BaseVertex(start);
+      if (extent) Bump(g_counts.screen_extent);
       d.out.Draw(DrawMode(base, dev) | extent, viz, (chunk << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
-      g_counts.draws.fetch_add(1, std::memory_order_relaxed);
+      Bump(g_counts.draws);
       const uint32_t left = count - chunk;
       if (!left) break;
       const uint32_t overlap = U32(base, kPrimitiveSplit + primitive * 8 + 4);
@@ -219,14 +219,14 @@ bool BeginVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, primitive = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
   const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
-  g_counts.begin_vertices.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.begin_vertices);
   const uint32_t dwords = (count * stride) >> 2;
   const uint32_t data = ScratchAlloc(dwords * 4);
   if (!data) {
     ctx.r3.u64 = 0;
     return true;
   }
-  Capture(ctx, base, dev, [&](Device& d) {
+  CaptureDraw(ctx, base, dev, [&](Device& d) {
     const uint32_t stride_dwords = (stride >> 2) & 0xFF;
     const uint8_t old_stride = U8(base, dev + 12528);
     S8(base, dev + 12528, uint8_t(stride_dwords));
@@ -236,11 +236,11 @@ bool BeginVertices(PPCContext& ctx, uint8_t* base) {
     S64(base, dev + 24, U64(base, dev + 24) & ~1ull);
     FlushAll(d);
     S8(base, dev + 12528, old_stride);
-    d.out.StateWord(RENUT_STATE_WORD(base_vertex), 0);
+    d.out.BaseVertex(0);
     const uint32_t fetch[6] = {1, 0, 1, 0, Phys(data) | 3, 0x10000002u | ((dwords << 2) & 0x03FFFFFCu)};
     d.out.State(RENUT_STATE_WORD(fetch) + 31 * 6, fetch, 6);
     d.out.Draw(DrawMode(base, dev), VizToken(base, dev), (count << 16) | (primitive & 0x3F) | 0x80, 0, 0, serial);
-    g_counts.draws.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.draws);
   });
   S64(base, dev + 24, U64(base, dev + 24) | 1);
   S32(base, dev + 13444, U32(base, dev + kRingWrite));
@@ -259,7 +259,7 @@ bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
   const uint32_t index_dwords = wide ? indices : (indices + 1) >> 1;
   const uint32_t serial = DrawSerial();
   auto lock = LockUnlessOwn(dev);
-  g_counts.indexed_up.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.indexed_up);
   const uint32_t vertex_data = ScratchAlloc(vertex_dwords * 4), index_data = ScratchAlloc(index_dwords * 4);
   if (!vertex_data || !index_data) {
     if (index_out) S32(base, index_out, 0);
@@ -267,7 +267,7 @@ bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
     ctx.r3.u64 = 0x8007000Eu;
     return true;
   }
-  Capture(ctx, base, dev, [&](Device& d) {
+  CaptureDraw(ctx, base, dev, [&](Device& d) {
     const uint8_t old_stride = U8(base, dev + 12528);
     const uint32_t stride_dwords = (stride >> 2) & 0xFF;
     S8(base, dev + 12528, uint8_t(stride_dwords));
@@ -276,7 +276,7 @@ bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
     }
     FlushAll(d);
     S8(base, dev + 12528, old_stride);
-    d.out.StateWord(RENUT_STATE_WORD(base_vertex), base_vertex);
+    d.out.BaseVertex(base_vertex);
     const uint32_t fetch[6] = {0, 0, 0, 0, Phys(vertex_data) | 3,
                                0x10000002u | ((vertex_dwords << 2) & 0x03FFFFFCu)};
     d.out.State(RENUT_STATE_WORD(fetch) + 31 * 6, fetch, 6);
@@ -286,7 +286,7 @@ bool BeginIndexedVertices(PPCContext& ctx, uint8_t* base) {
     List& list = d.out.list();
     list.indices_named = false;  // the next indexed draw names its buffer again
     d.out.Draw(DrawMode(base, dev), VizToken(base, dev), initiator, Phys(index_data), size, serial);
-    g_counts.draws.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.draws);
   });
   S64(base, dev + 24, U64(base, dev + 24) | 1);
   if (index_out) S32(base, index_out, index_data);
@@ -306,7 +306,7 @@ bool ClearNative(PPCContext& ctx, uint8_t* base) {
   const uint32_t rect = ctx.r5.u32, colour = ctx.r6.u32 ? ctx.r6.u32 : 0x82001160u;
   const float z = float(ctx.f1.f64);
   const uint32_t stencil = ctx.r8.u32;
-  std::lock_guard lock(g_front.mutex);
+  auto lock = LockUnlessOwn(dev);
   if (!U32(base, dev + 12456)) flags &= ~0xF0u;
   if (!flags) return true;
   auto viewport = [&](uint32_t at) {
@@ -352,7 +352,8 @@ uint8_t& EnginePass() {
 }
 
 uint32_t ResolveScratch() {
-  static uint32_t block = 0;
+  // One block a thread: two threads resolving at once must not share the lookup's outputs.
+  thread_local uint32_t block = 0;
   if (!block) {
     if (auto* memory = rex::system::kernel_memory()) block = memory->SystemHeapAlloc(256, 16);
   }
@@ -372,7 +373,7 @@ bool ResolveNative(PPCContext& ctx, uint8_t* base) {
   const uint32_t clear_stencil = U32(base, entry_sp + 92), params = U32(base, entry_sp + 100);
   const uint32_t scratch = ResolveScratch();
   if (!scratch || !texture) return false;
-  std::lock_guard lock(g_front.mutex);
+  auto lock = LockUnlessOwn(dev);
   PPCContext saved = ctx;
   const uint32_t source = flags & 7;
   if (!(flags & 0x70)) {
@@ -552,6 +553,7 @@ void CapturePhoto(PPCContext& ctx, uint8_t* base) {
   const uint32_t height = std::min(((size >> 3) & 0x7FFF) + 1, level.height);
   if (!level.address || !level.row_pitch || !width || !height) return;
   {
+    // Publish() touches the immediate list: the lock is needed even when this thread records a buffer.
     std::lock_guard lock(g_front.mutex);
     List& list = Current(dev);
     list.words.push_back(kOpPhoto);

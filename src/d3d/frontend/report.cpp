@@ -13,6 +13,8 @@ std::string g_report_path;
 void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
                   const std::function<std::string()>& executor) {
   static uint64_t last_frame = 0, last_draws = 0;
+  // Off, most counters stay at zero: no file rather than a file of zeros.
+  if (!renut::d3d::g_stats.load(std::memory_order_relaxed)) return;
   if (frame < last_frame + 300) return;
   const double f = double(frame - last_frame);
   auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
@@ -101,7 +103,7 @@ bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height) {
   list.words.push_back(height);
   list.words.push_back(stamped ? Phys(block + (16 + (next & 7)) * 4) : 0);
   list.words.push_back(stamped ? Phys(block + (16 + ((next + 1) & 7)) * 4) : 0);
-  g_counts.presents.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.presents);
   return true;
 }
 
@@ -118,7 +120,7 @@ bool WorkPending() { return g_work_pending.load(std::memory_order_acquire); }
 
 void TakeWorkPending() {
   g_work_pending.store(false, std::memory_order_release);
-  g_counts.worker_runs.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.worker_runs);
 }
 
 void SetFilesDirectory(std::string directory) {

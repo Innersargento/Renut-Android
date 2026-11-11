@@ -6,11 +6,11 @@ namespace renut::native_d3d {
 void BeginCommandBuffer(PPCContext& ctx) {
   const uint32_t dev = ctx.r3.u32, cb = ctx.r4.u32;
   std::lock_guard lock(g_front.mutex);
-  g_counts.recordings.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.recordings);
   auto [it, added] = g_front.recording.try_emplace(dev);
-  if (added) g_counts.devices.fetch_add(1, std::memory_order_relaxed);
+  if (added) Bump(g_counts.devices);
   if (it->second) {
-    g_counts.nested_recordings.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.nested_recordings);
     it->second->open.store(false, std::memory_order_release);
   }
   auto list = std::make_shared<List>();
@@ -44,14 +44,14 @@ void EndCommandBuffer(PPCContext& ctx, uint8_t* base) {
 void RunCommandBuffer(PPCContext& ctx, uint8_t* base) {
   const uint32_t dev = ctx.r3.u32, cb = ctx.r4.u32;
   std::lock_guard lock(g_front.mutex);
-  g_counts.runs.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.runs);
   Capture(ctx, base, dev, [&](Device& d) {
     uint64_t masks[5];
     for (uint32_t i = 0; i < 5; ++i) masks[i] = U64(base, dev + i * 8) & U64(base, cb + 24 + i * 8);
     Flush(d, masks);
     auto it = g_front.command_buffers.find(cb);
     if (it == g_front.command_buffers.end()) {
-      g_counts.unknown_runs.fetch_add(1, std::memory_order_relaxed);
+      Bump(g_counts.unknown_runs);
       return;
     }
     d.out.Run(it->second);
@@ -62,11 +62,13 @@ void RunCommandBuffer(PPCContext& ctx, uint8_t* base) {
 }
 
 void SetSurfaceClip(PPCContext& ctx, uint8_t* base) {
-  const uint32_t dev = ctx.r3.u32;
+  RecordSurfaceClip(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
+}
+
+void RecordSurfaceClip(uint8_t* base, uint32_t dev, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2) {
   auto lock = LockUnlessOwn(dev);
-  g_counts.surface_clips.fetch_add(1, std::memory_order_relaxed);
-  if (U8(base, dev + 10940) & 0x30) g_counts.tiled_surface_clips.fetch_add(1, std::memory_order_relaxed);
-  const uint32_t x1 = ctx.r4.u32, y1 = ctx.r5.u32, x2 = ctx.r6.u32, y2 = ctx.r7.u32;
+  Bump(g_counts.surface_clips);
+  if (U8(base, dev + 10940) & 0x30) Bump(g_counts.tiled_surface_clips);
   const std::array<uint32_t, 3> values = {0, ((y1 << 16) & 0x3FFF0000u) | (x1 & 0x3FFF),
                                           ((y2 << 16) & 0x3FFF0000u) | (x2 & 0x3FFF)};
   if (List* own = OwnRecording(dev)) {

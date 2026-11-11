@@ -116,6 +116,9 @@ struct List {
   // The index buffer last named in this list (kOpIndices).
   uint32_t indices_base = 0, indices_size = 0;
   bool indices_named = false;
+  // The base vertex last written in this list (kOpState), so a draw writes it only when it changes.
+  uint32_t base_vertex = 0;
+  bool base_vertex_known = false;
   // A command buffer's list from BeginCommandBuffer to EndCommandBuffer: the
   // thread that began it writes it without the front end's lock.
   std::atomic<bool> open{false};
@@ -166,6 +169,10 @@ bool WorkPending();
 // The device that swaps (the title's), 0 before its first act. The calls that name
 // no device (D3DDevice_IsFencePending, D3DDevice_BlockOnFence) mean this one.
 uint32_t MainDevice();
+// D3D::SetSurfaceClip recorded without going through the hook (the ported setters that end in it):
+// when SkipSurfaceClipOf says the original has nothing left to do, so no copy of the context is needed.
+bool SkipSurfaceClipOf(const uint8_t* base, uint32_t device);
+void RecordSurfaceClip(uint8_t* base, uint32_t device, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2);
 // True when every published list has run and the GPU backend is idle: a fence wait
 // still standing then has nothing left that could end it.
 bool ExecutorIdle();

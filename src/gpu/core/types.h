@@ -1,6 +1,8 @@
 #pragma once
 // Types and constants of the GPU backend, hoisted out of its class so that every subsystem
 // (and every file) names them the same way.
+#include <memory>
+
 #include "gpu/core/resources.h"
 
 namespace renut::gpu {
@@ -218,11 +220,16 @@ namespace renut::gpu {
     uint64_t indirect_offset = 0;
     // Only for the pair profile, and the trail a lost device prints.
     uint64_t vs_hash = 0, ps_hash = 0;
-    uint64_t s0_addr = 0, s10_addr = 0;
-    uint32_t s0_size = 0, s10_size = 0;
-    // The device address and size of each of the 17 streams the shaders read by address.
-    uint64_t stream_addr[17] = {};
-    uint32_t stream_size[17] = {};
+    // The trail's part, ~240 bytes a draw: only allocated while the trail is on (it is on for Mali), so
+    // the packet, which is copied a few times a draw, carries a pointer.
+    struct Trail {
+      uint64_t s0_addr = 0, s10_addr = 0;
+      uint32_t s0_size = 0, s10_size = 0;
+      // The device address and size of each of the 17 streams the shaders read by address.
+      uint64_t stream_addr[17] = {};
+      uint32_t stream_size[17] = {};
+    };
+    std::shared_ptr<const Trail> trail;
   };
 
   // The draws recorded last, for the report a lost device prints (see

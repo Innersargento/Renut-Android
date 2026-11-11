@@ -9,9 +9,6 @@ namespace renut::native_d3d {
 
 bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
   using namespace renut::d3d;
-  if (function < g_calls.size() && function != renut::d3d::kD3D_CBlocker_Check) {
-    g_calls[function].fetch_add(1, std::memory_order_relaxed);
-  }
   t_function = function;
   switch (Function(function)) {
     case kD3DDevice_DrawIndexedVertices:
@@ -60,6 +57,31 @@ bool OnEnter(uint32_t function, PPCContext& ctx, uint8_t* base) {
       return ReserveRing(ctx, base);
     case kD3D_InvalidateRange:
       return InvalidateRange(ctx, base);
+    case kD3D_CList_Terminate:
+      return ListTerminate(ctx, base);
+    case kD3D_CList_Link:
+      return ListLink(ctx, base);
+    case kD3D_CList_Grow:
+      return ListGrow(ctx, base);
+    case kD3D_AppendRegisters:
+      return AppendRegisters(ctx, base);
+    case kD3D_QueueIndirectRange:
+      return QueueIndirectRange(ctx, base);
+    case kD3D_CDevice_CreateInvalidateBuffer:
+      return CreateInvalidateBuffer(ctx, base);
+    case kD3D_CDevice_MarkAsOutOfMemory:
+      return MarkAsOutOfMemory(ctx, base);
+    case kD3D_GrowIndirectList1:
+      return GrowIndirectList(ctx, base, 13524, 250);
+    case kD3D_GrowIndirectList2:
+      return GrowIndirectList(ctx, base, 13536, 16);
+    // Only write the ring or the indirect lists, which nothing reads; no result.
+    case kD3D_CDevice_QueueIndirectBuffers:
+    case kD3D_CDevice_AddCommandsToPrimaryBuffer:
+    case kD3D_CDevice_BlockOnPrimaryRange:
+    case kD3D_CDevice_BlockOnSecondaryPosition:
+    case kD3D_StampFences:
+      return true;
     case kD3D_CacheFlush:
       // D3D::CacheFlush(address, size) (sub_8220F508): dcbf over the range, then a sync. The host's
       // caches are coherent, so only the barrier is kept, for what the CPU wrote before the GPU reads it.

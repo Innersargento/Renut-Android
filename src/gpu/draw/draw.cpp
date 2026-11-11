@@ -1789,16 +1789,16 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   pk.vs_hash = vs->entry->hash ^ (uint64_t(rel_constants_mode_ >= 10 ? rel_variant : 0) << 60);
   pk.ps_hash = ps ? ps->entry->hash : 0;
   if (backend.swap.trail_) {
-    pk.s0_addr = streams[0];
-    pk.s0_size = slot_sizes[0];
-    pk.s10_addr = streams[10];
-    pk.s10_size = slot_sizes[10];
-  }
-  if (backend.swap.trail_) {
+    auto trail = std::make_shared<DrawPacket::Trail>();
+    trail->s0_addr = streams[0];
+    trail->s0_size = slot_sizes[0];
+    trail->s10_addr = streams[10];
+    trail->s10_size = slot_sizes[10];
     for (uint32_t i = 0; i < RENUT_VERTEX_STREAM_COUNT; ++i) {
-      pk.stream_addr[i] = streams[i];
-      pk.stream_size[i] = slot_sizes[i];
+      trail->stream_addr[i] = streams[i];
+      trail->stream_size[i] = slot_sizes[i];
     }
+    pk.trail = std::move(trail);
   }
   if (blend_constants) {
     pk.blend_constants = true;

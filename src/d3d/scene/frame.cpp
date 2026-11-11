@@ -36,9 +36,6 @@ __attribute__((weak)) void sub_8265F3B0(PPCContext& __restrict, uint8_t*);  // s
 __attribute__((weak)) void sub_82D08BAC(PPCContext& __restrict, uint8_t*);  // the video scaler call
 __attribute__((weak)) void sub_82654FD8(PPCContext& __restrict, uint8_t*);  // export fence packet
 __attribute__((weak)) void sub_82655130(PPCContext& __restrict, uint8_t*);  // export fence packet, end
-__attribute__((weak)) void sub_82657A20(PPCContext& __restrict, uint8_t*);  // indirect buffer room
-__attribute__((weak)) void sub_82207680(PPCContext& __restrict, uint8_t*);  // texture layout of a resource
-__attribute__((weak)) void sub_8226BA20(PPCContext& __restrict, uint8_t*);  // export range invalidate
 }
 
 namespace renut::d3d::port {
@@ -211,7 +208,7 @@ u32 ExportBase(const Frame& f, u32 resource) {
 }
 
 bool HaveExport() {
-  return sub_82654FD8 && sub_82655130 && sub_82657A20 && sub_82207680 && sub_8226BA20;
+  return sub_82654FD8 && sub_82655130;
 }
 
 // D3DDevice_BeginExport(device, index, resource, kind). The original also writes the export's
@@ -250,35 +247,10 @@ bool EndExport(PPCContext& ctx, uint8_t* base) {
   if (const u32 fence = d.W(0x2A9C)) {
     f.Put(resource + 8, fence);
     f.Put(resource + 12, fence);
-  } else if (d.W(0x2AA0) & f.Get(resource)) {
-    u32 slot = d.W(0x34D4);
-    if (slot >= d.W(0x34D8))
-      slot = f.Call(sub_82657A20, {d.va});
-    f.Put(slot, 0x40000000u | (resource >> 2));
-    f.Put(slot + 4, 0xFFFFFFFFu);
-    d.SetW(0x34D4, slot + 8);
   }
-
-  switch (f.Get(resource) & 0xF) {
-    case 1:
-      f.Call(sub_8226BA20, {d.va, GpuOf(f.Get(resource + 0x18) & ~3u), f.Get(resource + 0x1C) & 0x03FFFFFCu});
-      break;
-    case 3: {
-      const u32 first = f.Get(resource + 0x20) & ~0xFFFu, second = f.Get(resource + 0x30) & ~0xFFFu;
-      const u32 out = f.sp;  // the layout call's outputs at +0x70..+0x90
-      f.Put(f.sp + 0x54, f.sp + 0x7C);
-      f.Put(f.sp + 0x5C, f.sp + 0x78);
-      f.Put(f.sp + 0x64, f.sp + 0x74);
-      f.Call(sub_82207680, {resource, 0, 0, f.sp + 0x90, f.sp + 0x88, f.sp + 0x70, f.sp + 0x84, f.sp + 0x80});
-      const u32 size = f.Get(out + 0x70);
-      f.Call(sub_8226BA20, {d.va, GpuOf(first), size});
-      if (second)
-        f.Call(sub_8226BA20, {d.va, GpuOf(second), size});
-      break;
-    }
-    default:
-      break;
-  }
+  // (A device recording a command buffer used to list the resource for the original Run to stamp
+  // with a fence, and the export's range was invalidated with a ring packet. The native Run stamps
+  // nothing and InvalidateRange writes nothing, so neither is left.)
 
   const u32 depth = d.W(kExportDepth) - 1;
   d.SetW(kExportDepth, depth);
@@ -364,23 +336,10 @@ bool Clear(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-// D3D::SetSurfaceClip(device, x1, y1, x2, y2) [0x82223270]: one window-scissor packet in the
-// ring, which is all the original does, so outside tiling nothing is left. While tiling it
-// writes a packet per tile, which stays the recompiled game's.
-bool SetSurfaceClip(PPCContext& ctx, uint8_t* base) {
-  Device d = DeviceAt(base, ctx.r3.u32);
-  if (!d)
-    return false;
-  // While tiling it writes a packet per tile, and a device recording a command buffer chains the
-  // segments its kicks make: both stay the original's.
-  return !TilingBound(d) && !d.W(off::CommandBuffer);
-}
-
 }  // namespace
 
 void RegisterFrame() {
   SetHandler(kD3DDevice_Clear, Clear);
-  SetHandler(kD3D_SetSurfaceClip, SetSurfaceClip);
   SetHandler(kD3DDevice_ClearF, ClearF);
   SetHandler(kD3DDevice_Present, Present);
   SetHandler(kD3DDevice_SetScalerParameters, SetScalerParameters);

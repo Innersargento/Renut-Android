@@ -5,12 +5,21 @@
 // (hooks/layer.cpp makes one per entry; the recompiled definitions are weak). The native
 // front end or a registered handler may take the call; otherwise the recompiled original
 // runs.
+#include <atomic>
 #include <cstdint>
 #include <string>
 
 #include <rex/ppc/context.h>
 
 namespace renut::d3d {
+
+// Whether the per-call and per-draw counters of the native report are kept (cvar renut_d3d_stats, or
+// renut_d3d_report_swaps > 0). Off, a counter costs one relaxed load; on, an atomic increment shared
+// between threads. Counters the sync logic reads are not Bump()ed.
+inline std::atomic<bool> g_stats{false};
+inline void Bump(std::atomic<uint64_t>& counter) {
+  if (g_stats.load(std::memory_order_relaxed)) counter.fetch_add(1, std::memory_order_relaxed);
+}
 
 enum Function : uint32_t {
 #define X(symbol, name) k##name,

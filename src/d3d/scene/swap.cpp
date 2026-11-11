@@ -32,7 +32,6 @@ REX_FUNC(sub_8265F688);  // D3DDevice_SetScalerParameters
 REX_FUNC(sub_822873E8);  // CDevice::StartNewSegment
 REX_FUNC(sub_8228F558);  // CDevice::BlockOnFence
 REX_FUNC(sub_8264DCD0);  // D3D_CBlocker_Check
-__attribute__((weak)) void sub_821EF4E8(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_821ED560(PPCContext& __restrict, uint8_t*);
 __attribute__((weak)) void sub_82287D38(PPCContext& __restrict, uint8_t*);
 // The kernel imports the original calls. 0x82D0827C, 0x82D0820C, 0x82D0821C, 0x82D08B2C,
@@ -64,7 +63,7 @@ u32 InsertMasked(u32 target, u32 source, u32 rotate, u32 mask) {
 }
 
 bool HaveAll() {
-  return sub_821EF4E8 && sub_821ED560 && sub_82287D38;
+  return sub_821ED560 && sub_82287D38;
 }
 
 // KeGetCurrentProcessType, as the kernel answers it for the calling thread: the type its DPC set while
@@ -147,7 +146,6 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
   if (hardware) {
     if (scaler_changed)
       d.SetW(0x5D94, d.W(0x5D94) | 0x40000000u);
-    f.Call(sub_821EF4E8, {dev, front});
   }
 
   SystemCommandBuffer(f, f.sp + 0xD0, f.sp + 0x74);

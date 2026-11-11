@@ -194,7 +194,8 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
     case DrawPacket::Kind::kPlain: L()->drawInstanced(pk.count, 1, pk.first, 0); break;
   }
   ++drawn_;
-  if (backend.swap.trail_) {
+  if (backend.swap.trail_ && pk.trail) {
+    const DrawPacket::Trail& trail = *pk.trail;
     // Only one draw in eight asks (a hash lookup a draw was over 1% of this
     // thread): the report of a lost device calls a pair new from its first
     // frame, and an unknown one is simply not called new.
@@ -205,10 +206,10 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
     const uint64_t at = recent_draw_count_.load(std::memory_order_relaxed);
     RecentDraw& recent = recent_draws_[at % kRecentDraws];
     recent = {backend.swaps_, pk.vs_hash, pk.ps_hash, uint64_t(uintptr_t(pk.pipeline)),
-              uint64_t(uintptr_t(pk.framebuffer)), pk.s0_addr, pk.s10_addr, first_frame,
-              uint32_t(pk.kind), pk.count, pk.first, pk.s0_size, pk.s10_size};
-    std::memcpy(recent.stream_addr, pk.stream_addr, sizeof(recent.stream_addr));
-    std::memcpy(recent.stream_size, pk.stream_size, sizeof(recent.stream_size));
+              uint64_t(uintptr_t(pk.framebuffer)), trail.s0_addr, trail.s10_addr, first_frame,
+              uint32_t(pk.kind), pk.count, pk.first, trail.s0_size, trail.s10_size};
+    std::memcpy(recent.stream_addr, trail.stream_addr, sizeof(recent.stream_addr));
+    std::memcpy(recent.stream_size, trail.stream_size, sizeof(recent.stream_size));
     recent.base_vertex = pk.base_vertex;
     auto address_of = [](const RenderBuffer* buffer) -> uint64_t {
       const auto* vulkan = static_cast<const VulkanBuffer*>(buffer);

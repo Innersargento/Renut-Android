@@ -3,6 +3,7 @@
 #include "d3d/resources/microcode.h"
 
 #include <algorithm>
+#include <array>
 #include <shared_mutex>
 #include <cstring>
 #include <unordered_map>
@@ -31,6 +32,9 @@ struct ContainerHashes {
 uint32_t ContainerAt(uint32_t shader, bool pixel) { return shader + (pixel ? 0x28 : 0x368); }
 uint32_t PhysicalAt(uint32_t shader, bool pixel) { return shader + (pixel ? 0x18 : 0x20); }
 
+// Moves on whenever NoteShaderObject changes the table.
+std::atomic<uint32_t> g_container_generation{1};
+
 ContainerHashes& Containers() {
   static ContainerHashes containers;
   return containers;
@@ -41,12 +45,27 @@ ContainerHashes& Containers() {
 // and the GPU backend reads and watches the memory itself.
 uint64_t NameShader(const Device& d, uint32_t object, bool pixel) {
   if (!object) return 0;
+  // Looked up once per change of shader per draw: the answer is kept per thread, good while no object has
+  // been noted since (NoteShaderObject moves the generation on), so the common case is no lock and no map.
+  struct Cached {
+    uint32_t object = 0;
+    uint32_t generation = 0;
+    ContainerEntry entry{};
+  };
+  thread_local std::array<Cached, 128> cache{};
+  const uint32_t generation = g_container_generation.load(std::memory_order_acquire);
+  Cached& slot = cache[(object >> 4) & 127];
   ContainerEntry entry{};
-  {
-    ContainerHashes& containers = Containers();
-    std::shared_lock lock(containers.mutex);
-    const auto found = containers.by_object.find(object);
-    if (found != containers.by_object.end()) entry = found->second;
+  if (slot.object == object && slot.generation == generation) {
+    entry = slot.entry;
+  } else {
+    {
+      ContainerHashes& containers = Containers();
+      std::shared_lock lock(containers.mutex);
+      const auto found = containers.by_object.find(object);
+      if (found != containers.by_object.end()) entry = found->second;
+    }
+    slot = {object, generation, entry};
   }
   if (!entry.hash) return 0;
   const uint32_t container = ContainerAt(object, pixel);
@@ -69,6 +88,7 @@ void NoteShaderObject(const uint8_t* base, uint32_t shader, bool pixel) {
   if (!physical || !virtual_size || !physical_size || virtual_size > (1u << 20) || physical_size > (1u << 20)) {
     std::unique_lock lock(containers.mutex);
     containers.by_object.erase(shader);  // whatever was noted here is not this object
+    g_container_generation.fetch_add(1, std::memory_order_release);
     return;
   }
   if (physical < 0x20000000u) physical = Cpu(physical);
@@ -77,6 +97,7 @@ void NoteShaderObject(const uint8_t* base, uint32_t shader, bool pixel) {
   std::memcpy(bytes.data() + virtual_size, GuestPtr(base, physical), physical_size);
   std::unique_lock lock(containers.mutex);
   containers.by_object[shader] = {XXH3_64bits(bytes.data(), bytes.size()), virtual_size, physical_size, raw_physical};
+  g_container_generation.fetch_add(1, std::memory_order_release);
 }
 
 
@@ -111,7 +132,8 @@ static_assert(RENUT_W(sq_ps_const) == RENUT_W(sq_vs_const) + 1);
 static_assert(RENUT_W(poly_offset_back_offset) == RENUT_W(poly_offset_front_scale) + 3);
 constexpr auto kTargetsMap = BlockMap<16>().Set(14, RENUT_W(screen_scissor_tl), 2);
 constexpr auto kMergerMap = BlockMap<21>()
-                                .Set(2, RENUT_W(base_vertex))
+                                // (Word 2, the base vertex, is not sent: every draw names its own through
+                                // Builder::BaseVertex, which keeps the last value the list holds.)
                                 .Set(4, RENUT_W(color_mask))
                                 .Set(5, RENUT_W(blend_color), 4)
                                 .Set(12, RENUT_W(stencil_ref_mask_bf), 9);  // + the mask, the alpha reference, the viewport
@@ -274,7 +296,7 @@ void LiteralConstants(Device& d, uint32_t header, uint32_t physical) {
     const uint32_t source = U32(d.base, entry + 4) + physical;
     entry += 8;
     d.out.StateFromGuest(d.base, RENUT_STATE_WORD(float_constants) + constant * 4, Cpu(Phys(source)), dwords);
-    g_counts.literal_blocks.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.literal_blocks);
   }
 }
 
@@ -301,7 +323,7 @@ void PatchAndLoad(Device& d, uint32_t match_ps, uint32_t shader, uint32_t progra
   S64(d.base, d.dev + 11840, U64(d.base, d.dev + 12536));
   S64(d.base, d.dev + 11832, U64(d.base, d.dev + 12528));
   d.out.Shader(0, address, dwords, NameShader(d, shader, false), declared, count, binding);
-  g_counts.patched_loads.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.patched_loads);
 }
 
 uint64_t PendingHiZEnable(Device& d, uint64_t mask) {
@@ -345,7 +367,7 @@ uint64_t PendingHiZEnable(Device& d, uint64_t mask) {
   if (v & 2) {
     if ((b41 & 4) && (U32(base, dev + 13504) == 0 || U32(base, dev + 13512) == 1)) {
       S8(base, dev + 10941, b41 & 0xFB);
-      g_counts.hiz_events.fetch_add(1, std::memory_order_relaxed);
+      Bump(g_counts.hiz_events);
     }
   } else if ((r7 & 1) && (depth & 4)) {
     const uint32_t zfunc = (depth >> 4) & 7;
@@ -403,7 +425,7 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
       const uint32_t address = Phys(U32(base, info + 40) + U32(base, ps + 24));
       const uint32_t dwords = U32(base, info + 44) >> 2;
       d.out.Shader(1, address, dwords, NameShader(d, ps, true), nullptr, 0, 0);
-      g_counts.shader_loads.fetch_add(1, std::memory_order_relaxed);
+      Bump(g_counts.shader_loads);
       uint32_t mc = U32(base, dev + 10580);
       S32(base, dev + 10536, U32(base, r28 + 24));
       if ((mc & 7) != 4) {
@@ -485,11 +507,11 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
         port::BoundFetches(vs, uint32_t(binding), bound);
     d.out.Shader(0, address, dwords, NameShader(d, vs, false), bound, bound_count, uint32_t(binding));
     S32(base, vs + uint32_t(binding) * 416 + 64, U32(base, dev + 10908));
-    g_counts.shader_loads.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.shader_loads);
   };
   if (U8(base, dev + 10940) & 0x40) {
     // Predicated tiling: the band variants once, unpredicated.
-    g_counts.predicated_tiling.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.predicated_tiling);
     if (r20 & 8) {
       r20 &= ~uint64_t(8);
     }
@@ -513,7 +535,7 @@ uint64_t PendingShaders(Device& d, uint64_t r20) {
 void Flush(Device& d, const uint64_t (&masks)[5]) {
   uint8_t* base = d.base;
   const uint32_t dev = d.dev;
-  g_counts.flushes.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.flushes);
   const uint64_t d0 = masks[0], d1 = masks[1], d3 = masks[3], d4 = masks[4];
   uint64_t d2 = masks[2];
   if (d0) {
@@ -529,7 +551,7 @@ void Flush(Device& d, const uint64_t (&masks)[5]) {
     if (U64(base, dev + kPredicatedMask) & d2) {
       // SetPending_Predicated (sub_8226AAB8): predicated tiling's band
       // windows. One pass on the host; counted to see it never comes.
-      g_counts.set_pending_predicated.fetch_add(1, std::memory_order_relaxed);
+      Bump(g_counts.set_pending_predicated);
     }
     if (d2 & 0xFFF) MappedStates(d, d2 << 52, kPipelineMap.word, dev + kRegs2200);
     if (d2 & (0xFFFFull << 42)) {
@@ -565,7 +587,7 @@ void FlushRenderStates(Device& d) {
   const uint32_t dev = d.dev;
   uint64_t d2 = U64(base, dev + 16);
   if (d2) {
-    if (U64(base, dev + kPredicatedMask) & d2) g_counts.set_pending_predicated.fetch_add(1, std::memory_order_relaxed);
+    if (U64(base, dev + kPredicatedMask) & d2) Bump(g_counts.set_pending_predicated);
     if (d2 & 0xFFF) {
       MappedStates(d, d2 << 52, kPipelineMap.word, dev + kRegs2200);
       d2 &= ~0xFFFull;

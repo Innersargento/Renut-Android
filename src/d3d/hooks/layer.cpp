@@ -28,6 +28,11 @@ REXCVAR_DEFINE_INT32(renut_d3d_report_swaps, 0, "reNut",
                      "second while it waits for a fence, and counting every call cost a quarter "
                      "of the process's cycles in one atomic increment");
 
+REXCVAR_DEFINE_BOOL(renut_d3d_stats, false, "reNut",
+                    "Keep the per-call and per-draw counters of the native Direct3D report "
+                    "(files/native-d3d.txt). Off by default: they are atomic increments on arrays "
+                    "shared between threads, on every call and draw");
+
 namespace renut::d3d {
 namespace {
 
@@ -47,6 +52,7 @@ inline int32_t ReportEvery() {
   int32_t every = report_every.load(std::memory_order_relaxed);
   if (every < 0) {
     every = std::max(0, REXCVAR_GET(renut_d3d_report_swaps));
+    g_stats.store(every > 0 || REXCVAR_GET(renut_d3d_stats), std::memory_order_relaxed);
     report_every.store(every, std::memory_order_relaxed);
   }
   return every;
@@ -99,12 +105,21 @@ void DumpShaderObject(uint8_t* base, uint32_t object, bool vertex) {
   if (!physical || virtual_size < 36 || virtual_size > (1u << 20) || physical_size > (1u << 20)) {
     return;
   }
-  std::vector<uint8_t> blob(header, header + virtual_size);
-  blob.insert(blob.end(), renut::GuestPtr(base, physical), renut::GuestPtr(base, physical) + physical_size);
-  // FNV-1a: stable across runs, good enough to deduplicate files.
+  const uint8_t* body = renut::GuestPtr(base, physical);
+  {
+    std::lock_guard lock(dump_mutex);
+    if (dump_directory.empty()) {
+      return;
+    }
+  }
+  // FNV-1a: stable across runs, good enough to deduplicate files. Hashed where the bytes are: the blob
+  // is only built for a shader not dumped yet.
   uint64_t hash = 0xCBF29CE484222325ull;
-  for (uint8_t byte : blob) {
-    hash = (hash ^ byte) * 0x100000001B3ull;
+  for (uint32_t i = 0; i < virtual_size; ++i) {
+    hash = (hash ^ header[i]) * 0x100000001B3ull;
+  }
+  for (uint32_t i = 0; i < physical_size; ++i) {
+    hash = (hash ^ body[i]) * 0x100000001B3ull;
   }
   std::lock_guard lock(dump_mutex);
   if (dump_directory.empty() || !dumped.insert(hash).second) {
@@ -112,7 +127,8 @@ void DumpShaderObject(uint8_t* base, uint32_t object, bool vertex) {
   }
   auto path = fmt::format("{}/{}_{:016X}.bin", dump_directory, vertex ? "vs" : "ps", hash);
   if (FILE* file = std::fopen(path.c_str(), "wb")) {
-    std::fwrite(blob.data(), 1, blob.size(), file);
+    std::fwrite(header, 1, virtual_size, file);
+    std::fwrite(body, 1, physical_size, file);
     std::fclose(file);
   }
 }
@@ -151,7 +167,7 @@ inline bool Enter(Function function, PPCContext& ctx, uint8_t* base) {
     Handler handler = handlers[function].load(std::memory_order_acquire);
     taken = handler && handler(ctx, base);
   }
-  (taken ? taken_counts : original_counts)[function].fetch_add(1, std::memory_order_relaxed);
+  Bump((taken ? taken_counts : original_counts)[function]);
   return taken;
 }
 
@@ -197,7 +213,11 @@ void SetShaderDumpDirectory(std::string directory) {
   for (const auto& entry : std::filesystem::directory_iterator(dump_directory, error)) {
     auto name = entry.path().stem().string();
     if (name.size() > 3) {
-      dumped.insert(std::stoull(name.substr(3), nullptr, 16));
+      // A stray file in the directory is not a dump: skip what does not parse.
+      char* end = nullptr;
+      const std::string digits = name.substr(3);
+      const unsigned long long hash = std::strtoull(digits.c_str(), &end, 16);
+      if (end && end != digits.c_str() && !*end) dumped.insert(hash);
     }
   }
 }

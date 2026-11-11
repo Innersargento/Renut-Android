@@ -189,6 +189,79 @@ bool InvalidateRange(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// --- Stubs for what only writes the ring or the tile lists --------------------------------------------
+//
+// Nothing reads the ring, the tile lists or the indirect-buffer lists (the native command buffers
+// record and run on the host), so the originals below have nothing left to do. What each keeps is
+// what its callers read back: a cursor that stays inside the sink, the result register, the
+// device flag the original sets.
+constexpr uint32_t kListLink = 4, kListCursor = 8, kListEnd = 12;
+
+// D3D::CList_Terminate(list) [sub_8220F408]: patched the last link and closed the list.
+bool ListTerminate(PPCContext& ctx, uint8_t* base) {
+  S32(base, ctx.r3.u32 + kListEnd, 0);
+  return true;
+}
+
+// D3D::CList_Link(list, first, cursor) [sub_8220F450]: chained a new chunk in. Its two callers (the
+// indirect queues) are stubs.
+bool ListLink(PPCContext&, uint8_t*) { return true; }
+
+// D3D::CList_Grow(list) [sub_8220F800]: a fresh chunk from the ring. The list starts over in the sink.
+bool ListGrow(PPCContext& ctx, uint8_t* base) {
+  const uint32_t sink = RingSink();
+  if (!sink) return false;
+  const uint32_t list = ctx.r3.u32;
+  S32(base, list, 0);
+  S32(base, list + kListLink, 0);
+  S32(base, list + kListCursor, sink);
+  S32(base, list + kListEnd, sink + kRingSinkSize);
+  ctx.r3.u64 = sink;
+  return true;
+}
+
+// D3D::AppendRegisters(device, cursor, ...) [sub_821E2940]: register writes as packets; the cursor
+// comes back where it was.
+bool AppendRegisters(PPCContext& ctx, uint8_t*) {
+  ctx.r3.u64 = ctx.r4.u32;
+  return true;
+}
+
+// D3D::QueueIndirectRange(device, cursor, ...) [sub_822105F0]: the cursor comes back as given.
+bool QueueIndirectRange(PPCContext& ctx, uint8_t*) {
+  ctx.r3.u64 = ctx.r4.u32;
+  return true;
+}
+
+// CDevice::CreateInvalidateBuffer(device, ?, &buffer) [sub_822108B8]: no buffer, as the original
+// answers when it needs none.
+bool CreateInvalidateBuffer(PPCContext& ctx, uint8_t* base) {
+  if (ctx.r5.u32) S32(base, ctx.r5.u32, 0);
+  return true;
+}
+
+// CDevice::MarkAsOutOfMemory(device) [sub_82657160]: the original points the ring at the side buffer;
+// the ring is the sink, so what is left is the flag Begin clears, and a valid ring for the device
+// (Direct3D_CreateDevice calls this before SetRingBufferParameters).
+bool MarkAsOutOfMemory(PPCContext& ctx, uint8_t* base) {
+  *GuestPtr(base, ctx.r3.u32 + 10941) |= 0x20;
+  RewindRing(base, ctx.r3.u32);
+  return true;
+}
+
+// CDevice::GrowIndirectList1/2(device) [sub_82657A20 / sub_82657AE8]: the next chunk of the list of
+// resources a command buffer names, whose only reader (the original Run, with StampFences) is gone.
+// The chunk is the sink; the result is the cursor.
+bool GrowIndirectList(PPCContext& ctx, uint8_t* base, uint32_t cursor, uint32_t entries) {
+  const uint32_t sink = RingSink();
+  if (!sink) return false;
+  const uint32_t dev = ctx.r3.u32;
+  S32(base, dev + cursor, sink + 8);
+  S32(base, dev + cursor + 4, sink + 8 + entries * 8);
+  ctx.r3.u64 = sink + 8;
+  return true;
+}
+
 // D3D::SetSurfaceClip(device, x1, y1, x2, y2) (sub_82223270) writes the window scissor and the per-tile clip
 // packets into the ring, and kicks it first when it is past its guarantee: nothing else (it changes
 // the device only through the ring pointer), and the front end has recorded the clip itself. reNut on PC
@@ -196,8 +269,9 @@ bool InvalidateRange(PPCContext& ctx, uint8_t* base) {
 // with the original Begin/End/Run: its ring writes chained segments that Run walked (the loading
 // screens hung on a null segment). With the native command buffers nothing chains, so only a recording
 // device on the original ones keeps it.
-bool SkipSurfaceClip(PPCContext& ctx, uint8_t* base) {
-  const uint32_t dev = ctx.r3.u32;
+bool SkipSurfaceClip(PPCContext& ctx, uint8_t* base) { return SkipSurfaceClipOf(base, ctx.r3.u32); }
+
+bool SkipSurfaceClipOf(const uint8_t* base, uint32_t dev) {
   return !U32(base, dev + kRecording) || renut::d3d::port::NativeCommandBuffers();
 }
 
@@ -240,7 +314,7 @@ bool SetFence(PPCContext& ctx, uint8_t* base) {
     list.words.push_back(Phys(block));
     list.words.push_back(position);
     list.words.push_back(fence);
-    g_counts.fences.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.fences);
   }
   // A device with immediate fences (and no memory export in progress, +21532) completes its own.
   if (!U32(base, dev + 21532) && (*GuestPtr(base, dev + 10941) & 2)) {
@@ -265,13 +339,13 @@ bool KickOff(PPCContext& ctx, uint8_t* base) {
 
 bool AddCallsToPrimaryBuffer(PPCContext& ctx, uint8_t*) {
   std::lock_guard lock(g_front.mutex);
-  if (g_front.main_device && ctx.r3.u32 != g_front.main_device) g_foreign_doorbells.fetch_add(1, std::memory_order_relaxed);
-  g_counts.doorbells.fetch_add(1, std::memory_order_relaxed);
-  if (g_front.sync_recording) g_counts.native_doorbells.fetch_add(1, std::memory_order_relaxed);
+  if (g_front.main_device && ctx.r3.u32 != g_front.main_device) Bump(g_foreign_doorbells);
+  Bump(g_counts.doorbells);
+  if (g_front.sync_recording) Bump(g_counts.native_doorbells);
   const bool carried = g_front.sync_recording;
   Publish();
   const bool skip = carried && ctx.r3.u32 == g_front.main_device;
-  if (skip) g_counts.doorbells_skipped.fetch_add(1, std::memory_order_relaxed);
+  if (skip) Bump(g_counts.doorbells_skipped);
   return skip;
 }
 
@@ -285,7 +359,7 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
   if (!g_front.sync_recording) return false;
   ctx.r3.u64 = ring;
   List& list = Current(dev);
-  g_counts.callbacks.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.callbacks);
   // Flag 2 is the callback, 4 the reset of its address, both when neither is set; the reset and the
   // waits are the scratch registers' business, which nothing here reads.
   const uint32_t kind = (flags & 6) ? (flags & 6) : 6;
@@ -296,7 +370,7 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
     list.words.push_back(function);
     list.words.push_back(context);
     list.words.push_back(mask);
-    g_counts.effect_records.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.effect_records);
   }
   return true;
 }
@@ -469,7 +543,7 @@ void CheckWait(PPCContext& ctx, uint8_t* base) {
     return;
   }
   wait->fired = true;
-  g_counts.stuck_waits.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.stuck_waits);
   const uint32_t issued = U32(base, dev + 10908) - 2;
   const uint32_t position = (U32(base, dev + 13244) & 3) | U32(base, dev + 13240);
   REXLOG_WARN("Renut: native sync: a wait (kind {}) stood still 1.5 s with every list run: fence {:X} of {:X}, "

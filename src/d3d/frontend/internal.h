@@ -76,6 +76,7 @@ void __imp__sub_8228A748(PPCContext& __restrict, uint8_t*);  // SynchronizeToPre
 
 namespace renut::native_d3d {
 
+using renut::d3d::Bump;
 using renut::d3d::Function;
 
 // ---------------------------------------------------------------------------
@@ -132,7 +133,6 @@ inline std::atomic<uint32_t> g_draw_serial{0};
 uint32_t DrawSerial();
 
 // Calls per Direct3D function, for the report.
-inline std::array<std::atomic<uint64_t>, renut::d3d::kFunctionCount> g_calls{};
 inline thread_local uint32_t t_function = 0;  // the Direct3D function this thread is in
 
 // Calls of a device other than the one that swaps, made while it records
@@ -188,6 +188,13 @@ class Builder {
     std::memcpy(p + 2, values, size_t(count) * 4);
   }
   void StateWord(uint32_t first, uint32_t value) { State(first, &value, 1); }
+  // The draw state's base vertex, not rewritten when the list already holds it (a nested run may change it).
+  void BaseVertex(uint32_t value) {
+    if (list_.base_vertex_known && list_.base_vertex == value) return;
+    list_.base_vertex = value;
+    list_.base_vertex_known = true;
+    StateWord(RENUT_STATE_WORD(base_vertex), value);
+  }
   // `count` big-endian dwords of guest memory, read now. (The constant blocks
   // are most of a list: one resize, not a push_back a dword.)
   void StateFromGuest(const uint8_t* base, uint32_t first, uint32_t address, uint32_t count) {
@@ -229,6 +236,7 @@ class Builder {
     return at;
   }
   void Run(std::shared_ptr<const List> child) {
+    list_.base_vertex_known = false;
     list_.words.push_back(kOpRun);
     list_.words.push_back(uint32_t(list_.runs.size()));
     list_.runs.push_back(std::move(child));
@@ -443,6 +451,14 @@ void Capture(PPCContext& ctx, uint8_t* base, uint32_t dev, Fill&& fill) {
   ctx = saved;
 }
 
+// Capture without the save and restore of the registers, for the draws: their fill (the state flush and
+// the packets) calls no guest code, so ctx comes back as it went in.
+template <typename Fill>
+void CaptureDraw(PPCContext& ctx, uint8_t* base, uint32_t dev, Fill&& fill) {
+  Device d{base, dev, ctx, Builder(Current(dev))};
+  fill(d);
+}
+
 // ---------------------------------------------------------------------------
 // Handlers.
 
@@ -547,6 +563,15 @@ bool RingAllocate(PPCContext& ctx, uint8_t* base);
 bool StartNewSegment(PPCContext& ctx, uint8_t* base);
 bool ReserveRing(PPCContext& ctx, uint8_t* base);
 bool InvalidateRange(PPCContext& ctx, uint8_t* base);
+// Stubs of what only writes the ring, the tile lists or the indirect lists (sync.cpp).
+bool ListTerminate(PPCContext& ctx, uint8_t* base);
+bool ListLink(PPCContext& ctx, uint8_t* base);
+bool ListGrow(PPCContext& ctx, uint8_t* base);
+bool AppendRegisters(PPCContext& ctx, uint8_t* base);
+bool QueueIndirectRange(PPCContext& ctx, uint8_t* base);
+bool CreateInvalidateBuffer(PPCContext& ctx, uint8_t* base);
+bool MarkAsOutOfMemory(PPCContext& ctx, uint8_t* base);
+bool GrowIndirectList(PPCContext& ctx, uint8_t* base, uint32_t cursor, uint32_t entries);
 bool BeginRingManual(PPCContext& ctx, uint8_t* base);
 // CDevice::KickOff (sub_82210AB0) and KickOffSegment (sub_822106C8): publish the list, issue
 // the fence and point the device's ring at a scratch block nothing reads. KickOff returns the ring.

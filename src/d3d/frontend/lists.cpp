@@ -27,8 +27,8 @@ List& Current(uint32_t dev) {
   auto it = g_front.recording.find(dev);
   if (it != g_front.recording.end() && it->second) return *it->second;
   if (g_front.main_device && dev != g_front.main_device) {
-    g_counts.foreign_immediate.fetch_add(1, std::memory_order_relaxed);
-    if (t_function < g_foreign.size()) g_foreign[t_function].fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.foreign_immediate);
+    if (t_function < g_foreign.size()) Bump(g_foreign[t_function]);
     g_foreign_device.store(dev, std::memory_order_relaxed);
   }
   PutBackClip(dev, *g_front.immediate);
@@ -44,7 +44,7 @@ void Publish() {
     std::lock_guard lock(g_front.published_mutex);
     g_front.published.push_back(std::move(done));
   }
-  g_counts.publishes.fetch_add(1, std::memory_order_relaxed);
+  Bump(g_counts.publishes);
   g_counts.lists_published.fetch_add(1, std::memory_order_relaxed);
   if (g_front.sync_recording) {
     g_work_pending.store(true, std::memory_order_release);
@@ -67,7 +67,7 @@ uint32_t ScratchAlloc(uint32_t bytes) {
     }
   });
   if (!g_scratch.base) {
-    g_counts.no_scratch.fetch_add(1, std::memory_order_relaxed);
+    Bump(g_counts.no_scratch);
     return 0;
   }
   bytes = (bytes + 63) & ~63u;
