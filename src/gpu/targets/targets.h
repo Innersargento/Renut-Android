@@ -113,7 +113,7 @@ struct Targets {
   // A 2D guest texture's image, its view (a swizzled BC texture has one) and descriptor.
   void RetireGuestTexture(GuestTexture& texture);
   void RetireSwizzled(Resolved& r);
-  uint32_t SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first);
+  uint32_t SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first, bool color = false);
   std::array<std::vector<std::unique_ptr<RenderFramebuffer>>, kPlumeFramesInFlight>
       retired_framebuffer_slots_;
   static uint64_t ResolvedKey(uint32_t address, RenderFormat format);

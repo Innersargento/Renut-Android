@@ -236,19 +236,28 @@ void Targets::Transition(RenderTexture* texture, RenderTextureLayout& current,
 
 
 
-uint32_t Targets::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first) {
+uint32_t Targets::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, bool stencil_first, bool color) {
   RenderTexture* texture = fitted ? r.fitted.get() : r.texture.get();
   if (!texture) return 0;
   // Only a resolve that kept its stencil (RG32F) reads differently as 8_8_8_8.
-  stencil_first = stencil_first && r.format == RenderFormat::R32G32_FLOAT;
-  Resolved::SwizzledView& s = r.swizzled[swizzle | (uint32_t(fitted) << 12) | (uint32_t(stencil_first) << 13)];
+  stencil_first = !color && stencil_first && r.format == RenderFormat::R32G32_FLOAT;
+  Resolved::SwizzledView& s = r.swizzled[swizzle | (uint32_t(fitted) << 12) | (uint32_t(stencil_first) << 13) |
+                                         (uint32_t(color) << 14)];
   if (s.texture != texture || !s.view || !s.descriptor) {
     if (s.view) retired_views_[backend.slot_].push_back(std::move(s.view));
     if (s.descriptor) retired_descriptor_slots_[backend.slot_].push_back(s.descriptor);
     // Xenos swizzle lanes: 0..3 pick a channel, every one of them the
     // depth; 4 is 0, 5 is 1. Fetched as 8_8_8_8, a k_24_8 surface has its
     // stencil in the first channel (the low byte), kept in G.
-    auto lane = [stencil_first](uint32_t code) {
+    // A colour resolve keeps its channels where they are (see ColorResolveSwizzle): only its constant lanes
+    // differ from the image.
+    uint32_t position = 0;
+    auto lane = [stencil_first, color, &position](uint32_t code) {
+      const uint32_t at = position++;
+      if (color && code < 4) {
+        constexpr RenderSwizzle kOwn[4] = {RenderSwizzle::R, RenderSwizzle::G, RenderSwizzle::B, RenderSwizzle::A};
+        return kOwn[at];
+      }
       if (code == 0 && stencil_first) return RenderSwizzle::G;
       return code < 4 ? RenderSwizzle::R : code == 5 ? RenderSwizzle::ONE : RenderSwizzle::ZERO;
     };
@@ -256,8 +265,10 @@ uint32_t Targets::SwizzledResolved(Resolved& r, bool fitted, uint32_t swizzle, b
     // depth aspect); its fitted copy is the R32_FLOAT a depth resolve makes.
     RenderTextureViewDesc desc =
         RenderTextureViewDesc::Texture2D(fitted && r.alias ? RenderFormat::R32_FLOAT : r.format);
-    desc.componentMapping = RenderComponentMapping(lane(swizzle & 7), lane((swizzle >> 3) & 7),
-                                                   lane((swizzle >> 6) & 7), lane((swizzle >> 9) & 7));
+    // (in order: the lanes count their own position)
+    const RenderSwizzle lane_r = lane(swizzle & 7), lane_g = lane((swizzle >> 3) & 7);
+    const RenderSwizzle lane_b = lane((swizzle >> 6) & 7), lane_a = lane((swizzle >> 9) & 7);
+    desc.componentMapping = RenderComponentMapping(lane_r, lane_g, lane_b, lane_a);
     s.view = texture->createTextureView(desc);
     s.descriptor = AllocateTextureDescriptor();
     s.texture = texture;

@@ -61,6 +61,9 @@ struct Draw {
   // Debug: <files>/plume-skip-shader holds a shader hash (hex); draws with
   // that vertex or pixel shader are dropped.
   uint64_t skip_shader_ = 0;
+  // A colour resolve is sampled with the constant lanes (0 and 1) of its fetch constant's swizzle: the alpha of a
+  // texture that has none reads 1 (IssueDraw).
+  bool color_resolve_swizzle_ = true;
   // Debug: <files>/plume-debug-shader holds a shader hash (hex); draws with
   // that vertex or pixel shader lose depth testing, blending, alpha test and
   // culling, to show where they land and what colour they come out.

@@ -364,16 +364,32 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       // A depth resolve goes through a view that repeats the depth (see
       // Resolved::swizzled). A colour resolve already holds the channels in
       // the order its fetch swizzle expects; applying it again swapped red
-      // and blue across the UI.
+      // and blue across the UI. Its constant lanes are another matter: a
+      // texture without alpha (X8R8G8B8, the front buffers) fetches 1 there,
+      // where the image holds whatever alpha the scene left. The door
+      // transition copies the front buffer with an alpha test and then blends
+      // that capture by its alpha: with the scene's alpha the world behind the
+      // jiggies was dropped, black.
       const uint32_t swizzle = uint32_t(fetch.swizzle) & 0xFFF;
       const bool depth_view = r.depth;
       const bool stencil_first = fetch.format == xenos::TextureFormat::k_8_8_8_8;
+      bool constant_lane = false;
+      for (uint32_t lane = 0; lane < 4; ++lane) constant_lane |= ((swizzle >> (3 * lane)) & 7) >= 4;
+      const bool color_view = !depth_view && constant_lane && color_resolve_swizzle_;
       if (fw < r.width || fh < r.height) {
         texture_descriptor[slot] = backend.targets.FittedResolved(r, std::min(fw, r.width), std::min(fh, r.height));
-        if (depth_view && texture_descriptor[slot]) texture_descriptor[slot] = backend.targets.SwizzledResolved(r, true, swizzle, stencil_first);
+        if ((depth_view || color_view) && texture_descriptor[slot]) {
+          const uint32_t view = backend.targets.SwizzledResolved(r, true, swizzle, stencil_first, color_view);
+          if (view || depth_view) texture_descriptor[slot] = view;
+        }
       } else {
         backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::SHADER_READ);
         texture_descriptor[slot] = depth_view ? backend.targets.SwizzledResolved(r, false, swizzle, stencil_first) : r.descriptor;
+        if (color_view) {
+          if (const uint32_t view = backend.targets.SwizzledResolved(r, false, swizzle, stencil_first, true)) {
+            texture_descriptor[slot] = view;
+          }
+        }
       }
     } else if (fetch.dimension == xenos::DataDimension::k2DOrStacked) {
       backend.textures.fetch_slot_ = int(slot);
