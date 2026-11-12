@@ -365,6 +365,24 @@ void Resolve::NativePhoto(const uint32_t* w) {
     }
   }
   buffer->unmap();
+  // These rows were written from the host, around the write watch of the texture the game then draws the photo
+  // with: its host image was kept (a watched texture is hashed again only once in 256 frames), and every shot
+  // after the first showed the first. Every texture over these rows is read again at its next draw, and uploaded
+  // whatever its hash says (a large texture's hash samples it: two shots may agree where it looks).
+  if (guest_w && guest_h) {
+    const uint64_t begin = address, end = begin + uint64_t(guest_h - 1) * pitch + uint64_t(guest_w) * 4;
+    for (auto& [key, texture] : backend.targets.guest_textures_) {
+      if (!texture.watched) continue;
+      bool over = false;
+      for (uint32_t which = 0; which < 2; ++which) {
+        over = over || (texture.watch_begin[which] < end && begin < texture.watch_end[which]);
+      }
+      if (!over) continue;
+      texture.watched = false;
+      texture.checked_frame = ~0ull;
+      texture.content = ~texture.content;
+    }
+  }
   ++photo_captures_;
   REXLOG_INFO("Renut: Plume photo capture {}: {}x{} guest texels into {:08X}, pitch {}, from a {}x{} {} target at scale {}",
               photo_captures_, guest_w, guest_h, address, pitch, host_w, host_h, rgba8 ? "8888" : "16f", scale);
