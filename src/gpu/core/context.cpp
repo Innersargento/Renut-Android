@@ -149,10 +149,20 @@ bool GpuBackend::SetupContext() {
   cube_view.dimension = RenderTextureViewDimension::TEXTURE_CUBE;
   white_cube_view_ = white_cube_->createTextureView(cube_view);
 
-  draw.rect_list_gs_ = device_->createShader(k_rect_list_geom, sizeof(k_rect_list_geom), "main",
-                                        RenderShaderFormat::SPIRV);
-  draw.point_list_gs_ = device_->createShader(k_point_list_geom, sizeof(k_point_list_geom), "main",
-                                         RenderShaderFormat::SPIRV);
+  // Qualcomm's own driver hands a geometry shader positions that are not the vertex shader's when it reads them
+  // from gl_in[]: its forms read them from a location the layer has the vertex shaders write as well
+  // (spirv_position_varying.h).
+  if (PlumeQualcommDriver()) {
+    draw.rect_list_gs_ = device_->createShader(k_rect_list_position_geom, sizeof(k_rect_list_position_geom), "main",
+                                               RenderShaderFormat::SPIRV);
+    draw.point_list_gs_ = device_->createShader(k_point_list_position_geom, sizeof(k_point_list_position_geom),
+                                                "main", RenderShaderFormat::SPIRV);
+  } else {
+    draw.rect_list_gs_ = device_->createShader(k_rect_list_geom, sizeof(k_rect_list_geom), "main",
+                                               RenderShaderFormat::SPIRV);
+    draw.point_list_gs_ = device_->createShader(k_point_list_geom, sizeof(k_point_list_geom), "main",
+                                                RenderShaderFormat::SPIRV);
+  }
 
   streams.upload_used_ = 0;
   uint64_t white = streams.Allocate(4 * 6, 256);

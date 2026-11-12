@@ -2,6 +2,9 @@
 
 #include "frame_pacing.h"
 #include "plume_vulkan.h"
+#include "spirv_int64.h"
+#include "spirv_position_varying.h"
+#include "spirv_vertex_inputs.h"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +13,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <string>
+#include <unordered_map>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -153,11 +159,26 @@ struct VulkanLayerState {
   PFN_vkCreateGraphicsPipelines create_graphics = nullptr;
   PFN_vkCreateComputePipelines create_compute = nullptr;
   PFN_vkCreateBuffer create_buffer = nullptr;
+  PFN_vkCreateShaderModule create_shader_module = nullptr;
+  PFN_vkDestroyShaderModule destroy_shader_module = nullptr;
   PFN_vkQueueSubmit queue_submit = nullptr;
   PFN_vkWaitForFences wait_for_fences = nullptr;
   bool installed = false;
   bool cache_control = false;               // VK_EXT_pipeline_creation_cache_control is on
   std::atomic<bool> buffer_address{false};  // buffers get the device address usage
+  // The device takes the *_USCALED / *_SSCALED formats as vertex attributes (Turnip does; Qualcomm's own driver
+  // has none of them, and compiles no vertex shader whose float input is fed an integer attribute). Known once
+  // the device is made; without them the vertex modules are retyped (TypedVertexModule).
+  std::atomic<bool> scaled_vertex{true};
+  // The device has no 64-bit integers in shaders (shaderInt64; Qualcomm's own driver): the modules that make
+  // their buffer addresses of them are rewritten for pairs of 32-bit ones (spirv_int64.h).
+  std::atomic<bool> lower_int64{false};
+  std::atomic<uint64_t> lowered{0}, not_lowered{0};
+  // Qualcomm's own driver (VK_DRIVER_ID_QUALCOMM_PROPRIETARY). Its geometry shaders read the vertex position
+  // from a location, which the layer has the vertex modules of their pipelines write (PositionedVertexModule).
+  std::atomic<bool> qualcomm{false};
+  // What the pipeline cache's file name carries for a driver other than Turnip ("-drv<id>"), set with the device.
+  std::string cache_tag;
   std::atomic<bool> device_lost{false};
 };
 VulkanLayerState layer;
@@ -341,7 +362,16 @@ void WritePlumePipelineCache() {
 void SetPlumePipelineCachePath(const std::string& path) {
   {
     std::lock_guard lock(pipeline_cache.mutex);
-    pipeline_cache.path = path;
+    // A cache per driver: each one refuses the other's blob, and the first fold under one would write the
+    // other's file over with its own. Turnip keeps the name it always had. The device exists by now (the
+    // renderer starts before the path is set).
+    std::string tagged = path;
+    const std::string suffix = ".bin";
+    if (!layer.cache_tag.empty() && tagged.size() > suffix.size() &&
+        tagged.compare(tagged.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      tagged.insert(tagged.size() - suffix.size(), layer.cache_tag);
+    }
+    pipeline_cache.path = tagged;
   }
   if (PlumeRenderer* renderer = PlumeRenderer::Get()) {
     PreloadPipelineCache(static_cast<VulkanDevice*>(renderer->device())->vk);
@@ -371,6 +401,10 @@ void SavePlumePipelineCache(bool now) {
 }
 
 bool PlumePipelineLookupSupported() { return pipeline_cache.lookup; }
+
+bool PlumeScaledVertexFormats() { return layer.scaled_vertex.load(std::memory_order_relaxed); }
+
+bool PlumeQualcommDriver() { return layer.qualcomm.load(std::memory_order_relaxed); }
 
 PlumePipelineLookupOnly::PlumePipelineLookupOnly() { pipeline_lookup_only = true; }
 PlumePipelineLookupOnly::~PlumePipelineLookupOnly() { pipeline_lookup_only = false; }
@@ -789,7 +823,174 @@ namespace {
 // The vertex formats the renderer asks Plume for, by the names Plume has, and
 // the Vulkan format each one stands for. UBYTE4/SHORT2/SHORT4 and the packed
 // 2_10_10_10 arrive in the vertex shader as converted floats.
+// The vertex modules of a device without the scaled vertex formats: the code of each as Plume made it, and the
+// forms of it whose inputs are the integer vectors its attributes are (spirv_vertex_inputs.h), by the kinds of
+// its 32 locations.
+struct VertexModules {
+  std::mutex mutex;
+  // Every vertex module's code, the retyped forms' included (by their own handle).
+  std::unordered_map<uint64_t, std::vector<uint32_t>> code;
+  std::map<std::pair<uint64_t, std::string>, VkShaderModule> typed;
+  // The form of a module (original or retyped) that also writes its position at
+  // spirv::kPositionVaryingLocation, for the pipelines with a geometry shader.
+  std::unordered_map<uint64_t, VkShaderModule> positioned;
+  uint64_t made = 0, refused = 0, positioned_made = 0, positioned_refused = 0;
+};
+VertexModules vertex_modules;
+
+uint64_t ModuleKey(VkShaderModule module) { return uint64_t(reinterpret_cast<uintptr_t>(module)); }
+
+// 0 not an integer format, 1 signed, 2 unsigned.
+uint32_t IntegerVertexFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R32G32B32_SINT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+      return 1;
+    case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32B32_UINT:
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+      return 2;
+    default:
+      return 0;
+  }
+}
+
+// The form of `module` for these kinds, made once; null when it is not a vertex module the layer saw made or
+// its inputs could not be retyped (the pipeline is then asked for as it was).
+VkShaderModule TypedVertexModule(VkDevice device, VkShaderModule module, const uint8_t* kinds) {
+  VertexModules& m = vertex_modules;
+  std::lock_guard lock(m.mutex);
+  const auto code = m.code.find(ModuleKey(module));
+  if (code == m.code.end()) return VK_NULL_HANDLE;
+  const auto key = std::make_pair(ModuleKey(module), std::string(reinterpret_cast<const char*>(kinds), 32));
+  const auto found = m.typed.find(key);
+  if (found != m.typed.end()) return found->second;
+  VkShaderModule typed = VK_NULL_HANDLE;
+  std::vector<uint32_t> words;
+  if (spirv::RetypeVertexInputs(code->second, kinds, words)) {
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = words.size() * sizeof(uint32_t);
+    info.pCode = words.data();
+    if (layer.create_shader_module(device, &info, nullptr, &typed) != VK_SUCCESS) typed = VK_NULL_HANDLE;
+  }
+  if (typed != VK_NULL_HANDLE) {
+    if (++m.made == 1) REXLOG_INFO("Renut: Plume vertex modules are retyped for their integer attributes");
+    m.code[ModuleKey(typed)] = std::move(words);
+  } else if (++m.refused <= 8) {
+    REXLOG_WARN("Renut: Plume vertex module not retyped for its integer attributes");
+  }
+  m.typed.emplace(key, typed);
+  return typed;
+}
+
+// The form of `module` (a vertex module the layer saw made, or a retyped one) that also writes its position at
+// spirv::kPositionVaryingLocation, where the host's geometry shaders read it; made once, null when it cannot be.
+VkShaderModule PositionedVertexModule(VkDevice device, VkShaderModule module) {
+  VertexModules& m = vertex_modules;
+  std::lock_guard lock(m.mutex);
+  const auto found = m.positioned.find(ModuleKey(module));
+  if (found != m.positioned.end()) return found->second;
+  VkShaderModule positioned = VK_NULL_HANDLE;
+  const auto code = m.code.find(ModuleKey(module));
+  std::vector<uint32_t> words;
+  if (code != m.code.end() && spirv::AddPositionVarying(code->second, words)) {
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = words.size() * sizeof(uint32_t);
+    info.pCode = words.data();
+    if (layer.create_shader_module(device, &info, nullptr, &positioned) != VK_SUCCESS) positioned = VK_NULL_HANDLE;
+  }
+  if (positioned != VK_NULL_HANDLE) {
+    if (++m.positioned_made == 1) {
+      REXLOG_INFO("Renut: Plume vertex modules of geometry-shader pipelines hand their position on at location {}",
+                  spirv::kPositionVaryingLocation);
+    }
+  } else if (++m.positioned_refused <= 8) {
+    REXLOG_WARN("Renut: Plume vertex module without its position at location {}: its geometry shader reads none",
+                spirv::kPositionVaryingLocation);
+  }
+  m.positioned.emplace(ModuleKey(module), positioned);
+  return positioned;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* info,
+                                                       const VkAllocationCallbacks* allocator,
+                                                       VkShaderModule* module) {
+  VkShaderModuleCreateInfo edited = *info;
+  std::vector<uint32_t> lowered;
+  if (layer.lower_int64.load(std::memory_order_relaxed) && info->pCode &&
+      spirv::UsesInt64(info->pCode, info->codeSize / sizeof(uint32_t))) {
+    if (spirv::LowerInt64(info->pCode, info->codeSize / sizeof(uint32_t), lowered)) {
+      edited.pCode = lowered.data();
+      edited.codeSize = lowered.size() * sizeof(uint32_t);
+      if (layer.lowered.fetch_add(1) == 0) {
+        REXLOG_INFO("Renut: Plume shader modules with 64-bit addresses are rewritten for pairs of 32-bit integers");
+      }
+    } else if (layer.not_lowered.fetch_add(1) < 8) {
+      REXLOG_WARN("Renut: Plume shader module with 64-bit integers not rewritten ({} words)",
+                  info->codeSize / sizeof(uint32_t));
+    }
+  }
+  const VkResult result = layer.create_shader_module(device, &edited, allocator, module);
+  // The vertex modules' code is kept where forms of them are made: the retyped ones (a device without scaled
+  // formats) and the positioned ones (Qualcomm's own driver: its geometry shaders read the position from a
+  // location).
+  if (result == VK_SUCCESS && edited.pCode &&
+      (!layer.scaled_vertex.load(std::memory_order_relaxed) || layer.qualcomm.load(std::memory_order_relaxed)) &&
+      spirv::IsVertexModule(edited.pCode, edited.codeSize / sizeof(uint32_t))) {
+    std::lock_guard lock(vertex_modules.mutex);
+    vertex_modules.code[ModuleKey(*module)].assign(edited.pCode, edited.pCode + edited.codeSize / sizeof(uint32_t));
+  }
+  return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL LayerDestroyShaderModule(VkDevice device, VkShaderModule module,
+                                                    const VkAllocationCallbacks* allocator) {
+  {
+    VertexModules& m = vertex_modules;
+    std::lock_guard lock(m.mutex);
+    // A form's positioned form goes with it.
+    auto drop_positioned = [&](uint64_t key) {
+      const auto p = m.positioned.find(key);
+      if (p == m.positioned.end()) return;
+      if (p->second != VK_NULL_HANDLE) layer.destroy_shader_module(device, p->second, nullptr);
+      m.positioned.erase(p);
+    };
+    if (m.code.erase(ModuleKey(module))) {
+      drop_positioned(ModuleKey(module));
+      for (auto it = m.typed.lower_bound({ModuleKey(module), std::string()});
+           it != m.typed.end() && it->first.first == ModuleKey(module);) {
+        if (it->second != VK_NULL_HANDLE) {
+          m.code.erase(ModuleKey(it->second));
+          drop_positioned(ModuleKey(it->second));
+          layer.destroy_shader_module(device, it->second, nullptr);
+        }
+        it = m.typed.erase(it);
+      }
+    }
+  }
+  layer.destroy_shader_module(device, module, allocator);
+}
+
 VkFormat LayerVertexFormat(VkFormat format) {
+  // A device without the scaled formats keeps the integer ones, and the vertex module is given integer inputs
+  // that it converts itself (TypedVertexModule). The unsigned scaled 2_10_10_10 is then the packed integer.
+  if (!layer.scaled_vertex.load(std::memory_order_relaxed)) {
+    switch (format) {
+      case VK_FORMAT_R8G8_UINT: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+      case VK_FORMAT_R8G8_SINT: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+      default: return format;
+    }
+  }
   switch (format) {
     case VK_FORMAT_R8G8B8A8_UINT: return VK_FORMAT_R8G8B8A8_USCALED;
     case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_SSCALED;
@@ -856,6 +1057,32 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, cons
     edited.enabledExtensionCount = uint32_t(extensions.size());
     edited.ppEnabledExtensionNames = extensions.data();
   }
+  // What the device makes of the vertex formats the renderer would use, and which driver it is.
+  {
+    bool scaled = true;
+    for (const VkFormat format :
+         {VK_FORMAT_R8G8B8A8_USCALED, VK_FORMAT_R8G8B8A8_SSCALED, VK_FORMAT_R16G16_USCALED, VK_FORMAT_R16G16_SSCALED,
+          VK_FORMAT_R16G16B16A16_USCALED, VK_FORMAT_R16G16B16A16_SSCALED, VK_FORMAT_A2B10G10R10_USCALED_PACK32}) {
+      VkFormatProperties properties{};
+      vkGetPhysicalDeviceFormatProperties(physical, format, &properties);
+      scaled = scaled && (properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+    }
+    layer.scaled_vertex.store(scaled, std::memory_order_relaxed);
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(physical, &features);
+    layer.lower_int64.store(!features.shaderInt64, std::memory_order_relaxed);
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties.pNext = &driver;
+    vkGetPhysicalDeviceProperties2(physical, &properties);
+    layer.cache_tag =
+        driver.driverID == VK_DRIVER_ID_MESA_TURNIP ? std::string() : fmt::format("-drv{}", uint32_t(driver.driverID));
+    layer.qualcomm.store(driver.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY, std::memory_order_relaxed);
+    REXLOG_INFO("Renut: Plume Vulkan driver {} ({}, {}): scaled vertex formats {}; 64-bit integers in shaders {}",
+                uint32_t(driver.driverID), driver.driverName, driver.driverInfo,
+                scaled ? "taken by the device" : "missing, the vertex modules get integer inputs",
+                features.shaderInt64 ? "available" : "missing, addresses become pairs of 32-bit integers");
+  }
   const VkResult result = layer.create_device(physical, &edited, allocator, device);
   layer.cache_control = result == VK_SUCCESS && control_wanted;
   return result;
@@ -872,6 +1099,7 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateGraphicsPipelines(VkDevice device, VkP
     std::vector<VkDynamicState> states;
     VkPipelineVertexInputStateCreateInfo vertex;
     std::vector<VkVertexInputAttributeDescription> attributes;
+    std::vector<VkPipelineShaderStageCreateInfo> stages;
   };
   thread_local std::vector<Edited> edited;
   thread_local std::vector<VkGraphicsPipelineCreateInfo> list;
@@ -921,6 +1149,65 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateGraphicsPipelines(VkDevice device, VkP
         e.vertex = *vertex;
         e.vertex.pVertexAttributeDescriptions = e.attributes.data();
         info.pVertexInputState = &e.vertex;
+      }
+    }
+    // A device without the scaled formats: the vertex module in the form whose inputs are the integers these
+    // attributes are. One the backend flagged (specialization constant 2, g_IntInputs: the shader reads its
+    // bits with asint) keeps its bits; the others are converted to the numbers a scaled format would have given.
+    if (!layer.scaled_vertex.load(std::memory_order_relaxed) && info.pVertexInputState && info.pStages) {
+      uint32_t vertex_stage = UINT32_MAX;
+      for (uint32_t s = 0; s < info.stageCount; ++s) {
+        if (info.pStages[s].stage == VK_SHADER_STAGE_VERTEX_BIT) vertex_stage = s;
+      }
+      if (vertex_stage != UINT32_MAX) {
+        const VkPipelineShaderStageCreateInfo& stage = info.pStages[vertex_stage];
+        uint32_t read_as_bits = 0;
+        if (const VkSpecializationInfo* spec = stage.pSpecializationInfo) {
+          for (uint32_t c = 0; c < spec->mapEntryCount; ++c) {
+            const VkSpecializationMapEntry& entry = spec->pMapEntries[c];
+            if (entry.constantID == 2 && entry.size == sizeof(uint32_t) && entry.offset + entry.size <= spec->dataSize) {
+              std::memcpy(&read_as_bits, static_cast<const uint8_t*>(spec->pData) + entry.offset, sizeof(uint32_t));
+            }
+          }
+        }
+        uint8_t kinds[32] = {};
+        bool any = false;
+        const auto* vertex = info.pVertexInputState;
+        for (uint32_t a = 0; a < vertex->vertexAttributeDescriptionCount; ++a) {
+          const VkVertexInputAttributeDescription& attribute = vertex->pVertexAttributeDescriptions[a];
+          const uint32_t integer = IntegerVertexFormat(attribute.format);
+          if (!integer || attribute.location >= 32) continue;
+          const bool bits = (read_as_bits >> attribute.location) & 1;
+          kinds[attribute.location] = integer == 1 ? (bits ? spirv::kInputSignedBits : spirv::kInputSignedNumber)
+                                                   : (bits ? spirv::kInputUnsignedBits : spirv::kInputUnsignedNumber);
+          any = true;
+        }
+        if (any) {
+          if (const VkShaderModule typed = TypedVertexModule(device, stage.module, kinds); typed != VK_NULL_HANDLE) {
+            e.stages.assign(info.pStages, info.pStages + info.stageCount);
+            e.stages[vertex_stage].module = typed;
+            info.pStages = e.stages.data();
+          }
+        }
+      }
+    }
+    // Qualcomm's own driver, a pipeline with a geometry shader (the host's rect_list_position.geom /
+    // point_list_position.geom): its vertex module in the form that also writes the position at the location
+    // those read it from (spirv_position_varying.h).
+    if (layer.qualcomm.load(std::memory_order_relaxed) && info.pStages) {
+      uint32_t vertex_stage = UINT32_MAX;
+      bool geometry = false;
+      for (uint32_t s = 0; s < info.stageCount; ++s) {
+        if (info.pStages[s].stage == VK_SHADER_STAGE_VERTEX_BIT) vertex_stage = s;
+        geometry |= info.pStages[s].stage == VK_SHADER_STAGE_GEOMETRY_BIT;
+      }
+      if (geometry && vertex_stage != UINT32_MAX) {
+        if (const VkShaderModule positioned = PositionedVertexModule(device, info.pStages[vertex_stage].module);
+            positioned != VK_NULL_HANDLE) {
+          if (info.pStages != e.stages.data()) e.stages.assign(info.pStages, info.pStages + info.stageCount);
+          e.stages[vertex_stage].module = positioned;
+          info.pStages = e.stages.data();
+        }
       }
     }
   }
@@ -983,12 +1270,16 @@ void InstallVulkanLayer() {
   layer.create_graphics = vkCreateGraphicsPipelines;
   layer.create_compute = vkCreateComputePipelines;
   layer.create_buffer = vkCreateBuffer;
+  layer.create_shader_module = vkCreateShaderModule;
+  layer.destroy_shader_module = vkDestroyShaderModule;
   layer.queue_submit = vkQueueSubmit;
   layer.wait_for_fences = vkWaitForFences;
   vkCreateDevice = LayerCreateDevice;
   vkCreateGraphicsPipelines = LayerCreateGraphicsPipelines;
   vkCreateComputePipelines = LayerCreateComputePipelines;
   vkCreateBuffer = LayerCreateBuffer;
+  vkCreateShaderModule = LayerCreateShaderModule;
+  vkDestroyShaderModule = LayerDestroyShaderModule;
   vkQueueSubmit = LayerQueueSubmit;
   vkWaitForFences = LayerWaitForFences;
 }

@@ -39,6 +39,12 @@ void SavePlumePipelineCache(bool now = false);
 // compiling one (VK_EXT_pipeline_creation_cache_control). Known once the
 // renderer has started.
 bool PlumePipelineLookupSupported();
+// Whether the device takes the *_USCALED / *_SSCALED vertex formats (false on Qualcomm's own Adreno driver,
+// where the layer retypes the vertex modules instead). Known once the renderer has started.
+bool PlumeScaledVertexFormats();
+// Whether the device runs Qualcomm's own Adreno driver (VK_DRIVER_ID_QUALCOMM_PROPRIETARY), which gets the few
+// workarounds Turnip does not need. Known once the renderer has started.
+bool PlumeQualcommDriver();
 // While one is alive on a thread, pipeline creation there only looks in the
 // cache: a pipeline that would have to be compiled comes back null at once.
 class PlumePipelineLookupOnly {

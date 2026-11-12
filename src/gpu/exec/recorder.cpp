@@ -187,7 +187,7 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
       BindIndexBuffer(pk.index_buffer, pk.index_format);
       auto* vulkan = static_cast<VulkanCommandList*>(L());
       vulkan->checkActiveRenderPass();
-      vkCmdDrawIndexedIndirect(vulkan->vk, static_cast<VulkanBuffer*>(pk.index_buffer)->vk, pk.indirect_offset, 1,
+      vkCmdDrawIndexedIndirect(vulkan->vk, static_cast<VulkanBuffer*>(pk.indirect_buffer)->vk, pk.indirect_offset, 1,
                                sizeof(VkDrawIndexedIndirectCommand));
       break;
     }

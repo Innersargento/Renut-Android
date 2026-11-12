@@ -332,6 +332,22 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (fetch.type != xenos::FetchConstantType::kTexture) continue;
     sampler_descriptor[slot] = backend.textures.GetSampler(fetch);
     Resolved* found = FindResolved(fetch.base_address << 12);
+    // Without shadows (renut_plume_no_shadows) the casters are dropped, which empties the maps that are drawn
+    // every frame: the two cascades around the player. The materials read three (slots 15, 14 and 13, picked by
+    // distance), and the far one is not among the surfaces drawn each frame, so past the near cascades the world
+    // kept its shadows. Every shadow map a material reads is the white texture instead (slot left at 0): its
+    // depth of 1 is "nothing between this and the light", what a map with no casters holds. A shadow map here
+    // is a depth resolve without stencil (the scene's depth keeps its stencil) or a texture in a depth format.
+    if (backend.no_shadows_ && slot >= 13 && slot <= 15) {
+      const auto format = xenos::TextureFormat(uint32_t(fetch.format));
+      const bool map = found && found->descriptor
+                           ? found->depth && found->format != RenderFormat::R32G32_FLOAT
+                           : fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+                                 (format == xenos::TextureFormat::k_24_8 ||
+                                  format == xenos::TextureFormat::k_24_8_FLOAT ||
+                                  format == xenos::TextureFormat::k_16_FLOAT);
+      if (map) continue;
+    }
     if (found && found->last_src && !found->read_dirty) {
       // Read after its source was drawn into again, or by a draw that is drawing into that source itself:
       // a texture that was the source's own image would not do for this read.
@@ -1682,7 +1698,9 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                          .count());
       ++backend.stats_.pipelines;
     }
-    if (!pipeline && !standin) {
+    // Said once a pipeline, and not tried again: one the driver refuses was made, and logged, again at every
+    // draw (100 MB of log in a minute on a driver that refused a few dozen).
+    if (!pipeline && !standin && failed_pipelines_.insert(key).second) {
       REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
                   vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
     }
@@ -1951,6 +1969,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     pk.kind = DrawPacket::Kind::kPatchIndirect;
     pk.index_buffer = adaptive_draw.buffer;
     pk.index_format = RenderFormat::R32_UINT;
+    pk.indirect_buffer = adaptive_draw.args_buffer;
     pk.indirect_offset = adaptive_draw.args_offset;
   } else if (patch_list) {
     pk.kind = DrawPacket::Kind::kPatch;

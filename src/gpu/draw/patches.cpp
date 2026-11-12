@@ -257,6 +257,42 @@ bool Patches::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endian,
                        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
                        0, 1, &barrier, 0, nullptr, 0, nullptr);
+  out.args_buffer = buffer.get();
+  out.args_offset = args_at;
+  if (PlumeQualcommDriver()) {
+    // Qualcomm's own driver: the draw reads its arguments from a transfer's copy (see patch_args_). Drawn from
+    // where patch_levels.comp wrote them, the water hung the GPU (kgsl "GPU hang detected", three in two seconds
+    // lose the device); the same indices and points drawn directly, or arguments a transfer wrote, never did.
+    std::unique_ptr<RenderBuffer>& args = patch_args_[backend.slot_];
+    if (!args || patch_args_used_ + kPatchArgsStride > patch_args_capacity_[backend.slot_]) {
+      const uint64_t capacity = std::max<uint64_t>(patch_args_capacity_[backend.slot_] * 2, 64 * kPatchArgsStride);
+      auto made = backend.device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+          capacity, RenderBufferFlag::STORAGE));  // the layer adds the indirect usage to a storage buffer
+      if (!made) return false;
+      // Draws recorded earlier this frame may still read the old one.
+      if (args) backend.streams.retired_buffers_[backend.slot_].push_back(std::move(args));
+      args = std::move(made);
+      patch_args_capacity_[backend.slot_] = capacity;
+      patch_args_used_ = 0;
+    }
+    const uint64_t copy_at = patch_args_used_;
+    patch_args_used_ += kPatchArgsStride;
+    VkMemoryBarrier to_copy = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    to_copy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &to_copy, 0, nullptr, 0, nullptr);
+    const VkBufferCopy copy = {args_at, copy_at, sizeof(VkDrawIndexedIndirectCommand)};
+    vkCmdCopyBuffer(cb, static_cast<VulkanBuffer*>(buffer.get())->vk, static_cast<VulkanBuffer*>(args.get())->vk, 1,
+                    &copy);
+    VkMemoryBarrier copied = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    copied.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &copied, 0,
+                         nullptr, 0, nullptr);
+    out.args_buffer = args.get();
+    out.args_offset = copy_at;
+  }
   // The compute layout's push constants may disturb the graphics ones.
   backend.targets.pushed_constants_[0] = backend.targets.pushed_constants_[1] = backend.targets.pushed_constants_[2] = UINT64_MAX;
   ++backend.stats_.adaptive_patch_draws;
@@ -264,7 +300,6 @@ bool Patches::ExpandAdaptivePatches(uint32_t factors_base, xenos::Endian endian,
   out.buffer = buffer.get();
   out.points_offset = points_at;
   out.points_bytes = points * 16;
-  out.args_offset = args_at;
   patch_reuse_.frame = backend.swaps_;
   patch_reuse_.factors = factors_address;
   patch_reuse_.patches = patches;

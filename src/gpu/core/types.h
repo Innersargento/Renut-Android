@@ -51,6 +51,9 @@ namespace renut::gpu {
   // arguments into the slot's buffer, filled from its start every frame.
   struct AdaptiveDraw {
     RenderBuffer* buffer = nullptr;
+    // Where the draw reads its indirect arguments: `buffer` itself, or on Qualcomm's own driver a copy a
+    // transfer made into a buffer of their own (see ExpandAdaptivePatches).
+    RenderBuffer* args_buffer = nullptr;
     uint64_t points_offset = 0, points_bytes = 0, args_offset = 0;
   };
 
@@ -196,7 +199,7 @@ namespace renut::gpu {
 
   struct DrawPacket {
     // kPatchIndirect: an adaptive patch draw, whose index count the GPU wrote
-    // at indirect_offset of index_buffer (ExpandAdaptivePatches).
+    // at indirect_offset of indirect_buffer (ExpandAdaptivePatches).
     enum class Kind : uint8_t { kNone, kIndexed, kPatch, kPlain, kPatchIndirect };
     RenderFramebuffer* framebuffer = nullptr;
     uint32_t pass_colors = 0;
@@ -217,6 +220,7 @@ namespace renut::gpu {
     RenderFormat index_format = RenderFormat::R16_UINT;
     uint32_t count = 0, first = 0;
     int32_t base_vertex = 0;
+    RenderBuffer* indirect_buffer = nullptr;
     uint64_t indirect_offset = 0;
     // Only for the pair profile, and the trail a lost device prints.
     uint64_t vs_hash = 0, ps_hash = 0;

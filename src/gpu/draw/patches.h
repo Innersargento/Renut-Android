@@ -39,6 +39,14 @@ struct Patches {
   std::unique_ptr<RenderBuffer> patch_out_[kPlumeFramesInFlight];
   uint64_t patch_out_capacity_[kPlumeFramesInFlight] = {};
   uint64_t patch_out_used_ = 0;
+  // Qualcomm's own driver only (PlumeQualcommDriver): per frame slot, the indirect arguments of its adaptive
+  // draws, copied there from patch_out_ (kPatchArgsStride bytes a draw), filled from the start every frame like
+  // patch_out_. An indirect draw of arguments the compute pass wrote, in the buffer the draw also takes its
+  // indices and points from, hangs that driver's GPU now and then; read from a transfer's copy it never did.
+  static constexpr uint64_t kPatchArgsStride = 32;
+  std::unique_ptr<RenderBuffer> patch_args_[kPlumeFramesInFlight];
+  uint64_t patch_args_capacity_[kPlumeFramesInFlight] = {};
+  uint64_t patch_args_used_ = 0;
   PatchReuse patch_reuse_;
   uint64_t export_draws_total_ = 0;
 };

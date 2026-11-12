@@ -149,6 +149,7 @@ void Targets::BeginFrame() {
   retired_views_[backend.slot_].clear();
   backend.streams.retired_buffers_[backend.slot_].clear();
   backend.patches.patch_out_used_ = 0;
+  backend.patches.patch_args_used_ = 0;
   while (!delayed_buffers_.empty() && backend.swaps_ - delayed_buffers_.front().first >= retire_delay_) {
     delayed_buffers_.pop_front();
   }
