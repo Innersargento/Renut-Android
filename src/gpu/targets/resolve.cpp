@@ -130,7 +130,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
         aliased = backend.targets.AliasDepthResolve(*source, surfaces.object_base);
         chosen = aliased;
       }
-      if (!chosen) chosen = &backend.targets.GetResolved(surfaces.object_base, dest_format, object_w, object_h);
+      if (!chosen) chosen = &backend.targets.GetResolved(surfaces.object_base, dest_format, object_w, object_h, source->scale);
       dest_x = uint32_t(ox);
       dest_y = uint32_t(oy);
       w = dest_x < chosen->width ? std::min(w, chosen->width - dest_x) : 0;

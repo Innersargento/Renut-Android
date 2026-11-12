@@ -510,23 +510,10 @@ void Targets::RefreshQuality() {
     }
   }
   if (dropped) RetireFramebuffers();
-  // The resolved textures never shrink (GetResolved keeps one that is big enough), so after a step down the
-  // frame the game presents would still be the old size with the new picture in its corner. They go too and
-  // are made again, at the right size, by the next resolves (the game resolves the scene every frame).
-  for (auto& [key, r] : resolved_) {
-    RetireSwizzled(r);
-    RetireTexture(r.texture, r.descriptor);
-    RetireTexture(r.fitted, r.fitted_descriptor);
-    r.fitted_width = r.fitted_height = 0;
-    r.fitted_generation = UINT64_MAX;
-    r.width = r.height = 0;
-    r.written = 0;
-    r.alias = false;
-    r.sampled = false;
-    r.last_src = nullptr;
-    r.layout = RenderTextureLayout::UNKNOWN;
-  }
-  InvalidateResolvedLookups();
+  // The resolved textures stay: each holds a picture that is still right at the scale it was resolved at
+  // (Resolved::scale, which its fetches go by), and some are written once and drawn for many frames (the door transition's capture of the scene): dropped, they
+  // were read from guest memory, which no resolve writes. One whose surface now has another scale is made again by the next resolve into
+  // it (GetResolved).
   ++object_epoch_;
 }
 
@@ -607,15 +594,18 @@ void Targets::SetFramebuffer(RenderFramebuffer* framebuffer) {
 }
 
 Resolved& Targets::GetResolved(uint32_t address, RenderFormat format, uint32_t width,
-                                             uint32_t height) {
+                                             uint32_t height, uint32_t scale) {
   InvalidateResolvedAddress(address);
   Resolved& resolved = resolved_[ResolvedKey(address, format)];
-  if (resolved.texture && resolved.format == format && resolved.width >= width &&
-      resolved.height >= height) {
+  // A texture last filled at another scale (the internal resolution or the shadow quality changed since) holds
+  // pixels of another size: it is not kept for being big enough, or the new picture would sit in its corner. It
+  // is made again at this resolve's size.
+  const bool same = resolved.texture && resolved.format == format && resolved.scale == scale;
+  if (same && resolved.width >= width && resolved.height >= height) {
     return resolved;
   }
-  uint32_t w = std::max(width, resolved.format == format ? resolved.width : 0u);
-  uint32_t h = std::max(height, resolved.format == format ? resolved.height : 0u);
+  uint32_t w = std::max(width, same ? resolved.width : 0u);
+  uint32_t h = std::max(height, same ? resolved.height : 0u);
   RetireSwizzled(resolved);
   RetireTexture(resolved.texture, resolved.descriptor);
   // A depth resolve with its stencil is written by a compute pass (Resolve::ResolveDepthStencil).
@@ -626,6 +616,9 @@ Resolved& Targets::GetResolved(uint32_t address, RenderFormat format, uint32_t w
   resolved.height = h;
   resolved.layout = RenderTextureLayout::UNKNOWN;
   resolved.descriptor = AllocateTextureDescriptor();
+  resolved.scale = scale;
+  // (the fitted copy is of the old image: FittedResolved makes it again when the size asked of it changes, and
+  // copies again at the next generation)
   return resolved;
 }
 

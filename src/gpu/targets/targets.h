@@ -52,7 +52,7 @@ struct Targets {
                                     Target* depth);
   void SetFramebuffer(RenderFramebuffer* framebuffer);
   uint32_t FittedResolved(Resolved& resolved, uint32_t width, uint32_t height);
-  Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height);
+  Resolved& GetResolved(uint32_t address, RenderFormat format, uint32_t width, uint32_t height, uint32_t scale);
   // A depth map resolved whole into a texture object, without the copy: the
   // surface's image becomes the resolved texture and the surface takes another
   // (files/plume-depthalias, default on). nullptr when no image was available.

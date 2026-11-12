@@ -27,7 +27,7 @@
 REXCVAR_DEFINE_INT32(renut_msaa, 0, "reNut/Plume",
                      "Multisampling of the scene, drawn in one band (no predicated tiling): 0 off, 1 2x, 2 4x. "
                      "The game's MSAA surfaces are kept at the screen's size and the host resolves their samples "
-                     "(colour averaged, depth from the first sample). Read when the game starts")
+                     "(colour averaged, depth from the first sample). Followed while the game runs")
     .range(0, 2);
 REXCVAR_DEFINE_INT32(renut_fps_target, 30, "reNut/Plume",
                      "Frame rate the game is held to: 30 is its own, 31-240 presents "
@@ -57,17 +57,52 @@ constexpr uint32_t kSceneMsaaMode = 0x82F9EC18;
 constexpr uint32_t kSceneColorMsaa = 0x82F9EB38, kSceneDepthMsaa = 0x82F9EB44;
 
 // The mode is the player's choice, whatever the game's own setting holds (its default is 2x).
-uint32_t SceneMsaaMode() { return uint32_t(std::clamp(REXCVAR_GET(renut_msaa), 0, 2)); }
+uint32_t WantedMsaaMode() { return uint32_t(std::clamp(REXCVAR_GET(renut_msaa), 0, 2)); }
 
+// The mode the game is in: what the hooks below go by. The option changes on another thread at any moment; the
+// game's word only in ApplySceneMsaa, together with the surfaces.
+uint32_t SceneMsaaMode(uint8_t* base) {
+  uint32_t mode;
+  std::memcpy(&mode, renut::GuestPtr(base, kSceneMsaaMode), sizeof(mode));
+  return std::min(__builtin_bswap32(mode), 2u);
+}
+
+// The MSAA type (bits 16-17 of a D3DSurface's +0x18, its RB_SURFACE_INFO) of the surface a pointer names.
+void SetSurfaceMsaaType(uint8_t* base, uint32_t pointer_va, uint32_t type) {
+  uint32_t surface;
+  std::memcpy(&surface, renut::GuestPtr(base, pointer_va), sizeof(surface));
+  surface = __builtin_bswap32(surface);
+  if (!surface) return;
+  uint8_t* word = renut::GuestPtr(base, surface + 0x18);
+  uint32_t info;
+  std::memcpy(&info, word, sizeof(info));
+  info = (__builtin_bswap32(info) & ~(3u << 16)) | (type << 16);
+  info = __builtin_bswap32(info);
+  std::memcpy(word, &info, sizeof(info));
+}
+
+// Puts the game in the player's mode. The game sizes its scene surfaces from the mode only when it makes its
+// device (sub_823ED2A8, which also makes the device again and is not something to run in the middle of a game),
+// so a change made while it runs is given to the two MSAA surfaces it already has: with one band they are the
+// screen's size in every mode, and the type in their header is all that differs (D3D::SetSurfaceHeader: the
+// pitch words of a 1280 wide surface are the same for 2x and 4x). The host makes their images again from the
+// header the next time they are bound (Targets::SurfaceTarget keys them by it).
 void ApplySceneMsaa(uint8_t* base) {
   auto* mode = reinterpret_cast<uint32_t*>(renut::GuestPtr(base, kSceneMsaaMode));
-  const uint32_t wanted = __builtin_bswap32(SceneMsaaMode());
+  const uint32_t wanted_mode = WantedMsaaMode();
+  const uint32_t wanted = __builtin_bswap32(wanted_mode);
   if (*mode != wanted) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true)) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1) < 8) {
       REXLOG_INFO("Renut: scene MSAA mode {} -> {}: one band, no predicated tiling", __builtin_bswap32(*mode),
-                  SceneMsaaMode());
+                  wanted_mode);
     }
+    // The type the game gives the mode (sub_823ED260): 2x is 4x when the word at 0x82F9EBE4 is 0.
+    uint32_t hidef;
+    std::memcpy(&hidef, renut::GuestPtr(base, 0x82F9EBE4), sizeof(hidef));
+    const uint32_t type = wanted_mode == 0 ? 0u : wanted_mode == 2 ? 2u : hidef ? 1u : 2u;
+    SetSurfaceMsaaType(base, kSceneColorMsaa, type);
+    SetSurfaceMsaaType(base, kSceneDepthMsaa, type);
     *mode = wanted;
   }
 }
@@ -422,7 +457,7 @@ constexpr uint32_t kPostColor = 0x82F9EB40, kPostDepth = 0x82F9EB48, kDevicePoin
 REX_HOOK_RAW(sub_8227A9F0) {
   const uint32_t sp = ctx.r1.u32;
   __imp__sub_8227A9F0(ctx, base);
-  if (!SceneMsaaMode()) return;
+  if (!SceneMsaaMode(base)) return;
   const uint32_t device = GuestWord(base, kDevicePointer);
   const uint32_t color = GuestWord(base, kPostColor), depth = GuestWord(base, kPostDepth);
   if (!device || !color || !depth) return;
@@ -451,7 +486,7 @@ REX_HOOK_RAW(sub_823DBEB8) {
   const uint32_t device = ctx.r4.u32, no_tiling = ctx.r5.u32;
   const uint32_t sp = ctx.r1.u32;
   __imp__sub_823DBEB8(ctx, base);
-  if (no_tiling || !SceneMsaaMode()) return;
+  if (no_tiling || !SceneMsaaMode(base)) return;
   const uint32_t color = GuestWord(base, kSceneColorMsaa), depth = GuestWord(base, kSceneDepthMsaa);
   if (!device || !color || !depth) return;
   PPCContext call = ctx;
