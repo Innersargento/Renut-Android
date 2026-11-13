@@ -1,5 +1,6 @@
 // Guest textures and samplers.
 #include "gpu/core/internal.h"
+#include "plume/etc2_transcode.h"
 
 namespace renut::gpu {
 
@@ -28,6 +29,24 @@ RenderFormat BcRenderFormat(BcKind kind) {
     case BcKind::kBC5: return RenderFormat::BC5_UNORM;
     default: return RenderFormat::R8G8B8A8_UNORM;
   }
+}
+
+// A level's blocks into the upload ring: as they are, or transcoded to the ETC2/EAC blocks of the same size
+// on a device without BC (etc2_transcode_; the layer makes the image in that format).
+void StageBlocks(const GpuBackend& backend, BcKind kind, uint8_t* staging, const uint8_t* blocks, size_t size) {
+  if (!backend.etc2_transcode_ || kind == BcKind::kNone) {
+    std::memcpy(staging, blocks, size);
+    return;
+  }
+  etc::Source source = etc::Source::kBC1;
+  switch (kind) {
+    case BcKind::kBC2: source = etc::Source::kBC2; break;
+    case BcKind::kBC3: source = etc::Source::kBC3; break;
+    case BcKind::kBC4: source = etc::Source::kBC4; break;
+    case BcKind::kBC5: source = etc::Source::kBC5; break;
+    default: break;
+  }
+  etc::Transcode(source, blocks, staging, size / etc::BlockBytes(source));
 }
 
 // A block-format image keeps the guest's channels, so the fetch constant's swizzle goes in the view (the
@@ -215,7 +234,7 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   // The block format this texture is kept in: its own when the device samples
   // it and the blocks fit, RGBA8 decoded on the CPU otherwise (and always while
   // a texture dump asks for the decoded pixels).
-  const BcKind want = backend.bc_supported_ && backend.swap.bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()
+  const BcKind want = backend.BlockTextures() && backend.swap.bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()
                           ? BcKindFor(fetch.format)
                           : BcKind::kNone;
   // Checked once per frame; the draws after the first reuse the result. A
@@ -354,7 +373,7 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
       }
       const uint64_t staging = backend.streams.Allocate(blocks.size(), 512);
       if (staging == UINT64_MAX) return 0;
-      std::memcpy(backend.draw.Pointer(staging), blocks.data(), blocks.size());
+      StageBlocks(backend, kind, backend.draw.Pointer(staging), blocks.data(), blocks.size());
       // The row is counted in texels and a multiple of the 4-texel block.
       backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
                                RenderTextureCopyLocation::PlacedFootprint(
@@ -545,7 +564,7 @@ uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& f
   GuestTexture& texture = guest_stacks_[key];
   if (texture.failed) return 0;
   BcKind kind = BcKind::kNone;
-  if (shrink == 0 && backend.bc_supported_ && backend.swap.bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()) {
+  if (shrink == 0 && backend.BlockTextures() && backend.swap.bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()) {
     const BcKind want = BcKindFor(fetch.format);
     if (want != BcKind::kNone && ((backend.bc3d_mask_ >> uint32_t(want)) & 1)) kind = want;
   }
@@ -635,7 +654,7 @@ uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& f
     if (kind != BcKind::kNone) {
       const uint64_t staging = backend.streams.Allocate(blocks[i].size(), 512);
       if (staging == UINT64_MAX) return 0;
-      std::memcpy(backend.draw.Pointer(staging), blocks[i].data(), blocks[i].size());
+      StageBlocks(backend, kind, backend.draw.Pointer(staging), blocks[i].data(), blocks[i].size());
       // Slices one after the other, each a whole number of block rows.
       backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), i),
                                RenderTextureCopyLocation::PlacedFootprint(
@@ -752,7 +771,7 @@ uint32_t Textures::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetc
   if (texture.failed) return 0;
   // The guest's own BC blocks when the device samples them (see GetGuestTexture), RGBA8 decoded otherwise.
   BcKind kind = BcKind::kNone;
-  if (backend.bc_supported_ && backend.swap.bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()) {
+  if (backend.BlockTextures() && backend.swap.bc_mode_ && !texture.bc_blocked && texdump_directory_.empty()) {
     kind = BcKindFor(fetch.format);
   }
   if (texture.texture && texture.checked_frame == backend.swaps_ && texdump_directory_.empty() &&
@@ -826,7 +845,7 @@ uint32_t Textures::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetc
     if (kind != BcKind::kNone) {
       const uint64_t staging = backend.streams.Allocate(face_blocks[face].size(), 512);
       if (staging == UINT64_MAX) return 0;
-      std::memcpy(backend.draw.Pointer(staging), face_blocks[face].data(), face_blocks[face].size());
+      StageBlocks(backend, kind, backend.draw.Pointer(staging), face_blocks[face].data(), face_blocks[face].size());
       backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), 0, face),
                                RenderTextureCopyLocation::PlacedFootprint(
                                    backend.draw.upload_.get(), host_format, width, height, 1, ((width + 3) / 4) * 4,

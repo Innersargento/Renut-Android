@@ -160,6 +160,8 @@ struct VulkanLayerState {
   PFN_vkCreateGraphicsPipelines create_graphics = nullptr;
   PFN_vkCreateComputePipelines create_compute = nullptr;
   PFN_vkCreateBuffer create_buffer = nullptr;
+  PFN_vkCreateImage create_image = nullptr;
+  PFN_vkCreateImageView create_image_view = nullptr;
   PFN_vkCreateShaderModule create_shader_module = nullptr;
   PFN_vkDestroyShaderModule destroy_shader_module = nullptr;
   PFN_vkQueueSubmit queue_submit = nullptr;
@@ -182,6 +184,9 @@ struct VulkanLayerState {
   // a set of each draw's own textures (spirv_descriptor_sets.h, GpuBackend::DrawTextureSet).
   std::atomic<bool> per_draw_textures{false};
   std::atomic<uint64_t> per_draw_rewritten{0};
+  // The device samples ETC2 but not BC: images and views of the BC formats are made in the ETC2/EAC format of
+  // the same block size (EtcFormatOfBc), which the textures were transcoded to.
+  std::atomic<bool> bc_as_etc2{false};
   // What the pipeline cache's file name carries for a driver other than Turnip ("-drv<id>"), set with the device.
   std::string cache_tag;
   std::atomic<bool> device_lost{false};
@@ -411,6 +416,7 @@ bool PlumeScaledVertexFormats() { return layer.scaled_vertex.load(std::memory_or
 
 bool PlumeQualcommDriver() { return layer.qualcomm.load(std::memory_order_relaxed); }
 bool PlumePerDrawTextures() { return layer.per_draw_textures.load(std::memory_order_relaxed); }
+void PlumeSetBcAsEtc2(bool on) { layer.bc_as_etc2.store(on, std::memory_order_relaxed); }
 
 PlumePipelineLookupOnly::PlumePipelineLookupOnly() { pipeline_lookup_only = true; }
 PlumePipelineLookupOnly::~PlumePipelineLookupOnly() { pipeline_lookup_only = false; }
@@ -1289,6 +1295,39 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateBuffer(VkDevice device, const VkBuffer
   return layer.create_buffer(device, &edited, allocator, buffer);
 }
 
+// A device that samples ETC2 but not BC (PlumeBcAsEtc2): the BC formats Plume makes images and views of hold
+// the ETC2/EAC blocks of the same size the textures were transcoded to (etc2_transcode.h).
+VkFormat EtcFormatOfBc(VkFormat format) {
+  if (!layer.bc_as_etc2.load(std::memory_order_relaxed)) return format;
+  switch (format) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK;
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return VK_FORMAT_EAC_R11_UNORM_BLOCK;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+    default: return format;
+  }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerCreateImage(VkDevice device, const VkImageCreateInfo* info,
+                                                const VkAllocationCallbacks* allocator, VkImage* image) {
+  const VkFormat format = EtcFormatOfBc(info->format);
+  if (format == info->format) return layer.create_image(device, info, allocator, image);
+  VkImageCreateInfo edited = *info;
+  edited.format = format;
+  return layer.create_image(device, &edited, allocator, image);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LayerCreateImageView(VkDevice device, const VkImageViewCreateInfo* info,
+                                                    const VkAllocationCallbacks* allocator, VkImageView* view) {
+  const VkFormat format = EtcFormatOfBc(info->format);
+  if (format == info->format) return layer.create_image_view(device, info, allocator, view);
+  VkImageViewCreateInfo edited = *info;
+  edited.format = format;
+  return layer.create_image_view(device, &edited, allocator, view);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL LayerQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits,
                                                 VkFence fence) {
   // Plume makes every submit wait for its semaphores at COLOR_ATTACHMENT_OUTPUT.
@@ -1325,6 +1364,10 @@ void InstallVulkanLayer() {
   layer.create_graphics = vkCreateGraphicsPipelines;
   layer.create_compute = vkCreateComputePipelines;
   layer.create_buffer = vkCreateBuffer;
+  layer.create_image = vkCreateImage;
+  layer.create_image_view = vkCreateImageView;
+  vkCreateImage = LayerCreateImage;
+  vkCreateImageView = LayerCreateImageView;
   layer.create_shader_module = vkCreateShaderModule;
   layer.destroy_shader_module = vkDestroyShaderModule;
   layer.queue_submit = vkQueueSubmit;

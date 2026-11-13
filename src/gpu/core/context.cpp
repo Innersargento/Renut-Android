@@ -120,28 +120,46 @@ bool GpuBackend::SetupContext() {
     VkPhysicalDeviceFeatures features{};
     vkGetPhysicalDeviceFeatures(static_cast<VulkanDevice*>(device_)->physicalDevice, &features);
     bc_supported_ = features.textureCompressionBC == VK_TRUE;
+    // A Mali (ARM's vendor id) with no BC but ETC2, the Mali-G52: the BC blocks are transcoded to the
+    // ETC2/EAC blocks of the same size (etc2_transcode.h) and the layer makes the BC images in those formats,
+    // so the textures keep the block path's size instead of four to eight times it in RGBA8. Measured on
+    // that GPU only; every other device without BC keeps the RGBA8 decoder.
+    const bool mali = static_cast<VulkanDevice*>(device_)->physicalDeviceProperties.vendorID == 0x13B5;
+    etc2_transcode_ = mali && !bc_supported_ && features.textureCompressionETC2 == VK_TRUE;
+    PlumeSetBcAsEtc2(etc2_transcode_);
     // A 3D image of a block format is not a given (the stacked textures need one): asked per
     // format, with the usage Plume gives every texture.
-    if (bc_supported_) {
+    if (BlockTextures()) {
       const VkPhysicalDevice physical = static_cast<VulkanDevice*>(device_)->physicalDevice;
-      const VkFormat formats[] = {VK_FORMAT_UNDEFINED,        VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
-                                  VK_FORMAT_BC2_UNORM_BLOCK,  VK_FORMAT_BC3_UNORM_BLOCK,
-                                  VK_FORMAT_BC4_UNORM_BLOCK,  VK_FORMAT_BC5_UNORM_BLOCK};
+      const VkFormat bc_formats[] = {VK_FORMAT_UNDEFINED,        VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+                                     VK_FORMAT_BC2_UNORM_BLOCK,  VK_FORMAT_BC3_UNORM_BLOCK,
+                                     VK_FORMAT_BC4_UNORM_BLOCK,  VK_FORMAT_BC5_UNORM_BLOCK};
+      const VkFormat etc_formats[] = {VK_FORMAT_UNDEFINED,
+                                      VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK,
+                                      VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+                                      VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+                                      VK_FORMAT_EAC_R11_UNORM_BLOCK,
+                                      VK_FORMAT_EAC_R11G11_UNORM_BLOCK};
       for (uint32_t kind = 1; kind < 6; ++kind) {
         VkImageFormatProperties props{};
         const VkResult result = vkGetPhysicalDeviceImageFormatProperties(
-            physical, formats[kind], VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
+            physical, etc2_transcode_ ? etc_formats[kind] : bc_formats[kind], VK_IMAGE_TYPE_3D,
+            VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, &props);
         if (result == VK_SUCCESS && props.maxExtent.depth >= 32) bc3d_mask_ |= 1u << kind;
       }
-      REXLOG_INFO("Renut: Plume BC 3D images (BC1..BC5 mask): {:#x}", bc3d_mask_);
+      REXLOG_INFO("Renut: Plume {} 3D images (BC1..BC5 mask): {:#x}", etc2_transcode_ ? "ETC2/EAC" : "BC",
+                  bc3d_mask_);
     }
     // ARM's vendor id.
     trail_device_default_ = static_cast<VulkanDevice*>(device_)->physicalDeviceProperties.vendorID == 0x13B5;
     swap.trail_ = trail_device_default_;
   }
   swap.bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
-  REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}", bc_supported_ ? "samples BC1-BC5" : "has no BC",
+  REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}",
+              bc_supported_     ? "samples BC1-BC5"
+              : etc2_transcode_ ? "has no BC, transcoded to ETC2/EAC"
+                                : "has no BC",
               swap.bc_mode_ ? "on" : "off");
   texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
   REXLOG_INFO("Renut: Plume texture quality: {}",

@@ -49,6 +49,9 @@ bool PlumeQualcommDriver();
 // a stage): each draw then binds a set of its own textures, and the layer rewrites the recompiled modules for it
 // (spirv_descriptor_sets.h). Known once the renderer has started.
 bool PlumePerDrawTextures();
+// Images and views of the BC formats are made in the ETC2/EAC format of the same block size, for a Mali that
+// samples ETC2 but not BC (the GPU backend transcodes the blocks: etc2_transcode.h). Set before any is made.
+void PlumeSetBcAsEtc2(bool on);
 // While one is alive on a thread, pipeline creation there only looks in the
 // cache: a pipeline that would have to be compiled comes back null at once.
 class PlumePipelineLookupOnly {

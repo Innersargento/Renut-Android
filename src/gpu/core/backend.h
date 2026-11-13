@@ -68,6 +68,11 @@ class GpuBackend final {
   uint32_t max_texture_dim_ = 0;
   // BC textures: the device samples them, and files/plume-bc / the cvar want them.
   bool bc_supported_ = false;
+  // A Mali with no BC but ETC2: the BC blocks are transcoded to ETC2/EAC as they are staged (StageBlocks), and the images
+  // made in those formats (PlumeSetBcAsEtc2).
+  bool etc2_transcode_ = false;
+  // The textures go up as blocks: BC as they are, or transcoded.
+  bool BlockTextures() const { return bc_supported_ || etc2_transcode_; }
   // Bit n (BcKind n): the device makes a 3D image of that block format (the stacked terrain textures).
   uint32_t bc3d_mask_ = 0;
   // 0 full, 1 half, 2 quarter: mips of a mip-filtered 2D texture not kept on the host.
