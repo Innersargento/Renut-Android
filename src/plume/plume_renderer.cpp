@@ -2,6 +2,7 @@
 
 #include "frame_pacing.h"
 #include "plume_vulkan.h"
+#include "plume/shaders/host_shaders.h"
 #include "spirv_descriptor_sets.h"
 #include "spirv_int64.h"
 #include "spirv_position_varying.h"
@@ -41,6 +42,19 @@ void renutSetPlumeVulkanEntry(PFN_vkGetInstanceProcAddr entry);
 REXCVAR_DEFINE_BOOL(renut_plume_vsync, true, "reNut/Plume",
                     "Present through the display's vertical sync (FIFO). Off asks for immediate "
                     "presentation where the driver has it, so frames are not held to the refresh rate");
+
+REXCVAR_DEFINE_BOOL(renut_plume_present_pass, true, "reNut/Plume",
+                    "Show the frame with one render pass on the swapchain image (cleared as the pass begins, the "
+                    "frame drawn as a textured rectangle) instead of a clear and a blit of the whole image. Read "
+                    "at start.");
+REXCVAR_DEFINE_BOOL(renut_plume_present_fit, true, "reNut/Plume",
+                    "Make the swapchain at the size of the game's frame (the screen's shape, the frame's lines) "
+                    "and leave the scaling to the display's compositor, instead of filling a swapchain of the "
+                    "screen's own resolution every frame. Read at start.");
+REXCVAR_DEFINE_BOOL(renut_plume_present_prerotate, true, "reNut/Plume",
+                    "Draw the frame already turned the way the screen is mounted (the swapchain's preTransform is "
+                    "the surface's current one), so the compositor does not turn every frame itself, which on "
+                    "many phones it does with the GPU. Needs renut_plume_present_pass. Read at start.");
 
 namespace renut {
 using namespace plume;
@@ -83,6 +97,62 @@ const char* TransformName(VkSurfaceTransformFlagBitsKHR transform) {
 void Require(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
 }
+
+// What the layer's vkCreateSwapchainKHR makes of the swapchain Plume asks for. Plume asks for the window's size
+// and no pre-transform; the renderer says here, before each resize, what the surface is and what it wants.
+struct SwapchainPlan {
+  // Asked (zero sizes leave Plume's request as it is):
+  VkPhysicalDevice physical = VK_NULL_HANDLE;
+  uint32_t surface_w = 0, surface_h = 0;  // the surface, as the window is held
+  uint32_t frame_w = 0, frame_h = 0;      // the frame the swapchain is made to fit (0: the surface's own size)
+  bool prerotate = false;
+  // Made:
+  VkExtent2D extent{};  // of the images, turned with them
+  VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;  // the preTransform given
+  VkSurfaceTransformFlagBitsKHR current = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;    // the surface's, as it was then
+  VkFormat format = VK_FORMAT_UNDEFINED;
+};
+SwapchainPlan swapchain_plan;
+
+// The render pass that shows a frame (PlumeRenderer::SubmitAndPresent): raw Vulkan, as Plume's passes always
+// load what the image held and a swapchain image is all written here.
+struct PresentPass {
+  bool ready = false;
+  VkDevice device = VK_NULL_HANDLE;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  VkRenderPass pass = VK_NULL_HANDLE;
+  VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkSampler sampler = VK_NULL_HANDLE;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kPlumeFramesInFlight> sets{};
+  // A view and a framebuffer per swapchain image, made at its first present and dropped with the swapchain.
+  struct Image {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+  };
+  std::vector<Image> images;
+
+  void DropImages() {
+    for (Image& image : images) {
+      if (image.framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(device, image.framebuffer, nullptr);
+      if (image.view != VK_NULL_HANDLE) vkDestroyImageView(device, image.view, nullptr);
+    }
+    images.clear();
+  }
+  void Destroy();
+  const Image* ImageFor(VkImage image, VkFormat image_format, VkExtent2D extent);
+};
+
+// The constants of present.vert / present.frag.
+struct PresentConstants {
+  float turn[4];
+  float extent[2];
+  float uv_scale[2];
+  float uv_limit[2];
+};
 }  // namespace
 
 struct PlumeRenderer::State {
@@ -125,12 +195,27 @@ struct PlumeRenderer::State {
   uint32_t logged_extent_w = 0, logged_extent_h = 0;
   // The letterboxed rectangle of the last present, logged when it changes.
   int32_t blit_rect[4] = {-1, -1, -1, -1};
+  // The surface's size as the window is held: the window's own when it was attached, then what Java reports.
+  uint32_t surface_w = 0, surface_h = 0;
+  // The swapchain's images as the layer made them (SwapchainPlan), which is not what Plume believes when the
+  // swapchain is fitted to the frame or turned.
+  VkExtent2D extent{};
+  VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  VkSurfaceTransformFlagBitsKHR surface_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  // renut_plume_present_*: as read at start. `samples` is what the callers of SubmitAndPresent go by.
+  bool fit = false, prerotate = false, samples = false;
+  PresentPass pass;
+  // The frame the swapchain is fitted to, and the other size the last presents showed (the swapchain follows
+  // once it has been shown for a while: the internal resolution option).
+  uint32_t fit_w = 1280, fit_h = 720;
+  uint32_t fit_next_w = 0, fit_next_h = 0, fit_count = 0;
 
   ~State() {
     if (device) {
       vkDeviceWaitIdle(static_cast<VulkanDevice*>(device.get())->vk);
     }
     release.clear();
+    pass.Destroy();
     for (auto& slot : slots) {
       slot.acquire.reset();
       slot.fence.reset();
@@ -196,6 +281,7 @@ struct VulkanLayerState {
   PFN_vkDestroyShaderModule destroy_shader_module = nullptr;
   PFN_vkQueueSubmit queue_submit = nullptr;
   PFN_vkWaitForFences wait_for_fences = nullptr;
+  PFN_vkCreateSwapchainKHR create_swapchain = nullptr;
   bool installed = false;
   bool cache_control = false;               // VK_EXT_pipeline_creation_cache_control is on
   std::atomic<bool> buffer_address{false};  // buffers get the device address usage
@@ -224,6 +310,199 @@ struct VulkanLayerState {
   std::atomic<bool> device_lost{false};
 };
 VulkanLayerState layer;
+
+// The pass, the pipeline and what they need. The shader modules and the pipeline are made by the driver's own
+// entry points: the layer's are for the modules and pipelines of the game's draws.
+bool CreatePresentPass(PresentPass& p, VkDevice device, VkFormat format) {
+  p.device = device;
+  p.format = format;
+  VkAttachmentDescription attachment{};
+  attachment.format = format;
+  attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription subpass{};
+  subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  subpass.colorAttachmentCount = 1;
+  subpass.pColorAttachments = &color;
+  // The image is acquired by the time the submission's semaphore wait ends, which the layer puts at every stage
+  // (LayerQueueSubmit); the frame's texture was written by the command list before this one.
+  VkSubpassDependency dependency{};
+  dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+  dependency.dstSubpass = 0;
+  dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  dependency.srcAccessMask = 0;
+  dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  VkRenderPassCreateInfo pass_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  pass_info.attachmentCount = 1;
+  pass_info.pAttachments = &attachment;
+  pass_info.subpassCount = 1;
+  pass_info.pSubpasses = &subpass;
+  pass_info.dependencyCount = 1;
+  pass_info.pDependencies = &dependency;
+  if (vkCreateRenderPass(device, &pass_info, nullptr, &p.pass) != VK_SUCCESS) return false;
+
+  VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  sampler_info.magFilter = VK_FILTER_LINEAR;
+  sampler_info.minFilter = VK_FILTER_LINEAR;
+  sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.maxAnisotropy = 1.0f;
+  if (vkCreateSampler(device, &sampler_info, nullptr, &p.sampler) != VK_SUCCESS) return false;
+
+  VkDescriptorSetLayoutBinding binding{};
+  binding.binding = 0;
+  binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  binding.descriptorCount = 1;
+  binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  set_info.bindingCount = 1;
+  set_info.pBindings = &binding;
+  if (vkCreateDescriptorSetLayout(device, &set_info, nullptr, &p.set_layout) != VK_SUCCESS) return false;
+  VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PresentConstants)};
+  VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout_info.setLayoutCount = 1;
+  layout_info.pSetLayouts = &p.set_layout;
+  layout_info.pushConstantRangeCount = 1;
+  layout_info.pPushConstantRanges = &range;
+  if (vkCreatePipelineLayout(device, &layout_info, nullptr, &p.layout) != VK_SUCCESS) return false;
+
+  VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kPlumeFramesInFlight};
+  VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pool_info.maxSets = kPlumeFramesInFlight;
+  pool_info.poolSizeCount = 1;
+  pool_info.pPoolSizes = &pool_size;
+  if (vkCreateDescriptorPool(device, &pool_info, nullptr, &p.pool) != VK_SUCCESS) return false;
+  std::array<VkDescriptorSetLayout, kPlumeFramesInFlight> layouts;
+  layouts.fill(p.set_layout);
+  VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  allocate.descriptorPool = p.pool;
+  allocate.descriptorSetCount = kPlumeFramesInFlight;
+  allocate.pSetLayouts = layouts.data();
+  if (vkAllocateDescriptorSets(device, &allocate, p.sets.data()) != VK_SUCCESS) return false;
+
+  const auto create_module = layer.create_shader_module ? layer.create_shader_module : vkCreateShaderModule;
+  const auto destroy_module = layer.destroy_shader_module ? layer.destroy_shader_module : vkDestroyShaderModule;
+  const auto create_pipelines = layer.create_graphics ? layer.create_graphics : vkCreateGraphicsPipelines;
+  VkShaderModule vertex = VK_NULL_HANDLE, fragment = VK_NULL_HANDLE;
+  VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  module_info.codeSize = sizeof(k_present_vert);
+  module_info.pCode = k_present_vert;
+  bool ok = create_module(device, &module_info, nullptr, &vertex) == VK_SUCCESS;
+  module_info.codeSize = sizeof(k_present_frag);
+  module_info.pCode = k_present_frag;
+  ok = ok && create_module(device, &module_info, nullptr, &fragment) == VK_SUCCESS;
+  if (ok) {
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertex;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragment;
+    stages[0].pName = stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blend_attachment;
+    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+    VkGraphicsPipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipeline_info.stageCount = 2;
+    pipeline_info.pStages = stages;
+    pipeline_info.pVertexInputState = &input;
+    pipeline_info.pInputAssemblyState = &assembly;
+    pipeline_info.pViewportState = &viewport;
+    pipeline_info.pRasterizationState = &raster;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pColorBlendState = &blend;
+    pipeline_info.pDynamicState = &dynamic;
+    pipeline_info.layout = p.layout;
+    pipeline_info.renderPass = p.pass;
+    ok = create_pipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &p.pipeline) == VK_SUCCESS &&
+         p.pipeline != VK_NULL_HANDLE;
+  }
+  if (vertex != VK_NULL_HANDLE) destroy_module(device, vertex, nullptr);
+  if (fragment != VK_NULL_HANDLE) destroy_module(device, fragment, nullptr);
+  p.ready = ok;
+  return ok;
+}
+}  // namespace
+
+void PresentPass::Destroy() {
+  ready = false;
+  if (device == VK_NULL_HANDLE) return;
+  DropImages();
+  if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
+  if (pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, pool, nullptr);
+  if (layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, layout, nullptr);
+  if (set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+  if (sampler != VK_NULL_HANDLE) vkDestroySampler(device, sampler, nullptr);
+  if (pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, pass, nullptr);
+  pipeline = VK_NULL_HANDLE;
+  pool = VK_NULL_HANDLE;
+  layout = VK_NULL_HANDLE;
+  set_layout = VK_NULL_HANDLE;
+  sampler = VK_NULL_HANDLE;
+  pass = VK_NULL_HANDLE;
+  device = VK_NULL_HANDLE;
+}
+
+const PresentPass::Image* PresentPass::ImageFor(VkImage image, VkFormat image_format, VkExtent2D extent) {
+  for (const Image& known : images) {
+    if (known.image == image) return &known;
+  }
+  if (!ready || image_format != format || !extent.width || !extent.height) return nullptr;
+  Image made;
+  made.image = image;
+  VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view_info.image = image;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = format;
+  view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  // (the driver's own entry point: the layer's is for the game's textures)
+  const auto create_view = layer.create_image_view ? layer.create_image_view : vkCreateImageView;
+  if (create_view(device, &view_info, nullptr, &made.view) != VK_SUCCESS) return nullptr;
+  VkFramebufferCreateInfo framebuffer_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  framebuffer_info.renderPass = pass;
+  framebuffer_info.attachmentCount = 1;
+  framebuffer_info.pAttachments = &made.view;
+  framebuffer_info.width = extent.width;
+  framebuffer_info.height = extent.height;
+  framebuffer_info.layers = 1;
+  if (vkCreateFramebuffer(device, &framebuffer_info, nullptr, &made.framebuffer) != VK_SUCCESS) {
+    vkDestroyImageView(device, made.view, nullptr);
+    return nullptr;
+  }
+  images.push_back(made);
+  return &images.back();
+}
+
+namespace {
 
 // plume-pipelines.bin -> plume-pipelines.delta.bin
 std::string DeltaPath(const std::string& path) {
@@ -559,9 +838,28 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
       if (f.format == VK_FORMAT_B8G8R8A8_UNORM) s.format = RenderFormat::B8G8R8A8_UNORM;
     }
     Require(s.format != RenderFormat::UNKNOWN, "Plume: superfície sem RGBA8/BGRA8.");
+    // How frames reach the screen (renut_plume_present_*). Without the pass the frame is blitted as before, and
+    // a blit cannot turn it: no pre-rotation then.
+    if (REXCVAR_GET(renut_plume_present_pass)) {
+      const VkFormat present_format =
+          s.format == RenderFormat::R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
+      if (!CreatePresentPass(s.pass, device->vk, present_format)) {
+        REXLOG_WARN("Renut: Plume present pass not made; frames are blitted to the swapchain");
+        s.pass.Destroy();
+      }
+    }
+    s.samples = s.pass.ready;
+    s.fit = REXCVAR_GET(renut_plume_present_fit);
+    s.prerotate = s.pass.ready && REXCVAR_GET(renut_plume_present_prerotate);
+    REXLOG_INFO("Renut: Plume present: {}, swapchain {}, {}",
+                s.pass.ready ? "one render pass" : "clear and blit",
+                s.fit ? "fitted to the frame" : "at the surface's size",
+                s.prerotate ? "turned as the surface is" : "turned by the compositor");
+    s.surface_w = uint32_t(std::max(ANativeWindow_getWidth(window), 0));
+    s.surface_h = uint32_t(std::max(ANativeWindow_getHeight(window), 0));
     s.swap = s.queue->createSwapChain(RenderSwapChainDesc(ToRenderWindow(window), s.format, 3));
     if (s.swap) s.swap->setVsyncEnabled(REXCVAR_GET(renut_plume_vsync));
-    Require(s.swap && s.swap->resize() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
+    Require(s.swap && renderer->ResizeSwapchain() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
     for (auto& slot : s.slots) {
       slot.commands = s.queue->createCommandList();
       slot.fence = s.device->createCommandFence();
@@ -569,7 +867,7 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
       Require(slot.commands && slot.fence && slot.acquire,
               "Plume: falha ao alocar a apresentação.");
     }
-    for (uint32_t i = 0; i < s.swap->getTextureCount(); ++i) {
+    while (s.release.size() < s.swap->getTextureCount()) {
       s.release.push_back(s.device->createCommandSemaphore());
     }
     REXLOG_INFO("Renut: Plume renderer started on {} ({}x{})", s.gpu, s.swap->getWidth(),
@@ -617,7 +915,7 @@ void PlumeRenderer::Present() {
   auto& slot = s.slots[0];
   uint32_t index = 0;
   if (!s.swap->acquireTexture(slot.acquire.get(), &index)) {
-    const bool resized = s.swap->resize();
+    const bool resized = ResizeSwapchain();
     REXLOG_WARN("Renut: Plume acquire failed before the first frame; swapchain resize {} ({}x{})",
                 resized ? "ok" : "FAILED", s.swap->getWidth(), s.swap->getHeight());
     return;
@@ -661,6 +959,56 @@ void PlumeRenderer::WaitForAllSlots() {
   for (uint32_t i = 0; i < kPlumeFramesInFlight; ++i) WaitForSlot(i);
 }
 
+bool PlumeRenderer::PresentSamples() const { return state_->samples; }
+
+// Every swapchain is made here (under swap_mutex): the layer is told what to make of Plume's request, the
+// views and framebuffers of the old images go, and what was made is read back.
+bool PlumeRenderer::ResizeSwapchain() {
+  auto& s = *state_;
+  if (!s.swap) return false;
+  // What the frames in flight draw into goes with the old swapchain.
+  WaitForAllSlots();
+  s.pass.DropImages();
+  // A frame was turned for a swapchain the pass can no longer draw into: the compositor turns them again.
+  if (!s.pass.ready) s.prerotate = false;
+  SwapchainPlan& plan = swapchain_plan;
+  const bool planned = (s.fit || s.prerotate) && s.surface_w && s.surface_h;
+  plan.physical = static_cast<VulkanDevice*>(s.device.get())->physicalDevice;
+  plan.surface_w = planned ? s.surface_w : 0;
+  plan.surface_h = planned ? s.surface_h : 0;
+  plan.frame_w = s.fit ? s.fit_w : 0;
+  plan.frame_h = s.fit ? s.fit_h : 0;
+  plan.prerotate = s.prerotate;
+  plan.extent = {};
+  // Plume sizes its request from the window, which answers the size its buffers were last given (the fitted
+  // or turned one): it is given the surface's own again, so that what Plume calls the swapchain's size stays
+  // the surface's (FollowSurfaceSize compares the two).
+  if (planned && s.window &&
+      (uint32_t(ANativeWindow_getWidth(s.window)) != s.surface_w ||
+       uint32_t(ANativeWindow_getHeight(s.window)) != s.surface_h)) {
+    ANativeWindow_setBuffersGeometry(s.window, int32_t(s.surface_w), int32_t(s.surface_h), 0);
+  }
+  const bool resized = s.swap->resize();
+  while (resized && s.release.size() < s.swap->getTextureCount()) {
+    s.release.push_back(s.device->createCommandSemaphore());
+  }
+  if (resized && plan.extent.width && plan.extent.height) {
+    s.extent = plan.extent;
+    s.transform = plan.transform;
+    s.surface_transform = plan.current;
+  } else if (resized) {
+    s.extent = {s.swap->getWidth(), s.swap->getHeight()};
+    s.transform = s.surface_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  }
+  s.blit_rect[0] = -1;
+  if (resized) {
+    REXLOG_INFO("Renut: Plume swapchain images {}x{}, pre-transform {} (surface {}x{}, fitted to {}x{})",
+                s.extent.width, s.extent.height, TransformName(s.transform), s.surface_w, s.surface_h,
+                plan.frame_w, plan.frame_h);
+  }
+  return resized;
+}
+
 void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* source,
                                      uint32_t width, uint32_t height, uint32_t slot_index) {
   auto& s = *state_;
@@ -688,10 +1036,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
       // The images in flight go before the swapchain is replaced under them.
       WaitForAllSlots();
       chain->requiredPresentMode = want;
-      if (chain->resize()) {
-        while (s.release.size() < s.swap->getTextureCount()) {
-          s.release.push_back(s.device->createCommandSemaphore());
-        }
+      if (ResizeSwapchain()) {
         REXLOG_INFO("Renut: Plume presents {} (target {} FPS)",
                     want == VK_PRESENT_MODE_FIFO_KHR      ? "on the vertical sync"
                     : want == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox"
@@ -705,6 +1050,29 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
     }
   }
   if (s.swap) FollowSurfaceSize();
+  if (s.swap && s.fit) {
+    // The swapchain is fitted to the frame's size; a frame of another size (the internal resolution option)
+    // is followed once it has been shown for half a second or so, not at the first one.
+    if (source && width && height && (width != s.fit_w || height != s.fit_h)) {
+      if (width != s.fit_next_w || height != s.fit_next_h) {
+        s.fit_next_w = width;
+        s.fit_next_h = height;
+        s.fit_count = 0;
+      }
+      if (++s.fit_count >= 30) {
+        REXLOG_INFO("Renut: Plume frames are {}x{} now (the swapchain was fitted to {}x{}): recreating it", width,
+                    height, s.fit_w, s.fit_h);
+        s.fit_w = width;
+        s.fit_h = height;
+        s.fit_count = 0;
+        ResizeSwapchain();
+      }
+    } else {
+      s.fit_count = 0;
+    }
+  }
+  // The pass was lost (a framebuffer the driver would not make) under a turned swapchain: a blit cannot turn.
+  if (s.swap && !s.pass.ready && s.transform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ResizeSwapchain();
   auto& slot = s.slots[slot_index % kPlumeFramesInFlight];
   // The caller waits before it reuses a slot, so this one is free by now.
   WaitForSlot(slot_index);
@@ -724,10 +1092,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
       REXLOG_WARN("Renut: Plume acquire failed (frame {}) on a dead surface ({}x{}); no resize", s.frames.load(),
                   s.window ? ANativeWindow_getWidth(s.window) : -1, s.window ? ANativeWindow_getHeight(s.window) : -1);
     } else if (s.swap) {
-      const bool resized = s.swap->resize();
-      while (resized && s.release.size() < s.swap->getTextureCount()) {
-        s.release.push_back(s.device->createCommandSemaphore());
-      }
+      const bool resized = ResizeSwapchain();
       REXLOG_WARN("Renut: Plume acquire failed (frame {}); swapchain resize {} ({}x{}, {} images)",
                   s.frames.load(), resized ? "ok" : "FAILED", s.swap->getWidth(), s.swap->getHeight(),
                   s.swap->getTextureCount());
@@ -739,44 +1104,141 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
   }
   auto* target = s.swap->getTexture(index);
   slot.commands->begin();
-  slot.commands->barriers(RenderBarrierStage::COPY,
-                          RenderTextureBarrier(target, RenderTextureLayout::COPY_DEST));
   VkCommandBuffer cb = static_cast<VulkanCommandList*>(slot.commands.get())->vk;
   VkImage dst = static_cast<VulkanTexture*>(target)->vk;
-  VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   // Black around a letterboxed frame; the game's last clear colour otherwise.
   VkClearColorValue background{};
   if (!source) {
     std::lock_guard lock(s.color_mutex);
     for (int i = 0; i < 4; ++i) background.float32[i] = s.clear_color[i];
   }
-  vkCmdClearColorImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &background, 1, &range);
+  // The images as they were made (the layer may have fitted and turned them), and the picture as the player
+  // sees it: a quarter turn swaps its sides.
+  const VkExtent2D extent =
+      s.extent.width && s.extent.height ? s.extent : VkExtent2D{s.swap->getWidth(), s.swap->getHeight()};
+  const bool sideways = s.transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+                        s.transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
+  // Letterbox: keep the guest's aspect ratio inside the picture.
+  const float sw = float(sideways ? extent.height : extent.width);
+  const float sh = float(sideways ? extent.width : extent.height);
+  int32_t x = 0, y = 0, w = 0, h = 0;
   if (source && width && height) {
-    // Letterbox: keep the guest's aspect ratio inside the swapchain.
-    const float sw = float(s.swap->getWidth()), sh = float(s.swap->getHeight());
     const float scale = std::min(sw / float(width), sh / float(height));
-    const int32_t w = int32_t(float(width) * scale), h = int32_t(float(height) * scale);
-    const int32_t x = (int32_t(sw) - w) / 2, y = (int32_t(sh) - h) / 2;
+    w = int32_t(float(width) * scale), h = int32_t(float(height) * scale);
+    x = (int32_t(sw) - w) / 2, y = (int32_t(sh) - h) / 2;
     if (s.blit_rect[0] != x || s.blit_rect[1] != y || s.blit_rect[2] != w || s.blit_rect[3] != h) {
-      REXLOG_INFO("Renut: Plume shows the {}x{} frame at {}x{}+{}+{} of the {}x{} swapchain (frame {})", width,
-                  height, w, h, x, y, uint32_t(sw), uint32_t(sh), s.frames.load());
+      REXLOG_INFO("Renut: Plume shows the {}x{} frame at {}x{}+{}+{} of the {}x{} picture (images {}x{}, {}; "
+                  "frame {})",
+                  width, height, w, h, x, y, uint32_t(sw), uint32_t(sh), extent.width, extent.height,
+                  TransformName(s.transform), s.frames.load());
       s.blit_rect[0] = x;
       s.blit_rect[1] = y;
       s.blit_rect[2] = w;
       s.blit_rect[3] = h;
     }
-    VkImageBlit blit{};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
-    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.dstOffsets[0] = {x, y, 0};
-    blit.dstOffsets[1] = {x + w, y + h, 1};
-    vkCmdBlitImage(cb, static_cast<VulkanTexture*>(source)->vk,
-                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   1, &blit, VK_FILTER_LINEAR);
   }
-  slot.commands->barriers(RenderBarrierStage::NONE,
-                          RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
+  const auto* chain = static_cast<VulkanSwapChain*>(s.swap.get());
+  const PresentPass::Image* image =
+      s.pass.ready ? s.pass.ImageFor(dst, chain->pickedSurfaceFormat.format, extent) : nullptr;
+  if (s.pass.ready && !image) {
+    REXLOG_ERROR("Renut: Plume present pass: no framebuffer for a {}x{} swapchain image (format {}, pass {}); "
+                 "frames are blitted from now on",
+                 extent.width, extent.height, int(chain->pickedSurfaceFormat.format), int(s.pass.format));
+    s.pass.ready = false;
+  }
+  if (image) {
+    // One pass: the image is cleared as the pass begins (in the tiles, not by a fill of its own) and the frame
+    // is a rectangle sampled from its texture, which the caller left in SHADER_READ.
+    auto* texture = static_cast<VulkanTexture*>(source);
+    const bool draw = texture && texture->imageView != VK_NULL_HANDLE && w > 0 && h > 0;
+    const VkDescriptorSet set = s.pass.sets[slot_index % kPlumeFramesInFlight];
+    if (draw) {
+      VkDescriptorImageInfo sampled{s.pass.sampler, texture->imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+      VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      write.dstSet = set;
+      write.dstBinding = 0;
+      write.descriptorCount = 1;
+      write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      write.pImageInfo = &sampled;
+      vkUpdateDescriptorSets(s.pass.device, 1, &write, 0, nullptr);
+    }
+    VkClearValue clear{};
+    clear.color = background;
+    VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    begin.renderPass = s.pass.pass;
+    begin.framebuffer = image->framebuffer;
+    begin.renderArea = {{0, 0}, extent};
+    begin.clearValueCount = 1;
+    begin.pClearValues = &clear;
+    vkCmdBeginRenderPass(cb, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    if (draw) {
+      const float texture_w = float(std::max<uint32_t>(uint32_t(texture->desc.width), 1u));
+      const float texture_h = float(std::max<uint32_t>(uint32_t(texture->desc.height), 1u));
+      PresentConstants constants{};
+      // The picture is turned against the turn the compositor leaves out: a point (x, y) of it, y down, goes to
+      // (-y, x) under "rotate 90", (-x, -y) under 180 and (y, -x) under 270. By columns.
+      switch (s.transform) {
+        case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+          constants.turn[1] = 1.f, constants.turn[2] = -1.f;
+          break;
+        case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+          constants.turn[0] = -1.f, constants.turn[3] = -1.f;
+          break;
+        case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+          constants.turn[1] = -1.f, constants.turn[2] = 1.f;
+          break;
+        default:
+          constants.turn[0] = 1.f, constants.turn[3] = 1.f;
+          break;
+      }
+      constants.extent[0] = float(w) / sw;
+      constants.extent[1] = float(h) / sh;
+      constants.uv_scale[0] = float(width) / texture_w;
+      constants.uv_scale[1] = float(height) / texture_h;
+      constants.uv_limit[0] = (float(width) - 0.5f) / texture_w;
+      constants.uv_limit[1] = (float(height) - 0.5f) / texture_h;
+      const VkViewport viewport{0.f, 0.f, float(extent.width), float(extent.height), 0.f, 1.f};
+      const VkRect2D scissor{{0, 0}, extent};
+      vkCmdSetViewport(cb, 0, 1, &viewport);
+      vkCmdSetScissor(cb, 0, 1, &scissor);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pass.pipeline);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pass.layout, 0, 1, &set, 0, nullptr);
+      vkCmdPushConstants(cb, s.pass.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                         sizeof(constants), &constants);
+      vkCmdDraw(cb, 4, 1, 0, 0);
+    }
+    vkCmdEndRenderPass(cb);
+    // The pass left the image ready to present; Plume, whose barriers go by what it last set, is told.
+    static_cast<VulkanTexture*>(target)->textureLayout = RenderTextureLayout::PRESENT;
+  } else {
+    slot.commands->barriers(RenderBarrierStage::COPY,
+                            RenderTextureBarrier(target, RenderTextureLayout::COPY_DEST));
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &background, 1, &range);
+    if (source && w > 0 && h > 0) {
+      // The caller left the texture to be sampled (PresentSamples) and the pass was lost since: the blit takes
+      // it as a copy source and gives it back.
+      if (s.samples) {
+        slot.commands->barriers(RenderBarrierStage::COPY,
+                                RenderTextureBarrier(source, RenderTextureLayout::COPY_SOURCE));
+      }
+      VkImageBlit blit{};
+      blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
+      blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      blit.dstOffsets[0] = {x, y, 0};
+      blit.dstOffsets[1] = {x + w, y + h, 1};
+      vkCmdBlitImage(cb, static_cast<VulkanTexture*>(source)->vk,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     1, &blit, VK_FILTER_LINEAR);
+      if (s.samples) {
+        slot.commands->barriers(RenderBarrierStage::GRAPHICS,
+                                RenderTextureBarrier(source, RenderTextureLayout::SHADER_READ));
+      }
+    }
+    slot.commands->barriers(RenderBarrierStage::NONE,
+                            RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
+  }
   slot.commands->end();
   const RenderCommandList* lists[] = {frame, slot.commands.get()};
   auto* wait = slot.acquire.get();
@@ -828,15 +1290,16 @@ bool PlumeRenderer::AttachWindow(PlumeWindow* window) {
     WaitForAllSlots();
     vkDeviceWaitIdle(static_cast<VulkanDevice*>(s.device.get())->vk);
     s.release.clear();
+    s.pass.DropImages();
     s.swap.reset();
     if (s.window) ReleaseWindow(s.window);
     s.window = window;
+    // The new surface's size is the window's until Java reports one for it (FollowSurfaceSize).
+    s.surface_w = uint32_t(std::max(ANativeWindow_getWidth(window), 0));
+    s.surface_h = uint32_t(std::max(ANativeWindow_getHeight(window), 0));
     s.swap = s.queue->createSwapChain(RenderSwapChainDesc(ToRenderWindow(window), s.format, 3));
     if (s.swap) s.swap->setVsyncEnabled(REXCVAR_GET(renut_plume_vsync));
-    Require(s.swap && s.swap->resize() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
-    for (uint32_t i = 0; i < s.swap->getTextureCount(); ++i) {
-      s.release.push_back(s.device->createCommandSemaphore());
-    }
+    Require(s.swap && ResizeSwapchain() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
     REXLOG_INFO("Renut: Plume swapchain recreated ({}x{})", s.swap->getWidth(), s.swap->getHeight());
     // A new surface: whatever Java said about the old one no longer counts, and the next
     // size it reports for this one is taken again even if it equals an earlier one.
@@ -888,7 +1351,8 @@ void PlumeRenderer::LogSurface(const char* when) {
     return;
   }
   // The extent is the window's own shape (the Mali reports 1920x1200 under "rotate 90" on a
-  // tablet held in landscape): the compositor turns the images after, as preTransform is identity.
+  // tablet held in landscape): the compositor turns the images after when preTransform is identity, and the
+  // images are made turned when it is the surface's (renut_plume_present_prerotate, ResizeSwapchain).
   REXLOG_INFO("Renut: Plume surface ({}): currentExtent {}x{}, extent {}x{}..{}x{}, transform {} "
               "(supported {:#x}), images {}..{}",
               when, caps.currentExtent.width, caps.currentExtent.height, caps.minImageExtent.width, caps.minImageExtent.height, caps.maxImageExtent.width,
@@ -917,7 +1381,10 @@ void PlumeRenderer::FollowSurfaceSize() {
                   static_cast<const void*>(s.window));
     } else if (!width || !height) {
       REXLOG_WARN("Renut: Plume ignores an empty surface size {}x{}", width, height);
-    } else if (width == s.swap->getWidth() && height == s.swap->getHeight()) {
+    } else if (width == s.swap->getWidth() && height == s.swap->getHeight() &&
+               (!(s.fit || s.prerotate) || (width == s.surface_w && height == s.surface_h))) {
+      s.surface_w = width;
+      s.surface_h = height;
       REXLOG_INFO("Renut: Plume swapchain already {}x{}, as the surface (frame {})", width, height, s.frames.load());
     } else {
       REXLOG_WARN("Renut: Plume swapchain is {}x{} but the surface is now {}x{} (frame {}): recreating it",
@@ -932,10 +1399,9 @@ void PlumeRenderer::FollowSurfaceSize() {
         REXLOG_INFO("Renut: Plume window said {}x{}; buffers set to {}x{} (result {}, now {}x{})", window_w, window_h,
                     width, height, set, ANativeWindow_getWidth(s.window), ANativeWindow_getHeight(s.window));
       }
-      const bool resized = s.swap->resize();
-      while (resized && s.release.size() < s.swap->getTextureCount()) {
-        s.release.push_back(s.device->createCommandSemaphore());
-      }
+      s.surface_w = width;
+      s.surface_h = height;
+      const bool resized = ResizeSwapchain();
       if (resized && s.swap->getWidth() == width && s.swap->getHeight() == height) {
         REXLOG_INFO("Renut: Plume swapchain recreated at {}x{} ({} images)", s.swap->getWidth(), s.swap->getHeight(),
                     s.swap->getTextureCount());
@@ -950,7 +1416,7 @@ void PlumeRenderer::FollowSurfaceSize() {
   }
   // Now and then, ask the surface itself too and log once each size that disagrees with
   // the swapchain, in case a change ever arrives without Java seeing it.
-  if (++s.presents_since_check < 300) return;
+  if (++s.presents_since_check < 120) return;
   s.presents_since_check = 0;
   auto* chain = static_cast<VulkanSwapChain*>(s.swap.get());
   VkSurfaceCapabilitiesKHR caps{};
@@ -959,6 +1425,19 @@ void PlumeRenderer::FollowSurfaceSize() {
       caps.currentExtent.width == UINT32_MAX) {
     return;
   }
+  // The phone was turned upside down: the surface keeps its size, so Java reports nothing, and only its
+  // transform says it. The frames are turned the new way from the next swapchain on (until then the compositor
+  // makes up the difference).
+  if (s.prerotate && caps.currentTransform != s.surface_transform) {
+    REXLOG_INFO("Renut: Plume surface transform is {} now (the swapchain was made under {}): recreating it",
+                TransformName(caps.currentTransform), TransformName(s.surface_transform));
+    ResizeSwapchain();
+    // (whatever was made, this transform has been answered: one try each time it changes)
+    s.surface_transform = caps.currentTransform;
+    return;
+  }
+  // (a fitted or turned swapchain makes the window answer its images' size)
+  if (caps.currentExtent.width == s.extent.width && caps.currentExtent.height == s.extent.height) return;
   const uint32_t sw = s.swap->getWidth(), sh = s.swap->getHeight();
   if (caps.currentExtent.width == sw && caps.currentExtent.height == sh) {
     s.logged_extent_w = s.logged_extent_h = 0;
@@ -1533,6 +2012,75 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerQueueSubmit(VkQueue queue, uint32_t count, c
   return result;
 }
 
+// Plume asks for a swapchain of the window's size that the compositor turns. What the renderer planned instead
+// (SwapchainPlan): images of the frame's size in the surface's shape, which the compositor scales, and already
+// turned the way the surface is, which leaves it nothing to turn.
+VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+                                                    const VkAllocationCallbacks* allocator,
+                                                    VkSwapchainKHR* swapchain) {
+  SwapchainPlan& plan = swapchain_plan;
+  VkSwapchainCreateInfoKHR edited = *info;
+  VkSurfaceTransformFlagBitsKHR current = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  if (plan.surface_w && plan.surface_h) {
+    uint32_t w = plan.surface_w, h = plan.surface_h;
+    if (plan.frame_w && plan.frame_h) {
+      // The frame is letterboxed into the surface's shape; the images are made smaller until it fills them
+      // one texel to one, never larger than the surface.
+      if (uint64_t(w) * plan.frame_h <= uint64_t(h) * plan.frame_w) {
+        if (w > plan.frame_w) {
+          h = uint32_t((uint64_t(h) * plan.frame_w + w / 2) / w);
+          w = plan.frame_w;
+        }
+      } else if (h > plan.frame_h) {
+        w = uint32_t((uint64_t(w) * plan.frame_h + h / 2) / h);
+        h = plan.frame_h;
+      }
+    }
+    VkSurfaceCapabilitiesKHR caps{};
+    const bool known = plan.physical != VK_NULL_HANDLE &&
+                       vkGetPhysicalDeviceSurfaceCapabilitiesKHR(plan.physical, info->surface, &caps) == VK_SUCCESS;
+    VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    if (known) current = caps.currentTransform;
+    if (plan.prerotate && known && (caps.supportedTransforms & caps.currentTransform)) {
+      switch (caps.currentTransform) {
+        case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+        case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+          std::swap(w, h);
+          transform = caps.currentTransform;
+          break;
+        case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+          transform = caps.currentTransform;
+          break;
+        default:
+          break;  // identity, or a mirrored one the pass does not draw: left to the compositor
+      }
+    }
+    if (known) {
+      w = std::clamp(w, caps.minImageExtent.width, std::max(caps.minImageExtent.width, caps.maxImageExtent.width));
+      h = std::clamp(h, caps.minImageExtent.height, std::max(caps.minImageExtent.height, caps.maxImageExtent.height));
+    }
+    edited.imageExtent = {std::max(w, 1u), std::max(h, 1u)};
+    edited.preTransform = transform;
+  }
+  VkResult result = layer.create_swapchain(device, &edited, allocator, swapchain);
+  if (result != VK_SUCCESS && (edited.imageExtent.width != info->imageExtent.width ||
+                               edited.imageExtent.height != info->imageExtent.height ||
+                               edited.preTransform != info->preTransform)) {
+    // The driver would not make it as planned: as Plume asked, then, which is what it always made.
+    REXLOG_WARN("Renut: Plume swapchain {}x{} with pre-transform {} refused ({}); made as the window is instead",
+                edited.imageExtent.width, edited.imageExtent.height, TransformName(edited.preTransform), int(result));
+    edited = *info;
+    result = layer.create_swapchain(device, &edited, allocator, swapchain);
+  }
+  if (result == VK_SUCCESS) {
+    plan.extent = edited.imageExtent;
+    plan.transform = edited.preTransform;
+    plan.current = current;
+    plan.format = edited.imageFormat;
+  }
+  return result;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL LayerWaitForFences(VkDevice device, uint32_t count, const VkFence* fences,
                                                   VkBool32 wait_all, uint64_t timeout) {
   const VkResult result = layer.wait_for_fences(device, count, fences, wait_all, timeout);
@@ -1557,6 +2105,10 @@ void InstallVulkanLayer() {
   layer.destroy_shader_module = vkDestroyShaderModule;
   layer.queue_submit = vkQueueSubmit;
   layer.wait_for_fences = vkWaitForFences;
+  if (vkCreateSwapchainKHR) {
+    layer.create_swapchain = vkCreateSwapchainKHR;
+    vkCreateSwapchainKHR = LayerCreateSwapchain;
+  }
   vkCreateDevice = LayerCreateDevice;
   vkCreateGraphicsPipelines = LayerCreateGraphicsPipelines;
   vkCreateComputePipelines = LayerCreateComputePipelines;

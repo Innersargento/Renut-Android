@@ -87,15 +87,18 @@ class PlumeRenderer {
   plume::RenderDevice* device() const;
   plume::RenderCommandQueue* queue() const;
 
-  // Executes `frame` (already ended), then scales `source` (in COPY_SOURCE
-  // layout after `frame`; width x height of it is shown) onto the swapchain and
-  // presents, in one submission on `slot`'s resources. `source` null presents
-  // the clear colour.
+  // Executes `frame` (already ended), then scales `source` (width x height of it
+  // is shown; in SHADER_READ layout after `frame` when PresentSamples(), in
+  // COPY_SOURCE otherwise) onto the swapchain and presents, in one submission on
+  // `slot`'s resources. `source` null presents the clear colour.
   //
   // Returns as soon as the work is queued: what `frame` used stays in use until
   // WaitForSlot(slot) returns, and the caller owns that wait.
   void SubmitAndPresent(plume::RenderCommandList* frame, plume::RenderTexture* source,
                         uint32_t width, uint32_t height, uint32_t slot);
+  // Whether the frame is sampled by a render pass on the swapchain image (renut_plume_present_pass) instead
+  // of blitted: the layout SubmitAndPresent's `source` is to be left in. Fixed once the renderer has started.
+  bool PresentSamples() const;
   // Waits for whatever SubmitAndPresent left running on `slot`, if anything.
   void WaitForSlot(uint32_t slot);
   // Waits for every slot. For teardown and the ring's overflow path.
@@ -129,6 +132,8 @@ class PlumeRenderer {
   // Under swap_mutex: recreates the swapchain when the surface's size moved away from it,
   // and logs what the window, the surface and the swapchain say.
   void FollowSurfaceSize();
+  // Under swap_mutex: makes the swapchain again (every resize goes through it) as the present options ask.
+  bool ResizeSwapchain();
   void LogSurface(const char* when);
   struct State;
   std::unique_ptr<State> state_;

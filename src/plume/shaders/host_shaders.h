@@ -10,5 +10,7 @@ extern const uint32_t k_patch_expand_comp[2492];  // patch_expand.comp
 extern const uint32_t k_patch_levels_comp[1774];  // patch_levels.comp
 extern const uint32_t k_point_list_geom[1624];  // point_list.geom
 extern const uint32_t k_point_list_position_geom[1558];  // point_list_position.geom
+extern const uint32_t k_present_frag[216];  // present.frag
+extern const uint32_t k_present_vert[350];  // present.vert
 extern const uint32_t k_rect_list_geom[3171];  // rect_list.geom
 extern const uint32_t k_rect_list_position_geom[3096];  // rect_list_position.geom

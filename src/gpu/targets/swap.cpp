@@ -57,10 +57,14 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   // COPY_SOURCE below, which is a transition of its own.
   backend.resolve.FlushImagesForNextFrame();
   RenderTexture* source = nullptr;
+  // The renderer samples the frame in a pass of its own (it is in SHADER_READ already, from the flush above:
+  // no barrier), or blits it from a copy source.
+  const RenderTextureLayout present_layout =
+      renderer && renderer->PresentSamples() ? RenderTextureLayout::SHADER_READ : RenderTextureLayout::COPY_SOURCE;
   Resolved* found = backend.draw.FindResolved(frontbuffer_ptr);
   if (found && found->texture) {
     Resolved& r = *found;
-    backend.targets.Transition(r.texture.get(), r.layout, RenderTextureLayout::COPY_SOURCE);
+    backend.targets.Transition(r.texture.get(), r.layout, present_layout);
     source = r.texture.get();
     frontbuffer_width = std::min(frontbuffer_width, r.width);
     frontbuffer_height = std::min(frontbuffer_height, r.height);
@@ -81,6 +85,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         snap_dump = true;
       }
     }
+    backend.targets.Transition(backend.resolve.snap_.get(), backend.resolve.snap_layout_, present_layout);
   }
   snap_taken_ = false;
   snap_seen_ = 0;
