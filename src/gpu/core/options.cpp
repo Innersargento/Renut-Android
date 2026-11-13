@@ -49,6 +49,12 @@ REXCVAR_DEFINE_INT32(renut_plume_low_memory, -1, "reNut/Plume",
 REXCVAR_DEFINE_INT32(renut_plume_texture_max_dim, 0, "reNut/Plume",
                      "Largest side a guest texture keeps on the host; the top mips of a larger one are dropped. "
                      "0 follows low-memory mode (512 there, no limit otherwise).");
+REXCVAR_DEFINE_INT32(renut_plume_mali_rebase_indices, 1, "reNut/Plume",
+                     "ARM's Mali driver gives a vertex shader the wrong vertex index in an indexed draw whose "
+                     "smallest index is not zero, and the meshes a shader fetches by that index come out "
+                     "stretched or black. Such a draw's indices are sent less their smallest, which becomes the "
+                     "draw's vertex offset: 0 off, 1 for the shaders that fetch by themselves, 2 for every "
+                     "indexed draw. No effect on other drivers.");
 REXCVAR_DEFINE_INT32(renut_plume_bc_textures, 1, "reNut/Plume",
                      "Upload the guest's DXT1/2/3/4/5, DXT5A and DXN 2D textures as the BC1-BC5 blocks they "
                      "already are (a quarter to an eighth of the RGBA8 the decoder makes, no CPU decode) on a GPU "

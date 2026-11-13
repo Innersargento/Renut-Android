@@ -266,6 +266,14 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     // is compiled again at the next launch, which is what holds the loading screens.
     SavePlumePipelineCache();
     backend.no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
+    if (const uint32_t rebase =
+            PlumeArmDriver() ? uint32_t(std::clamp(REXCVAR_GET(renut_plume_mali_rebase_indices), 0, 2)) : 0u;
+        rebase != rebase_indices_) {
+      rebase_indices_ = rebase;
+      REXLOG_INFO("Renut: Plume indices sent from zero, the smallest in the vertex offset: {}",
+                  rebase == 0 ? "off" : rebase == 1 ? "the draws of shaders that fetch by the vertex index"
+                                                    : "every indexed draw");
+    }
     {
       const bool callers = REXCVAR_GET(renut_plume_draw_callers);
       backend.draw.caller_trace_ = callers;

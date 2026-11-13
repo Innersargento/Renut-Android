@@ -1779,15 +1779,20 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       vertex_count = 0;
     }
   }
+  uint32_t index_rebase = 0;
   if (indexed) {
     const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
     index_format = is32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT;
     const uint32_t size = index_count * (is32 ? 4 : 2);
+    // ARM's driver (swap.rebase_indices_): the indices are read back too, to be sent from zero.
+    const bool rebase = !quad_list && !patch_list &&
+                        (backend.swap.rebase_indices_ == 2 ||
+                         (backend.swap.rebase_indices_ == 1 && !vs->live_fetches.empty()));
     // A quad list's indices are read back here to be split into triangles,
     // so they stay in the ring.
     backend.streams.stream_object_ = backend.lists.native_indices_;
     const bool uploaded =
-        quad_list ? backend.streams.UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)
+        quad_list || rebase ? backend.streams.UploadGuest(index_buffer_info->guest_base, size, index_buffer_info->endianness, index_offset)
                   : backend.streams.GuestStream(index_buffer_info->guest_base, size, index_buffer_info->endianness,
                                 index_buffer, index_offset);
     backend.streams.stream_object_ = {};
@@ -1797,6 +1802,34 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                     index_buffer_info->endianness);
     }
     index_bytes = size;
+    // The indices less their smallest, which goes into the draw's vertex offset instead: the same vertices
+    // and the same gl_VertexIndex by the specification, with a smallest index of zero for the driver. With
+    // another smallest index the Mali-G52's (r34p0) hands the shader an index that is not the vertex's, and
+    // a shader that fetches its vertices by it (vfetchLive: most of the attic of the Single Player menu,
+    // Banjo) read past its stream - whatever lay after it in the ring or in the kept buffer, so the picture
+    // changed with where the buffers happened to lie (black, blue noise, stretched surfaces). How the index
+    // is wrong was not measured; that a smallest index of zero puts it right was (tablet, 2026-11-13).
+    if (rebase) {
+      const uint32_t restart = is32 ? 0xFFFFFFFFu : 0xFFFFu;
+      std::vector<uint32_t> values(index_count);
+      uint32_t least = UINT32_MAX;
+      for (uint32_t i = 0; i < index_count; ++i) {
+        values[i] = is32 ? reinterpret_cast<const uint32_t*>(Pointer(index_offset))[i]
+                         : reinterpret_cast<const uint16_t*>(Pointer(index_offset))[i];
+        if (values[i] != restart) least = std::min(least, values[i]);
+      }
+      if (least != UINT32_MAX && least != 0) {
+        const uint64_t rebased = backend.streams.Allocate(size, 256);
+        if (rebased == UINT64_MAX) return backend.shaders.Drop("upload full", vs, ps);
+        for (uint32_t i = 0; i < index_count; ++i) {
+          const uint32_t value = values[i] == restart ? restart : values[i] - least;
+          if (is32) reinterpret_cast<uint32_t*>(Pointer(rebased))[i] = value;
+          else reinterpret_cast<uint16_t*>(Pointer(rebased))[i] = uint16_t(value);
+        }
+        index_offset = rebased;
+        index_rebase = least;
+      }
+    }
   }
   if (quad_list) {
     // Two triangles per quad, as 32-bit indices.
@@ -1924,7 +1957,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     draw_slots_.push_back(entry);
   }
   pk.slot_count = uint32_t(draw_slots_.size());
-  const int32_t base_vertex = int32_t(regs.base_vertex);
+  const int32_t base_vertex = int32_t(regs.base_vertex) + int32_t(index_rebase);
   if (trace_ && index_buffer == upload_.get()) {
     uint32_t lo = UINT32_MAX, hi = 0;
     for (uint32_t i = 0; i < vertex_count; ++i) {

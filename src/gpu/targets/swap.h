@@ -15,6 +15,11 @@ struct Swap {
   uint32_t bc_mode_ = 1;
   // Debug: <files>/plume-no-persist sends every stream through the ring again.
   bool keep_streams_ = true;
+  // ARM's driver hands a vertex shader the wrong vertex index in an indexed draw whose smallest index is not
+  // zero: such a draw's indices are sent less the smallest, which goes into the vertex offset (IssueDraw).
+  // 0 never, 1 the draws of a shader that fetches by itself (the ones that read the index), 2 every indexed
+  // draw. renut_plume_mali_rebase_indices on that driver, 0 elsewhere.
+  uint32_t rebase_indices_ = 0;
   bool depth_alias_ = true;
   static constexpr bool key_reuse_ = true;
   std::vector<TracedStream> traced_streams_;

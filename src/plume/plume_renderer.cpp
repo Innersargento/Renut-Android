@@ -210,6 +210,8 @@ struct VulkanLayerState {
   // Qualcomm's own driver (VK_DRIVER_ID_QUALCOMM_PROPRIETARY). Its geometry shaders read the vertex position
   // from a location, which the layer has the vertex modules of their pipelines write (PositionedVertexModule).
   std::atomic<bool> qualcomm{false};
+  // ARM's own driver (VK_DRIVER_ID_ARM_PROPRIETARY, the Mali-G52).
+  std::atomic<bool> arm{false};
   // The device's limits do not take the bindless heaps (the Mali-G52): the recompiled modules are rewritten for
   // a set of each draw's own textures (spirv_descriptor_sets.h, GpuBackend::DrawTextureSet).
   std::atomic<bool> per_draw_textures{false};
@@ -445,6 +447,7 @@ bool PlumePipelineLookupSupported() { return pipeline_cache.lookup; }
 bool PlumeScaledVertexFormats() { return layer.scaled_vertex.load(std::memory_order_relaxed); }
 
 bool PlumeQualcommDriver() { return layer.qualcomm.load(std::memory_order_relaxed); }
+bool PlumeArmDriver() { return layer.arm.load(std::memory_order_relaxed); }
 bool PlumePerDrawTextures() { return layer.per_draw_textures.load(std::memory_order_relaxed); }
 void PlumeSetBcAsEtc2(bool on) { layer.bc_as_etc2.store(on, std::memory_order_relaxed); }
 
@@ -1320,6 +1323,7 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, cons
     layer.cache_tag =
         driver.driverID == VK_DRIVER_ID_MESA_TURNIP ? std::string() : fmt::format("-drv{}", uint32_t(driver.driverID));
     layer.qualcomm.store(driver.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY, std::memory_order_relaxed);
+    layer.arm.store(driver.driverID == VK_DRIVER_ID_ARM_PROPRIETARY, std::memory_order_relaxed);
     REXLOG_INFO("Renut: Plume Vulkan driver {} ({}, {}): scaled vertex formats {}; 64-bit integers in shaders {}",
                 uint32_t(driver.driverID), driver.driverName, driver.driverInfo,
                 scaled ? "taken by the device" : "missing, the vertex modules get integer inputs",
