@@ -154,6 +154,11 @@ struct GuestTexture {
   uint32_t skip = 0;
   // Stacked textures: halvings of the pixels on the CPU (a stack without mips under texture quality).
   uint32_t shrink = 0;
+  // 2D textures on a device that transcodes (GetGuestTexture): new contents seen but not uploaded yet, how
+  // many checks they have waited, and that the next draw checks again whatever the write watch says.
+  uint64_t settle_content = 0;
+  uint8_t settle_checks = 0;
+  bool settling = false;
 };
 
 // Bytes a 2D guest texture takes on the host, its mip chain included.
@@ -171,7 +176,7 @@ uint64_t ContentHash(const uint8_t* data, uint32_t span);
 uint32_t ExportElementBytes(uint32_t format);
 
 struct Stats {
-  uint64_t textures_decoded = 0, texture_failures = 0, textures_bc = 0;
+  uint64_t textures_decoded = 0, texture_failures = 0, textures_bc = 0, textures_settling = 0;
   uint64_t draws = 0, drawn = 0, no_vs = 0, no_ps = 0, bad_shader = 0, skipped_prim = 0,
            no_target = 0, resolves = 0, clears = 0, pipelines = 0, overflow = 0;
   // Render passes begun. A tiler resolves and reloads the whole target at each

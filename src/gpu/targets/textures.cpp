@@ -46,7 +46,27 @@ void StageBlocks(const GpuBackend& backend, BcKind kind, uint8_t* staging, const
     case BcKind::kBC5: source = etc::Source::kBC5; break;
     default: break;
   }
-  etc::Transcode(source, blocks, staging, size / etc::BlockBytes(source));
+  // A large level is shared out between this thread and three more, each with a run of whole blocks: a
+  // level start uploads hundreds of textures at once, and the command thread alone held every frame of it.
+  const size_t bytes = etc::BlockBytes(source), count = size / bytes;
+  constexpr size_t kThreads = 4, kBlocksWorthSharing = 4096;
+  if (count < kBlocksWorthSharing) {
+    etc::Transcode(source, blocks, staging, count);
+    return;
+  }
+  const size_t share = (count + kThreads - 1) / kThreads;
+  std::array<std::thread, kThreads - 1> helpers;
+  for (size_t i = 0; i < helpers.size(); ++i) {
+    const size_t first = std::min((i + 1) * share, count), last = std::min((i + 2) * share, count);
+    if (first == last) continue;
+    helpers[i] = std::thread([=] {
+      etc::Transcode(source, blocks + first * bytes, staging + first * bytes, last - first);
+    });
+  }
+  etc::Transcode(source, blocks, staging, std::min(share, count));
+  for (std::thread& helper : helpers) {
+    if (helper.joinable()) helper.join();
+  }
 }
 
 // A block-format image keeps the guest's channels, so the fetch constant's swizzle goes in the view (the
@@ -243,8 +263,8 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   // this thread - except once every 256 frames, in case a write went around
   // the watch.
   backend.streams.DrainWatchHits();
-  const bool unchanged =
-      texture.checked_frame == backend.swaps_ || (texture.watched && ((backend.swaps_ + key) & 255) != 0);
+  const bool unchanged = texture.checked_frame == backend.swaps_ ||
+                         (texture.watched && !texture.settling && ((backend.swaps_ + key) & 255) != 0);
   if (texture.texture && unchanged && texdump_directory_.empty() && texture.bc == want && texture.skip == skip) {
     texture.checked_frame = backend.swaps_;
     backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
@@ -278,9 +298,27 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   for (uint32_t i = skip; i < levels; ++i) HashCombine(content, ContentHash(data[i], layouts[i].extent));
   if (!texdump_directory_.empty() && dumped_.insert(key).second) texture.content = ~content;
   if (texture.texture && texture.content == content && texture.bc == want && texture.skip == skip) {
+    texture.settling = false;
+    texture.settle_checks = 0;
     backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
     return texture.descriptor;
   }
+  // Transcoded textures (a device without BC): the game fills a streamed texture over several frames, and
+  // each state in between was transcoded whole and shown, a level start flickering through them at a few
+  // frames a second. New contents of a texture that has an image wait until two checks in a row find them
+  // the same (three checks at most, for one written every frame); the image it has is drawn meanwhile.
+  if (backend.etc2_transcode_ && want != BcKind::kNone && texture.texture && texture.bc == want &&
+      texture.skip == skip && texdump_directory_.empty() &&
+      !(texture.settling && texture.settle_content == content) && texture.settle_checks < 3) {
+    texture.settling = true;
+    texture.settle_content = content;
+    ++texture.settle_checks;
+    ++backend.stats_.textures_settling;
+    backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
+    return texture.descriptor;
+  }
+  texture.settling = false;
+  texture.settle_checks = 0;
   std::vector<uint32_t> rgba;
   std::vector<uint8_t> blocks;
   const uint32_t width = layouts[skip].width, height = layouts[skip].height;
@@ -372,7 +410,11 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
         blocks.assign(size_t((w + 3) / 4) * ((h + 3) / 4) * BcBlockBytes(kind), 0);
       }
       const uint64_t staging = backend.streams.Allocate(blocks.size(), 512);
-      if (staging == UINT64_MAX) return 0;
+      if (staging == UINT64_MAX) {
+        // Not uploaded: the image is not what `content` says, and the next draw tries again.
+        texture.content = ~content;
+        return 0;
+      }
       StageBlocks(backend, kind, backend.draw.Pointer(staging), blocks.data(), blocks.size());
       // The row is counted in texels and a multiple of the 4-texel block.
       backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
@@ -382,7 +424,10 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
     }
     if (level && !DecodeTextureLevel(fetch, layouts[skip + level], data[skip + level], 0, rgba)) return 0;
     const uint64_t staging = backend.streams.Allocate(uint64_t(w) * h * 4, 512);
-    if (staging == UINT64_MAX) return 0;
+    if (staging == UINT64_MAX) {
+      texture.content = ~content;
+      return 0;
+    }
     std::memcpy(backend.draw.Pointer(staging), rgba.data(), size_t(w) * h * 4);
     backend.recorder.L()->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.texture.get(), level),
                              RenderTextureCopyLocation::PlacedFootprint(
