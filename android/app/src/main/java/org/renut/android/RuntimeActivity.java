@@ -45,6 +45,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native void nativeBackground();
     private static native boolean nativeSetPaused(boolean paused);
     private static native boolean nativeForeground(Surface surface);
+    private static native void nativeSurfaceChanged(Surface surface,int width,int height);
     private static native void nativeButton(int button,boolean down);
     private static native void nativeStick(int stick,float x,float y);
     private static native void nativeTrigger(int trigger,float value);
@@ -483,6 +484,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 RecipeSeed.sync(this);  // before the renderer reads the recipe lists
                 System.loadLibrary("SDL3");org.libsdl.app.SDL.setupJNI();org.libsdl.app.SDL.initialize();org.libsdl.app.SDL.setContext(this);
                 System.loadLibrary("renut_runtime");loaded=true;
+                pushSurfaceSize("library loaded");
                 runOnUiThread(this::syncSecondPlayer);  // a second pad that was already plugged in
                 if(cancelled){nativeStop();return;}
                 report=nativeValidate(getFilesDir().getAbsolutePath(),target,getApplicationInfo().nativeLibraryDir,
@@ -509,7 +511,38 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
      */
     private volatile boolean ended;
     private void stop(){cancelled=true;if(loaded)nativeStop();}
+    private static final String SURFACE_TAG="renut-surface";
+    /** The size surfaceChanged last reported; the native swapchain follows it. */
+    private volatile int surfaceWidth,surfaceHeight;
+    private String displayState(){
+        android.content.res.Configuration c=getResources().getConfiguration();
+        int rotation=-1;
+        try{rotation=getWindowManager().getDefaultDisplay().getRotation()*90;}catch(Exception ignored){}
+        android.util.DisplayMetrics m=getResources().getDisplayMetrics();
+        return "orientation="+(c.orientation==android.content.res.Configuration.ORIENTATION_LANDSCAPE?"landscape"
+            :c.orientation==android.content.res.Configuration.ORIENTATION_PORTRAIT?"portrait":String.valueOf(c.orientation))
+            +" rotation="+rotation+" display="+m.widthPixels+"x"+m.heightPixels
+            +" view="+(surface!=null?surface.getWidth()+"x"+surface.getHeight():"none")
+            +" interactive="+((android.os.PowerManager)getSystemService(POWER_SERVICE)).isInteractive();
+    }
+    private void pushSurfaceSize(String why){
+        int w=surfaceWidth,h=surfaceHeight;
+        if(!loaded||ended||w<=0||h<=0||surface==null){
+            android.util.Log.i(SURFACE_TAG,"size not passed on ("+why+"): "+w+"x"+h+" loaded="+loaded+" ended="+ended);
+            return;
+        }
+        Surface s=surface.getHolder().getSurface();
+        if(s==null||!s.isValid()){android.util.Log.w(SURFACE_TAG,"size not passed on ("+why+"): surface not valid");return;}
+        android.util.Log.i(SURFACE_TAG,"size "+w+"x"+h+" passed on ("+why+"), "+displayState());
+        nativeSurfaceChanged(s,w,h);
+    }
+    @Override public void onConfigurationChanged(android.content.res.Configuration c){
+        super.onConfigurationChanged(c);
+        android.util.Log.i(SURFACE_TAG,"configuration changed: "+displayState());
+    }
     @Override public void surfaceCreated(SurfaceHolder h){
+        android.util.Log.i(SURFACE_TAG,"surfaceCreated frame="+h.getSurfaceFrame()+" started="+started+" loaded="+loaded
+            +" background="+inBackground+" "+displayState());
         // Request the selected display rate for the game surface as well as
         // the window; the default 60 Hz keeps an even cadence for 30 FPS.
         if(launch&&android.os.Build.VERSION.SDK_INT>=30){
@@ -525,8 +558,17 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         }
         startValidation(h.getSurface());
     }
-    @Override public void surfaceChanged(SurfaceHolder h,int format,int width,int height){}
+    @Override public void surfaceChanged(SurfaceHolder h,int format,int width,int height){
+        android.util.Log.i(SURFACE_TAG,"surfaceChanged "+width+"x"+height+" format="+format+" "+displayState());
+        surfaceWidth=width;surfaceHeight=height;
+        // A game opened with the screen off starts in portrait and turns to landscape a moment
+        // later: the swapchain has to follow, or the portrait images are stretched onto the screen.
+        if(launch)pushSurfaceSize("surfaceChanged");
+    }
     @Override public void surfaceDestroyed(SurfaceHolder h){
+        android.util.Log.i(SURFACE_TAG,"surfaceDestroyed ended="+ended+" started="+started+" loaded="+loaded
+            +" finishing="+isFinishing());
+        surfaceWidth=surfaceHeight=0;
         // The game is kept, paused, while the app is away (see KeepAliveService). Only the
         // diagnostic screens, which own no game state, stop with their surface.
         if(ended)return;

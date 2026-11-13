@@ -57,6 +57,29 @@ namespace {
 std::mutex instance_mutex;
 std::unique_ptr<PlumeRenderer> instance;
 
+// What Java last said about a surface's size (PlumeRenderer::SetSurfaceSize). The window
+// is only compared, never used: it may be gone by the time a present reads this.
+struct SurfaceSize {
+  std::mutex mutex;
+  const PlumeWindow* window = nullptr;
+  uint32_t width = 0, height = 0;
+  uint64_t serial = 0;
+};
+SurfaceSize surface_size;
+
+const char* TransformName(VkSurfaceTransformFlagBitsKHR transform) {
+  switch (transform) {
+    case VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR: return "identity";
+    case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR: return "rotate 90";
+    case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: return "rotate 180";
+    case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: return "rotate 270";
+    case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR: return "mirror";
+    case VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR: return "inherit";
+    default: return "mirror+rotate";
+  }
+}
+
+
 void Require(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
 }
@@ -95,6 +118,13 @@ struct PlumeRenderer::State {
   std::mutex color_mutex;
   std::array<float, 4> clear_color{0.f, 0.f, 0.f, 1.f};
   std::atomic<uint64_t> frames{0};
+  // FollowSurfaceSize: the last surface size it acted on, presents since the last check
+  // of the surface's own extent, and the last mismatch it logged (logged once each).
+  uint64_t size_serial = 0;
+  uint32_t presents_since_check = 0;
+  uint32_t logged_extent_w = 0, logged_extent_h = 0;
+  // The letterboxed rectangle of the last present, logged when it changes.
+  int32_t blit_rect[4] = {-1, -1, -1, -1};
 
   ~State() {
     if (device) {
@@ -541,6 +571,7 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     }
     REXLOG_INFO("Renut: Plume renderer started on {} ({}x{})", s.gpu, s.swap->getWidth(),
                 s.swap->getHeight());
+    renderer->LogSurface("start");
     {
       std::lock_guard cache_lock(pipeline_cache.mutex);
       pipeline_cache.lookup = layer.cache_control;
@@ -579,10 +610,13 @@ void PlumeRenderer::Present() {
   // Before the game draws anything there is no pipelining to preserve, so this
   // path keeps slot 0 and waits.
   WaitForAllSlots();
+  FollowSurfaceSize();
   auto& slot = s.slots[0];
   uint32_t index = 0;
   if (!s.swap->acquireTexture(slot.acquire.get(), &index)) {
-    s.swap->resize();
+    const bool resized = s.swap->resize();
+    REXLOG_WARN("Renut: Plume acquire failed before the first frame; swapchain resize {} ({}x{})",
+                resized ? "ok" : "FAILED", s.swap->getWidth(), s.swap->getHeight());
     return;
   }
   auto* target = s.swap->getTexture(index);
@@ -667,6 +701,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
       }
     }
   }
+  if (s.swap) FollowSurfaceSize();
   auto& slot = s.slots[slot_index % kPlumeFramesInFlight];
   // The caller waits before it reuses a slot, so this one is free by now.
   WaitForSlot(slot_index);
@@ -679,7 +714,24 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
       s.queue->executeCommandLists(&list, 1, nullptr, 0, nullptr, 0, slot.fence.get());
       slot.pending = true;
     }
-    if (s.swap) s.swap->resize();
+    if (s.swap && (!s.window || ANativeWindow_getWidth(s.window) <= 0 || ANativeWindow_getHeight(s.window) <= 0)) {
+      // The surface is gone (Android answers a negative size): Plume would clamp that to the
+      // largest extent and fail, leaving the swapchain's size at 4096x4096. The new surface
+      // comes through AttachWindow.
+      REXLOG_WARN("Renut: Plume acquire failed (frame {}) on a dead surface ({}x{}); no resize", s.frames.load(),
+                  s.window ? ANativeWindow_getWidth(s.window) : -1, s.window ? ANativeWindow_getHeight(s.window) : -1);
+    } else if (s.swap) {
+      const bool resized = s.swap->resize();
+      while (resized && s.release.size() < s.swap->getTextureCount()) {
+        s.release.push_back(s.device->createCommandSemaphore());
+      }
+      REXLOG_WARN("Renut: Plume acquire failed (frame {}); swapchain resize {} ({}x{}, {} images)",
+                  s.frames.load(), resized ? "ok" : "FAILED", s.swap->getWidth(), s.swap->getHeight(),
+                  s.swap->getTextureCount());
+      LogSurface("after a failed acquire");
+    } else {
+      REXLOG_WARN("Renut: Plume present with no swapchain (frame {})", s.frames.load());
+    }
     return;
   }
   auto* target = s.swap->getTexture(index);
@@ -702,6 +754,14 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
     const float scale = std::min(sw / float(width), sh / float(height));
     const int32_t w = int32_t(float(width) * scale), h = int32_t(float(height) * scale);
     const int32_t x = (int32_t(sw) - w) / 2, y = (int32_t(sh) - h) / 2;
+    if (s.blit_rect[0] != x || s.blit_rect[1] != y || s.blit_rect[2] != w || s.blit_rect[3] != h) {
+      REXLOG_INFO("Renut: Plume shows the {}x{} frame at {}x{}+{}+{} of the {}x{} swapchain (frame {})", width,
+                  height, w, h, x, y, uint32_t(sw), uint32_t(sh), s.frames.load());
+      s.blit_rect[0] = x;
+      s.blit_rect[1] = y;
+      s.blit_rect[2] = w;
+      s.blit_rect[3] = h;
+    }
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
@@ -775,6 +835,11 @@ bool PlumeRenderer::AttachWindow(PlumeWindow* window) {
       s.release.push_back(s.device->createCommandSemaphore());
     }
     REXLOG_INFO("Renut: Plume swapchain recreated ({}x{})", s.swap->getWidth(), s.swap->getHeight());
+    // A new surface: whatever Java said about the old one no longer counts, and the next
+    // size it reports for this one is taken again even if it equals an earlier one.
+    s.size_serial = 0;
+    s.blit_rect[0] = -1;
+    LogSurface("new surface");
   } catch (const std::exception& e) {
     REXLOG_ERROR("Renut: {}", e.what());
     return false;
@@ -785,6 +850,122 @@ bool PlumeRenderer::AttachWindow(PlumeWindow* window) {
   }
   s.pause_cv.notify_all();
   return true;
+}
+
+void PlumeRenderer::SetSurfaceSize(PlumeWindow* window, uint32_t width, uint32_t height) {
+  uint64_t serial;
+  {
+    std::lock_guard lock(surface_size.mutex);
+    surface_size.window = window;
+    surface_size.width = width;
+    surface_size.height = height;
+    serial = ++surface_size.serial;
+  }
+  REXLOG_INFO("Renut: surface {} reports {}x{} ({}; window says {}x{}, report {})", static_cast<const void*>(window),
+              width, height, width >= height ? "landscape" : "portrait",
+              window ? ANativeWindow_getWidth(window) : -1, window ? ANativeWindow_getHeight(window) : -1, serial);
+}
+
+void PlumeRenderer::LogSurface(const char* when) {
+  auto& s = *state_;
+  if (!s.swap) {
+    REXLOG_INFO("Renut: Plume surface ({}): no swapchain", when);
+    return;
+  }
+  auto* chain = static_cast<VulkanSwapChain*>(s.swap.get());
+  auto* device = static_cast<VulkanDevice*>(s.device.get());
+  VkSurfaceCapabilitiesKHR caps{};
+  const VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device->physicalDevice, chain->surface, &caps);
+  REXLOG_INFO("Renut: Plume surface ({}): window {}x{} format {}; swapchain {}x{}, {} images, present mode {}",
+              when, s.window ? ANativeWindow_getWidth(s.window) : -1, s.window ? ANativeWindow_getHeight(s.window) : -1,
+              s.window ? ANativeWindow_getFormat(s.window) : -1, s.swap->getWidth(), s.swap->getHeight(),
+              s.swap->getTextureCount(), int(chain->createdPresentMode));
+  if (result != VK_SUCCESS) {
+    REXLOG_WARN("Renut: Plume surface ({}): vkGetPhysicalDeviceSurfaceCapabilitiesKHR = {}", when, int(result));
+    return;
+  }
+  // The extent is the window's own shape (the Mali reports 1920x1200 under "rotate 90" on a
+  // tablet held in landscape): the compositor turns the images after, as preTransform is identity.
+  REXLOG_INFO("Renut: Plume surface ({}): currentExtent {}x{}, extent {}x{}..{}x{}, transform {} "
+              "(supported {:#x}), images {}..{}",
+              when, caps.currentExtent.width, caps.currentExtent.height, caps.minImageExtent.width, caps.minImageExtent.height, caps.maxImageExtent.width,
+              caps.maxImageExtent.height, TransformName(caps.currentTransform), uint32_t(caps.supportedTransforms),
+              caps.minImageCount, caps.maxImageCount);
+}
+
+void PlumeRenderer::FollowSurfaceSize() {
+  auto& s = *state_;
+  if (!s.swap) return;
+  const PlumeWindow* window;
+  uint32_t width, height;
+  uint64_t serial;
+  {
+    std::lock_guard lock(surface_size.mutex);
+    window = surface_size.window;
+    width = surface_size.width;
+    height = surface_size.height;
+    serial = surface_size.serial;
+  }
+  if (serial != s.size_serial) {
+    s.size_serial = serial;
+    s.presents_since_check = 0;
+    if (window != s.window) {
+      REXLOG_INFO("Renut: Plume ignores a size for surface {} (it presents to {})", static_cast<const void*>(window),
+                  static_cast<const void*>(s.window));
+    } else if (!width || !height) {
+      REXLOG_WARN("Renut: Plume ignores an empty surface size {}x{}", width, height);
+    } else if (width == s.swap->getWidth() && height == s.swap->getHeight()) {
+      REXLOG_INFO("Renut: Plume swapchain already {}x{}, as the surface (frame {})", width, height, s.frames.load());
+    } else {
+      REXLOG_WARN("Renut: Plume swapchain is {}x{} but the surface is now {}x{} (frame {}): recreating it",
+                  s.swap->getWidth(), s.swap->getHeight(), width, height, s.frames.load());
+      // Images the presentation engine may still hold go first.
+      WaitForAllSlots();
+      // Plume sizes the swapchain from the window, which keeps answering the size its
+      // buffers were last given: give it the surface's own.
+      const int32_t window_w = ANativeWindow_getWidth(s.window), window_h = ANativeWindow_getHeight(s.window);
+      if (uint32_t(window_w) != width || uint32_t(window_h) != height) {
+        const int32_t set = ANativeWindow_setBuffersGeometry(s.window, int32_t(width), int32_t(height), 0);
+        REXLOG_INFO("Renut: Plume window said {}x{}; buffers set to {}x{} (result {}, now {}x{})", window_w, window_h,
+                    width, height, set, ANativeWindow_getWidth(s.window), ANativeWindow_getHeight(s.window));
+      }
+      const bool resized = s.swap->resize();
+      while (resized && s.release.size() < s.swap->getTextureCount()) {
+        s.release.push_back(s.device->createCommandSemaphore());
+      }
+      if (resized && s.swap->getWidth() == width && s.swap->getHeight() == height) {
+        REXLOG_INFO("Renut: Plume swapchain recreated at {}x{} ({} images)", s.swap->getWidth(), s.swap->getHeight(),
+                    s.swap->getTextureCount());
+      } else {
+        REXLOG_ERROR("Renut: Plume swapchain resize to {}x{} {}: it is {}x{}", width, height,
+                     resized ? "gave another size" : "FAILED", s.swap->getWidth(), s.swap->getHeight());
+      }
+      s.blit_rect[0] = -1;
+      LogSurface("after following the surface");
+    }
+    return;
+  }
+  // Now and then, ask the surface itself too and log once each size that disagrees with
+  // the swapchain, in case a change ever arrives without Java seeing it.
+  if (++s.presents_since_check < 300) return;
+  s.presents_since_check = 0;
+  auto* chain = static_cast<VulkanSwapChain*>(s.swap.get());
+  VkSurfaceCapabilitiesKHR caps{};
+  if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(static_cast<VulkanDevice*>(s.device.get())->physicalDevice,
+                                                chain->surface, &caps) != VK_SUCCESS ||
+      caps.currentExtent.width == UINT32_MAX) {
+    return;
+  }
+  const uint32_t sw = s.swap->getWidth(), sh = s.swap->getHeight();
+  if (caps.currentExtent.width == sw && caps.currentExtent.height == sh) {
+    s.logged_extent_w = s.logged_extent_h = 0;
+  } else if (caps.currentExtent.width != s.logged_extent_w || caps.currentExtent.height != s.logged_extent_h) {
+    s.logged_extent_w = caps.currentExtent.width;
+    s.logged_extent_h = caps.currentExtent.height;
+    REXLOG_WARN("Renut: Plume surface extent {}x{} (transform {}) differs from the {}x{} swapchain (frame {})",
+                caps.currentExtent.width, caps.currentExtent.height, TransformName(caps.currentTransform), sw, sh,
+                s.frames.load());
+  }
 }
 
 std::string PlumeRenderer::report() const {

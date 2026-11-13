@@ -116,9 +116,21 @@ extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeB
     if(live_game_window)live_game_window->SetWindow(nullptr);
   }
 }
+// SurfaceView.surfaceChanged: the surface's size, which the swapchain follows at its next
+// present (a game started in portrait and turned to landscape stayed stretched).
+extern "C" JNIEXPORT void JNICALL Java_org_renut_android_RuntimeActivity_nativeSurfaceChanged(JNIEnv* env,jclass,jobject surface,jint width,jint height) {
+  auto* window=surface?ANativeWindow_fromSurface(env,surface):nullptr;
+  __android_log_print(ANDROID_LOG_INFO,"reNutRuntime","surfaceChanged %dx%d window %p (native %dx%d)",int(width),int(height),
+                      static_cast<void*>(window),window?ANativeWindow_getWidth(window):-1,window?ANativeWindow_getHeight(window):-1);
+  if(!window)return;
+  renut::PlumeRenderer::SetSurfaceSize(window,uint32_t(width>0?width:0),uint32_t(height>0?height:0));
+  ANativeWindow_release(window);
+}
 // A new surface: swapchain replaced, the game runs again.
 extern "C" JNIEXPORT jboolean JNICALL Java_org_renut_android_RuntimeActivity_nativeForeground(JNIEnv* env,jclass,jobject surface) {
   auto* window=surface?ANativeWindow_fromSurface(env,surface):nullptr;
+  __android_log_print(ANDROID_LOG_INFO,"reNutRuntime","foreground: new surface %p (native %dx%d)",static_cast<void*>(window),
+                      window?ANativeWindow_getWidth(window):-1,window?ANativeWindow_getHeight(window):-1);
   if(!window)return JNI_FALSE;
   {
     std::lock_guard<std::mutex> lock(game_window_mutex);
@@ -313,6 +325,8 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       if(!javaString(env,tuDebug).empty())note("TU_DEBUG: "+javaString(env,tuDebug));
       auto* window=ANativeWindow_fromSurface(env,surface);
       if(!window)throw std::runtime_error("Janela Android indisponível.");
+      __android_log_print(ANDROID_LOG_INFO,"reNutRuntime","start: surface %p is %dx%d",static_cast<void*>(window),
+                          ANativeWindow_getWidth(window),ANativeWindow_getHeight(window));
       std::unique_ptr<ANativeWindow,decltype(&ANativeWindow_release)> owned(window,ANativeWindow_release);
       game_context=std::make_unique<renut::GameContext>();
       game_window=std::make_unique<renut::GameWindow>(*game_context,window);

@@ -113,10 +113,20 @@ class PlumeRenderer {
   bool AttachWindow(PlumeWindow* window);
   void ReleaseForShutdown();
 
+  // The size Java's SurfaceView reports for `window` (surfaceChanged), callable before
+  // the renderer exists. The swapchain follows it at the next present: Android does not
+  // fail the acquire when a surface turns, it scales the old images onto the new shape (a
+  // game opened in portrait and turned to landscape was drawn stretched for good).
+  static void SetSurfaceSize(PlumeWindow* window, uint32_t width, uint32_t height);
+
   ~PlumeRenderer();
 
  private:
   PlumeRenderer();
+  // Under swap_mutex: recreates the swapchain when the surface's size moved away from it,
+  // and logs what the window, the surface and the swapchain say.
+  void FollowSurfaceSize();
+  void LogSurface(const char* when);
   struct State;
   std::unique_ptr<State> state_;
 };

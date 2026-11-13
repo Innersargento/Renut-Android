@@ -22,7 +22,7 @@
         <activity android:name=".LayoutEditorActivity" android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode" />
         <activity android:name=".RuntimeActivity" android:process=":runtime" android:exported="false"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboardHidden" />
         <!-- In the game's process: keeps it alive while the app is in the background. -->
         <service android:name=".KeepAliveService" android:process=":runtime" android:exported="false"
             android:foregroundServiceType="specialUse">
