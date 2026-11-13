@@ -103,6 +103,7 @@ REXCVAR_DECLARE(int32_t, renut_plume_texture_max_dim);
 REXCVAR_DECLARE(int32_t, renut_plume_bc_textures);
 REXCVAR_DECLARE(int32_t, renut_plume_mali_rebase_indices);
 REXCVAR_DECLARE(int32_t, renut_plume_texture_quality);
+REXCVAR_DECLARE(int32_t, renut_plume_aniso_max);
 REXCVAR_DECLARE(int32_t, renut_plume_shadow_quality);
 REXCVAR_DECLARE(int32_t, renut_plume_internal_resolution);
 REXCVAR_DECLARE(bool, renut_plume_precompile);

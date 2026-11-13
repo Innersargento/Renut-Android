@@ -469,8 +469,12 @@ uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   desc.mipLODBias = float(fetch.lod_bias) / 32.0f;
   if (fetch.aniso_filter != xenos::AnisoFilter::kDisabled &&
       fetch.aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
-    desc.anisotropyEnabled = true;
-    desc.maxAnisotropy = 1u << (uint32_t(fetch.aniso_filter) - 1);
+    // Within renut_plume_aniso_max (read at start, so the key above needs none of it).
+    const uint32_t asked = std::min(1u << (uint32_t(fetch.aniso_filter) - 1), backend.aniso_max_);
+    if (asked > 1) {
+      desc.anisotropyEnabled = true;
+      desc.maxAnisotropy = asked;
+    }
   }
   if (xenos::ClampModeUsesBorder(fetch.clamp_x) || xenos::ClampModeUsesBorder(fetch.clamp_y) ||
       xenos::ClampModeUsesBorder(fetch.clamp_z)) {

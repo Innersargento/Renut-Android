@@ -65,6 +65,11 @@ REXCVAR_DEFINE_INT32(renut_plume_texture_quality, 0, "reNut/Plume",
                      "filtering (the world; the interface and fonts are read from the base level alone and "
                      "stay sharp) drops its top one or two mips, never below 64 px. Live:")
     .range(0, 2);
+REXCVAR_DEFINE_INT32(renut_plume_aniso_max, 4, "reNut/Plume",
+                     "The most anisotropic filtering a texture fetch gets: 1 (none), 2, 4, 8 or 16 samples. The "
+                     "game asks for up to 16 on some surfaces, which a phone's GPU pays for on every such texel; "
+                     "16 gives every fetch what it asks. Read at start.")
+    .range(1, 16);
 REXCVAR_DEFINE_INT32(renut_plume_shadow_quality, 0, "reNut/Plume",
                      "Shadow map resolution: 0 full, 1 three quarters, 2 half (a side of the dynamic maps; "
                      "the cached atlas is not touched). The maps are drawn and resolved smaller and sampled "
