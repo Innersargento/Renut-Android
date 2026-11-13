@@ -4,6 +4,38 @@
 
 namespace renut::gpu {
 
+bool NeedsPerDrawTextures(const VkPhysicalDeviceLimits& limits) {
+  // Sets 0-3 are the bindless heaps below, set 4 the constant files (CreateConstantBuffers); every
+  // stage sees all of them. A driver that takes a layout past its limits need not refuse it: the
+  // Mali-G52 (r34p0) made a 5-set layout and then faulted inside vkCreatePipelineLayout.
+  return limits.maxBoundDescriptorSets < 5 ||
+         limits.maxPerStageDescriptorSampledImages < kMaxTextures2D + kMaxTextures3D + kMaxTexturesCube ||
+         limits.maxPerStageDescriptorSamplers < kMaxSamplers;
+}
+
+std::string MissingDescriptorLimits(const VkPhysicalDeviceLimits& limits, const VkPhysicalDeviceFeatures& features) {
+  if (!NeedsPerDrawTextures(limits)) return {};
+  // The per-draw set (DrawTextureSet): 32 of each kind in one set, the constants in a second.
+  constexpr uint32_t slots = spirv::kPerDrawTextureSlots;
+  std::string missing;
+  const auto need = [&](bool ok, std::string what) {
+    if (ok) return;
+    if (!missing.empty()) missing += "; ";
+    missing += what;
+  };
+  need(limits.maxBoundDescriptorSets >= 2,
+       fmt::format("{} conjuntos de descritores, 2 usados", limits.maxBoundDescriptorSets));
+  need(limits.maxPerStageDescriptorSampledImages >= 3 * slots,
+       fmt::format("{} texturas por estágio, {} usadas", limits.maxPerStageDescriptorSampledImages, 3 * slots));
+  need(limits.maxPerStageDescriptorSamplers >= slots,
+       fmt::format("{} samplers por estágio, {} usados", limits.maxPerStageDescriptorSamplers, slots));
+  need(limits.maxDescriptorSetUniformBuffersDynamic >= kConstantBindings,
+       fmt::format("{} uniform buffers dinâmicos, {} usados", limits.maxDescriptorSetUniformBuffersDynamic,
+                   kConstantBindings));
+  need(features.shaderSampledImageArrayDynamicIndexing, "sem shaderSampledImageArrayDynamicIndexing");
+  return missing;
+}
+
 bool GpuBackend::SetupContext() {
   // Direct3D's doorbell wakes the worker through this (native_d3d.h).
   native_d3d::SetWake([this] { wake_->Set(); });
@@ -23,16 +55,22 @@ bool GpuBackend::SetupContext() {
   RenderDescriptorRange range_3d(RenderDescriptorRangeType::TEXTURE, 0, kMaxTextures3D);
   RenderDescriptorRange range_cube(RenderDescriptorRangeType::TEXTURE, 0, kMaxTexturesCube);
   RenderDescriptorRange range_samplers(RenderDescriptorRangeType::SAMPLER, 0, kMaxSamplers);
+  // Per-draw textures: the heaps are only copied from (DrawTextureSet), so they are plain sets - Plume's
+  // boundless ones are update-after-bind, which such a device need not have - and the pipeline layout is made
+  // of the draw set and the constants instead (CreateConstantBuffers).
+  per_draw_textures_ = PlumePerDrawTextures();
+  const bool boundless = !per_draw_textures_;
   RenderDescriptorSetDesc sets[] = {
-      RenderDescriptorSetDesc(&range_2d, 1, true, kMaxTextures2D),
-      RenderDescriptorSetDesc(&range_3d, 1, true, kMaxTextures3D),
-      RenderDescriptorSetDesc(&range_cube, 1, true, kMaxTexturesCube),
-      RenderDescriptorSetDesc(&range_samplers, 1, true, kMaxSamplers),
+      RenderDescriptorSetDesc(&range_2d, 1, boundless, kMaxTextures2D),
+      RenderDescriptorSetDesc(&range_3d, 1, boundless, kMaxTextures3D),
+      RenderDescriptorSetDesc(&range_cube, 1, boundless, kMaxTexturesCube),
+      RenderDescriptorSetDesc(&range_samplers, 1, boundless, kMaxSamplers),
   };
   RenderPushConstantRange push(0, 0, 0, kPushBytes,
                                RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::GEOMETRY |
                                    RenderShaderStageFlag::PIXEL);
-  layout_ = device_->createPipelineLayout(RenderPipelineLayoutDesc(&push, 1, sets, 4, false, true));
+  layout_ = device_->createPipelineLayout(
+      RenderPipelineLayoutDesc(&push, 1, per_draw_textures_ ? nullptr : sets, per_draw_textures_ ? 0 : 4, false, true));
   set_2d_ = device_->createDescriptorSet(sets[0]);
   set_3d_ = device_->createDescriptorSet(sets[1]);
   set_cube_ = device_->createDescriptorSet(sets[2]);
@@ -51,6 +89,10 @@ bool GpuBackend::SetupContext() {
     return false;
   }
   set_samplers_->setSampler(kSamplerDefault, samplers_[kSamplerDefault].get());
+  // A copy reads every entry it names: none may be unwritten (a sampler heap slot is, until its sampler).
+  if (per_draw_textures_) {
+    for (uint32_t i = 0; i < kMaxSamplers; ++i) set_samplers_->setSampler(i, samplers_[kSamplerDefault].get());
+  }
   textures.next_sampler_ = kSamplerDefault + 1;
 
   {
@@ -326,7 +368,98 @@ void GpuBackend::ShutdownContext() {
     constants_pool_ = VK_NULL_HANDLE;
     constants_set_layout_ = VK_NULL_HANDLE;
     constants_set_ = VK_NULL_HANDLE;
+    DestroyDrawTextureSets();
   }
+}
+
+void GpuBackend::DestroyDrawTextureSets() {
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  for (DrawTextureSets& sets : draw_texture_sets_) {
+    for (VkDescriptorPool pool : sets.pools) vkDestroyDescriptorPool(vk_device, pool, nullptr);
+    sets = DrawTextureSets{};
+  }
+  if (draw_set_layout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(vk_device, draw_set_layout_, nullptr);
+  draw_set_layout_ = VK_NULL_HANDLE;
+}
+
+void GpuBackend::ResetDrawTextureSets(uint32_t slot) {
+  if (!per_draw_textures_) return;
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  DrawTextureSets& sets = draw_texture_sets_[slot];
+  for (VkDescriptorPool pool : sets.pools) vkResetDescriptorPool(vk_device, pool, 0);
+  sets.current = 0;
+  sets.cache.clear();
+}
+
+VkDescriptorSet GpuBackend::DrawTextureSet(const uint32_t* textures_2d, const uint32_t* textures_3d,
+                                           const uint32_t* cubes, const uint32_t* samplers) {
+  constexpr uint32_t n = spirv::kPerDrawTextureSlots;
+  DrawTextureSets& sets = draw_texture_sets_[slot_];
+  if (sets.epoch != heap_epoch_) {
+    sets.cache.clear();
+    sets.epoch = heap_epoch_;
+  }
+  const uint32_t* kinds[4] = {textures_2d, textures_3d, cubes, samplers};
+  constexpr uint32_t sizes[4] = {kMaxTextures2D, kMaxTextures3D, kMaxTexturesCube, kMaxSamplers};
+  DrawTextureKey key;
+  for (uint32_t k = 0; k < 4; ++k) {
+    for (uint32_t i = 0; i < n; ++i) key.index[k * n + i] = uint16_t(kinds[k][i] < sizes[k] ? kinds[k][i] : 0);
+  }
+  const auto [it, inserted] = sets.cache.try_emplace(key, VK_NULL_HANDLE);
+  if (!inserted) return it->second;
+
+  VkDevice vk_device = static_cast<VulkanDevice*>(device_)->vk;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  for (;;) {
+    if (sets.current == sets.pools.size()) {
+      // A pool holds a few hundred draws' sets; a frame that needs more takes another.
+      constexpr uint32_t kSetsPerPool = 512;
+      const VkDescriptorPoolSize sizes_of_pool[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * n * kSetsPerPool},
+                                                     {VK_DESCRIPTOR_TYPE_SAMPLER, n * kSetsPerPool}};
+      VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+      pool_info.maxSets = kSetsPerPool;
+      pool_info.poolSizeCount = 2;
+      pool_info.pPoolSizes = sizes_of_pool;
+      VkDescriptorPool pool = VK_NULL_HANDLE;
+      if (vkCreateDescriptorPool(vk_device, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+        sets.cache.erase(it);
+        return VK_NULL_HANDLE;
+      }
+      sets.pools.push_back(pool);
+    }
+    VkDescriptorSetAllocateInfo allocate = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocate.descriptorPool = sets.pools[sets.current];
+    allocate.descriptorSetCount = 1;
+    allocate.pSetLayouts = &draw_set_layout_;
+    const VkResult result = vkAllocateDescriptorSets(vk_device, &allocate, &set);
+    if (result == VK_SUCCESS) break;
+    if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) {
+      sets.cache.erase(it);
+      return VK_NULL_HANDLE;
+    }
+    ++sets.current;
+  }
+  const VkDescriptorSet heaps[4] = {
+      static_cast<VulkanDescriptorSet*>(set_2d_.get())->vk, static_cast<VulkanDescriptorSet*>(set_3d_.get())->vk,
+      static_cast<VulkanDescriptorSet*>(set_cube_.get())->vk, static_cast<VulkanDescriptorSet*>(set_samplers_.get())->vk};
+  VkCopyDescriptorSet copies[4 * n];
+  for (uint32_t k = 0; k < 4; ++k) {
+    for (uint32_t i = 0; i < n; ++i) {
+      VkCopyDescriptorSet& copy = copies[k * n + i];
+      copy = {VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+      copy.srcSet = heaps[k];
+      copy.srcBinding = 0;
+      copy.srcArrayElement = key.index[k * n + i];
+      copy.dstSet = set;
+      copy.dstBinding = k;
+      copy.dstArrayElement = i;
+      copy.descriptorCount = 1;
+    }
+  }
+  vkUpdateDescriptorSets(vk_device, 0, nullptr, 4 * n, copies);
+  ++sets.built;
+  it->second = set;
+  return set;
 }
 
 // Set 4 of the pipeline layout: the stages' constant files and the shared
@@ -351,9 +484,29 @@ bool GpuBackend::CreateConstantBuffers() {
     return false;
   }
   std::vector<VkDescriptorSetLayout> set_layouts;
-  for (VulkanDescriptorSetLayout* set_layout : layout->descriptorSetLayouts) set_layouts.push_back(set_layout->vk);
-  if (set_layouts.size() != 4) return false;
+  if (per_draw_textures_) {
+    // Set 0: the draw's own 2D, 3D, cube textures and samplers, 32 of each (DrawTextureSet); set 1 below.
+    VkDescriptorSetLayoutBinding textures[4] = {};
+    for (uint32_t k = 0; k < 4; ++k) {
+      textures[k].binding = k;
+      textures[k].descriptorType = k == 3 ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      textures[k].descriptorCount = spirv::kPerDrawTextureSlots;
+      textures[k].stageFlags =
+          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo textures_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    textures_info.bindingCount = 4;
+    textures_info.pBindings = textures;
+    if (vkCreateDescriptorSetLayout(vk_device, &textures_info, nullptr, &draw_set_layout_) != VK_SUCCESS) {
+      return false;
+    }
+    set_layouts.push_back(draw_set_layout_);
+  } else {
+    for (VulkanDescriptorSetLayout* set_layout : layout->descriptorSetLayouts) set_layouts.push_back(set_layout->vk);
+    if (set_layouts.size() != 4) return false;
+  }
   set_layouts.push_back(constants_set_layout_);
+  if (set_layouts.size() != ConstantSet() + 1) return false;
   VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   layout_info.setLayoutCount = uint32_t(set_layouts.size());
   layout_info.pSetLayouts = set_layouts.data();

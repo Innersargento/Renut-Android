@@ -45,6 +45,10 @@ bool PlumeScaledVertexFormats();
 // Whether the device runs Qualcomm's own Adreno driver (VK_DRIVER_ID_QUALCOMM_PROPRIETARY), which gets the few
 // workarounds Turnip does not need. Known once the renderer has started.
 bool PlumeQualcommDriver();
+// Whether the device's limits leave out the bindless texture heaps (the Mali-G52: four bound sets, 256 textures
+// a stage): each draw then binds a set of its own textures, and the layer rewrites the recompiled modules for it
+// (spirv_descriptor_sets.h). Known once the renderer has started.
+bool PlumePerDrawTextures();
 // While one is alive on a thread, pipeline creation there only looks in the
 // cache: a pipeline that would have to be compiled comes back null at once.
 class PlumePipelineLookupOnly {

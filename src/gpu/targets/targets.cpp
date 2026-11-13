@@ -119,6 +119,10 @@ void Targets::BeginFrame() {
                                       .count());
   backend.patches.ReleaseDepthResolveSlot(backend.slot_);
   backend.streams.ApplyWritebacks(backend.slot_);
+  // The draw texture sets of the frame that last held the slot (DrawTextureSet), and the writes below
+  // change what heap indices hold.
+  backend.ResetDrawTextureSets(backend.slot_);
+  ++backend.heap_epoch_;
   list_ = backend.lists_[backend.slot_].get();
   slice_base_ = slice_origin_ + uint64_t(backend.slot_) * backend.upload_slice_size_;
   for (uint32_t index : retired_descriptor_slots_[backend.slot_]) {
@@ -176,6 +180,7 @@ void Targets::StartList() {
   pushed_constants_[0] = pushed_constants_[1] = pushed_constants_[2] = UINT64_MAX;
   std::fill(std::begin(backend.recorder.bound_constant_offsets_), std::end(backend.recorder.bound_constant_offsets_), UINT32_MAX);
   backend.recorder.viewport_bound_ = backend.recorder.scissor_bound_ = false;
+  backend.recorder.bound_texture_set_ = VK_NULL_HANDLE;
   bound_vertex_buffers_.fill(VertexBinding{});
   bound_index_buffer_ = nullptr;
   bound_index_format_ = RenderFormat::UNKNOWN;
@@ -580,10 +585,13 @@ void Targets::SetFramebuffer(RenderFramebuffer* framebuffer) {
   if (!recorder) backend.recorder.SyncRecorder();
   if (!state_bound_) {
     backend.recorder.L()->setGraphicsPipelineLayout(backend.layout_.get());
-    backend.recorder.L()->setGraphicsDescriptorSet(backend.set_2d_.get(), 0);
-    backend.recorder.L()->setGraphicsDescriptorSet(backend.set_3d_.get(), 1);
-    backend.recorder.L()->setGraphicsDescriptorSet(backend.set_cube_.get(), 2);
-    backend.recorder.L()->setGraphicsDescriptorSet(backend.set_samplers_.get(), 3);
+    // Per-draw textures: the heaps are not in the layout; each draw binds its own set (Recorder::EmitDraw).
+    if (!backend.per_draw_textures_) {
+      backend.recorder.L()->setGraphicsDescriptorSet(backend.set_2d_.get(), 0);
+      backend.recorder.L()->setGraphicsDescriptorSet(backend.set_3d_.get(), 1);
+      backend.recorder.L()->setGraphicsDescriptorSet(backend.set_cube_.get(), 2);
+      backend.recorder.L()->setGraphicsDescriptorSet(backend.set_samplers_.get(), 3);
+    }
     state_bound_ = true;
   }
   if (bound_framebuffer_ != framebuffer) {

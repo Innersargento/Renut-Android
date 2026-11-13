@@ -212,6 +212,8 @@ namespace renut::gpu {
     uint64_t push[3] = {};
     uint32_t instances = 1;
     uint32_t constant_offsets[kConstantBindings] = {};
+    // Per-draw textures: the draw's texture set (GpuBackend::DrawTextureSet); null with the bindless heaps.
+    VkDescriptorSet texture_set = VK_NULL_HANDLE;
     RenderViewport viewport;
     RenderRect scissor;
     uint32_t first_slot = 0, slot_count = 0;

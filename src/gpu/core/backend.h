@@ -92,6 +92,39 @@ class GpuBackend final {
   VkDescriptorPool constants_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet constants_set_ = VK_NULL_HANDLE;
   bool CreateConstantBuffers();
+  // Per-draw textures (PlumePerDrawTextures: a device whose limits leave out the heaps, the Mali-G52). The
+  // four heaps above are never bound, only copied from: each draw binds set 0 of its own 32 2D, 3D and cube
+  // textures and 32 samplers in fetch-slot order, its shared block holds the slot numbers where the heap
+  // indices were, and the constants are set 1 (spirv_descriptor_sets.h rewrites the modules to match).
+  bool per_draw_textures_ = false;
+  uint32_t ConstantSet() const {
+    return per_draw_textures_ ? spirv::kPerDrawConstantSet : spirv::kCompiledConstantSet;
+  }
+  // Bumped by every write into a heap: a set copied before it may hold what an index used to be.
+  uint64_t heap_epoch_ = 0;
+  VkDescriptorSetLayout draw_set_layout_ = VK_NULL_HANDLE;
+  struct DrawTextureKey {
+    uint16_t index[4 * spirv::kPerDrawTextureSlots];
+    bool operator==(const DrawTextureKey& other) const { return std::memcmp(index, other.index, sizeof(index)) == 0; }
+  };
+  struct DrawTextureKeyHash {
+    size_t operator()(const DrawTextureKey& key) const { return size_t(XXH3_64bits(key.index, sizeof(key.index))); }
+  };
+  // One frame in flight's sets, freed together once its fence has passed (ResetDrawTextureSets). Draws that
+  // name the same textures share one, until a heap write.
+  struct DrawTextureSets {
+    std::vector<VkDescriptorPool> pools;
+    size_t current = 0;
+    std::unordered_map<DrawTextureKey, VkDescriptorSet, DrawTextureKeyHash> cache;
+    uint64_t epoch = 0;
+    uint64_t built = 0;
+  };
+  std::array<DrawTextureSets, kPlumeFramesInFlight> draw_texture_sets_;
+  // The set of a draw whose fetch slots hold these heap indices (32 of each); null if none could be made.
+  VkDescriptorSet DrawTextureSet(const uint32_t* textures_2d, const uint32_t* textures_3d, const uint32_t* cubes,
+                                 const uint32_t* samplers);
+  void ResetDrawTextureSets(uint32_t slot);
+  void DestroyDrawTextureSets();
   bool trail_device_default_ = false;
   std::array<std::unique_ptr<RenderCommandList>, kPlumeFramesInFlight> lists_;
   uint32_t slot_ = kPlumeFramesInFlight - 1;
@@ -291,6 +324,7 @@ inline void Targets::SetTexture2D(uint32_t index, const RenderTexture* texture, 
     written = {texture, view};
     ++backend.recorder.descriptor_writes_;
     backend.set_2d_->setTexture(index, texture, RenderTextureLayout::SHADER_READ, view);
+    ++backend.heap_epoch_;
   }
 
 inline uint32_t Textures::Allocate3DDescriptor() {

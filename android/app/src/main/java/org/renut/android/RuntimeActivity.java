@@ -494,6 +494,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 try{Files.write(new File(getFilesDir(),"runtime-report.txt").toPath(),report.getBytes(StandardCharsets.UTF_8));}catch(Exception ignored){}
             }
             final String message=report;
+            ended=true;
             runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
                 if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);if(temp!=null)temp.setVisibility(View.GONE);
                     if(gameMenu!=null)gameMenu.getView().setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
@@ -501,6 +502,12 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         },"renut-runtime-validation").start();
     }
     private volatile boolean inBackground;
+    /**
+     * nativeValidate has returned: the session is over and its native state torn down. Hiding the
+     * surface to show the report must not pause it (nativeBackground then aborted on a destroyed
+     * mutex, and a start that failed - a GPU without the limits the renderer needs - read as a crash).
+     */
+    private volatile boolean ended;
     private void stop(){cancelled=true;if(loaded)nativeStop();}
     @Override public void surfaceCreated(SurfaceHolder h){
         // Request the selected display rate for the game surface as well as
@@ -522,6 +529,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     @Override public void surfaceDestroyed(SurfaceHolder h){
         // The game is kept, paused, while the app is away (see KeepAliveService). Only the
         // diagnostic screens, which own no game state, stop with their surface.
+        if(ended)return;
         if(launch&&started&&loaded&&!isFinishing()){inBackground=true;nativeBackground();}
         else{stop();if(launch&&!isFinishing())finish();}  // not loaded yet: nothing to keep
     }

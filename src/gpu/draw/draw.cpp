@@ -552,10 +552,30 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (debug_mode_ & 32) texture_descriptor[0] = 0;
   }
   for (uint32_t mask = backend.swap.white_slots_; mask; mask &= mask - 1) texture_descriptor[__builtin_ctz(mask)] = 0;
-  std::memcpy(sh + RENUT_SHARED_TEXTURE2D_OFFSET, texture_descriptor, sizeof(texture_descriptor));
-  std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
-  std::memcpy(sh + RENUT_SHARED_TEXTURE3D_OFFSET, stack_descriptor, sizeof(stack_descriptor));
-  std::memcpy(sh + RENUT_SHARED_SAMPLER_OFFSET, sampler_descriptor, sizeof(sampler_descriptor));
+  texture_set_ = VK_NULL_HANDLE;
+  if (backend.per_draw_textures_) {
+    // The draw's own set holds slot i's texture at element i, so what the shaders index by is the slot.
+    static_assert(sizeof(texture_descriptor) / sizeof(texture_descriptor[0]) == spirv::kPerDrawTextureSlots);
+    static constexpr auto kSlots = [] {
+      std::array<uint32_t, spirv::kPerDrawTextureSlots> slots{};
+      for (uint32_t i = 0; i < slots.size(); ++i) slots[i] = i;
+      return slots;
+    }();
+    texture_set_ = backend.DrawTextureSet(texture_descriptor, stack_descriptor, cube_descriptor, sampler_descriptor);
+    if (texture_set_ == VK_NULL_HANDLE) {
+      ++backend.stats_.skipped_prim;
+      return true;
+    }
+    for (const uint32_t offset : {RENUT_SHARED_TEXTURE2D_OFFSET, RENUT_SHARED_TEXTURECUBE_OFFSET,
+                                  RENUT_SHARED_TEXTURE3D_OFFSET, RENUT_SHARED_SAMPLER_OFFSET}) {
+      std::memcpy(sh + offset, kSlots.data(), sizeof(kSlots));
+    }
+  } else {
+    std::memcpy(sh + RENUT_SHARED_TEXTURE2D_OFFSET, texture_descriptor, sizeof(texture_descriptor));
+    std::memcpy(sh + RENUT_SHARED_TEXTURECUBE_OFFSET, cube_descriptor, sizeof(cube_descriptor));
+    std::memcpy(sh + RENUT_SHARED_TEXTURE3D_OFFSET, stack_descriptor, sizeof(stack_descriptor));
+    std::memcpy(sh + RENUT_SHARED_SAMPLER_OFFSET, sampler_descriptor, sizeof(sampler_descriptor));
+  }
   std::memcpy(sh + RENUT_SHARED_BOOLEANS_OFFSET, regs.bools,
               RENUT_BOOL_REGISTER_COUNT / 8);
   if (loop_constants_dirty_) {
@@ -1860,6 +1880,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           uint32_t(stage == 1 && skip_ps_constants ? unused_ps_offset : constant_offsets_[stage][chunk]);
     }
   }
+  pk.texture_set = texture_set_;
   pk.constant_offsets[kSharedHotBinding] = uint32_t(shared_offset_);
   pk.constant_offsets[kSharedColdBinding] = uint32_t(shared_cold_offset_);
   // Draws that read no constant by a0/aL keep whatever whole-file block was

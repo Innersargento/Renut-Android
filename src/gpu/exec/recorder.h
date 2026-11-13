@@ -27,6 +27,8 @@ struct Recorder {
   // 16 drops depth-only draws.
   uint32_t bind_skip_ = 0;
   uint32_t bound_constant_offsets_[kConstantBindings];
+  // Per-draw textures: the draw texture set the list has bound at set 0 (GpuBackend::DrawTextureSet).
+  VkDescriptorSet bound_texture_set_ = VK_NULL_HANDLE;
   // What the list has bound, to leave unchanged state alone (StartList resets).
   RenderViewport bound_viewport_;
   RenderRect bound_scissor_;

@@ -465,6 +465,7 @@ uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const uint32_t index = next_sampler_++;
   backend.samplers_[index] = std::move(sampler);
   backend.set_samplers_->setSampler(index, backend.samplers_[index].get());
+  ++backend.heap_epoch_;
   sampler_indices_.emplace(key, index);
   return index;
 }
@@ -652,6 +653,7 @@ uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& f
   backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
   backend.set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ,
                               texture.view.get());
+  ++backend.heap_epoch_;
   ++backend.stats_.textures_decoded;
   if (kind != BcKind::kNone) ++backend.stats_.textures_bc;
   return texture.descriptor;
@@ -729,6 +731,7 @@ uint32_t Textures::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fe
                                staging));
   backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
   backend.set_3d_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ);
+  ++backend.heap_epoch_;
   ++backend.stats_.textures_decoded;
   return texture.descriptor;
 }
@@ -842,6 +845,7 @@ uint32_t Textures::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetc
   backend.targets.Transition(texture.texture.get(), texture.layout, RenderTextureLayout::SHADER_READ);
   backend.set_cube_->setTexture(texture.descriptor, texture.texture.get(), RenderTextureLayout::SHADER_READ,
                         texture.view.get());
+  ++backend.heap_epoch_;
   ++backend.stats_.textures_decoded;
   if (kind != BcKind::kNone) ++backend.stats_.textures_bc;
   return texture.descriptor;

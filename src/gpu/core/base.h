@@ -17,6 +17,7 @@
 #include "plume/xenos_ucode_key.h"
 #include "vendor/smolv/smolv.h"
 #include "plume/spirv_rewrites.h"
+#include "plume/spirv_descriptor_sets.h"
 #include "plume/hiz_model.h"
 
 #include <pthread.h>

@@ -2,6 +2,7 @@
 
 #include "frame_pacing.h"
 #include "plume_vulkan.h"
+#include "spirv_descriptor_sets.h"
 #include "spirv_int64.h"
 #include "spirv_position_varying.h"
 #include "spirv_vertex_inputs.h"
@@ -177,6 +178,10 @@ struct VulkanLayerState {
   // Qualcomm's own driver (VK_DRIVER_ID_QUALCOMM_PROPRIETARY). Its geometry shaders read the vertex position
   // from a location, which the layer has the vertex modules of their pipelines write (PositionedVertexModule).
   std::atomic<bool> qualcomm{false};
+  // The device's limits do not take the bindless heaps (the Mali-G52): the recompiled modules are rewritten for
+  // a set of each draw's own textures (spirv_descriptor_sets.h, GpuBackend::DrawTextureSet).
+  std::atomic<bool> per_draw_textures{false};
+  std::atomic<uint64_t> per_draw_rewritten{0};
   // What the pipeline cache's file name carries for a driver other than Turnip ("-drv<id>"), set with the device.
   std::string cache_tag;
   std::atomic<bool> device_lost{false};
@@ -405,6 +410,7 @@ bool PlumePipelineLookupSupported() { return pipeline_cache.lookup; }
 bool PlumeScaledVertexFormats() { return layer.scaled_vertex.load(std::memory_order_relaxed); }
 
 bool PlumeQualcommDriver() { return layer.qualcomm.load(std::memory_order_relaxed); }
+bool PlumePerDrawTextures() { return layer.per_draw_textures.load(std::memory_order_relaxed); }
 
 PlumePipelineLookupOnly::PlumePipelineLookupOnly() { pipeline_lookup_only = true; }
 PlumePipelineLookupOnly::~PlumePipelineLookupOnly() { pipeline_lookup_only = false; }
@@ -416,6 +422,10 @@ void PlumePipelineCacheCounts(uint64_t* found, uint64_t* compiled) {
 
 void InstallVulkanLayer();
 void VulkanLayerDeviceCreated(bool buffer_device_address);
+namespace gpu {  // gpu/core/context.cpp
+bool NeedsPerDrawTextures(const VkPhysicalDeviceLimits& limits);
+std::string MissingDescriptorLimits(const VkPhysicalDeviceLimits& limits, const VkPhysicalDeviceFeatures& features);
+}
 
 PlumeRenderer::PlumeRenderer() : state_(std::make_unique<State>()) {}
 PlumeRenderer::~PlumeRenderer() = default;
@@ -448,9 +458,46 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     // needs to see before the device is made.
     InstallVulkanLayer();
     s.device = s.api->createDevice("");
-    Require(bool(s.device), "Plume: dispositivo indisponível.");
+    Require(bool(s.device) && static_cast<VulkanDevice*>(s.device.get())->vk != VK_NULL_HANDLE,
+            "Plume: dispositivo indisponível.");
+    {
+      // Plume calls the Vulkan 1.2 name, and volk resolved it from the instance only. A Vulkan 1.1
+      // driver (Mali-G52 r34p0 on the Unisoc T618) has buffer device addresses as
+      // VK_KHR_buffer_device_address alone: the core name is no entry point there and the first
+      // call jumped to address 0. Asked of the device, under either name.
+      const VkDevice vk_device = static_cast<VulkanDevice*>(s.device.get())->vk;
+      auto address = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
+          vkGetDeviceProcAddr(vk_device, "vkGetBufferDeviceAddress"));
+      if (!address) {
+        address = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
+            vkGetDeviceProcAddr(vk_device, "vkGetBufferDeviceAddressKHR"));
+      }
+      vkGetBufferDeviceAddress = address;
+      Require(address || !s.device->getCapabilities().bufferDeviceAddress,
+              "Plume: vkGetBufferDeviceAddress indisponível.");
+    }
     VulkanLayerDeviceCreated(s.device->getCapabilities().bufferDeviceAddress);
     s.gpu = s.device->getDescription().name;
+    // Past the bindless heaps' limits each draw binds a set of its own textures; past even that, the
+    // start is refused here with the reason on screen: past its limits the driver may fault in a loop (the
+    // guest fault handler takes the signal) and the game stays on a black screen.
+    const auto* vulkan_device = static_cast<VulkanDevice*>(s.device.get());
+    const VkPhysicalDeviceLimits& limits = vulkan_device->physicalDeviceProperties.limits;
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(vulkan_device->physicalDevice, &features);
+    layer.per_draw_textures.store(gpu::NeedsPerDrawTextures(limits), std::memory_order_relaxed);
+    if (layer.per_draw_textures.load(std::memory_order_relaxed)) {
+      REXLOG_INFO("Renut: Plume {}: the bindless texture heaps are past its limits ({} sets, {} textures and {} "
+                  "samplers a stage); each draw binds a set of its own textures",
+                  s.gpu, limits.maxBoundDescriptorSets, limits.maxPerStageDescriptorSampledImages,
+                  limits.maxPerStageDescriptorSamplers);
+    }
+    if (const std::string missing = gpu::MissingDescriptorLimits(limits, features); !missing.empty()) {
+      const std::string why = "Plume: a GPU " + s.gpu + " não comporta o modelo de texturas do renderizador (" +
+                              missing + ").";
+      REXLOG_ERROR("Renut: {}", why);
+      Require(false, why.c_str());
+    }
     s.queue = s.device->createCommandQueue(RenderCommandListType::DIRECT);
     Require(bool(s.queue), "Plume: fila indisponível.");
     // The Android surface reports RGBA8 on the tested devices; fall back to BGRA8.
@@ -926,10 +973,18 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateShaderModule(VkDevice device, const Vk
                                                        const VkAllocationCallbacks* allocator,
                                                        VkShaderModule* module) {
   VkShaderModuleCreateInfo edited = *info;
-  std::vector<uint32_t> lowered;
-  if (layer.lower_int64.load(std::memory_order_relaxed) && info->pCode &&
-      spirv::UsesInt64(info->pCode, info->codeSize / sizeof(uint32_t))) {
-    if (spirv::LowerInt64(info->pCode, info->codeSize / sizeof(uint32_t), lowered)) {
+  std::vector<uint32_t> per_draw, lowered;
+  if (layer.per_draw_textures.load(std::memory_order_relaxed) && info->pCode &&
+      spirv::RewritePerDrawTextures(info->pCode, info->codeSize / sizeof(uint32_t), per_draw)) {
+    edited.pCode = per_draw.data();
+    edited.codeSize = per_draw.size() * sizeof(uint32_t);
+    if (layer.per_draw_rewritten.fetch_add(1) == 0) {
+      REXLOG_INFO("Renut: Plume shader modules are rewritten for a texture set per draw (sets 0 and 1)");
+    }
+  }
+  if (layer.lower_int64.load(std::memory_order_relaxed) && edited.pCode &&
+      spirv::UsesInt64(edited.pCode, edited.codeSize / sizeof(uint32_t))) {
+    if (spirv::LowerInt64(edited.pCode, edited.codeSize / sizeof(uint32_t), lowered)) {
       edited.pCode = lowered.data();
       edited.codeSize = lowered.size() * sizeof(uint32_t);
       if (layer.lowered.fetch_add(1) == 0) {

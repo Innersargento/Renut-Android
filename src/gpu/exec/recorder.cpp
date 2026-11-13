@@ -133,11 +133,17 @@ void Recorder::EmitDraw(const DrawPacket& pk, const DeferredSlot* slots, uint32_
     L()->setGraphicsPushConstants(0, pk.push, 0, sizeof(pk.push));
     std::memcpy(backend.targets.pushed_constants_, pk.push, sizeof(pk.push));
   }
+  if (pk.texture_set != VK_NULL_HANDLE && pk.texture_set != bound_texture_set_) {
+    vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(L())->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            static_cast<VulkanPipelineLayout*>(backend.layout_.get())->vk, spirv::kPerDrawTextureSet, 1,
+                            &pk.texture_set, 0, nullptr);
+    bound_texture_set_ = pk.texture_set;
+  }
   if (std::memcmp(pk.constant_offsets, bound_constant_offsets_, sizeof(pk.constant_offsets)) != 0 &&
       !((bind_skip_ & 1) && bound_constant_offsets_[0] != UINT32_MAX)) {
     vkCmdBindDescriptorSets(static_cast<VulkanCommandList*>(L())->vk, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            static_cast<VulkanPipelineLayout*>(backend.layout_.get())->vk, 4, 1, &backend.constants_set_,
-                            kConstantBindings, pk.constant_offsets);
+                            static_cast<VulkanPipelineLayout*>(backend.layout_.get())->vk, backend.ConstantSet(), 1,
+                            &backend.constants_set_, kConstantBindings, pk.constant_offsets);
     std::memcpy(bound_constant_offsets_, pk.constant_offsets, sizeof(pk.constant_offsets));
   }
   // Dynamic state, vertex and index buffers are only set when they change:

@@ -95,6 +95,8 @@ struct Draw {
   uint64_t shared_offset_ = UINT64_MAX;
   // And its second half, from RENUT_SHARED_HOT_SIZE on (binding 9).
   uint64_t shared_cold_offset_ = UINT64_MAX;
+  // Per-draw textures: the set of the draw being issued (GpuBackend::DrawTextureSet), for its packet.
+  VkDescriptorSet texture_set_ = VK_NULL_HANDLE;
   // The loop constants go into that half only when the guest wrote one.
   bool loop_constants_dirty_ = true;
   // files/plume-relconst (or the cvar): how a vertex shader's relative constant
