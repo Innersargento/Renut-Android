@@ -51,6 +51,7 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Gamepad
 import androidx.compose.material.icons.filled.Language as LanguageIcon
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -729,6 +730,7 @@ private val SKIN_LABELS = listOf(
     val turnip = remember(driver) { activity.uiDriverIsTurnip() }
     val sustained = activity.uiRuntimeOption("renut_adpf", "true") == "true"
     var noShadows by remember { mutableStateOf(activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true") }
+    var noBloom by remember { mutableStateOf(activity.uiRuntimeOption(RuntimeOptions.NO_BLOOM, "false") == "true") }
     val vsyncOn = activity.uiRuntimeOption(RuntimeOptions.VSYNC, "true") == "true"
     val textureLevels = listOf(stringResource(R.string.texture_quality_full), stringResource(R.string.texture_quality_half),
         stringResource(R.string.texture_quality_quarter))
@@ -850,6 +852,10 @@ private val SKIN_LABELS = listOf(
                         shadowQuality = level
                         activity.uiSetRuntimeOption(RuntimeOptions.SHADOW_QUALITY, level.toString())
                     }
+                }
+                ToggleRow(stringResource(R.string.settings_no_bloom), noBloom, !busy) {
+                    noBloom = it
+                    activity.uiSetRuntimeOption(RuntimeOptions.NO_BLOOM, it.toString())
                 }
                 ToggleRow(stringResource(R.string.settings_adpf), sustained, !busy) {
                     activity.uiSetRuntimeOption("renut_adpf", it.toString())
@@ -1277,6 +1283,7 @@ private val SidebarWidth = 360.dp
     fun level(key: String) = (activity.uiGraphicsOption(key, "0").toIntOrNull() ?: 0).coerceIn(0, 2)
     var vsyncOn by remember { mutableStateOf(activity.uiVsync()) }
     var noShadows by remember { mutableStateOf(activity.uiGraphicsOption("renut_plume_no_shadows", "false") == "true") }
+    var noBloom by remember { mutableStateOf(activity.uiGraphicsOption(RuntimeOptions.NO_BLOOM, "false") == "true") }
     var textureQuality by remember { mutableStateOf(level(RuntimeOptions.TEXTURE_QUALITY)) }
     var resolution by remember { mutableStateOf(level(RuntimeOptions.INTERNAL_RESOLUTION)) }
     var msaa by remember { mutableStateOf(level(RuntimeOptions.MSAA)) }
@@ -1308,6 +1315,10 @@ private val SidebarWidth = 360.dp
             listOf(R.string.aniso_off, R.string.aniso_2x, R.string.aniso_4x, R.string.aniso_8x, R.string.aniso_16x)) {
             aniso = it
             activity.uiSetGraphicsOption(RuntimeOptions.ANISO, RuntimeOptions.ANISO_VALUES[it].toString())
+        }
+        SidebarToggle(Icons.Default.LightMode, stringResource(R.string.settings_no_bloom), noBloom) {
+            noBloom = it
+            activity.uiSetGraphicsOption(RuntimeOptions.NO_BLOOM, it.toString())
         }
         SidebarChoice(stringResource(R.string.settings_shadow_quality), if (noShadows) 3 else shadowQuality,
             listOf(R.string.shadow_quality_full, R.string.shadow_quality_medium, R.string.shadow_quality_low,

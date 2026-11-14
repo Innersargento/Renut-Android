@@ -276,6 +276,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     // is compiled again at the next launch, which is what holds the loading screens.
     SavePlumePipelineCache();
     backend.no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
+    backend.no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
     if (const uint32_t rebase =
             PlumeArmDriver() ? uint32_t(std::clamp(REXCVAR_GET(renut_plume_mali_rebase_indices), 0, 2)) : 0u;
         rebase != rebase_indices_) {

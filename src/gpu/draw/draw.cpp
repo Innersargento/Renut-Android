@@ -1321,6 +1321,9 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     stencil_back = output.stencil_back;
   }
   RenderBlendDesc blends[4];
+  // renut_plume_no_bloom: the bright pass (scene * its alpha + glow) writes black, so every blur after it and
+  // the final add are black too.
+  bool bloom_cut = false;
   for (uint32_t i = 0; i < color_count; ++i) {
     RenderBlendDesc& b = blends[i];
     b = output.blends[i];
@@ -1328,6 +1331,12 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (debug_draw && (debug_mode_ & 2)) {
       b.blendEnabled = false;
       b.renderTargetWriteMask = 0xF;
+    }
+    if (backend.no_bloom_ && ps && ps->entry->hash == 0x1B958C7DC860BBBEull && IsBlendable(colors[i]->format)) {
+      b.blendEnabled = true;
+      b.srcBlend = b.dstBlend = b.srcBlendAlpha = b.dstBlendAlpha = RenderBlend::ZERO;
+      b.blendOp = b.blendOpAlpha = RenderBlendOperation::ADD;
+      bloom_cut = true;
     }
   }
   // Blend constants (RB_BLEND_RED..ALPHA) are dynamic state, set per draw, in
@@ -1439,6 +1448,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     key_bytes.Put(colors[i]->format);
     key_bytes.Put(uint8_t(blends[i].blendEnabled | ((blends[i].renderTargetWriteMask != output.blends[i].renderTargetWriteMask) << 1)));
   }
+  // Only the bright pass with the bloom cut adds a byte: its blend is not the output state's.
+  if (bloom_cut) key_bytes.Put(uint8_t(0xB1));
   key_bytes.Put(uint8_t((depth != nullptr) | (depth_enabled << 1) | (depth_write << 2)));
   key_bytes.Put(depth_control.zfunc);
   // Only multisampled draws add a byte, so the keys of the others stay as they were.

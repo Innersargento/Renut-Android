@@ -386,4 +386,5 @@
     <string name="hud_frametime">帧时间</string>
     <string name="hud_driver">驱动与 GPU</string>
     <string name="hud_memory">游戏内存</string>
+    <string name="settings_no_bloom">移除泛光</string>
 </resources>

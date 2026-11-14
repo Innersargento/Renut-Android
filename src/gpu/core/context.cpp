@@ -196,6 +196,7 @@ bool GpuBackend::SetupContext() {
   targets.list_ = lists_[0].get();
   hiz.mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2));
   no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
+  no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
   swap.adaptive_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1));
   if (no_shadows_) swap.shadow_min_indices_ = UINT32_MAX;
   recorder.fence_ = device_->createCommandFence();

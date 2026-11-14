@@ -386,4 +386,5 @@
     <string name="hud_frametime">Frametime</string>
     <string name="hud_driver">Driver y GPU</string>
     <string name="hud_memory">Memoria del juego</string>
+    <string name="settings_no_bloom">Quitar bloom</string>
 </resources>

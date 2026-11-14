@@ -96,6 +96,7 @@ REXCVAR_DECLARE(int32_t, renut_plume_adaptive_patches);
 REXCVAR_DECLARE(int32_t, renut_plume_water_tess_percent);
 REXCVAR_DECLARE(int32_t, renut_plume_shadow_min_indices);
 REXCVAR_DECLARE(bool, renut_plume_no_shadows);
+REXCVAR_DECLARE(bool, renut_plume_no_bloom);
 REXCVAR_DECLARE(bool, renut_plume_draw_callers);
 REXCVAR_DECLARE(bool, renut_plume_ui_depth_fix);
 REXCVAR_DECLARE(int32_t, renut_plume_low_memory);

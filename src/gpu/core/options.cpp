@@ -71,6 +71,9 @@ REXCVAR_DEFINE_INT32(renut_plume_aniso_max, 4, "reNut/Plume",
                      "16 gives every fetch what it asks. Live: a sampler made for another maximum is made anew when the "
                      "game next draws with it.")
     .range(1, 16);
+REXCVAR_DEFINE_BOOL(renut_plume_no_bloom, false, "reNut/Plume",
+                    "Make the bloom's bright pass write black, so the blur chain and the final blend add no glow. "
+                    "Live: the pass's pipeline is made again when the option changes.");
 REXCVAR_DEFINE_INT32(renut_plume_shadow_quality, 0, "reNut/Plume",
                      "Shadow map resolution: 0 full, 1 three quarters, 2 half (a side of the dynamic maps; "
                      "the cached atlas is not touched). The maps are drawn and resolved smaller and sampled "

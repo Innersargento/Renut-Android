@@ -42,6 +42,8 @@ final class RuntimeOptions {
     }
     /** 0 off, 1 2x, 2 4x: the samples of the scene's single band (gpu); read when the game starts. */
     static final String MSAA = "renut_msaa";
+    /** Draw the game without its bloom (gpu); followed live. */
+    static final String NO_BLOOM = "renut_plume_no_bloom";
     /** Write the runtime's log to a file of Documents/renut at each start (LogStorage). */
     static final String LOG_TO_FILE = "renut_log_to_file";
     /** Write the app's logcat to a file of Documents/renut while the game runs (LogStorage). */
@@ -85,7 +87,7 @@ final class RuntimeOptions {
     }
 
     private static final Set<String> BOOLEANS = new java.util.HashSet<>(java.util.Arrays.asList(
-        LEGACY_UNCAP_FPS, "renut_plume_no_shadows", "renut_adpf", "renut_plume_vsync", CHEATS, LOG_TO_FILE, LOGCAT));
+        LEGACY_UNCAP_FPS, "renut_plume_no_shadows", NO_BLOOM, "renut_adpf", "renut_plume_vsync", CHEATS, LOG_TO_FILE, LOGCAT));
     static {
         BOOLEANS.addAll(java.util.Arrays.asList(CHEAT_FLAGS));
     }

@@ -145,6 +145,8 @@ class GpuBackend final {
   std::atomic<bool> device_watch_stop_{false};
   WatchThread device_watch_{device_watch_stop_};
   bool no_shadows_ = false;
+  // renut_plume_no_bloom, followed live.
+  bool no_bloom_ = false;
   bool dedupe_descriptors_ = false;
   std::array<ResolvedLookup, kResolvedLookupSize> resolved_lookup_{};
   uint64_t resolved_lookup_serial_ = 1;
