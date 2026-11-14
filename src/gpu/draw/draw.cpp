@@ -294,7 +294,12 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // never dropped. Off (0) by default.
   if (backend.swap.shadow_min_indices_ && !color_count && index_count < backend.swap.shadow_min_indices_ && pitch != 1280 &&
       depth_control.z_write_enable && !depth_control.stencil_enable &&
-      !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT)) {
+      !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && !(backend.no_shadows_ && pitch == 512)) {
+    // The far cascade (slot 15, 2048x2048, a colour resolve) is not drawn in one go: the game fills it from
+    // 512-wide depth surfaces (the log shows only 512, 768 and 1024 for depth-only draws), a piece at a time as
+    // the player walks. With those casters dropped the pieces would stay empty after the option goes off and
+    // on again, shadows coming back only where the player has walked since. They are drawn (a few big draws
+    // now and then) and its reads are the white texture while the option is on (see the shadow slots below).
     ++backend.stats_.shadow_culled;
     return true;
   }
@@ -345,12 +350,16 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // is a depth resolve without stencil (the scene's depth keeps its stencil) or a texture in a depth format.
     if (backend.no_shadows_ && slot >= 13 && slot <= 15) {
       const auto format = xenos::TextureFormat(uint32_t(fetch.format));
-      const bool map = found && found->descriptor
-                           ? found->depth && found->format != RenderFormat::R32G32_FLOAT
-                           : fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+      // The far cascade (slot 15, 2048x2048, k_16_FLOAT) is a colour resolve, not a depth one, so a resolved
+      // texture counts as a shadow map by its fetch format too; the format test alone is what a texture that is
+      // not a resolve gets.
+      const bool shadow_format = fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
                                  (format == xenos::TextureFormat::k_24_8 ||
                                   format == xenos::TextureFormat::k_24_8_FLOAT ||
                                   format == xenos::TextureFormat::k_16_FLOAT);
+      const bool map = found && found->descriptor
+                           ? (found->depth && found->format != RenderFormat::R32G32_FLOAT) || shadow_format
+                           : shadow_format;
       if (map) continue;
     }
     if (found && found->last_src && !found->read_dirty) {

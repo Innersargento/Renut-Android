@@ -721,8 +721,6 @@ private val SKIN_LABELS = listOf(
         confirmButton = { TextButton(onClick = { confirmDeleteDriver = false; activity.uiDeleteDriver() }) { Text(stringResource(R.string.common_delete)) } },
         dismissButton = { TextButton(onClick = { confirmDeleteDriver = false }) { Text(stringResource(R.string.common_cancel)) } })
     val busy = activity.uiBusy()
-    val fpsEnabled = activity.uiFpsEnabled()
-    val tempEnabled = activity.uiTempEnabled()
     val controlsEnabled = activity.uiShowControls()
     val oneUiEnabled = activity.uiOneUiEnabled()
     val tuMode = activity.uiTuMode()
@@ -778,8 +776,6 @@ private val SKIN_LABELS = listOf(
         }
         item {
             Panel(stringResource(R.string.settings_display)) {
-                ToggleRow(stringResource(R.string.settings_fps), fpsEnabled, !busy) { activity.uiSetFps(it) }
-                ToggleRow(stringResource(R.string.settings_temp), tempEnabled, !busy) { activity.uiSetTemp(it) }
                 FpsTargetSlider(RuntimeOptions.fpsTarget(activity), !busy, onLive = {}) {
                     activity.uiSetRuntimeOption(RuntimeOptions.FPS_TARGET, it.toString())
                 }
@@ -1138,6 +1134,7 @@ private val SidebarWidth = 360.dp
         value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
     }
     val summary = snapshot?.let { stringResource(R.string.menu_ach_summary, it.unlocked.size, it.count(), it.earnedGamerscore) }
+    var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(stringResource(R.string.menu_eyebrow), color = Accent, fontWeight = FontWeight.Bold, fontSize = 11.sp, letterSpacing = 1.sp)
@@ -1160,6 +1157,10 @@ private val SidebarWidth = 360.dp
         }
         SidebarItem(Icons.Default.Palette, stringResource(R.string.menu_graphics), stringResource(R.string.menu_graphics_hint), chevron = true) {
             menu.page = GameMenu.Page.Graphics
+        }
+        SidebarToggle(Icons.Default.SportsEsports, stringResource(R.string.menu_onscreen_controls), controlsVisible) {
+            controlsVisible = it
+            activity.uiSetGameControlsVisible(it)
         }
         SidebarItem(Icons.Default.Visibility, stringResource(R.string.menu_hud), stringResource(R.string.menu_hud_hint), chevron = true) {
             menu.page = GameMenu.Page.Hud
@@ -1247,7 +1248,6 @@ private val SidebarWidth = 360.dp
         Text(stringResource(R.string.menu_hud), Modifier.weight(1f), color = Text, fontWeight = FontWeight.Bold, fontSize = 22.sp)
         IconButton(onClick = { menu.close() }) { Icon(Icons.Default.Close, stringResource(R.string.menu_close), tint = Muted) }
     }
-    var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
     val flags = remember {
         mutableStateMapOf<String, Boolean>().apply {
             for (key in listOf("fps", "frametime", "driver", "memory", "temp")) put(key, activity.uiHudFlag(key))
@@ -1260,10 +1260,6 @@ private val SidebarWidth = 360.dp
         }
     }
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        SidebarToggle(Icons.Default.SportsEsports, stringResource(R.string.menu_onscreen_controls), controlsVisible) {
-            controlsVisible = it
-            activity.uiSetGameControlsVisible(it)
-        }
         flag("fps", Icons.Default.Visibility, R.string.settings_fps)
         flag("frametime", Icons.Default.Speed, R.string.hud_frametime)
         flag("driver", Icons.Default.Memory, R.string.hud_driver)
