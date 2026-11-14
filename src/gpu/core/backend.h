@@ -417,7 +417,17 @@ inline Resolved* Draw::FindResolved(uint32_t address) {
         return nullptr;
       }
     }
-    if (latest) latest->sampled = true;
+    if (latest) {
+      latest->sampled = true;
+      if (latest->copy_skipped) {
+        // Its last resolve was not copied (no draw read it in 120 resolves) and a draw reads it after all:
+        // this read sees an older copy, and every resolve into it copies from now on.
+        latest->copy_skipped = false;
+        latest->never_skip = true;
+        latest->unread_streak = 0;
+        backend.resolve.never_skip_.insert(address);
+      }
+    }
     ways[1] = ways[0];
     ways[0] = {address, backend.resolved_lookup_serial_, latest};
     return latest;

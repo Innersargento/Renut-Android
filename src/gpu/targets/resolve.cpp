@@ -155,6 +155,12 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
     dest.last_dest[0] = dest_x, dest.last_dest[1] = dest_y;
     dest.last_depth = copying_depth;
     if (unread) ++backend.stats_.resolves_unread;
+    // A texture no draw has read in its last 120 resolves gets no copy until a draw reads it; then its address
+    // copies again for the rest of the session (FindResolved, never_skip_).
+    dest.unread_streak = unread ? dest.unread_streak + 1 : 0;
+    const bool skip_copy = !aliased && !dest.never_skip && dest.unread_streak >= 120 &&
+                           !never_skip_.count(surfaces.object_base);
+    dest.copy_skipped = skip_copy;
     // What became of the copy this one replaces (see Resolved::last_copy).
     if (dest.written != 0 && dest.last_copy) {
       const uint32_t kind = !dest.sampled ? 0u : dest.read_dirty ? 2u : 1u;
@@ -180,6 +186,8 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
     if (aliased) {
       // Nothing to copy: the texture is the surface's own image.
       ++backend.stats_.resolves_aliased;
+    } else if (skip_copy) {
+      // Not read in 120 resolves: no copy (see above).
     } else if (dest.texture && copying_depth && w && h) {
       ++backend.stats_.resolves_depth;
       backend.stats_.resolve_px_depth += uint64_t(w) * h;
@@ -188,7 +196,11 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       // The scene's depth with its stencil: one compute pass into the texture, when the device allows it; the
       // staging buffers otherwise. A multisampled image cannot go through them (a buffer copy takes one sample
       // per texel): only the compute pass, which reads its first sample, resolves it.
-      if (!(packed && dest.format == RenderFormat::R32G32_FLOAT &&
+      if (packed && !RenderFormatIsStencil(source->format)) {
+        // A surface made without stencil (a shadow map, Targets::SurfaceTarget) resolved with it: not expected
+        // of a shadow map. This copy is not made; the surface gets its stencil for the next ones.
+        backend.targets.RequireStencil(*source);
+      } else if (!(packed && dest.format == RenderFormat::R32G32_FLOAT &&
             ResolveDepthStencil(*source, sx, sy, w, h, dest.texture.get(), dest.layout, dest_x, dest_y))) {
         if (multisampled) {
           if (++backend.stats_.msaa_depth_skipped <= 4) {
@@ -221,7 +233,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
                                  dest_y, 0, &box);
       }
     }
-    dest.last_copy = !aliased && dest.texture && w && h;
+    dest.last_copy = !aliased && !skip_copy && dest.texture && w && h;
     dest.read_dirty = false;
     dest.last_px = uint64_t(w) * h;
     if (dest.texture) {
@@ -280,7 +292,8 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
       std::array<Target*, 4> none{};
       backend.targets.SetFramebuffer(backend.targets.GetFramebuffer(none, 0, depth));
       const uint32_t d = copy.depth_clear;
-      backend.recorder.L()->clearDepthStencil(true, true, float(d >> 8) / float(0xFFFFFF), d & 0xFF, &depth_rect, 1);
+      backend.recorder.L()->clearDepthStencil(true, RenderFormatIsStencil(depth->format), float(d >> 8) / float(0xFFFFFF),
+                                              d & 0xFF, &depth_rect, 1);
       ++backend.stats_.clears;
     }
   }

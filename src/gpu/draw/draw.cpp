@@ -255,6 +255,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   Target* depth = nullptr;
   if (depth_control.z_enable || depth_control.stencil_enable) {
     depth = backend.targets.NativeTarget(4);
+    // A shadow map made without stencil (Targets::SurfaceTarget) that this draw tests or writes
+    // the stencil of gets it back.
+    if (depth && depth_control.stencil_enable && depth->format == RenderFormat::D32_FLOAT) {
+      backend.targets.RequireStencil(*depth);
+    }
   }
   {
     backend.targets.MatchSurfaceSizes(colors, color_count, depth);
@@ -1452,6 +1457,9 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (bloom_cut) key_bytes.Put(uint8_t(0xB1));
   key_bytes.Put(uint8_t((depth != nullptr) | (depth_enabled << 1) | (depth_write << 2)));
   key_bytes.Put(depth_control.zfunc);
+  // Only a depth target without stencil (a shadow map) adds a byte: its
+  // pipelines are made for another depth format, and every other draw keeps its key.
+  if (depth && depth->format == RenderFormat::D32_FLOAT) key_bytes.Put(uint8_t(0xD3));
   // Only multisampled draws add a byte, so the keys of the others stay as they were.
   if (pass_samples > 1) key_bytes.Put(uint8_t(pass_samples | (coverage_mask << 4)));
   // Only stencil draws add bytes, so the cached pipelines of every other draw

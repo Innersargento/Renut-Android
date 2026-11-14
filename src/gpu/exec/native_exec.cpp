@@ -348,10 +348,14 @@ void Lists::NativeClear(const uint32_t* w) {
             depth->depth_undefined = !whole;
           }
         }
-        backend.targets.Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
-        std::array<Target*, 4> none{};
-        backend.targets.SetFramebuffer(backend.targets.GetFramebuffer(none, 0, depth));
-        backend.recorder.L()->clearDepthStencil(clear_depth, clear_stencil || fresh, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
+        // A shadow map made without stencil (Targets::SurfaceTarget) has no stencil to clear.
+        const bool stencil_aspect = (clear_stencil || fresh) && RenderFormatIsStencil(depth->format);
+        if (clear_depth || stencil_aspect) {
+          backend.targets.Transition(depth->texture.get(), depth->layout, RenderTextureLayout::DEPTH_WRITE);
+          std::array<Target*, 4> none{};
+          backend.targets.SetFramebuffer(backend.targets.GetFramebuffer(none, 0, depth));
+          backend.recorder.L()->clearDepthStencil(clear_depth, stencil_aspect, std::clamp(z, 0.f, 1.f), stencil, &rect, 1);
+        }
       }
     }
   }

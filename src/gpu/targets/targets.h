@@ -23,6 +23,10 @@ struct Targets {
   // A framebuffer is as big as its first attachment: the others grow to it.
   void MatchSurfaceSizes(std::array<Target*, 4>& colors, uint32_t color_count, Target*& depth);
   bool GrowSurfaceTarget(Target& target, uint32_t width, uint32_t height);
+  // A depth surface made without stencil (a shadow map, SurfaceTarget) that a draw or a resolve needs the
+  // stencil of: made again as D32S8 (what it held is lost) and kept so, also when made again later.
+  void RequireStencil(Target& target);
+  std::unordered_set<uint64_t> stencil_keys_;
   void RetireFramebuffers();
   void EvictSurfaceTargets();
   // Follows the quality cvars (resolution, shadow maps, MSAA) while the game runs; called once a frame.

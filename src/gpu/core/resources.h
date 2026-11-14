@@ -41,6 +41,8 @@ struct Target {
   uint32_t alias_cycles = 0;
   bool aliased_since_clear = false;
   bool depth_undefined = false;
+  // Its key in Targets::targets_ (a depth surface made without stencil remembers there that it needs one).
+  uint64_t key = 0;
 };
 
 // A guest pixel coordinate in a target's host pixels, rounded down or up.
@@ -130,6 +132,11 @@ struct Resolved {
   bool last_copy = false;
   bool read_dirty = false;
   uint64_t last_px = 0;
+  // Resolves in a row whose copy no draw read before the next one: from 120 on the copy is not made
+  // (copy_skipped); a draw that reads it then sets never_skip for good.
+  uint32_t unread_streak = 0;
+  bool copy_skipped = false;
+  bool never_skip = false;
 };
 
 struct GuestTexture {

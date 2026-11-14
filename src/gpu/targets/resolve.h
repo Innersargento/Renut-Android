@@ -30,6 +30,9 @@ struct Resolve {
   // GPU.
   void NativePhoto(const uint32_t* record);
   uint32_t photo_captures_ = 0, volume_logged_ = 0;
+  // Addresses a draw read after their copy was skipped (ExecuteResolve): never skipped again
+  // this session, also when their Resolved entry is made anew (an eviction, a stale lookup).
+  std::unordered_set<uint32_t> never_skip_;
   void NativeResolve(const uint32_t* record);
   // Copies a rectangle of a depth target's depth into an R32_FLOAT texture, or
   // its depth and stencil into an RG32F one.

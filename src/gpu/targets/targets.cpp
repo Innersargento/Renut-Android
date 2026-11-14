@@ -363,6 +363,10 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
   if (target.texture) return &target;
   uint32_t width = std::max(((s.dims >> 18) & 0x3FFF) + 1, 16u);
   uint32_t height = std::max(((((s.dims >> 3) & 0x7FFF) + 1) + 15) & ~15u, 16u);
+  // The shadow maps (D24S8, 512 px and more: the cascades) test and write depth only, so they are made
+  // without the S8 plane, which a tiler loads and stores with every pass. A draw or resolve that needs it
+  // brings it back (RequireStencil), and the surface keeps it.
+  const bool no_stencil = depth && format == 0 && std::min(width, height) >= 512 && !stencil_keys_.count(key);
   // The dynamic shadow maps are the only D24S8 depth surfaces (the scene's is
   // D24FS8) of this size: drawn at the shadow quality's fraction of it.
   uint32_t scale = 4;
@@ -376,7 +380,7 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
     width = std::max((width * scale + 3) / 4, 16u);
     height = std::max((height * scale + 3) / 4, 16u);
   }
-  const RenderFormat rf = depth ? RenderFormat::D32_FLOAT_S8_UINT
+  const RenderFormat rf = depth ? (no_stencil ? RenderFormat::D32_FLOAT : RenderFormat::D32_FLOAT_S8_UINT)
                                 : ColorFormat(xenos::ColorRenderTargetFormat(format));
   // The surface's MSAA type (bits 16-17 of its RB_SURFACE_INFO word: 0 none, 1 2x, 2 4x), within the option and
   // what the device draws in this format.
@@ -414,9 +418,30 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
   target.layout = RenderTextureLayout::UNKNOWN;
   target.surface = s.object;
   target.surface_info = s.info & ~0xFFFu;
+  target.key = key;
   ++surface_created_;
   RetireFramebuffers();
   return &target;
+}
+
+void Targets::RequireStencil(Target& target) {
+  if (!target.depth || target.format != RenderFormat::D32_FLOAT) return;
+  stencil_keys_.insert(target.key);
+  const RenderMultisampling multisampling(RenderSampleCounts(target.samples));
+  auto texture = backend.device_->createTexture(
+      RenderTextureDesc::DepthTarget(target.width, target.height, RenderFormat::D32_FLOAT_S8_UINT, multisampling));
+  // Without the new image the surface stays as it is: a stencil test on it then passes always.
+  if (!texture || !static_cast<VulkanTexture*>(texture.get())->vk) return;
+  if (target.texture) retired_slots_[backend.slot_].push_back(std::move(target.texture));
+  target.texture = std::move(texture);
+  target.format = RenderFormat::D32_FLOAT_S8_UINT;
+  target.layout = RenderTextureLayout::UNKNOWN;
+  target.restore_key = 0;  // what it held was lost with its image
+  target.restore_image = nullptr;
+  target.alias_cycles = 0;
+  target.aliased_since_clear = false;
+  target.depth_undefined = true;
+  RetireFramebuffers();
 }
 
 void Targets::RetireFramebuffers() {
