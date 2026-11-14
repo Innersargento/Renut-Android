@@ -56,6 +56,10 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private static native long nativeRumble();
     private static native void nativeSetFpsTarget(int fps);
     private static native long nativeFrameCount();
+    /** The last frame times in milliseconds, oldest first; empty when the game is not presenting. */
+    private static native float[] nativeFrameTimes();
+    /** The GPU, the driver and the Vulkan version, one per line; empty until the renderer has started. */
+    private static native String nativeDriverInfo();
     private static native boolean nativeSetCvar(String name,String value);
     private static native void nativeTextInputResult(String text,boolean cancelled);
     private TextView fps, temp;
@@ -63,6 +67,10 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     private HudLayout.Profile hudProfile;
     // The player's switches (settings, sidebar); a readout also has to be visible in the layout profile.
     private boolean fpsWanted, tempWanted;
+    /** The readouts besides FPS and temperature: each is a view of its own with a switch of its own. */
+    private TextView frametimeView, driverView, memoryView;
+    private boolean showFrametime, showDriver, showMemory;
+    private String driverText = "", memoryText = "";
     private AchievementToast achievementToast;
     // The one game screen that is open: the native side reports unlocks through a static method.
     private static volatile java.lang.ref.WeakReference<RuntimeActivity> current;
@@ -180,11 +188,21 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             // the game menu switches it on and off.
             fps=new TextView(this);fps.setTextColor(Color.rgb(120,255,120));fps.setTextSize(14);
             fps.setTypeface(android.graphics.Typeface.MONOSPACE,android.graphics.Typeface.BOLD);
-            fps.setShadowLayer(3,1,1,Color.BLACK);fps.setText("FPS --");
+            fps.setShadowLayer(3,1,1,Color.BLACK);fps.setText("");
             fpsWanted=getIntent().getBooleanExtra("fps",false);
+            android.content.SharedPreferences hud=getSharedPreferences("MainActivity",MODE_PRIVATE);
+            showFrametime=hud.getBoolean("hud_frametime",false);
+            showDriver=hud.getBoolean("hud_driver",false);
+            showMemory=hud.getBoolean("hud_memory",false);
             fps.setVisibility(fpsWanted?View.VISIBLE:View.GONE);
-            // Both readouts sit where the screen layout profile says (applyHudLayout), measured from the top left.
+            // Every readout sits where the screen layout profile says (applyHudLayout), measured from the top left.
             root.addView(fps,new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.START));
+            frametimeView=newReadout(root,Color.rgb(110,216,255),13);
+            driverView=newReadout(root,Color.rgb(214,160,255),12);
+            memoryView=newReadout(root,Color.rgb(200,200,255),13);
+            frametimeView.setVisibility(showFrametime?View.VISIBLE:View.GONE);
+            driverView.setVisibility(showDriver?View.VISIBLE:View.GONE);
+            memoryView.setVisibility(showMemory?View.VISIBLE:View.GONE);
             temp=new TextView(this);temp.setTextColor(Color.rgb(255,196,110));temp.setTextSize(13);
             temp.setTypeface(android.graphics.Typeface.MONOSPACE,android.graphics.Typeface.BOLD);
             temp.setShadowLayer(3,1,1,Color.BLACK);temp.setText("");
@@ -194,6 +212,8 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             thermal=new ThermalReader(this);
             View.OnLayoutChangeListener replace=(v,l,t,r,bm,ol,ot,or,ob)->placeReadouts();
             root.addOnLayoutChangeListener(replace);fps.addOnLayoutChangeListener(replace);temp.addOnLayoutChangeListener(replace);
+            frametimeView.addOnLayoutChangeListener(replace);driverView.addOnLayoutChangeListener(replace);
+            memoryView.addOnLayoutChangeListener(replace);
             applyHudLayout();
             // Temperatures change slowly: read the sensors off the UI thread every two seconds.
             final java.util.concurrent.ExecutorService sensors=java.util.concurrent.Executors.newSingleThreadExecutor(
@@ -207,13 +227,31 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
                 temp.postDelayed(this,2000);
             }},500);
             final long[] last={-1,0};
+            final String[] fpsLine={"FPS --"};
+            final int[] ticks={0};
+            final java.util.concurrent.ExecutorService memory=java.util.concurrent.Executors.newSingleThreadExecutor(
+                r->{Thread t=new Thread(r,"renut-memory");t.setDaemon(true);return t;});
             fps.postDelayed(new Runnable(){@Override public void run(){
-                if(isFinishing())return;
+                if(isFinishing()){memory.shutdown();return;}
                 if(loaded&&fps.getVisibility()==View.VISIBLE){
                     long frames=nativeFrameCount(),now=android.os.SystemClock.elapsedRealtime();
-                    if(last[0]>=0&&now>last[1])fps.setText(String.format(java.util.Locale.ROOT,"FPS %.1f",(frames-last[0])*1000.0/(now-last[1])));
+                    if(last[0]>=0&&now>last[1])fpsLine[0]=String.format(java.util.Locale.ROOT,"FPS %.1f",(frames-last[0])*1000.0/(now-last[1]));
                     last[0]=frames;last[1]=now;
+                    fps.setText(fpsLine[0]);
                 }else last[0]=-1;  // hidden or not loaded: the first reading after it is not an average
+                if(loaded&&frametimeView.getVisibility()==View.VISIBLE)frametimeView.setText(frameTimeLine());
+                // Set once the renderer has its device.
+                if(loaded&&driverView.getVisibility()==View.VISIBLE&&driverText.isEmpty()){
+                    driverText=nativeDriverInfo();
+                    driverView.setText(driverText);
+                }
+                // The process's memory is read off the UI thread, every two seconds (it parses /proc).
+                if(loaded&&memoryView.getVisibility()==View.VISIBLE&&ticks[0]++%4==0)memory.execute(()->{
+                    android.os.Debug.MemoryInfo info=new android.os.Debug.MemoryInfo();
+                    android.os.Debug.getMemoryInfo(info);
+                    final String text=String.format(java.util.Locale.ROOT,"RAM %d MB",info.getTotalPss()/1024);
+                    runOnUiThread(()->memoryView.setText(text));
+                });
                 fps.postDelayed(this,500);
             }},500);
             results.setVisibility(View.GONE);results.setBackgroundColor(Color.rgb(16,10,6));
@@ -268,22 +306,78 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         overlay.setVisibility(visible?View.VISIBLE:View.GONE);
         getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("showControls",visible).apply();
     }
+    /** A text view for one readout, built hidden; applyHudLayout and updateReadouts show and place it. */
+    private TextView newReadout(ViewGroup root,int color,int size){
+        TextView view=new TextView(this);view.setTextColor(color);view.setTextSize(size);
+        view.setTypeface(android.graphics.Typeface.MONOSPACE,android.graphics.Typeface.BOLD);
+        view.setShadowLayer(3,1,1,Color.BLACK);view.setText("");view.setVisibility(View.GONE);
+        root.addView(view,new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.START));
+        return view;
+    }
+    /** A readout shows while its switch is on and the layout profile has not hidden it. */
+    private void updateReadouts(){
+        if(fps==null||temp==null||frametimeView==null)return;
+        setReadout(fps,HudLayout.FPS,fpsWanted);
+        setReadout(temp,HudLayout.TEMP,tempWanted);
+        setReadout(frametimeView,HudLayout.FRAMETIME,showFrametime);
+        setReadout(driverView,HudLayout.DRIVER,showDriver);
+        setReadout(memoryView,HudLayout.MEMORY,showMemory);
+    }
+    private void setReadout(TextView view,String id,boolean wanted){
+        view.setVisibility(wanted&&(hudProfile==null||HudLayout.visible(hudProfile,id))?View.VISIBLE:View.GONE);
+    }
+    /** The frame time over the last frames: the mean, the 1% low (as a rate) and the worst. */
+    private static String frameTimeLine(){
+        float[] times=nativeFrameTimes();
+        if(times==null||times.length==0)return "-- ms";
+        float sum=0,worst=0;
+        for(float t:times){sum+=t;worst=Math.max(worst,t);}
+        float[] sorted=times.clone();
+        java.util.Arrays.sort(sorted);
+        float p99=sorted[Math.min(sorted.length-1,(int)Math.ceil(sorted.length*0.99)-1)];
+        return String.format(java.util.Locale.ROOT,"%.1f ms  1%%low %.0f  max %.1f",sum/times.length,1000f/Math.max(p99,0.001f),worst);
+    }
+    /** The lines of the HUD that have a switch of their own: "fps", "frametime", "driver", "memory" and "temp". */
+    public boolean uiHudFlag(String key){
+        switch(key){
+            case "fps":return fpsWanted;
+            case "temp":return tempWanted;
+            case "frametime":return showFrametime;
+            case "driver":return showDriver;
+            case "memory":return showMemory;
+            default:return false;
+        }
+    }
+    public void uiSetHudFlag(String key,boolean on){
+        switch(key){
+            case "fps":uiSetFpsVisible(on);return;
+            case "temp":uiSetTempVisible(on);return;
+            case "frametime":showFrametime=on;break;
+            case "driver":showDriver=on;break;
+            case "memory":showMemory=on;break;
+            default:return;
+        }
+        updateReadouts();
+        getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("hud_"+key,on).apply();
+    }
     /** Reads the selected screen layout profile and puts the controller and the readouts where it says. */
     private void applyHudLayout(){
         if(!launch||overlay==null)return;
         hudProfile=HudLayout.load(this);
         overlay.setLayout(hudProfile);  // each control carries its own opacity
-        fps.setVisibility(fpsWanted&&HudLayout.visible(hudProfile,HudLayout.FPS)?View.VISIBLE:View.GONE);
-        temp.setVisibility(tempWanted&&HudLayout.visible(hudProfile,HudLayout.TEMP)?View.VISIBLE:View.GONE);
+        updateReadouts();
         placeReadouts();
     }
     private void placeReadouts(){
-        if(fps==null||temp==null||hudProfile==null)return;
+        if(fps==null||temp==null||frametimeView==null||hudProfile==null)return;
         View root=(View)fps.getParent();
         int w=root.getWidth(),h=root.getHeight();
         if(w<=0||h<=0)return;
         placeReadout(fps,HudLayout.FPS,w,h);
         placeReadout(temp,HudLayout.TEMP,w,h);
+        placeReadout(frametimeView,HudLayout.FRAMETIME,w,h);
+        placeReadout(driverView,HudLayout.DRIVER,w,h);
+        placeReadout(memoryView,HudLayout.MEMORY,w,h);
     }
     private void placeReadout(TextView view,String id,int w,int h){
         HudLayout.Shape shape=HudLayout.shape(hudProfile,id,w,h);
@@ -368,7 +462,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     public void uiSetFpsVisible(boolean visible){
         if(fps==null)return;
         fpsWanted=visible;
-        fps.setVisibility(visible&&HudLayout.visible(hudProfile,HudLayout.FPS)?View.VISIBLE:View.GONE);
+        updateReadouts();
         getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putBoolean("fps",visible).apply();
     }
     /** The player's pause. False when the game could not take it (not drawing yet), so the menu shows the truth. */
@@ -423,12 +517,6 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         for(int player=0;player<ExternalController.PLAYERS;player++)
             if(controllers[player]!=null)devices[player]=controllers[player].device();
         return devices;
-    }
-    public boolean uiRumbleEnabled(){return rumbleWanted;}
-    public void uiSetRumble(boolean enabled){
-        rumbleWanted=enabled;
-        ExternalController.setRumbleEnabled(this,enabled);
-        if(!enabled&&rumble!=null)rumble.stop();
     }
     /** Tells the game whether a second player's pad is there; it learns of the change on its next poll. */
     private void syncSecondPlayer(){
@@ -499,7 +587,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             final String message=report;
             ended=true;
             runOnUiThread(()->{if(!isFinishing()){status.setText(message);if(surface!=null)surface.setVisibility(View.GONE);
-                if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);if(temp!=null)temp.setVisibility(View.GONE);
+                if(launch){if(overlay!=null)overlay.setVisibility(View.GONE);if(fps!=null)fps.setVisibility(View.GONE);if(temp!=null)temp.setVisibility(View.GONE);if(frametimeView!=null)frametimeView.setVisibility(View.GONE);if(driverView!=null)driverView.setVisibility(View.GONE);if(memoryView!=null)memoryView.setVisibility(View.GONE);
                     if(gameMenu!=null)gameMenu.getView().setVisibility(View.GONE);results.setVisibility(View.VISIBLE);}
                 else results.setLayoutParams(new LinearLayout.LayoutParams(-1,0,1));}});
         },"renut-runtime-validation").start();

@@ -148,13 +148,37 @@ void StopKernelTime() {
 // (adpf.cpp) hangs on.
 namespace {
 std::atomic<uint64_t> g_guest_swaps{0};
+// The instant (steady clock, ns) of each of the last swaps, for the frame-time readout.
+constexpr size_t kSwapRing = 512;
+std::atomic<uint64_t> g_swap_ns[kSwapRing];
+uint64_t SteadyNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
 }
 extern "C" void (*renut_frame_hook)() = nullptr;
 extern "C" void renut_note_guest_swap() {
-  g_guest_swaps.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t n = g_guest_swaps.fetch_add(1, std::memory_order_relaxed);
+  g_swap_ns[n % kSwapRing].store(SteadyNs(), std::memory_order_relaxed);
   if (auto hook = renut_frame_hook) hook();
 }
 extern "C" uint64_t renut_guest_swap_count() { return g_guest_swaps.load(std::memory_order_relaxed); }
+// The last `max` (at most 256) intervals between swaps in milliseconds, oldest first; none when the game has not
+// swapped for two seconds (paused, loading, or not started).
+extern "C" size_t renut_frame_times(float* out, size_t max) {
+  const uint64_t count = g_guest_swaps.load(std::memory_order_relaxed);
+  if (count < 2) return 0;
+  const uint64_t newest = g_swap_ns[(count - 1) % kSwapRing].load(std::memory_order_relaxed);
+  if (SteadyNs() - newest > 2000000000ull) return 0;
+  const size_t wanted = std::min<size_t>({max, 256, size_t(count - 1)});
+  size_t written = 0;
+  for (uint64_t i = count - wanted; i < count; ++i) {
+    const uint64_t now = g_swap_ns[i % kSwapRing].load(std::memory_order_relaxed);
+    const uint64_t before = g_swap_ns[(i - 1) % kSwapRing].load(std::memory_order_relaxed);
+    if (now > before) out[written++] = float(double(now - before) / 1e6);
+  }
+  return written;
+}
 #if !defined(__ANDROID__)
 // Frames of silence the output played: counted by the audio output
 // (renut_audio.cpp) on Android, which has its own.

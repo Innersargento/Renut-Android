@@ -258,7 +258,6 @@
     <string name="ctrl_players_touch">The touch screen always controls Player 1.</string>
     <string name="ctrl_rumble">Vibration</string>
     <string name="ctrl_rumble_note">Each controller rumbles for its own player. If a controller has no rumble motor, or you play on the touch screen alone, the phone vibrates instead.</string>
-    <string name="ctrl_rumble_test">Test vibration</string>
     <string name="result_panel">Result</string>
     <string name="runtime_eyebrow">RUNTIME TEST</string>
     <string name="runtime_subtitle">Experimental validation</string>
@@ -382,4 +381,9 @@
     <string name="logs_to_file">Write the log to a file</string>
     <string name="logs_to_file_note">One file per game start in Documents/renut: renut-YYYYMMDD-HHMMSS.log for the log and logcat-YYYYMMDD-HHMMSS.txt for logcat (the app and the game process). Takes effect from the next start.</string>
     <string name="logs_logcat">Capture the app\'s logcat</string>
+    <string name="menu_hud">HUD</string>
+    <string name="menu_hud_hint">FPS, frame time, driver, memory, temperature</string>
+    <string name="hud_frametime">Frame time</string>
+    <string name="hud_driver">Driver and GPU</string>
+    <string name="hud_memory">Game memory</string>
 </resources>

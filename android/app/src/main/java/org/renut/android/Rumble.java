@@ -143,20 +143,4 @@ final class Rumble {
             phoneOn = true;
         } catch (RuntimeException ignored) { /* vibration is a courtesy, never a reason to fail */ }
     }
-
-    /** One short pulse on every player's gamepad (the phone for a player without one), for the menus. */
-    static void test(Context context) {
-        final Rumble rumble = new Rumble(context);
-        InputDevice[] devices = new InputDevice[ExternalController.PLAYERS];
-        for (ExternalController.Pad pad : ExternalController.pads(context)) {
-            if (pad.role >= 0) devices[pad.role] = pad.device;
-        }
-        // A player with a pad pulses it; with none at all, the first player (the touch screen) pulses the phone.
-        long packed = 0;
-        for (int player = 0; player < ExternalController.PLAYERS; player++) {
-            if (devices[player] != null) packed |= 0xFFFFFFFFL << (player * 32);
-        }
-        rumble.apply(packed != 0 ? packed : 0xFFFFFFFFL, devices);
-        new Handler(Looper.getMainLooper()).postDelayed(rumble::stop, 700);
-    }
 }

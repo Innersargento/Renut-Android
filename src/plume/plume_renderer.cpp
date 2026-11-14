@@ -307,6 +307,9 @@ struct VulkanLayerState {
   std::atomic<bool> bc_as_etc2{false};
   // What the pipeline cache's file name carries for a driver other than Turnip ("-drv<id>"), set with the device.
   std::string cache_tag;
+  // "GPU name, driver name and info, Vulkan version" for the HUD's driver line, set with the device.
+  std::mutex driver_text_mutex;
+  std::string driver_text;
   std::atomic<bool> device_lost{false};
 };
 VulkanLayerState layer;
@@ -727,6 +730,10 @@ bool PlumeScaledVertexFormats() { return layer.scaled_vertex.load(std::memory_or
 
 bool PlumeQualcommDriver() { return layer.qualcomm.load(std::memory_order_relaxed); }
 bool PlumeArmDriver() { return layer.arm.load(std::memory_order_relaxed); }
+std::string PlumeDriverText() {
+  std::lock_guard lock(layer.driver_text_mutex);
+  return layer.driver_text;
+}
 bool PlumePerDrawTextures() { return layer.per_draw_textures.load(std::memory_order_relaxed); }
 void PlumeSetBcAsEtc2(bool on) { layer.bc_as_etc2.store(on, std::memory_order_relaxed); }
 
@@ -1801,6 +1808,13 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, cons
     vkGetPhysicalDeviceProperties2(physical, &properties);
     layer.cache_tag =
         driver.driverID == VK_DRIVER_ID_MESA_TURNIP ? std::string() : fmt::format("-drv{}", uint32_t(driver.driverID));
+    {
+      std::lock_guard lock(layer.driver_text_mutex);
+      layer.driver_text = fmt::format("{}\n{} {}\nVulkan {}.{}.{}", properties.properties.deviceName, driver.driverName,
+                                      driver.driverInfo, VK_API_VERSION_MAJOR(properties.properties.apiVersion),
+                                      VK_API_VERSION_MINOR(properties.properties.apiVersion),
+                                      VK_API_VERSION_PATCH(properties.properties.apiVersion));
+    }
     layer.qualcomm.store(driver.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY, std::memory_order_relaxed);
     layer.arm.store(driver.driverID == VK_DRIVER_ID_ARM_PROPRIETARY, std::memory_order_relaxed);
     REXLOG_INFO("Renut: Plume Vulkan driver {} ({}, {}): scaled vertex formats {}; 64-bit integers in shaders {}",

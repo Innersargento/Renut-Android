@@ -213,6 +213,19 @@ extern "C" uint64_t renut_guest_swap_count();
 extern "C" JNIEXPORT jlong JNICALL Java_org_renut_android_RuntimeActivity_nativeFrameCount(JNIEnv*,jclass) {
   return jlong(renut_guest_swap_count());
 }
+extern "C" size_t renut_frame_times(float* out, size_t max);
+// The last frame times in milliseconds, oldest first (host_support.cpp); empty when the game is not presenting.
+extern "C" JNIEXPORT jfloatArray JNICALL Java_org_renut_android_RuntimeActivity_nativeFrameTimes(JNIEnv* env,jclass) {
+  float times[256];
+  const size_t count = renut_frame_times(times, 256);
+  jfloatArray result = env->NewFloatArray(jsize(count));
+  if (result && count) env->SetFloatArrayRegion(result, 0, jsize(count), times);
+  return result;
+}
+// The GPU, the driver and the Vulkan version, one per line (empty until the renderer has started).
+extern "C" JNIEXPORT jstring JNICALL Java_org_renut_android_RuntimeActivity_nativeDriverInfo(JNIEnv* env,jclass) {
+  return env->NewStringUTF(renut::PlumeDriverText().c_str());
+}
 static std::string javaString(JNIEnv* env,jstring value){
   if(!value)return {};const char* chars=env->GetStringUTFChars(value,nullptr);
   if(!chars)throw std::runtime_error("String JNI indisponível.");

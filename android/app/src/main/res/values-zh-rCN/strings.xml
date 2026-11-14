@@ -258,7 +258,6 @@
     <string name="ctrl_players_touch">触屏始终控制玩家 1。</string>
     <string name="ctrl_rumble">震动</string>
     <string name="ctrl_rumble_note">每个手柄为各自的玩家震动。如果手柄没有震动马达，或只使用触屏，则由手机震动代替。</string>
-    <string name="ctrl_rumble_test">测试震动</string>
     <string name="result_panel">结果</string>
     <string name="runtime_eyebrow">运行时测试</string>
     <string name="runtime_subtitle">实验性验证</string>
@@ -382,4 +381,9 @@
     <string name="logs_to_file">将日志写入文件</string>
     <string name="logs_to_file_note">每次启动游戏在 Documents/renut 中生成一个文件：日志为 renut-年月日-时分秒.log，logcat 为 logcat-年月日-时分秒.txt（应用与游戏进程）。下次启动生效。</string>
     <string name="logs_logcat">捕获应用的 logcat</string>
+    <string name="menu_hud">HUD</string>
+    <string name="menu_hud_hint">FPS、帧时间、驱动、内存、温度</string>
+    <string name="hud_frametime">帧时间</string>
+    <string name="hud_driver">驱动与 GPU</string>
+    <string name="hud_memory">游戏内存</string>
 </resources>

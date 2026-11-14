@@ -50,14 +50,15 @@ import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Gamepad
 import androidx.compose.material.icons.filled.Language as LanguageIcon
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SportsEsports
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.filled.Vibration
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Palette
@@ -169,7 +170,7 @@ class WelcomeModel {
  * RuntimeActivity (Java) drives it; Compose observes the state below.
  */
 class GameMenu internal constructor(private val activity: RuntimeActivity) {
-    internal enum class Page { Main, Achievements, Controllers, Graphics }
+    internal enum class Page { Main, Achievements, Controllers, Graphics, Hud }
 
     var isOpen by mutableStateOf(false); private set
     var isPaused by mutableStateOf(false); private set
@@ -1118,6 +1119,7 @@ private val SidebarWidth = 360.dp
                     GameMenu.Page.Achievements -> SidebarAchievements(activity, menu)
                     GameMenu.Page.Controllers -> SidebarControllers(activity, menu)
                     GameMenu.Page.Graphics -> SidebarGraphics(activity, menu)
+                    GameMenu.Page.Hud -> SidebarHud(activity, menu)
                 }
             }
         }
@@ -1125,10 +1127,6 @@ private val SidebarWidth = 360.dp
 }
 
 @Composable private fun ColumnScope.SidebarMain(activity: RuntimeActivity, menu: GameMenu) {
-    var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
-    var fpsVisible by remember { mutableStateOf(activity.uiFpsVisible()) }
-    var tempVisible by remember { mutableStateOf(activity.uiTempVisible()) }
-    var rumbleOn by remember { mutableStateOf(activity.uiRumbleEnabled()) }
     // The summary line is read from the files the runtime keeps, off the main thread.
     val snapshot by produceState<Achievements.Snapshot?>(null) {
         value = withContext(Dispatchers.IO) { Achievements.load(activity.filesDir) }
@@ -1157,23 +1155,10 @@ private val SidebarWidth = 360.dp
         SidebarItem(Icons.Default.Palette, stringResource(R.string.menu_graphics), stringResource(R.string.menu_graphics_hint), chevron = true) {
             menu.page = GameMenu.Page.Graphics
         }
-        SidebarToggle(Icons.Default.Vibration, stringResource(R.string.ctrl_rumble), rumbleOn) {
-            rumbleOn = it
-            activity.uiSetRumble(it)
-        }
-        SidebarToggle(Icons.Default.SportsEsports, stringResource(R.string.menu_onscreen_controls), controlsVisible) {
-            controlsVisible = it
-            activity.uiSetGameControlsVisible(it)
-        }
-        SidebarToggle(Icons.Default.Visibility, stringResource(R.string.settings_fps), fpsVisible) {
-            fpsVisible = it
-            activity.uiSetFpsVisible(it)
+        SidebarItem(Icons.Default.Visibility, stringResource(R.string.menu_hud), stringResource(R.string.menu_hud_hint), chevron = true) {
+            menu.page = GameMenu.Page.Hud
         }
         SidebarFpsTarget(activity)
-        SidebarToggle(Icons.Default.Thermostat, stringResource(R.string.settings_temp), tempVisible) {
-            tempVisible = it
-            activity.uiSetTempVisible(it)
-        }
         SidebarItem(Icons.Default.Tune, stringResource(R.string.layouts_manage)) {
             menu.close()
             activity.uiOpenLayoutEditor()
@@ -1247,6 +1232,40 @@ private val SidebarWidth = 360.dp
 }
 
 /** The sidebar's graphics page: every option is a cvar the renderer follows at its next frame, and is saved. */
+/** The HUD page: each readout over the game, and the on-screen controller, has a switch of its own; the layout editor places each. */
+@Composable private fun ColumnScope.SidebarHud(activity: RuntimeActivity, menu: GameMenu) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = { menu.page = GameMenu.Page.Main }) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.menu_back), tint = Text)
+        }
+        Text(stringResource(R.string.menu_hud), Modifier.weight(1f), color = Text, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+        IconButton(onClick = { menu.close() }) { Icon(Icons.Default.Close, stringResource(R.string.menu_close), tint = Muted) }
+    }
+    var controlsVisible by remember { mutableStateOf(activity.uiGameControlsVisible()) }
+    val flags = remember {
+        mutableStateMapOf<String, Boolean>().apply {
+            for (key in listOf("fps", "frametime", "driver", "memory", "temp")) put(key, activity.uiHudFlag(key))
+        }
+    }
+    @Composable fun flag(key: String, icon: ImageVector, title: Int) {
+        SidebarToggle(icon, stringResource(title), flags[key] == true) {
+            flags[key] = it
+            activity.uiSetHudFlag(key, it)
+        }
+    }
+    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SidebarToggle(Icons.Default.SportsEsports, stringResource(R.string.menu_onscreen_controls), controlsVisible) {
+            controlsVisible = it
+            activity.uiSetGameControlsVisible(it)
+        }
+        flag("fps", Icons.Default.Visibility, R.string.settings_fps)
+        flag("frametime", Icons.Default.Speed, R.string.hud_frametime)
+        flag("driver", Icons.Default.Memory, R.string.hud_driver)
+        flag("memory", Icons.Default.Storage, R.string.hud_memory)
+        flag("temp", Icons.Default.Thermostat, R.string.settings_temp)
+    }
+}
+
 @Composable private fun ColumnScope.SidebarGraphics(activity: RuntimeActivity, menu: GameMenu) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         IconButton(onClick = { menu.page = GameMenu.Page.Main }) {
@@ -1357,7 +1376,6 @@ private val SidebarWidth = 360.dp
             onChanged()
         }
         Text(stringResource(R.string.ctrl_rumble_note), color = Muted, fontSize = 12.sp)
-        ActionButton(stringResource(R.string.ctrl_rumble_test), rumble, outlined = true) { Rumble.test(context) }
         val twoPlayers = pads.any { it.role == ExternalController.PLAYER_TWO }
         if (twoPlayers) Text(stringResource(R.string.ctrl_players_two_active), color = Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         else if (pads.isNotEmpty()) Text(stringResource(R.string.ctrl_players_hint_one), color = Muted, fontSize = 13.sp)
@@ -1706,6 +1724,9 @@ private fun editorColor(id: String): Color = when (id) {
     HudLayout.Y -> Color(0xFFF5B800)
     HudLayout.FPS -> Color(0xFF78FF78)
     HudLayout.TEMP -> Color(0xFFFFC46E)
+    HudLayout.FRAMETIME -> Color(0xFF6ED8FF)
+    HudLayout.DRIVER -> Color(0xFFD6A0FF)
+    HudLayout.MEMORY -> Color(0xFFC8C8FF)
     else -> Color.White
 }
 
@@ -1724,6 +1745,9 @@ private fun editorColor(id: String): Color = when (id) {
     HudLayout.START -> stringResource(R.string.layout_item_start)
     HudLayout.FPS -> stringResource(R.string.settings_fps)
     HudLayout.TEMP -> stringResource(R.string.settings_temp)
+    HudLayout.FRAMETIME -> stringResource(R.string.hud_frametime)
+    HudLayout.DRIVER -> stringResource(R.string.hud_driver)
+    HudLayout.MEMORY -> stringResource(R.string.hud_memory)
     else -> stringResource(R.string.layout_item_face, id.uppercase())
 }
 
@@ -1877,7 +1901,13 @@ private fun moveElement(model: LayoutEditorModel, id: String, by: androidx.compo
                 val outline = if (id == model.picked) Color(0xFFFF9B45) else tint.copy(alpha = 0.8f * alpha)
                 val strokeWidth = if (id == model.picked) unit * 0.09f else unit * 0.05f
                 if (readout) {
-                    val text = if (id == HudLayout.FPS) "FPS 30.0" else sampleTemp
+                    val text = when (id) {
+                        HudLayout.FPS -> "FPS 30.0"
+                        HudLayout.FRAMETIME -> "16.6 ms  1%low 30  max 18.0"
+                        HudLayout.MEMORY -> "RAM 1800 MB"
+                        HudLayout.DRIVER -> "GPU · driver · Vulkan"
+                        else -> sampleTemp
+                    }
                     labels.color = tint.copy(alpha = alpha).toArgb()
                     labels.textSize = unit * 0.34f * (model.profile.items[id]?.scale ?: 1f)
                     canvas.drawText(text, shape.cx, shape.cy + labels.textSize / 3f, labels)

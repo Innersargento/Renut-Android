@@ -258,7 +258,6 @@
     <string name="ctrl_players_touch">La pantalla táctil siempre controla al Jugador 1.</string>
     <string name="ctrl_rumble">Vibración</string>
     <string name="ctrl_rumble_note">Cada mando vibra para su jugador. Si el mando no tiene motor de vibración, o juegas solo en la pantalla, vibra el teléfono.</string>
-    <string name="ctrl_rumble_test">Probar vibración</string>
     <string name="result_panel">Resultado</string>
     <string name="runtime_eyebrow">PRUEBA DEL RUNTIME</string>
     <string name="runtime_subtitle">Validación experimental</string>
@@ -382,4 +381,9 @@
     <string name="logs_to_file">Guardar el registro en un archivo</string>
     <string name="logs_to_file_note">Un archivo por inicio del juego en Documents/renut: renut-AAAAMMDD-HHMMSS.log para el registro y logcat-AAAAMMDD-HHMMSS.txt para logcat (la app y el proceso del juego). Se aplica desde el próximo inicio.</string>
     <string name="logs_logcat">Capturar el logcat de la app</string>
+    <string name="menu_hud">HUD</string>
+    <string name="menu_hud_hint">FPS, frametime, driver, memoria, temperatura</string>
+    <string name="hud_frametime">Frametime</string>
+    <string name="hud_driver">Driver y GPU</string>
+    <string name="hud_memory">Memoria del juego</string>
 </resources>

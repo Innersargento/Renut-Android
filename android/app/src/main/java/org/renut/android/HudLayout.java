@@ -26,15 +26,18 @@ import java.util.Map;
 public final class HudLayout {
     static final String LT = "lt", RT = "rt", LB = "lb", RB = "rb", STICK_L = "stick_l", DPAD = "dpad",
             STICK_R = "stick_r", Y = "y", X = "x", B = "b", A = "a", BACK = "back", START = "start",
-            FPS = "fps", TEMP = "temp";
-    static final String[] IDS = {LT, RT, LB, RB, STICK_L, DPAD, STICK_R, Y, X, B, A, BACK, START, FPS, TEMP};
+            FPS = "fps", TEMP = "temp", FRAMETIME = "frametime", DRIVER = "driver", MEMORY = "memory";
+    static final String[] IDS = {LT, RT, LB, RB, STICK_L, DPAD, STICK_R, Y, X, B, A, BACK, START, FPS, TEMP,
+            FRAMETIME, DRIVER, MEMORY};
     /** The profile nobody edits: every element where the controller's own geometry puts it. */
     static final String DEFAULT = "default";
     static final float MIN_SCALE = 0.5f, MAX_SCALE = 2.0f, MIN_OPACITY = 0.2f;
 
     private HudLayout() {}
 
-    static boolean isReadout(String id) { return FPS.equals(id) || TEMP.equals(id); }
+    static boolean isReadout(String id) {
+        return FPS.equals(id) || TEMP.equals(id) || FRAMETIME.equals(id) || DRIVER.equals(id) || MEMORY.equals(id);
+    }
 
     // ---- model -------------------------------------------------------------------------------
 
@@ -153,7 +156,7 @@ public final class HudLayout {
     /**
      * The pad's own layout: triggers and bumpers on top, the left stick high and the D-pad low on
      * the left, face buttons high and the right stick low on the right, Back and Start centred.
-     * The readouts sit at the bottom centre, as the FPS counter always has.
+     * The readouts sit at the bottom centre, one over the other, as the FPS counter always has.
      */
     static Shape defaultShape(String id, int w, int h) {
         float u = Math.min(w, h) / 10f;
@@ -175,6 +178,9 @@ public final class HudLayout {
             case START: return rect(w / 2f + u * 1.95f, u * 0.95f, u * 0.95f, u * 0.38f);
             case FPS: return rect(w / 2f, h - u * 0.45f, u * 0.9f, u * 0.3f);
             case TEMP: return rect(w / 2f, h - u * 1.05f, u * 1.7f, u * 0.3f);
+            case FRAMETIME: return rect(w / 2f, h - u * 1.65f, u * 2.3f, u * 0.3f);
+            case MEMORY: return rect(w / 2f, h - u * 2.25f, u * 1.1f, u * 0.3f);
+            case DRIVER: return rect(w / 2f, h - u * 3.25f, u * 2.4f, u * 0.55f);
             default: throw new IllegalArgumentException(id);
         }
     }
@@ -194,7 +200,7 @@ public final class HudLayout {
         return item == null ? 1f : item.opacity;
     }
 
-    /** A pad control is always visible; the FPS and temperature readouts can be switched off. */
+    /** A pad control is always visible; the readouts (FPS, frame time, driver, memory, temperature) can be switched off. */
     static boolean visible(Profile profile, String id) {
         if (!isReadout(id)) return true;
         Item item = profile == null ? null : profile.items.get(id);

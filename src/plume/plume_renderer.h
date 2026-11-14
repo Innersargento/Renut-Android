@@ -48,6 +48,8 @@ bool PlumeQualcommDriver();
 // Whether the device runs ARM's own Mali driver (VK_DRIVER_ID_ARM_PROPRIETARY). Known once the renderer has
 // started.
 bool PlumeArmDriver();
+// The GPU, driver and Vulkan version, one per line, for the HUD (empty before the device exists).
+std::string PlumeDriverText();
 // Whether the device's limits leave out the bindless texture heaps (the Mali-G52: four bound sets, 256 textures
 // a stage): each draw then binds a set of its own textures, and the layer rewrites the recompiled modules for it
 // (spirv_descriptor_sets.h). Known once the renderer has started.
