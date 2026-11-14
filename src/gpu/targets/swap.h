@@ -96,8 +96,8 @@ struct Swap {
   uint64_t depth_dump_generation_ = 0, depth_dump_frame_ = 0;
   // Whether each recorded draw leaves its entry in recent_draws_, for the report
   // of a lost device. A hash lookup, ~200 bytes of stream addresses and a few
-  // buffer-address calls a draw: on by default only where the GPU is a Mali,
-  // which has lost its device on a draw's data; files/plume-trail overrides.
+  // buffer-address calls a draw: on by default only on ARM's own Mali driver
+  // (PanVK is left out, like Turnip), which has lost its device on a draw's data; files/plume-trail overrides.
   bool trail_ = false;
   bool skin_log_ = false;
   std::unordered_set<uint64_t> skin_skip_;

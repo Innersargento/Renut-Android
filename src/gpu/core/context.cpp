@@ -120,11 +120,11 @@ bool GpuBackend::SetupContext() {
     VkPhysicalDeviceFeatures features{};
     vkGetPhysicalDeviceFeatures(static_cast<VulkanDevice*>(device_)->physicalDevice, &features);
     bc_supported_ = features.textureCompressionBC == VK_TRUE;
-    // A Mali (ARM's vendor id) with no BC but ETC2, the Mali-G52: the BC blocks are transcoded to the
-    // ETC2/EAC blocks of the same size (etc2_transcode.h) and the layer makes the BC images in those formats,
-    // so the textures keep the block path's size instead of four to eight times it in RGBA8. Measured on
-    // that GPU only; every other device without BC keeps the RGBA8 decoder.
-    const bool mali = static_cast<VulkanDevice*>(device_)->physicalDeviceProperties.vendorID == 0x13B5;
+    // ARM's own driver (not PanVK, which takes the path Turnip does) with no BC but ETC2, the Mali-G52: the BC
+    // blocks are transcoded to the ETC2/EAC blocks of the same size (etc2_transcode.h) and the layer makes the
+    // BC images in those formats, so the textures keep the block path's size instead of four to eight times it
+    // in RGBA8. Measured on that GPU only; every other device without BC keeps the RGBA8 decoder.
+    const bool mali = PlumeArmDriver();
     etc2_transcode_ = mali && !bc_supported_ && features.textureCompressionETC2 == VK_TRUE;
     PlumeSetBcAsEtc2(etc2_transcode_);
     // A 3D image of a block format is not a given (the stacked textures need one): asked per
@@ -151,8 +151,8 @@ bool GpuBackend::SetupContext() {
       REXLOG_INFO("Renut: Plume {} 3D images (BC1..BC5 mask): {:#x}", etc2_transcode_ ? "ETC2/EAC" : "BC",
                   bc3d_mask_);
     }
-    // ARM's vendor id.
-    trail_device_default_ = static_cast<VulkanDevice*>(device_)->physicalDeviceProperties.vendorID == 0x13B5;
+    // ARM's own driver, as above.
+    trail_device_default_ = PlumeArmDriver();
     swap.trail_ = trail_device_default_;
   }
   swap.bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
