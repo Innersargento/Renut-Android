@@ -372,4 +372,14 @@
         <item>右摇杆 →</item>
         <item>右摇杆 ↑</item>
     </string-array>
+    <string name="logs_storage">存储</string>
+    <string name="logs_access_on">已允许访问所有文件：配置、日志和捕获保存在 Documents/renut。</string>
+    <string name="logs_access_off">没有所有文件访问权限时，配置保存在应用目录，日志保存在应用自己的 Documents 目录。允许访问即可使用 Documents/renut。</string>
+    <string name="logs_access_button">允许访问文件</string>
+    <string name="logs_config_file">配置文件 (renut.toml)</string>
+    <string name="logs_output_folder">日志文件夹</string>
+    <string name="logs_runtime">游戏日志</string>
+    <string name="logs_to_file">将日志写入文件</string>
+    <string name="logs_to_file_note">每次启动游戏在 Documents/renut 中生成一个文件：日志为 renut-年月日-时分秒.log，logcat 为 logcat-年月日-时分秒.txt（应用与游戏进程）。下次启动生效。</string>
+    <string name="logs_logcat">捕获应用的 logcat</string>
 </resources>

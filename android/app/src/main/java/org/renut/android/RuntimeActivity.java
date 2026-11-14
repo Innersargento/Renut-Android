@@ -482,6 +482,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             String report;
             try {
                 RecipeSeed.sync(this);  // before the renderer reads the recipe lists
+                LogStorage.prepareLaunch(this);  // the configuration kept in Documents, and where the log goes
                 System.loadLibrary("SDL3");org.libsdl.app.SDL.setupJNI();org.libsdl.app.SDL.initialize();org.libsdl.app.SDL.setContext(this);
                 System.loadLibrary("renut_runtime");loaded=true;
                 pushSurfaceSize("library loaded");
@@ -578,5 +579,5 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     // Leaving the screen no longer ends the game; only closing it does (onDestroy).
     @Override protected void onPause(){clearControllers();super.onPause();if(!launch){stop();finish();}}
     @Override protected void onResume(){super.onResume();if(launch){setupControllers();applyHudLayout();}}
-    @Override protected void onDestroy(){if(cvarReceiver!=null){unregisterReceiver(cvarReceiver);cvarReceiver=null;}if(rumble!=null)rumble.stop();if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
+    @Override protected void onDestroy(){if(cvarReceiver!=null){unregisterReceiver(cvarReceiver);cvarReceiver=null;}if(rumble!=null)rumble.stop();if(inputManager!=null)inputManager.unregisterInputDeviceListener(deviceListener);stop();LogStorage.stopLogcat();if(launch)KeepAliveService.stop(this);super.onDestroy();if(isFinishing())android.os.Process.killProcess(android.os.Process.myPid());}
 }

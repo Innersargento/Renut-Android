@@ -231,6 +231,14 @@ public final class MainActivity extends androidx.activity.ComponentActivity {
     public void uiSetTuMode(String value){getPreferences(0).edit().putString("tuDebug",value).apply();refresh();}
     public String uiIr3Mode(){return getPreferences(0).getString("ir3Debug","");}
     public void uiSetIr3Mode(String value){getPreferences(0).edit().putString("ir3Debug",value).apply();refresh();}
+    // ---- Logs page: the files kept in Documents/renut --------------------------------------------------------------
+    public boolean uiFilesAccess(){return LogStorage.hasAccess();}
+    public void uiRequestFilesAccess(){
+        try{startActivity(LogStorage.accessIntent(this));}
+        catch(RuntimeException e){startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));}
+    }
+    public String uiLogOutputDir(){return LogStorage.outputDir(this).getAbsolutePath();}
+    public String uiConfigPath(){return LogStorage.configFile(this).getAbsolutePath();}
     public String uiRuntimeOption(String key,String fallback){return RuntimeOptions.get(this,key,fallback);}
     public void uiSetRuntimeOption(String key,String value){
         try { RuntimeOptions.set(this,key,value); }

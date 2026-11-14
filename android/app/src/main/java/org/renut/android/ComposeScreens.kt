@@ -726,7 +726,6 @@ private val SKIN_LABELS = listOf(
     val tuMode = activity.uiTuMode()
     val ir3Mode = activity.uiIr3Mode()
     val turnip = remember(driver) { activity.uiDriverIsTurnip() }
-    val logLevel = activity.uiRuntimeOption("log_level", "info")
     val sustained = activity.uiRuntimeOption("renut_adpf", "true") == "true"
     var noShadows by remember { mutableStateOf(activity.uiRuntimeOption("renut_plume_no_shadows", "false") == "true") }
     val vsyncOn = activity.uiRuntimeOption(RuntimeOptions.VSYNC, "true") == "true"
@@ -817,10 +816,6 @@ private val SKIN_LABELS = listOf(
         item {
             Panel(stringResource(R.string.settings_runtime)) {
                 Text(stringResource(R.string.settings_runtime_note), color = Muted, fontSize = 13.sp)
-                SingleChoiceSelector(stringResource(R.string.settings_log_level), logLevel,
-                    listOf("trace", "debug", "info", "warn", "error", "critical", "off")) {
-                    activity.uiSetRuntimeOption("log_level", it)
-                }
                 SingleChoiceSelector(stringResource(R.string.settings_texture_quality), textureLevels[textureQuality],
                     textureLevels, !busy) { choice ->
                     val level = textureLevels.indexOf(choice).coerceAtLeast(0)
@@ -860,7 +855,46 @@ private val SKIN_LABELS = listOf(
                 }
             }
         }
+        item { LogsSection(activity, tick) }
         item { Text(stringResource(R.string.settings_footer), color = Muted, fontSize = 12.sp) }
+    }
+}
+
+/**
+ * The logs section of the settings: the level, whether the runtime's log goes to a file of Documents/renut, and a
+ * capture of logcat. The files need the "all files" access of the system settings to reach Documents; without it
+ * they stay in the app's folders.
+ */
+@Composable private fun LogsSection(activity: MainActivity, tick: Int) {
+    @Suppress("UNUSED_VARIABLE") val update = tick
+    val busy = activity.uiBusy()
+    val access = activity.uiFilesAccess()
+    var logLevel by remember { mutableStateOf(activity.uiRuntimeOption("log_level", "info")) }
+    var toFile by remember { mutableStateOf(activity.uiRuntimeOption(RuntimeOptions.LOG_TO_FILE, "false") == "true") }
+    var logcat by remember { mutableStateOf(activity.uiRuntimeOption(RuntimeOptions.LOGCAT, "false") == "true") }
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Panel(stringResource(R.string.logs_storage)) {
+            Text(stringResource(if (access) R.string.logs_access_on else R.string.logs_access_off), color = Muted, fontSize = 13.sp)
+            if (!access) ActionButton(stringResource(R.string.logs_access_button), true, outlined = true) { activity.uiRequestFilesAccess() }
+            InfoRow(stringResource(R.string.logs_config_file), activity.uiConfigPath())
+            InfoRow(stringResource(R.string.logs_output_folder), activity.uiLogOutputDir())
+        }
+        Panel(stringResource(R.string.logs_runtime)) {
+            SingleChoiceSelector(stringResource(R.string.settings_log_level), logLevel,
+                listOf("trace", "debug", "info", "warn", "error", "critical", "off"), !busy) {
+                logLevel = it
+                activity.uiSetRuntimeOption("log_level", it)
+            }
+            ToggleRow(stringResource(R.string.logs_to_file), toFile, !busy) {
+                toFile = it
+                activity.uiSetRuntimeOption(RuntimeOptions.LOG_TO_FILE, it.toString())
+            }
+            ToggleRow(stringResource(R.string.logs_logcat), logcat, !busy) {
+                logcat = it
+                activity.uiSetRuntimeOption(RuntimeOptions.LOGCAT, it.toString())
+            }
+            Text(stringResource(R.string.logs_to_file_note), color = Muted, fontSize = 12.sp)
+        }
     }
 }
 

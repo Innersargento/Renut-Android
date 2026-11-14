@@ -372,4 +372,14 @@
         <item>Stick derecho →</item>
         <item>Stick derecho ↑</item>
     </string-array>
+    <string name="logs_storage">Almacenamiento</string>
+    <string name="logs_access_on">Acceso a todos los archivos permitido: la configuración, el registro y las capturas están en Documents/renut.</string>
+    <string name="logs_access_off">Sin acceso a todos los archivos, la configuración queda en la carpeta de la app y los registros en su carpeta Documents. Permítelo para usar Documents/renut.</string>
+    <string name="logs_access_button">Permitir acceso a los archivos</string>
+    <string name="logs_config_file">Archivo de configuración (renut.toml)</string>
+    <string name="logs_output_folder">Carpeta de registros</string>
+    <string name="logs_runtime">Registro del juego</string>
+    <string name="logs_to_file">Guardar el registro en un archivo</string>
+    <string name="logs_to_file_note">Un archivo por inicio del juego en Documents/renut: renut-AAAAMMDD-HHMMSS.log para el registro y logcat-AAAAMMDD-HHMMSS.txt para logcat (la app y el proceso del juego). Se aplica desde el próximo inicio.</string>
+    <string name="logs_logcat">Capturar el logcat de la app</string>
 </resources>

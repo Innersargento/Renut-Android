@@ -42,6 +42,10 @@ final class RuntimeOptions {
     }
     /** 0 off, 1 2x, 2 4x: the samples of the scene's single band (gpu); read when the game starts. */
     static final String MSAA = "renut_msaa";
+    /** Write the runtime's log to a file of Documents/renut at each start (LogStorage). */
+    static final String LOG_TO_FILE = "renut_log_to_file";
+    /** Write the app's logcat to a file of Documents/renut while the game runs (LogStorage). */
+    static final String LOGCAT = "renut_logcat_capture";
 
     /**
      * The frame rate the game is held to (frame_pacing.h): 30 is its own, 31-240 a rate of the
@@ -81,7 +85,7 @@ final class RuntimeOptions {
     }
 
     private static final Set<String> BOOLEANS = new java.util.HashSet<>(java.util.Arrays.asList(
-        LEGACY_UNCAP_FPS, "renut_plume_no_shadows", "renut_adpf", "renut_plume_vsync", CHEATS));
+        LEGACY_UNCAP_FPS, "renut_plume_no_shadows", "renut_adpf", "renut_plume_vsync", CHEATS, LOG_TO_FILE, LOGCAT));
     static {
         BOOLEANS.addAll(java.util.Arrays.asList(CHEAT_FLAGS));
     }
@@ -150,5 +154,5 @@ final class RuntimeOptions {
         }
     }
 
-    private static File config(Context context) { return new File(context.getFilesDir(), "renut.toml"); }
+    private static File config(Context context) { return LogStorage.configFile(context); }
 }

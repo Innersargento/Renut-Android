@@ -372,4 +372,14 @@
         <item>Analógico direito →</item>
         <item>Analógico direito ↑</item>
     </string-array>
+    <string name="logs_storage">Armazenamento</string>
+    <string name="logs_access_on">Acesso a todos os arquivos permitido: a configuração, o log e as capturas ficam em Documentos/renut.</string>
+    <string name="logs_access_off">Sem acesso a todos os arquivos, a configuração fica na pasta do app e os logs na pasta Documents do app. Permita o acesso para usar Documentos/renut.</string>
+    <string name="logs_access_button">Permitir acesso aos arquivos</string>
+    <string name="logs_config_file">Arquivo de configuração (renut.toml)</string>
+    <string name="logs_output_folder">Pasta dos logs</string>
+    <string name="logs_runtime">Log do jogo</string>
+    <string name="logs_to_file">Gravar o log em arquivo</string>
+    <string name="logs_to_file_note">Um arquivo por início do jogo em Documentos/renut: renut-AAAAMMDD-HHMMSS.log para o log e logcat-AAAAMMDD-HHMMSS.txt para o logcat (o app e o processo do jogo). Vale a partir do próximo início.</string>
+    <string name="logs_logcat">Capturar o logcat do app</string>
 </resources>

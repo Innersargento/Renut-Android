@@ -372,4 +372,14 @@
         <item>Right stick →</item>
         <item>Right stick ↑</item>
     </string-array>
+    <string name="logs_storage">Storage</string>
+    <string name="logs_access_on">All files access granted: the configuration, the log and the captures are kept in Documents/renut.</string>
+    <string name="logs_access_off">Without all files access, the configuration stays in the app folder and the logs in the app\'s own Documents folder. Allow it to use Documents/renut.</string>
+    <string name="logs_access_button">Allow file access</string>
+    <string name="logs_config_file">Configuration file (renut.toml)</string>
+    <string name="logs_output_folder">Logs folder</string>
+    <string name="logs_runtime">Game log</string>
+    <string name="logs_to_file">Write the log to a file</string>
+    <string name="logs_to_file_note">One file per game start in Documents/renut: renut-YYYYMMDD-HHMMSS.log for the log and logcat-YYYYMMDD-HHMMSS.txt for logcat (the app and the game process). Takes effect from the next start.</string>
+    <string name="logs_logcat">Capture the app\'s logcat</string>
 </resources>

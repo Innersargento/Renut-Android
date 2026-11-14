@@ -34,6 +34,11 @@
 #include "guest/host_support.h"
 using rex::X_STATUS;
 extern const rex::PPCImageInfo PPCImageConfig;
+// The Logs page's switch (LogStorage.java reads it from renut.toml; the runtime only has to know the name).
+REXCVAR_DEFINE_BOOL(renut_log_to_file, false, "reNut/Logs",
+                    "Write the runtime's log to a file of Documents/renut at each start");
+REXCVAR_DEFINE_BOOL(renut_logcat_capture, false, "reNut/Logs",
+                    "Write the app's logcat to a file of Documents/renut while the game runs");
 void renutSetContentActivity(JNIEnv*, jobject);
 std::string renutCheatsSummary();
 namespace renut {
@@ -259,6 +264,13 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
     // /data/user/0 and /data/data may name the same directory on Android.
     root = std::filesystem::canonical(root);
     auto log_path = (root / "rexglue-runtime.log").string();
+    // The app asks for the log in a file of Documents/renut (LogStorage.java): its path, on one line.
+    {
+      std::string target;
+      std::getline(std::ifstream(root / "log-target.txt"), target);
+      while (!target.empty() && (target.back() == '\r' || target.back() == ' ')) target.pop_back();
+      if (!target.empty()) log_path = target;
+    }
     // Optional cvar overrides for on-device experiments, pushed with
     // `adb shell run-as org.renut.android` into files/renut.toml. Loaded before
     // logging so that log_level applies from the first line.
