@@ -79,6 +79,12 @@ class GpuBackend final {
   uint32_t texture_quality_ = 0;
   // renut_plume_aniso_max: the most anisotropy a sampler is made with (a power of two, 1 = none).
   uint32_t aniso_max_ = 16;
+  // The largest power of two within the option, 1 to 16.
+  static uint32_t AnisoLevel(int32_t option) {
+    uint32_t level = 1;
+    while (level * 2 <= uint32_t(std::clamp(option, 1, 16))) level *= 2;
+    return level;
+  }
   void* watch_handle_ = nullptr;
   RenderDevice* device_ = nullptr;
   RenderCommandQueue* queue_ = nullptr;

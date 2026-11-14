@@ -265,6 +265,11 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       backend.texture_quality_ = uint32_t(quality);
     }
 
+    if (const uint32_t aniso = backend.AnisoLevel(REXCVAR_GET(renut_plume_aniso_max)); aniso != backend.aniso_max_) {
+      REXLOG_INFO("Renut: Plume anisotropic filtering: up to {}x (samplers are made again when next used)", aniso);
+      backend.aniso_max_ = aniso;
+    }
+
     backend.targets.RefreshQuality();
     // The pipelines compiled since the last write go to disk (cheap when none are new, and at most
     // every 15 s otherwise): the process is usually killed, not shut down, and what only a pause saves

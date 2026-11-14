@@ -68,7 +68,8 @@ REXCVAR_DEFINE_INT32(renut_plume_texture_quality, 0, "reNut/Plume",
 REXCVAR_DEFINE_INT32(renut_plume_aniso_max, 4, "reNut/Plume",
                      "The most anisotropic filtering a texture fetch gets: 1 (none), 2, 4, 8 or 16 samples. The "
                      "game asks for up to 16 on some surfaces, which a phone's GPU pays for on every such texel; "
-                     "16 gives every fetch what it asks. Read at start.")
+                     "16 gives every fetch what it asks. Live: a sampler made for another maximum is made anew when the "
+                     "game next draws with it.")
     .range(1, 16);
 REXCVAR_DEFINE_INT32(renut_plume_shadow_quality, 0, "reNut/Plume",
                      "Shadow map resolution: 0 full, 1 three quarters, 2 half (a side of the dynamic maps; "

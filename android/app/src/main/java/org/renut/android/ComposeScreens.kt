@@ -735,6 +735,11 @@ private val SKIN_LABELS = listOf(
     var textureQuality by remember {
         mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
     }
+    val anisoLevels = listOf(R.string.aniso_off, R.string.aniso_2x, R.string.aniso_4x, R.string.aniso_8x, R.string.aniso_16x)
+        .map { stringResource(it) }
+    var aniso by remember {
+        mutableStateOf(RuntimeOptions.anisoLevel(activity.uiRuntimeOption(RuntimeOptions.ANISO, "4")))
+    }
     val shadowLevels = listOf(stringResource(R.string.shadow_quality_full), stringResource(R.string.shadow_quality_medium),
         stringResource(R.string.shadow_quality_low), stringResource(R.string.shadow_quality_none))
     var shadowQuality by remember {
@@ -821,6 +826,11 @@ private val SKIN_LABELS = listOf(
                     val level = textureLevels.indexOf(choice).coerceAtLeast(0)
                     textureQuality = level
                     activity.uiSetRuntimeOption(RuntimeOptions.TEXTURE_QUALITY, level.toString())
+                }
+                SingleChoiceSelector(stringResource(R.string.settings_aniso), anisoLevels[aniso], anisoLevels, !busy) { choice ->
+                    val level = anisoLevels.indexOf(choice).coerceAtLeast(0)
+                    aniso = level
+                    activity.uiSetRuntimeOption(RuntimeOptions.ANISO, RuntimeOptions.ANISO_VALUES[level].toString())
                 }
                 SingleChoiceSelector(stringResource(R.string.settings_internal_resolution), resolutionLevels[internalResolution],
                     resolutionLevels, !busy) { choice ->
@@ -1218,6 +1228,9 @@ private val SidebarWidth = 360.dp
     var resolution by remember { mutableStateOf(level(RuntimeOptions.INTERNAL_RESOLUTION)) }
     var msaa by remember { mutableStateOf(level(RuntimeOptions.MSAA)) }
     var shadowQuality by remember { mutableStateOf(level(RuntimeOptions.SHADOW_QUALITY)) }
+    var aniso by remember {
+        mutableStateOf(RuntimeOptions.anisoLevel(activity.uiGraphicsOption(RuntimeOptions.ANISO, "4")))
+    }
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         SidebarToggle(Icons.Default.Sync, stringResource(R.string.settings_vsync), vsyncOn) {
             vsyncOn = it
@@ -1237,6 +1250,11 @@ private val SidebarWidth = 360.dp
             listOf(R.string.texture_quality_full, R.string.texture_quality_half, R.string.texture_quality_quarter)) {
             textureQuality = it
             activity.uiSetGraphicsOption(RuntimeOptions.TEXTURE_QUALITY, it.toString())
+        }
+        SidebarChoice(stringResource(R.string.settings_aniso), aniso,
+            listOf(R.string.aniso_off, R.string.aniso_2x, R.string.aniso_4x, R.string.aniso_8x, R.string.aniso_16x)) {
+            aniso = it
+            activity.uiSetGraphicsOption(RuntimeOptions.ANISO, RuntimeOptions.ANISO_VALUES[it].toString())
         }
         SidebarChoice(stringResource(R.string.settings_shadow_quality), if (noShadows) 3 else shadowQuality,
             listOf(R.string.shadow_quality_full, R.string.shadow_quality_medium, R.string.shadow_quality_low,

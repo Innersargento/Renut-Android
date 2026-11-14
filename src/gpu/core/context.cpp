@@ -164,9 +164,7 @@ bool GpuBackend::SetupContext() {
   texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
   REXLOG_INFO("Renut: Plume texture quality: {}",
               texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
-  // The largest power of two within the option.
-  aniso_max_ = 1;
-  while (aniso_max_ * 2 <= uint32_t(std::clamp(REXCVAR_GET(renut_plume_aniso_max), 1, 16))) aniso_max_ *= 2;
+  aniso_max_ = AnisoLevel(REXCVAR_GET(renut_plume_aniso_max));
   REXLOG_INFO("Renut: Plume anisotropic filtering: up to {}x", aniso_max_);
   targets.shadow_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
   REXLOG_INFO("Renut: Plume shadow map resolution: {}/4 of the guest's", targets.shadow_scale_);

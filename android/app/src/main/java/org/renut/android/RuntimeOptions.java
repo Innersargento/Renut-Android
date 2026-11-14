@@ -26,6 +26,20 @@ final class RuntimeOptions {
     static final String SHADOW_QUALITY = "renut_plume_shadow_quality";
     /** 0 full, 1 three quarters, 2 half: the resolution the scene is drawn at (gpu). */
     static final String INTERNAL_RESOLUTION = "renut_plume_internal_resolution";
+    /** 1 (off), 2, 4, 8 or 16: the most anisotropic filtering a texture fetch gets (gpu); default 4. */
+    static final String ANISO = "renut_plume_aniso_max";
+    /** The values the aniso option takes, in the order of its levels. */
+    static final int[] ANISO_VALUES = {1, 2, 4, 8, 16};
+    static final int ANISO_DEFAULT_LEVEL = 2;
+
+    /** The saved aniso option as the position of its level (the nearest at or below a value written by hand). */
+    static int anisoLevel(String value) {
+        int parsed;
+        try { parsed = Integer.parseInt(value.trim()); } catch (NumberFormatException e) { return ANISO_DEFAULT_LEVEL; }
+        int level = 0;
+        for (int i = 0; i < ANISO_VALUES.length; i++) if (ANISO_VALUES[i] <= parsed) level = i;
+        return level;
+    }
     /** 0 off, 1 2x, 2 4x: the samples of the scene's single band (gpu); read when the game starts. */
     static final String MSAA = "renut_msaa";
 
@@ -104,6 +118,7 @@ final class RuntimeOptions {
         }
         if (!(fps || BOOLEANS.contains(key) && (value.equals("true") || value.equals("false"))
             || key.equals("log_level") && LEVELS.contains(value)
+            || key.equals(ANISO) && java.util.Arrays.stream(ANISO_VALUES).anyMatch(v -> Integer.toString(v).equals(value))
             || (key.equals(TEXTURE_QUALITY) || key.equals(SHADOW_QUALITY) || key.equals(INTERNAL_RESOLUTION)
                 || key.equals(MSAA))
                 && (value.equals("0") || value.equals("1") || value.equals("2"))

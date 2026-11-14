@@ -468,11 +468,19 @@ void Textures::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
 // stack with the clock and relies on repeating.
 uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   const bool stack_wrap = fetch.stacked;
-  const uint32_t key = uint32_t(fetch.mag_filter) | (uint32_t(fetch.min_filter) << 2) |
+  // The anisotropy the fetch gets: what it asks for within renut_plume_aniso_max, which a change of the option
+  // moves live, so the sampler made for another maximum is another sampler (a fetch without anisotropy has one).
+  uint32_t anisotropy = 1;
+  if (fetch.aniso_filter != xenos::AnisoFilter::kDisabled &&
+      fetch.aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
+    anisotropy = std::min(1u << (uint32_t(fetch.aniso_filter) - 1), backend.aniso_max_);
+  }
+  const uint64_t key = uint64_t(fetch.mag_filter) | (uint32_t(fetch.min_filter) << 2) |
                        (uint32_t(fetch.mip_filter) << 4) | (uint32_t(fetch.aniso_filter) << 6) |
                        (uint32_t(fetch.clamp_x) << 9) | (uint32_t(fetch.clamp_y) << 12) |
                        (uint32_t(fetch.clamp_z) << 15) | (uint32_t(fetch.stacked) << 18) |
-                       ((uint32_t(fetch.lod_bias) & 0x3FF) << 19) | (stack_wrap ? 1u << 30 : 0u);
+                       ((uint32_t(fetch.lod_bias) & 0x3FF) << 19) | (stack_wrap ? 1u << 30 : 0u) |
+                       (uint64_t(anisotropy) << 32);
   if (const uint32_t* memo = sampler_memo_.Find(key)) return *memo;
   auto found = sampler_indices_.find(key);
   if (found != sampler_indices_.end()) {
@@ -512,14 +520,9 @@ uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   desc.addressW = fetch.stacked && !stack_wrap ? RenderTextureAddressMode::CLAMP : address(fetch.clamp_z);
   // The bias has five fractional bits.
   desc.mipLODBias = float(fetch.lod_bias) / 32.0f;
-  if (fetch.aniso_filter != xenos::AnisoFilter::kDisabled &&
-      fetch.aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
-    // Within renut_plume_aniso_max (read at start, so the key above needs none of it).
-    const uint32_t asked = std::min(1u << (uint32_t(fetch.aniso_filter) - 1), backend.aniso_max_);
-    if (asked > 1) {
-      desc.anisotropyEnabled = true;
-      desc.maxAnisotropy = asked;
-    }
+  if (anisotropy > 1) {
+    desc.anisotropyEnabled = true;
+    desc.maxAnisotropy = anisotropy;
   }
   if (xenos::ClampModeUsesBorder(fetch.clamp_x) || xenos::ClampModeUsesBorder(fetch.clamp_y) ||
       xenos::ClampModeUsesBorder(fetch.clamp_z)) {

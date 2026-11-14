@@ -27,7 +27,7 @@ struct Textures {
   std::unordered_set<uint64_t> dumped_;
   void DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch, const std::vector<uint32_t>& rgba,
                    uint32_t width, uint32_t height, const char* kind);
-  std::unordered_map<uint32_t, uint32_t> sampler_indices_;
+  std::unordered_map<uint64_t, uint32_t> sampler_indices_;
   // Nothing is ever erased from sampler_indices_, so its nodes stay put.
   LookupMemo<uint32_t, 8> sampler_memo_;
   uint32_t next_sampler_ = 0;

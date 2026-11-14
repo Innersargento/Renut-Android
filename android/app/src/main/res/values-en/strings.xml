@@ -124,6 +124,12 @@
     <string name="texture_quality_full">Full</string>
     <string name="texture_quality_half">Half</string>
     <string name="texture_quality_quarter">Quarter</string>
+    <string name="settings_aniso">Anisotropic filtering</string>
+    <string name="aniso_off">Off</string>
+    <string name="aniso_2x">2x</string>
+    <string name="aniso_4x">4x</string>
+    <string name="aniso_8x">8x</string>
+    <string name="aniso_16x">16x</string>
     <string name="settings_internal_resolution">Internal resolution</string>
     <string name="internal_resolution_full">Full · 720p</string>
     <string name="internal_resolution_three_quarters">3/4 · 540p</string>

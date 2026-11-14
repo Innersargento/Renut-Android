@@ -124,6 +124,12 @@
     <string name="texture_quality_full">完整</string>
     <string name="texture_quality_half">一半</string>
     <string name="texture_quality_quarter">四分之一</string>
+    <string name="settings_aniso">各向异性过滤</string>
+    <string name="aniso_off">关闭</string>
+    <string name="aniso_2x">2x</string>
+    <string name="aniso_4x">4x</string>
+    <string name="aniso_8x">8x</string>
+    <string name="aniso_16x">16x</string>
     <string name="settings_internal_resolution">内部分辨率</string>
     <string name="internal_resolution_full">完整 · 720p</string>
     <string name="internal_resolution_three_quarters">3/4 · 540p</string>
