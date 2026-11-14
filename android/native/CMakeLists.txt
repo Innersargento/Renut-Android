@@ -7,7 +7,7 @@ get_filename_component(RENUT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 # The code reNut itself writes: src/.
 set(RENUT_SRC "${RENUT_ROOT}/src")
 set(RENUT_ANDROID "${RENUT_SRC}/platform")
-# The SDK is the git submodule thirdparty/rexglue-sdk (tag v0.10.0) exactly as
+# The SDK is the git submodule thirdparty/rexglue-sdk (tag v0.10.1) exactly as
 # released: nothing under thirdparty/ is edited, patched or copied. What Android
 # needs on top of it is under src/ (platform/shims/, guest/kernel_overrides.*,
 # the audio output) or arrives as compile options below.
@@ -38,13 +38,15 @@ add_link_options(-flto=thin -Wl,--thinlto-jobs=all
 # builds on (platform/shims/android_chrono.h).
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${RENUT_ANDROID}/shims/android_chrono.h>")
 include("${REXGLUE_ROOT}/cmake/rex_pch.cmake")
+# rexglue_add_version_resource (0.10.1 and later), which the SDK's own targets call; it does nothing off Windows.
+include("${REXGLUE_ROOT}/cmake/rex_version.cmake")
 set(REXGLUE_DERIVED_MAJOR 0)
 set(REXGLUE_DERIVED_MINOR 10)
-set(REXGLUE_DERIVED_PATCH 0)
+set(REXGLUE_DERIVED_PATCH 1)
 set(REXGLUE_DERIVED_TWEAK 0)
-set(REXGLUE_FULL_VERSION "0.10.0-renut-android")
-set(REXGLUE_NUMERIC_VERSION "0.10.0")
-set(REXGLUE_FLOOR_VERSION "0.10.0")
+set(REXGLUE_FULL_VERSION "0.10.1-renut-android")
+set(REXGLUE_NUMERIC_VERSION "0.10.1")
+set(REXGLUE_FLOOR_VERSION "0.10.1")
 set(REXGLUE_VERSION_CHANNEL "renut-android")
 set(REX_PLATFORM "android-arm64")
 string(TIMESTAMP REXGLUE_BUILD_TIMESTAMP "%Y%m%d_%H%M")

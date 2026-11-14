@@ -51,13 +51,13 @@ XEX_PACKAGE = "org.renut.android"
 # release for this platform to external/ (sha256 checked) the first time.
 
 # The code generator, from the SDK release the sources are pinned to (sha256 as published by GitHub).
-HOST_SDK_VERSION = "0.10.0"
+HOST_SDK_VERSION = "0.10.1"
 HOST_SDK = {
-    "win-amd64": "ad4485da853fbe932e9f5dbb643f9b5fe85dc73775ebbad4df6879fe6df0c11b",
-    "linux-amd64": "0388edb3f8fb1444f1b0ad5d440cb02d9690ac20a76b04fd6b7dcc19f59328a6",
-    "linux-arm64": "feeeccedc1c0c8b4737c0e847e814314dcb89db5a6fecd3c14e32df8bb79d0a6",
-    "mac-amd64": "a71b12e8c91d7f9084683166c59a176634e6adc711f2c60f80cc4a286aa13642",
-    "mac-arm64": "1192638b51a6963aa6a4f24b77ebcb90c16f7fd0b91b311e11a90100f5274326",
+    "win-amd64": "26dbcd19e6976a7ad349917bffc58c1a0f21ad43d71a963d16b623c8e70d1f4d",
+    "linux-amd64": "4a6feb3da8d4dbb49fe21434a623de6d02961d9d0c9be5ccbaadb808aca2a11b",
+    "linux-arm64": "ad802a5ff887d0af66f94381392e588fcbaccb020643a51a3e4dd134dc3753f5",
+    "mac-amd64": "966140fb56d4e59407b6c036724ad563f517d4e5236180b1b02c2b4fe6fc74f8",
+    "mac-arm64": "26bc321d7eef1f55a1d7222a0d9e389b5bf1bca0969a5cca08af17e5338a9e95",
 }
 
 STEP = [0]
