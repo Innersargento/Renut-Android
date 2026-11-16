@@ -13,16 +13,17 @@ d3d/            the game's Direct3D, taken over from the recompiled code
   sync/         fences
   frontend/     the native front end: draws, clears and resolves recorded as host lists
 gpu/            the GPU backend that runs those lists on Plume (renut::gpu)
-  core/         the backend object, options, context, shared types; draw_state.h is the state a draw reads
+  core/         the backend object, the graphics driver of the SDK (host.cpp), options, context, shared types; draw_state.h is the state a draw reads
                 (the front end's records write it by word, there is no register file), state_bits.h the bit
                 layouts of its words
   exec/         executes the lists (native_exec.cpp), records Vulkan commands
   draw/         draws, streams, pipelines and their cache, shaders, patches, Hi-Z
   targets/      render targets, resolves, textures, the swap
-  xenos/        microcode analysis, interpreter, translator
+  xenos/        microcode analysis, interpreter (on the SDK's rex::xenos::ucode)
 plume/          the Plume renderer glue: swapchain, textures, frame pacing, host shaders
 guest/          what is done to the recompiled game: kernel overrides, fixes, cheats
-platform/       Android: JNI, audio, ADPF, users, text input, Vulkan loader
+platform/       Android: JNI, the RenutApp (a rex::app::TitleApp), the drivers it gives the SDK (window, AAudio,
+                touch controller; android_drivers.cpp), settings.h, ADPF, users, text input, Vulkan loader
 vendor/         smolv
 ```
 

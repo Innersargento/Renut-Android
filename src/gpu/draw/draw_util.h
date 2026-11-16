@@ -20,11 +20,17 @@
 #include <rex/assert.h>
 #include "gpu/core/draw_state.h"
 #include "gpu/core/state_bits.h"
-#include <rex/graphics/xenos.h>
+#include <rex/xenos/fetch.h>
+#include <rex/xenos/format.h>
+#include <rex/xenos/packet.h>
+#include <rex/xenos/register.h>
+#include <rex/xenos/state.h>
+#include <rex/xenos/texture.h>
+#include <rex/xenos/ucode.h>
 #include <rex/memory.h>
 
 namespace renut::gpu::draw_util {
-using namespace rex::graphics;
+using namespace rex::xenos;
 namespace memory = rex::memory;
 
 
@@ -101,7 +107,7 @@ inline bool IsPrimitivePolygonal(const DrawState& st) {
 extern const int8_t kD3D10StandardSamplePositions2x[2][2];
 extern const int8_t kD3D10StandardSamplePositions4x[4][2];
 
-bits::RB_DEPTHCONTROL GetNormalizedDepthControl(const DrawState& st, xenos::EdramMode edram_mode);
+bits::RB_DEPTHCONTROL GetNormalizedDepthControl(const DrawState& st, xenos::EDRAMMode edram_mode);
 
 // Direct3D 9 and Xenos constant polygon offset is an absolute floating-point
 // value.

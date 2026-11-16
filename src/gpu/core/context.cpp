@@ -1,5 +1,7 @@
 // Vulkan context set-up and tear-down and the GPU backend's worker loop.
 #include "gpu/core/internal.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 #include "plume/shaders/host_shaders.h"
 
 namespace renut::gpu {
@@ -24,13 +26,13 @@ std::string MissingDescriptorLimits(const VkPhysicalDeviceLimits& limits, const 
     missing += what;
   };
   need(limits.maxBoundDescriptorSets >= 2,
-       fmt::format("{} conjuntos de descritores, 2 usados", limits.maxBoundDescriptorSets));
+       std::format("{} conjuntos de descritores, 2 usados", limits.maxBoundDescriptorSets));
   need(limits.maxPerStageDescriptorSampledImages >= 3 * slots,
-       fmt::format("{} texturas por estágio, {} usadas", limits.maxPerStageDescriptorSampledImages, 3 * slots));
+       std::format("{} texturas por estágio, {} usadas", limits.maxPerStageDescriptorSampledImages, 3 * slots));
   need(limits.maxPerStageDescriptorSamplers >= slots,
-       fmt::format("{} samplers por estágio, {} usados", limits.maxPerStageDescriptorSamplers, slots));
+       std::format("{} samplers por estágio, {} usados", limits.maxPerStageDescriptorSamplers, slots));
   need(limits.maxDescriptorSetUniformBuffersDynamic >= kConstantBindings,
-       fmt::format("{} uniform buffers dinâmicos, {} usados", limits.maxDescriptorSetUniformBuffersDynamic,
+       std::format("{} uniform buffers dinâmicos, {} usados", limits.maxDescriptorSetUniformBuffersDynamic,
                    kConstantBindings));
   need(features.shaderSampledImageArrayDynamicIndexing, "sem shaderSampledImageArrayDynamicIndexing");
   return missing;
@@ -38,10 +40,10 @@ std::string MissingDescriptorLimits(const VkPhysicalDeviceLimits& limits, const 
 
 bool GpuBackend::SetupContext() {
   // Direct3D's doorbell wakes the worker through this (native_d3d.h).
-  native_d3d::SetWake([this] { wake_->Set(); });
+  native_d3d::SetWake([this] { wake_.Set(); });
   auto* renderer = PlumeRenderer::Get();
   if (!renderer) {
-    REXLOG_ERROR("Renut: Plume GPU backend without a Plume renderer");
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume GPU backend without a Plume renderer");
     return false;
   }
   device_ = renderer->device();
@@ -76,7 +78,7 @@ bool GpuBackend::SetupContext() {
   set_cube_ = device_->createDescriptorSet(sets[2]);
   set_samplers_ = device_->createDescriptorSet(sets[3]);
   if (!layout_ || !set_2d_ || !set_3d_ || !set_cube_ || !set_samplers_) {
-    REXLOG_ERROR("Renut: Plume pipeline layout unavailable");
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume pipeline layout unavailable");
     return false;
   }
 
@@ -85,7 +87,7 @@ bool GpuBackend::SetupContext() {
   // constants.
   samplers_[kSamplerDefault] = device_->createSampler(RenderSamplerDesc());
   if (!samplers_[kSamplerDefault]) {
-    REXLOG_ERROR("Renut: Plume default sampler unavailable");
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume default sampler unavailable");
     return false;
   }
   set_samplers_->setSampler(kSamplerDefault, samplers_[kSamplerDefault].get());
@@ -97,7 +99,7 @@ bool GpuBackend::SetupContext() {
 
   {
     const uint64_t total_ram = renutPhysicalMemoryBytes();
-    const int32_t mode = REXCVAR_GET(renut_plume_low_memory);
+    const int32_t mode = renut::GetSettings().plume_low_memory.Get();
     low_memory_ = mode < 0 ? total_ram < (6ull << 30) : mode > 0;
     if (low_memory_) {
       // Showdown Town has peaked at 126 MB of ring a frame on a big device; a
@@ -108,8 +110,8 @@ bool GpuBackend::SetupContext() {
       max_texture_dim_ = 512;
       targets.texture_budget_ = 256ull << 20;
     }
-    if (const int32_t dim = REXCVAR_GET(renut_plume_texture_max_dim); dim > 0) max_texture_dim_ = uint32_t(dim);
-    REXLOG_INFO("Renut: Plume memory profile {}: {} MB of RAM, ring {} MB a slice, kept streams {} MB, textures "
+    if (const int32_t dim = renut::GetSettings().plume_texture_max_dim.Get(); dim > 0) max_texture_dim_ = uint32_t(dim);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume memory profile {}: {} MB of RAM, ring {} MB a slice, kept streams {} MB, textures "
                 "{} MB over {} px",
                 low_memory_ ? "low" : "full", total_ram >> 20, upload_slice_size_ >> 20, streams.kept_budget_ >> 20,
                 targets.texture_budget_ >> 20, max_texture_dim_);
@@ -148,32 +150,32 @@ bool GpuBackend::SetupContext() {
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, &props);
         if (result == VK_SUCCESS && props.maxExtent.depth >= 32) bc3d_mask_ |= 1u << kind;
       }
-      REXLOG_INFO("Renut: Plume {} 3D images (BC1..BC5 mask): {:#x}", etc2_transcode_ ? "ETC2/EAC" : "BC",
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume {} 3D images (BC1..BC5 mask): {:#x}", etc2_transcode_ ? "ETC2/EAC" : "BC",
                   bc3d_mask_);
     }
     // ARM's own driver, as above.
     trail_device_default_ = PlumeArmDriver();
     swap.trail_ = trail_device_default_;
   }
-  swap.bc_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1));
-  REXLOG_INFO("Renut: Plume BC textures: device {}, mode {}",
+  swap.bc_mode_ = uint32_t(std::clamp(renut::GetSettings().plume_bc_textures.Get(), 0, 1));
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume BC textures: device {}, mode {}",
               bc_supported_     ? "samples BC1-BC5"
               : etc2_transcode_ ? "has no BC, transcoded to ETC2/EAC"
                                 : "has no BC",
               swap.bc_mode_ ? "on" : "off");
-  texture_quality_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2));
-  REXLOG_INFO("Renut: Plume texture quality: {}",
+  texture_quality_ = uint32_t(std::clamp(renut::GetSettings().plume_texture_quality.Get(), 0, 2));
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume texture quality: {}",
               texture_quality_ == 0 ? "full" : texture_quality_ == 1 ? "half" : "quarter");
-  aniso_max_ = AnisoLevel(REXCVAR_GET(renut_plume_aniso_max));
-  REXLOG_INFO("Renut: Plume anisotropic filtering: up to {}x", aniso_max_);
-  targets.shadow_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
-  REXLOG_INFO("Renut: Plume shadow map resolution: {}/4 of the guest's", targets.shadow_scale_);
-  targets.internal_scale_ = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_internal_resolution), 0, 2));
-  REXLOG_INFO("Renut: Plume internal resolution: {}/4 of the guest's", targets.internal_scale_);
+  aniso_max_ = AnisoLevel(renut::GetSettings().plume_aniso_max.Get());
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume anisotropic filtering: up to {}x", aniso_max_);
+  targets.shadow_scale_ = 4 - uint32_t(std::clamp(renut::GetSettings().plume_shadow_quality.Get(), 0, 2));
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume shadow map resolution: {}/4 of the guest's", targets.shadow_scale_);
+  targets.internal_scale_ = 4 - uint32_t(std::clamp(renut::GetSettings().plume_internal_resolution.Get(), 0, 2));
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume internal resolution: {}/4 of the guest's", targets.internal_scale_);
   {
-    const int32_t msaa = std::clamp(REXCVAR_GET(renut_msaa), 0, 2);
+    const int32_t msaa = std::clamp(renut::GetSettings().msaa.Get(), 0, 2);
     targets.msaa_samples_ = msaa == 1 ? 2u : msaa == 2 ? 4u : 1u;
-    REXLOG_INFO("Renut: Plume scene MSAA: {}", msaa == 0 ? "off" : msaa == 1 ? "up to 2x" : "up to 4x");
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume scene MSAA: {}", msaa == 0 ? "off" : msaa == 1 ? "up to 2x" : "up to 4x");
   }
   // One slice per frame in flight, after the permanent allocations.
   const uint64_t upload_bytes = upload_slice_size_ * kPlumeFramesInFlight + 4096;
@@ -181,23 +183,23 @@ bool GpuBackend::SetupContext() {
       upload_bytes, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::CONSTANT |
                         RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::STORAGE));
   if (!draw.upload_) {
-    REXLOG_ERROR("Renut: Plume upload buffer unavailable");
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume upload buffer unavailable");
     return false;
   }
   upload_data_ = static_cast<uint8_t*>(draw.upload_->map());
   upload_address_ = draw.upload_->getDeviceAddress();
   if (!CreateConstantBuffers()) {
-    REXLOG_ERROR("Renut: Plume constant buffers unavailable");
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume constant buffers unavailable");
     return false;
   }
-  watch_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(Streams::WatchHitThunk, &streams);
+  if (rex::IPhysicalWriteWatch* watch = renut::host::WriteWatch()) watch_handle_ = watch->AddWriteListener(write_listener_);
 
   for (auto& list : lists_) list = queue_->createCommandList();
   targets.list_ = lists_[0].get();
-  hiz.mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2));
-  no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
-  no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
-  swap.adaptive_mode_ = uint32_t(std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1));
+  hiz.mode_ = uint32_t(std::clamp(renut::GetSettings().plume_hiz.Get(), 0, 2));
+  no_shadows_ = renut::GetSettings().plume_no_shadows.Get();
+  no_bloom_ = renut::GetSettings().plume_no_bloom.Get();
+  swap.adaptive_mode_ = uint32_t(std::clamp(renut::GetSettings().plume_adaptive_patches.Get(), 0, 1));
   if (no_shadows_) swap.shadow_min_indices_ = UINT32_MAX;
   recorder.fence_ = device_->createCommandFence();
 
@@ -268,13 +270,13 @@ bool GpuBackend::SetupContext() {
     set_cube_->setTexture(i, white_cube_.get(), RenderTextureLayout::SHADER_READ,
                           white_cube_view_.get());
   }
-  draw.lookup_budget_us_ = uint64_t(REXCVAR_GET(renut_plume_pipeline_lookup_ms)) * 1000;
+  draw.lookup_budget_us_ = uint64_t(renut::GetSettings().plume_pipeline_lookup_ms.Get()) * 1000;
   draw.lookup_here_ = draw.lookup_budget_us_ && PlumePipelineLookupSupported();
-  REXLOG_INFO("Renut: Plume pipelines: async compile, {}, boolean registers read from the shared block",
-              draw.lookup_here_ ? fmt::format("cache lookups at the draw up to {} ms a frame", draw.lookup_budget_us_ / 1000)
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume pipelines: async compile, {}, boolean registers read from the shared block",
+              draw.lookup_here_ ? std::format("cache lookups at the draw up to {} ms a frame", draw.lookup_budget_us_ / 1000)
                            : std::string("no cache lookups at the draw"));
   targets.BeginFrame();
-  REXLOG_INFO("Renut: Plume GPU backend ready ({} frames in flight, upload {} MB at {:X})",
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume GPU backend ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);
   pipelines.StartRecipes();
   device_watch_stop_ = false;
@@ -313,9 +315,9 @@ void GpuBackend::RunWorkerLoop() {
     // Out of commands: spin for new ones, since waiting on the event costs more
     // than the wait is worth; it is waited on after a while to let the core rest.
     if (++idle > 500) {
-      rex::thread::Wait(wake_.get(), true, std::chrono::milliseconds(5));
+      wake_.WaitFor(std::chrono::milliseconds(5));
     }
-    rex::thread::MaybeYield();
+    std::this_thread::yield();
   }
 }
 
@@ -343,10 +345,7 @@ void GpuBackend::ShutdownContext() {
   ++draw.export_epoch_;
   streams.exports_.clear();
   streams.patch_grids_.clear();
-  if (watch_handle_) {
-    memory_->UnregisterPhysicalMemoryInvalidationCallback(watch_handle_);
-    watch_handle_ = nullptr;
-  }
+  watch_handle_.Reset();
   ++draw.stream_epoch_;
     streams.kept_streams_.clear();
   streams.kept_memo_.Clear();

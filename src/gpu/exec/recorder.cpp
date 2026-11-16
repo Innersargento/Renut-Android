@@ -1,5 +1,6 @@
 // The draw recording thread, deferred draws and the device-lost report.
 #include "gpu/core/internal.h"
+#include "platform/log.h"
 
 namespace renut::gpu {
 
@@ -257,12 +258,12 @@ void Recorder::ReportDeviceLost() {
     std::fclose(meminfo);
   }
   const uint64_t now = backend.swaps_;
-  REXLOG_ERROR("Renut: Plume device lost at swap {}; {} MB of RAM available; {} draws recorded", now,
+  REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume device lost at swap {}; {} MB of RAM available; {} draws recorded", now,
                avail_kb >> 10, recent_draw_count_.load());
-  REXLOG_ERROR("Renut: Plume 2D descriptor writes {} (skipped {} as unchanged)", descriptor_writes_,
+  REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume 2D descriptor writes {} (skipped {} as unchanged)", descriptor_writes_,
                descriptor_writes_skipped_);
   if (backend.draw.validate_windows_) {
-    REXLOG_ERROR("Renut: Plume validation: {} ranges compared, {} stale", backend.resolve.validate_ranges_, backend.resolve.validate_stale_);
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume validation: {} ranges compared, {} stale", backend.resolve.validate_ranges_, backend.resolve.validate_stale_);
   }
   if (backend.swap.skin_log_) backend.resolve.LogSkinned();
   const uint64_t total = recent_draw_count_.load(std::memory_order_acquire);
@@ -323,7 +324,7 @@ void Recorder::ReportDeviceLost() {
   for (const auto& [key, group] : groups) {
     if (shown++ >= 160) break;
     const RecentDraw& d = group.draw;
-    REXLOG_ERROR(
+    REXLOG_CAT_ERROR(rex::log::renut, 
         "Renut: Plume   frame {}{} vs={:016X} ps={:016X} x{} indices={} kind={} first={} pipeline={:X} fb={:X} "
         "s0={}B@{:X} s10={}B@{:X}",
         d.frame, d.pair_first_frame + 3 >= now ? " NEW" : "", d.vs, d.ps, group.draws, group.indices, d.kind,
@@ -357,7 +358,7 @@ void Recorder::SyncAfterDraw(const DrawPacket& pk) {
   const auto wait_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start).count();
   ++sync_draw_count_;
-  sync_recent_[sync_draw_count_ % sync_recent_.size()] = fmt::format("#{}: {}", sync_draw_count_, sync_draw_info_);
+  sync_recent_[sync_draw_count_ % sync_recent_.size()] = std::format("#{}: {}", sync_draw_count_, sync_draw_info_);
   if (result != VK_SUCCESS) {
     {
       unsigned long long avail_kb = 0;
@@ -368,38 +369,38 @@ void Recorder::SyncAfterDraw(const DrawPacket& pk) {
         }
         std::fclose(meminfo);
       }
-      REXLOG_ERROR("Renut: Plume system memory at the failure: {} MB available", avail_kb >> 10);
+      REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume system memory at the failure: {} MB available", avail_kb >> 10);
     }
     for (size_t i = 1; i <= sync_recent_.size(); ++i) {
       const std::string& line = sync_recent_[(sync_draw_count_ + i) % sync_recent_.size()];
-      if (!line.empty()) REXLOG_ERROR("Renut: Plume   recent draw {}", line);
+      if (!line.empty()) REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume   recent draw {}", line);
     }
-    REXLOG_ERROR(
+    REXLOG_CAT_ERROR(rex::log::renut, 
         "Renut: Plume GPU failed ({}) after {} ms on synced draw #{} in frame {}: vs={:016X} ps={:016X} kind={} "
         "count={} first={} base={} pipeline={}",
         int(result), wait_ms, sync_draw_count_, backend.swaps_, pk.vs_hash, pk.ps_hash, int(pk.kind), pk.count, pk.first,
         pk.base_vertex, static_cast<const void*>(pk.pipeline));
-    REXLOG_ERROR("Renut: Plume   {} streams of synced draws had a stale kept window before this one", sync_stale_streams_);
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume   {} streams of synced draws had a stale kept window before this one", sync_stale_streams_);
     const auto first_ok = sync_first_ok_.find(pk.vs_hash * 1099511628211ull ^ pk.ps_hash);
-    if (first_ok != sync_first_ok_.end()) REXLOG_ERROR("Renut: Plume   first OK draw of this pair {}", first_ok->second);
+    if (first_ok != sync_first_ok_.end()) REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume   first OK draw of this pair {}", first_ok->second);
     backend.draw.sync_draws_ = false;
   } else {
     vkResetFences(vk_device, 1, &vk_fence);
     if (sync_draw_info_.find("STALE") != std::string::npos && sync_stale_logged_ < 200) {
       ++sync_stale_logged_;
-      REXLOG_INFO("Renut: Plume stale window under draw #{} frame {}: {}", sync_draw_count_, backend.swaps_, sync_draw_info_);
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume stale window under draw #{} frame {}: {}", sync_draw_count_, backend.swaps_, sync_draw_info_);
     }
     if (sync_watch_ && (pk.vs_hash == sync_watch_ || pk.ps_hash == sync_watch_) && sync_watch_count_ < 600) {
       ++sync_watch_count_;
-      REXLOG_INFO("Renut: Plume watched draw #{} frame {} pipeline={} fb={} ok: {}", sync_draw_count_, backend.swaps_,
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume watched draw #{} frame {} pipeline={} fb={} ok: {}", sync_draw_count_, backend.swaps_,
                   static_cast<const void*>(pk.pipeline), static_cast<const void*>(pk.framebuffer), sync_draw_info_);
     }
     // Each pair is named once, the first time it ran to completion.
     if (sync_seen_.insert(pk.vs_hash * 1099511628211ull ^ pk.ps_hash).second) {
       sync_first_ok_[pk.vs_hash * 1099511628211ull ^ pk.ps_hash] =
-          fmt::format("frame {} pipeline={} fb={}: {}", backend.swaps_, static_cast<const void*>(pk.pipeline),
+          std::format("frame {} pipeline={} fb={}: {}", backend.swaps_, static_cast<const void*>(pk.pipeline),
                       static_cast<const void*>(pk.framebuffer), sync_draw_info_);
-      REXLOG_INFO("Renut: Plume synced draw #{} ok, new pair (frame {}): vs={:016X} ps={:016X} count={}",
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume synced draw #{} ok, new pair (frame {}): vs={:016X} ps={:016X} count={}",
                   sync_draw_count_, backend.swaps_, pk.vs_hash, pk.ps_hash, pk.count);
     }
   }

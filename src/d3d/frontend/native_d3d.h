@@ -141,7 +141,8 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
 // Where the report goes (the runtime's files directory).
 void SetFilesDirectory(std::string directory);
 // Native sync: VdSwap's frame (frontbuffer GPU address and size) as a record of
-// the swapping device's list; false when the swap goes through the ring.
+// the swapping device's list; false when the swap goes through the ring. `frontbuffer` is the guest virtual
+// address (it becomes the GPU address the resolves are keyed by).
 bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height);
 // Native sync: the GPU backend finished a published list.
 void NoteListExecuted();

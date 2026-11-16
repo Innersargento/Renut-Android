@@ -12,20 +12,27 @@
  */
 
 #include <cfloat>
+#include "platform/guest.h"
 #include <cmath>
 #include <cstring>
 
 #include <rex/assert.h>
 #include "gpu/xenos/interpreter.h"
 #include "gpu/core/state_bits.h"
-#include <rex/graphics/xenos.h>
+#include <rex/xenos/fetch.h>
+#include <rex/xenos/format.h>
+#include <rex/xenos/packet.h>
+#include <rex/xenos/register.h>
+#include <rex/xenos/state.h>
+#include <rex/xenos/texture.h>
+#include <rex/xenos/ucode.h>
 #include <rex/math.h>
 #include <rex/types.h>
 
 namespace renut::gpu {
 namespace interp {
-namespace xenos = rex::graphics::xenos;
-namespace ucode = rex::graphics::ucode;
+namespace xenos = rex::xenos;
+namespace ucode = rex::xenos::ucode;
 
 
 void ShaderInterpreter::Execute() {
@@ -49,7 +56,7 @@ void ShaderInterpreter::Execute() {
       cf_instr.dword_1 = cf_pair[1] & 0xFFFF;
     }
 
-    ucode::ControlFlowOpcode cf_opcode = cf_instr.opcode();
+    ucode::ControlFlowOpcode cf_opcode = cf_instr.GetOpcode();
     switch (cf_opcode) {
       case ucode::ControlFlowOpcode::kNop: {
       } break;
@@ -72,8 +79,8 @@ void ShaderInterpreter::Execute() {
           case ucode::ControlFlowOpcode::kCondExecPredCleanEnd: {
             const ucode::ControlFlowCondExecInstruction cf_cond_exec =
                 *reinterpret_cast<const ucode::ControlFlowCondExecInstruction*>(&cf_exec);
-            uint32_t bool_address = cf_cond_exec.bool_address();
-            if (cf_cond_exec.condition() !=
+            uint32_t bool_address = cf_cond_exec.GetBoolAddress();
+            if (cf_cond_exec.GetCondition() !=
                 ((bool_constants[bool_address >> 5] & (UINT32_C(1) << (bool_address & 31))) != 0)) {
               continue;
             }
@@ -82,7 +89,7 @@ void ShaderInterpreter::Execute() {
           case ucode::ControlFlowOpcode::kCondExecPredEnd: {
             const ucode::ControlFlowCondExecPredInstruction cf_cond_exec_pred =
                 *reinterpret_cast<const ucode::ControlFlowCondExecPredInstruction*>(&cf_exec);
-            if (cf_cond_exec_pred.condition() != state_.predicate) {
+            if (cf_cond_exec_pred.GetCondition() != state_.predicate) {
               continue;
             }
           } break;
@@ -90,34 +97,34 @@ void ShaderInterpreter::Execute() {
             break;
         }
 
-        for (uint32_t exec_index = 0; exec_index < cf_exec.count(); ++exec_index) {
-          const uint32_t* exec_instruction = &ucode_[3 * (cf_exec.address() + exec_index)];
-          if ((cf_exec.sequence() >> (exec_index << 1)) & 0b01) {
+        for (uint32_t exec_index = 0; exec_index < cf_exec.GetCount(); ++exec_index) {
+          const uint32_t* exec_instruction = &ucode_[3 * (cf_exec.GetAddress() + exec_index)];
+          if ((cf_exec.GetSequence() >> (exec_index << 1)) & 0b01) {
             const ucode::FetchInstruction& fetch_instr =
                 *reinterpret_cast<const ucode::FetchInstruction*>(exec_instruction);
-            if (fetch_instr.is_predicated() &&
-                fetch_instr.predicate_condition() != state_.predicate) {
+            if (fetch_instr.IsPredicated() &&
+                fetch_instr.GetPredicateCondition() != state_.predicate) {
               continue;
             }
-            if (fetch_instr.opcode() == ucode::FetchOpcode::kVertexFetch) {
-              ExecuteVertexFetchInstruction(fetch_instr.vertex_fetch());
+            if (fetch_instr.GetOpcode() == ucode::FetchOpcode::kVertexFetch) {
+              ExecuteVertexFetchInstruction(fetch_instr.GetVertexFetch());
             } else {
               // Not supporting texture fetching (very complex).
               float zero_result[4] = {};
-              StoreFetchResult(fetch_instr.dest(), fetch_instr.is_dest_relative(),
-                               fetch_instr.dest_swizzle(), zero_result);
+              StoreFetchResult(fetch_instr.GetDest(), fetch_instr.IsDestRelative(),
+                               fetch_instr.GetDestSwizzle(), zero_result);
             }
           } else {
             const ucode::AluInstruction& alu_instr =
                 *reinterpret_cast<const ucode::AluInstruction*>(exec_instruction);
-            if (alu_instr.is_predicated() && alu_instr.predicate_condition() != state_.predicate) {
+            if (alu_instr.IsPredicated() && alu_instr.GetPredicateCondition() != state_.predicate) {
               continue;
             }
             ExecuteAluInstruction(alu_instr);
           }
         }
 
-        if (ucode::DoesControlFlowOpcodeEndShader(cf_opcode)) {
+        if (ucode::IsControlFlowOpcodeEnd(cf_opcode)) {
           exec_ended = true;
         }
       } break;
@@ -125,31 +132,31 @@ void ShaderInterpreter::Execute() {
       case ucode::ControlFlowOpcode::kLoopStart: {
         ucode::ControlFlowLoopStartInstruction cf_loop_start =
             *reinterpret_cast<const ucode::ControlFlowLoopStartInstruction*>(&cf_instr);
-        assert_true(state_.loop_stack_depth < 4);
+        REX_ASSERT(state_.loop_stack_depth < 4);
         if (++state_.loop_stack_depth > 4) {
-          cf_index_next = cf_loop_start.address();
+          cf_index_next = cf_loop_start.GetAddress();
           continue;
         }
         auto loop_constant =
-            rex::memory::Reinterpret<xenos::LoopConstant>(state_constants_.loops[cf_loop_start.loop_id()]);
+            std::bit_cast<xenos::LoopConstant>(state_constants_.loops[cf_loop_start.GetLoopID()]);
         state_.loop_constants[state_.loop_stack_depth] = loop_constant;
         uint32_t& loop_iterator_ref = state_.loop_iterators[state_.loop_stack_depth];
-        if (!cf_loop_start.is_repeat()) {
+        if (!cf_loop_start.IsRepeat()) {
           loop_iterator_ref = 0;
         }
         if (loop_iterator_ref >= loop_constant.count) {
-          cf_index_next = cf_loop_start.address();
+          cf_index_next = cf_loop_start.GetAddress();
           continue;
         }
         ++state_.loop_stack_depth;
       } break;
 
       case ucode::ControlFlowOpcode::kLoopEnd: {
-        assert_not_zero(state_.loop_stack_depth);
+        REX_ASSERT(state_.loop_stack_depth);
         if (!state_.loop_stack_depth) {
           continue;
         }
-        assert_true(state_.loop_stack_depth <= 4);
+        REX_ASSERT(state_.loop_stack_depth <= 4);
         if (state_.loop_stack_depth > 4) {
           --state_.loop_stack_depth;
           continue;
@@ -157,41 +164,41 @@ void ShaderInterpreter::Execute() {
         ucode::ControlFlowLoopEndInstruction cf_loop_end =
             *reinterpret_cast<const ucode::ControlFlowLoopEndInstruction*>(&cf_instr);
         xenos::LoopConstant loop_constant = state_.loop_constants[state_.loop_stack_depth - 1];
-        assert_zero(
+        REX_ASSERT((
             std::memcmp(&loop_constant,
-                        &state_constants_.loops[cf_loop_end.loop_id()],
-                        sizeof(loop_constant)));
+                        &state_constants_.loops[cf_loop_end.GetLoopID()],
+                        sizeof(loop_constant))) == 0);
         uint32_t loop_iterator = ++state_.loop_iterators[state_.loop_stack_depth - 1];
         if (loop_iterator < loop_constant.count &&
-            (!cf_loop_end.is_predicated_break() || cf_loop_end.condition() != state_.predicate)) {
-          cf_index_next = cf_loop_end.address();
+            (!cf_loop_end.IsPredicatedBreak() || cf_loop_end.GetCondition() != state_.predicate)) {
+          cf_index_next = cf_loop_end.GetAddress();
           continue;
         }
         --state_.loop_stack_depth;
       } break;
 
       case ucode::ControlFlowOpcode::kCondCall: {
-        assert_true(state_.call_stack_depth < 4);
+        REX_ASSERT(state_.call_stack_depth < 4);
         if (state_.call_stack_depth >= 4) {
           continue;
         }
         const ucode::ControlFlowCondCallInstruction cf_cond_call =
             *reinterpret_cast<const ucode::ControlFlowCondCallInstruction*>(&cf_instr);
-        if (!cf_cond_call.is_unconditional()) {
-          if (cf_cond_call.is_predicated()) {
-            if (cf_cond_call.condition() != state_.predicate) {
+        if (!cf_cond_call.IsUnconditional()) {
+          if (cf_cond_call.IsPredicated()) {
+            if (cf_cond_call.GetCondition() != state_.predicate) {
               continue;
             }
           } else {
-            uint32_t bool_address = cf_cond_call.bool_address();
-            if (cf_cond_call.condition() !=
+            uint32_t bool_address = cf_cond_call.GetBoolAddress();
+            if (cf_cond_call.GetCondition() !=
                 ((bool_constants[bool_address >> 5] & (UINT32_C(1) << (bool_address & 31))) != 0)) {
               continue;
             }
           }
         }
         state_.call_return_addresses[state_.call_stack_depth++] = cf_index + 1;
-        cf_index_next = cf_cond_call.address();
+        cf_index_next = cf_cond_call.GetAddress();
       } break;
 
       case ucode::ControlFlowOpcode::kReturn: {
@@ -206,35 +213,35 @@ void ShaderInterpreter::Execute() {
       case ucode::ControlFlowOpcode::kCondJmp: {
         const ucode::ControlFlowCondJmpInstruction cf_cond_jmp =
             *reinterpret_cast<const ucode::ControlFlowCondJmpInstruction*>(&cf_instr);
-        if (!cf_cond_jmp.is_unconditional()) {
-          if (cf_cond_jmp.is_predicated()) {
-            if (cf_cond_jmp.condition() != state_.predicate) {
+        if (!cf_cond_jmp.IsUnconditional()) {
+          if (cf_cond_jmp.IsPredicated()) {
+            if (cf_cond_jmp.GetCondition() != state_.predicate) {
               continue;
             }
           } else {
-            uint32_t bool_address = cf_cond_jmp.bool_address();
-            if (cf_cond_jmp.condition() !=
+            uint32_t bool_address = cf_cond_jmp.GetBoolAddress();
+            if (cf_cond_jmp.GetCondition() !=
                 ((bool_constants[bool_address >> 5] & (UINT32_C(1) << (bool_address & 31))) != 0)) {
               continue;
             }
           }
         }
-        cf_index_next = cf_cond_jmp.address();
+        cf_index_next = cf_cond_jmp.GetAddress();
       } break;
 
       case ucode::ControlFlowOpcode::kAlloc: {
         if (export_sink_) {
           const ucode::ControlFlowAllocInstruction& cf_alloc =
               *reinterpret_cast<const ucode::ControlFlowAllocInstruction*>(&cf_instr);
-          export_sink_->AllocExport(cf_alloc.alloc_type(), cf_alloc.size());
+          export_sink_->AllocExport(cf_alloc.GetAllocType(), cf_alloc.GetSize());
         }
       } break;
 
-      case ucode::ControlFlowOpcode::kMarkVsFetchDone: {
+      case ucode::ControlFlowOpcode::kMarkVSFetchDone: {
       } break;
 
       default:
-        assert_unhandled_case(cf_opcode);
+        REX_UNHANDLED_CASE(cf_opcode);
     }
   }
 }
@@ -266,9 +273,9 @@ const std::array<float, 4> ShaderInterpreter::GetFloatConstant(uint32_t address,
 void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
   // Vector operation.
   float vector_result[4] = {};
-  ucode::AluVectorOpcode vector_opcode = instr.vector_opcode();
-  const ucode::AluVectorOpcodeInfo& vector_opcode_info =
-      ucode::GetAluVectorOpcodeInfo(vector_opcode);
+  ucode::AluVectorOpcode vector_opcode = instr.GetVectorOpcode();
+  const ucode::AluVectorOpcodeTraits& vector_opcode_info =
+      ucode::GetAluVectorOpcodeTraits(vector_opcode);
   uint32_t vector_result_write_mask = instr.GetVectorOpResultWriteMask();
   if (vector_result_write_mask || vector_opcode_info.changed_state) {
     float vector_operands[3][4];
@@ -277,24 +284,24 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
         continue;
       }
       const float* vector_src_ptr;
-      uint32_t vector_src_register = instr.src_reg(1 + i);
+      uint32_t vector_src_register = instr.GetSrcReg(1 + i);
       bool vector_src_absolute = false;
       std::array<float, 4> vector_src_float_constant;
-      if (instr.src_is_temp(1 + i)) {
+      if (instr.IsSrcTemp(1 + i)) {
         vector_src_ptr =
-            GetTempRegister(ucode::AluInstruction::src_temp_reg(vector_src_register),
-                            ucode::AluInstruction::is_src_temp_relative(vector_src_register));
+            GetTempRegister(ucode::AluInstruction::GetSrcTempReg(vector_src_register),
+                            ucode::AluInstruction::IsSrcTempRelative(vector_src_register));
         vector_src_absolute =
-            ucode::AluInstruction::is_src_temp_value_absolute(vector_src_register);
+            ucode::AluInstruction::IsSrcTempValueAbsolute(vector_src_register);
       } else {
         vector_src_float_constant =
-            GetFloatConstant(vector_src_register, instr.src_const_is_addressed(1 + i),
-                             instr.is_const_address_register_relative());
+            GetFloatConstant(vector_src_register, instr.IsSrcConstAddressed(1 + i),
+                             instr.IsConstAddressRegisterRelative());
         vector_src_ptr = vector_src_float_constant.data();
       }
       uint32_t vector_src_absolute_mask = ~(uint32_t(vector_src_absolute) << 31);
-      uint32_t vector_src_negate_bit = uint32_t(instr.src_negate(1 + i)) << 31;
-      uint32_t vector_src_swizzle = instr.src_swizzle(1 + i);
+      uint32_t vector_src_negate_bit = uint32_t(instr.IsSrcNegated(1 + i)) << 31;
+      uint32_t vector_src_swizzle = instr.GetSrcSwizzle(1 + i);
       for (uint32_t j = 0; j < 4; ++j) {
         float vector_src_component =
             FlushDenormal(vector_src_ptr[ucode::AluInstruction::GetSwizzledComponentIndex(
@@ -562,7 +569,7 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
         }
       } break;
       default: {
-        assert_unhandled_case(vector_opcode);
+        REX_UNHANDLED_CASE(vector_opcode);
       }
     }
     if (replicate_vector_result_x) {
@@ -573,9 +580,9 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
   }
 
   // Scalar operation.
-  ucode::AluScalarOpcode scalar_opcode = instr.scalar_opcode();
-  const ucode::AluScalarOpcodeInfo& scalar_opcode_info =
-      ucode::GetAluScalarOpcodeInfo(scalar_opcode);
+  ucode::AluScalarOpcode scalar_opcode = instr.GetScalarOpcode();
+  const ucode::AluScalarOpcodeTraits& scalar_opcode_info =
+      ucode::GetAluScalarOpcodeTraits(scalar_opcode);
   float scalar_operands[2];
   uint32_t scalar_operand_component_count = 0;
   bool scalar_src_absolute = false;
@@ -583,21 +590,21 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
     case 1: {
       // r#/c#.w or r#/c#.wx.
       const float* scalar_src_ptr;
-      uint32_t scalar_src_register = instr.src_reg(3);
+      uint32_t scalar_src_register = instr.GetSrcReg(3);
       std::array<float, 4> scalar_src_float_constant;
-      if (instr.src_is_temp(3)) {
+      if (instr.IsSrcTemp(3)) {
         scalar_src_ptr =
-            GetTempRegister(ucode::AluInstruction::src_temp_reg(scalar_src_register),
-                            ucode::AluInstruction::is_src_temp_relative(scalar_src_register));
+            GetTempRegister(ucode::AluInstruction::GetSrcTempReg(scalar_src_register),
+                            ucode::AluInstruction::IsSrcTempRelative(scalar_src_register));
         scalar_src_absolute =
-            ucode::AluInstruction::is_src_temp_value_absolute(scalar_src_register);
+            ucode::AluInstruction::IsSrcTempValueAbsolute(scalar_src_register);
       } else {
         scalar_src_float_constant =
-            GetFloatConstant(scalar_src_register, instr.src_const_is_addressed(3),
-                             instr.is_const_address_register_relative());
+            GetFloatConstant(scalar_src_register, instr.IsSrcConstAddressed(3),
+                             instr.IsConstAddressRegisterRelative());
         scalar_src_ptr = scalar_src_float_constant.data();
       }
-      uint32_t scalar_src_swizzle = instr.src_swizzle(3);
+      uint32_t scalar_src_swizzle = instr.GetSrcSwizzle(3);
       scalar_operand_component_count = scalar_opcode_info.single_operand_is_two_component ? 2 : 1;
       for (uint32_t i = 0; i < scalar_operand_component_count; ++i) {
         scalar_operands[i] = scalar_src_ptr[ucode::AluInstruction::GetSwizzledComponentIndex(
@@ -606,20 +613,20 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
     } break;
     case 2: {
       scalar_operand_component_count = 2;
-      uint32_t scalar_src_swizzle = instr.src_swizzle(3);
+      uint32_t scalar_src_swizzle = instr.GetSrcSwizzle(3);
       // c#.w.
-      scalar_operands[0] = GetFloatConstant(instr.src_reg(3), instr.src_const_is_addressed(3),
-                                            instr.is_const_address_register_relative())
+      scalar_operands[0] = GetFloatConstant(instr.GetSrcReg(3), instr.IsSrcConstAddressed(3),
+                                            instr.IsConstAddressRegisterRelative())
           [ucode::AluInstruction::GetSwizzledComponentIndex(scalar_src_swizzle, 3)];
       // r#.x.
       scalar_operands[1] = GetTempRegister(
-          instr.scalar_const_reg_op_src_temp_reg(),
+          instr.GetScalarConstRegOpSrcTempReg(),
           false)[ucode::AluInstruction::GetSwizzledComponentIndex(scalar_src_swizzle, 0)];
     } break;
   }
   if (scalar_operand_component_count) {
     uint32_t scalar_src_absolute_mask = ~(uint32_t(scalar_src_absolute) << 31);
-    uint32_t scalar_src_negate_bit = uint32_t(instr.src_negate(3)) << 31;
+    uint32_t scalar_src_negate_bit = uint32_t(instr.IsSrcNegated(3)) << 31;
     for (uint32_t i = 0; i < scalar_operand_component_count; ++i) {
       float scalar_operand = FlushDenormal(scalar_operands[i]);
       *reinterpret_cast<uint32_t*>(&scalar_operand) =
@@ -828,20 +835,20 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
     case ucode::AluScalarOpcode::kRetainPrev: {
     } break;
     default: {
-      assert_unhandled_case(scalar_opcode);
+      REX_UNHANDLED_CASE(scalar_opcode);
     }
   }
 
-  if (instr.vector_clamp()) {
+  if (instr.IsVectorClamped()) {
     for (uint32_t i = 0; i < 4; ++i) {
       vector_result[i] = rex::saturate(vector_result[i]);
     }
   }
   float scalar_result =
-      instr.scalar_clamp() ? rex::saturate(state_.previous_scalar) : state_.previous_scalar;
+      instr.IsScalarClamped() ? rex::saturate(state_.previous_scalar) : state_.previous_scalar;
 
   uint32_t scalar_result_write_mask = instr.GetScalarOpResultWriteMask();
-  if (instr.is_export()) {
+  if (instr.IsExport()) {
     if (export_sink_) {
       float export_value[4];
       uint32_t export_constant_1_mask = instr.GetConstant1WriteMask();
@@ -859,13 +866,13 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
         }
         export_value[i] = export_component;
       }
-      export_sink_->Export(ucode::ExportRegister(instr.vector_dest()), export_value,
+      export_sink_->Export(ucode::ExportRegister(instr.GetVectorDest()), export_value,
                            vector_result_write_mask | scalar_result_write_mask |
                                instr.GetConstant0WriteMask() | export_constant_1_mask);
     }
   } else {
     if (vector_result_write_mask) {
-      float* vector_dest = GetTempRegister(instr.vector_dest(), instr.is_vector_dest_relative());
+      float* vector_dest = GetTempRegister(instr.GetVectorDest(), instr.IsVectorDestRelative());
       for (uint32_t i = 0; i < 4; ++i) {
         if (vector_result_write_mask & (UINT32_C(1) << i)) {
           vector_dest[i] = vector_result[i];
@@ -873,7 +880,7 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
       }
     }
     if (scalar_result_write_mask) {
-      float* scalar_dest = GetTempRegister(instr.scalar_dest(), instr.is_scalar_dest_relative());
+      float* scalar_dest = GetTempRegister(instr.GetScalarDest(), instr.IsScalarDestRelative());
       for (uint32_t i = 0; i < 4; ++i) {
         if (scalar_result_write_mask & (UINT32_C(1) << i)) {
           scalar_dest[i] = scalar_result;
@@ -910,7 +917,7 @@ void ShaderInterpreter::StoreFetchResult(uint32_t dest, bool is_dest_relative, u
       default:
         // ucode::FetchDestinationSwizzle::k0 or the invalid swizzle 6.
         // TODO(Triang3l): Find the correct handling of the invalid swizzle 6.
-        assert_true(component_swizzle == ucode::FetchDestinationSwizzle::k0);
+        REX_ASSERT(component_swizzle == ucode::FetchDestinationSwizzle::k0);
         dest_data[i] = 0.0f;
         break;
     }
@@ -922,24 +929,24 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
   // optimization internal error in Visual Studio 2019, mainly in the format
   // unpacking. Using loops with up to 4 iterations here instead.
 
-  if (!instr.is_mini_fetch()) {
+  if (!instr.IsMiniFetch()) {
     state_.vfetch_full_last = instr;
   }
 
-  xenos::xe_gpu_vertex_fetch_t fetch_constant =
-      state_constants_.GetVertexFetch(state_.vfetch_full_last.fetch_constant_index());
+  xenos::VertexFetch fetch_constant =
+      state_constants_.GetVertexFetch(state_.vfetch_full_last.GetFetchConstantIndex());
 
-  if (!instr.is_mini_fetch()) {
+  if (!instr.IsMiniFetch()) {
     // Get the part of the address that depends on vfetch_full data.
     uint32_t vertex_index = uint32_t(
-        std::floor(GetTempRegister(instr.src(), instr.is_src_relative())[instr.src_swizzle()] +
-                   (instr.is_index_rounded() ? 0.5f : 0.0f)));
-    state_.vfetch_address_dwords = instr.stride() * vertex_index + fetch_constant.address;
+        std::floor(GetTempRegister(instr.GetSrcReg(), instr.IsSrcRelative())[instr.GetSrcSwizzle()] +
+                   (instr.IsIndexRounded() ? 0.5f : 0.0f)));
+    state_.vfetch_address_dwords = instr.GetStride() * vertex_index + fetch_constant.address;
   }
 
   // TODO(Triang3l): Find the default values for unused components.
   float result[4] = {};
-  uint32_t dest_swizzle = instr.dest_swizzle();
+  uint32_t dest_swizzle = instr.GetDestSwizzle();
   uint32_t used_result_components = 0b0000;
   for (uint32_t i = 0; i < 4; ++i) {
     uint32_t dest_component_swizzle = (dest_swizzle >> (3 * i)) & 0b111;
@@ -948,13 +955,13 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
     }
   }
   uint32_t needed_dwords =
-      xenos::GetVertexFormatNeededWords(instr.data_format(), used_result_components);
+      xenos::GetVertexFormatNeededWords(instr.GetDataFormat(), used_result_components);
   if (needed_dwords) {
     uint32_t data[4] = {};
-    const uint32_t* memory_dwords = reinterpret_cast<const uint32_t*>(memory_.physical_membase());
+    const uint32_t* memory_dwords = reinterpret_cast<const uint32_t*>(renut::host::Physical(0));
     uint32_t buffer_end_dwords = fetch_constant.address + fetch_constant.size;
     uint32_t dword_0_address_dwords =
-        uint32_t(int32_t(state_.vfetch_address_dwords) + instr.offset());
+        uint32_t(int32_t(state_.vfetch_address_dwords) + instr.GetOffset());
     for (uint32_t i = 0; i < 4; ++i) {
       if (!(needed_dwords & (UINT32_C(1) << i))) {
         continue;
@@ -963,7 +970,7 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
       uint32_t dword_address_dwords = dword_0_address_dwords + i;
       if (dword_address_dwords >= fetch_constant.address &&
           dword_address_dwords < buffer_end_dwords) {
-        dword_value = xenos::GpuSwap(memory_dwords[dword_address_dwords], fetch_constant.endian);
+        dword_value = xenos::GPUSwap(memory_dwords[dword_address_dwords], fetch_constant.endian);
       }
       data[i] = dword_value;
     }
@@ -971,7 +978,7 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
     uint32_t packed_components = 0b0000;
     uint32_t packed_widths[4], packed_offsets[4];
     uint32_t packed_dwords[] = {data[0], data[0]};
-    switch (instr.data_format()) {
+    switch (instr.GetDataFormat()) {
       case xenos::VertexFormat::k_8_8_8_8: {
         packed_components = 0b1111;
         packed_widths[0] = packed_widths[1] = packed_widths[2] = packed_widths[3] = 8;
@@ -1014,30 +1021,30 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
       } break;
       case xenos::VertexFormat::k_16_16_16_16_FLOAT: {
         if (used_result_components & 0b1000) {
-          result[3] = rex::xenos_half_to_float(uint16_t(data[1] >> 16));
+          result[3] = rex::xenos::HalfToFloat(uint16_t(data[1] >> 16));
         }
         if (used_result_components & 0b0100) {
-          result[2] = rex::xenos_half_to_float(uint16_t(data[1]));
+          result[2] = rex::xenos::HalfToFloat(uint16_t(data[1]));
         }
       }
         [[fallthrough]];
       case xenos::VertexFormat::k_16_16_FLOAT: {
         if (used_result_components & 0b0010) {
-          result[1] = rex::xenos_half_to_float(uint16_t(data[0] >> 16));
+          result[1] = rex::xenos::HalfToFloat(uint16_t(data[0] >> 16));
         }
         if (used_result_components & 0b0001) {
-          result[0] = rex::xenos_half_to_float(uint16_t(data[0]));
+          result[0] = rex::xenos::HalfToFloat(uint16_t(data[0]));
         }
       } break;
       case xenos::VertexFormat::k_32:
       case xenos::VertexFormat::k_32_32:
       case xenos::VertexFormat::k_32_32_32_32: {
-        if (instr.is_signed()) {
+        if (instr.IsSigned()) {
           for (uint32_t i = 0; i < 4; ++i) {
             result[i] = float(int32_t(data[i]));
           }
-          if (instr.is_normalized()) {
-            if (instr.signed_rf_mode() == xenos::SignedRepeatingFractionMode::kNoZero) {
+          if (instr.IsNormalized()) {
+            if (instr.GetSignedRFMode() == xenos::SignedRepeatingFractionMode::kNoZero) {
               for (uint32_t i = 0; i < 4; ++i) {
                 result[i] = (result[i] + 0.5f) / 2147483647.5f;
               }
@@ -1053,7 +1060,7 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
           for (uint32_t i = 0; i < 4; ++i) {
             result[i] = float(data[i]);
           }
-          if (instr.is_normalized()) {
+          if (instr.IsNormalized()) {
             for (uint32_t i = 0; i < 4; ++i) {
               result[i] /= 4294967295.0f;
             }
@@ -1069,13 +1076,13 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
         }
       } break;
       default:
-        assert_unhandled_case(instr.data_format());
+        REX_UNHANDLED_CASE(instr.GetDataFormat());
         break;
     }
 
     packed_components &= used_result_components;
     if (packed_components) {
-      if (instr.is_signed()) {
+      if (instr.IsSigned()) {
         for (uint32_t i = 0; i < 4; ++i) {
           if (!(packed_components & (UINT32_C(1) << i))) {
             continue;
@@ -1085,8 +1092,8 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
               float(int32_t(packed_dwords[i >> 1]) << (32 - (packed_width + packed_offsets[i])) >>
                     (32 - packed_width));
         }
-        if (instr.is_normalized()) {
-          if (instr.signed_rf_mode() == xenos::SignedRepeatingFractionMode::kNoZero) {
+        if (instr.IsNormalized()) {
+          if (instr.GetSignedRFMode() == xenos::SignedRepeatingFractionMode::kNoZero) {
             for (uint32_t i = 0; i < 4; ++i) {
               if (!(packed_components & (UINT32_C(1) << i))) {
                 continue;
@@ -1110,7 +1117,7 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
           }
           result[i] = float(packed_dwords[i >> 1] & ((UINT32_C(1) << packed_widths[i]) - 1));
         }
-        if (instr.is_normalized()) {
+        if (instr.IsNormalized()) {
           for (uint32_t i = 0; i < 4; ++i) {
             if (!(packed_components & (UINT32_C(1) << i))) {
               continue;
@@ -1122,7 +1129,7 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
     }
   }
 
-  int32_t exp_adjust = instr.exp_adjust();
+  int32_t exp_adjust = instr.GetExpAdjust();
   if (exp_adjust) {
     float exp_adjust_factor = std::ldexp(1.0f, exp_adjust);
     for (uint32_t i = 0; i < 4; ++i) {
@@ -1130,7 +1137,7 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
     }
   }
 
-  StoreFetchResult(instr.dest(), instr.is_dest_relative(), instr.dest_swizzle(), result);
+  StoreFetchResult(instr.GetDest(), instr.IsDestRelative(), instr.GetDestSwizzle(), result);
 }
 
 }  // namespace interp

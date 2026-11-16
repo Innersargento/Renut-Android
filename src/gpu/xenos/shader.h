@@ -15,13 +15,19 @@
 #include <cstdint>
 #include <vector>
 
-#include <rex/graphics/format/ucode.h>
-#include <rex/graphics/xenos.h>
+#include <rex/xenos/ucode.h>
+#include <rex/xenos/fetch.h>
+#include <rex/xenos/format.h>
+#include <rex/xenos/packet.h>
+#include <rex/xenos/register.h>
+#include <rex/xenos/state.h>
+#include <rex/xenos/texture.h>
+#include <rex/xenos/ucode.h>
 #include <rex/memory.h>
 
 namespace renut::gpu {
 namespace xshader {
-namespace xenos = rex::graphics::xenos;
+namespace xenos = rex::xenos;
 namespace memory = rex::memory;
 
 class Shader {

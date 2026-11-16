@@ -8,11 +8,13 @@
 // Strings cross as UTF-16 (jchar == char16_t) so nothing goes through JNI's modified UTF-8.
 #include <jni.h>
 #include <android/log.h>
-#include <rex/logging.h>
-#include <rex/memory/utils.h>
+#include "platform/log.h"
+#include <rex/hid/input_system.h>
+#include <rex/kernel/thread_registry.h>
+#include <rex/kernel/object/notification_broadcaster.h>
+#include <rex/kernel/types/status.h>
 #include <rex/ppc/context.h>
-#include <rex/system/kernel_state.h>
-#include <rex/system/xtypes.h>
+#include "platform/guest.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -24,9 +26,7 @@
 
 #include "guest/guest_address.h"
 
-// The SDK's X_ERROR_* macros are written with the unqualified types.
-using rex::X_RESULT;
-using rex::X_STATUS;
+namespace kernel = rex::kernel;
 
 extern "C" void __imp__XamShowKeyboardUI(PPCContext& __restrict ctx, uint8_t* base);
 
@@ -168,8 +168,9 @@ extern "C" void renut_imp_XamShowKeyboardUI(PPCContext& __restrict ctx, uint8_t*
   const uint32_t buffer_address = ctx.r8.u32;
   const uint32_t buffer_length = ctx.r9.u32;
   const uint32_t overlapped = ctx.r10.u32;
-  auto* kernel = rex::system::kernel_state();
-  if (!text_box_available.load() || !kernel || !buffer_address || !overlapped) {
+  rex::kernel::TitleRuntime* title = renut::host::Title();
+  auto* overlaps = rex::AppInterfaces::Get<kernel::IOverlappedDispatcher>();
+  if (!text_box_available.load() || !title || !overlaps || !buffer_address || !overlapped) {
     __imp__XamShowKeyboardUI(ctx, base);
     return;
   }
@@ -180,7 +181,7 @@ extern "C" void renut_imp_XamShowKeyboardUI(PPCContext& __restrict ctx, uint8_t*
   request.description = GuestString(base, ctx.r7.u32);
   request.max_length = buffer_length ? buffer_length - 1 : 0;
   if (request.default_text.size() > request.max_length) request.default_text.resize(request.max_length);
-  REXKRNL_INFO("XamShowKeyboardUI: flags {:08X}, up to {} characters", request.flags, request.max_length);
+  REXLOG_CAT_INFO(rex::log::renut, "XamShowKeyboardUI: flags {:08X}, up to {} characters", request.flags, request.max_length);
   uint8_t* buffer = renut::GuestPtr(base, buffer_address);
   // The buffer holds big-endian UTF-16, terminated, at most buffer_length characters.
   auto store = [buffer, buffer_length](const std::u16string& text) {
@@ -192,28 +193,32 @@ extern "C" void renut_imp_XamShowKeyboardUI(PPCContext& __restrict ctx, uint8_t*
     }
     buffer[count * 2] = buffer[count * 2 + 1] = 0;
   };
-  auto run = [request = std::move(request), store](uint32_t& extended_error, uint32_t& length) -> rex::X_RESULT {
-    length = 0;
+  auto run = [request = std::move(request), store]() -> kernel::CompletionOptions {
     std::u16string text;
     if (!request.max_length || !TextInputHandler(request, text)) {
       // Cancelled: the title reads ERROR_CANCELLED from the overlapped and must not find
       // anything but an empty string in its buffer.
       store(std::u16string());
-      extended_error = X_ERROR_CANCELLED;
-      return X_ERROR_SUCCESS;
+      return {.result = kernel::X_ERROR_SUCCESS, .extended_error = kernel::X_ERROR_CANCELLED, .length = 0};
     }
     store(text);
-    extended_error = X_ERROR_SUCCESS;
-    return X_ERROR_SUCCESS;
+    return {.result = kernel::X_ERROR_SUCCESS, .extended_error = kernel::X_ERROR_SUCCESS, .length = 0};
   };
-  // XN_SYS_UI while the box is up, as the SDK's own dialogs do.
-  auto pre = [kernel] { kernel->BroadcastNotification(0x9, true); };
-  auto post = [kernel] {
+  // XN_SYS_UI while the box is up, as the SDK's own dialogs do, and the pads hidden from the title
+  // (IInputSystem::AcquireUIBlock): the press that confirms the text must not reach the game. The
+  // block also masks the buttons still held when it ends, until they are released.
+  auto* input = rex::AppInterfaces::Get<rex::hid::IInputSystem>();
+  auto pre = [title, input] {
+    if (input) input->AcquireUIBlock();
+    title->GetNotificationBroadcaster().BroadcastNotification(0x9, true);
+  };
+  auto post = [title, input] {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    kernel->BroadcastNotification(0x9, false);
+    title->GetNotificationBroadcaster().BroadcastNotification(0x9, false);
+    if (input) input->ReleaseUIBlock();
   };
-  kernel->CompleteOverlappedDeferredEx(run, overlapped, pre, post);
-  ctx.r3.u64 = X_ERROR_IO_PENDING;
+  overlaps->CompleteDeferred(overlapped, std::move(run), std::move(pre), std::move(post));
+  ctx.r3.u64 = kernel::X_ERROR_IO_PENDING;
 }
 
 // The player pressed OK (cancelled=false, text = what was typed) or cancelled.

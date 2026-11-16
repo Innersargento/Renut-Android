@@ -1,5 +1,7 @@
 // Hi-Z culling.
 #include "gpu/core/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
 
 namespace renut::gpu {
 
@@ -110,14 +112,14 @@ HizModelEntry* HiZ::HizModelFor(HostShader& vs) {
 // The model against the SDK's interpreter, on two vertices of the draw about to
 // use it: what the symbolic executor claims must be what the microcode does.
 bool HiZ::HizValidate(HostShader& vs, renut::hiz::Model& model,
-                                        const xenos::xe_gpu_vertex_fetch_t& fetch, uint32_t vertex_a,
+                                        const xenos::VertexFetch& fetch, uint32_t vertex_a,
                                         uint32_t vertex_b) {
   if (!ShaderInterpreter::CanInterpretShader(vs)) return false;
   struct Sink final : ShaderInterpreter::ExportSink {
     float position[4] = {};
     uint32_t written = 0;
-    void Export(rex::graphics::ucode::ExportRegister reg, const float* value, uint32_t mask) override {
-      if (reg != rex::graphics::ucode::ExportRegister::kVSPosition) return;
+    void Export(rex::xenos::ucode::ExportRegister reg, const float* value, uint32_t mask) override {
+      if (reg != rex::xenos::ucode::ExportRegister::kVSPosition) return;
       for (uint32_t i = 0; i < 4; ++i) {
         if (mask & (1u << i)) {
           position[i] = value[i];
@@ -126,13 +128,13 @@ bool HiZ::HizValidate(HostShader& vs, renut::hiz::Model& model,
       }
     }
   } sink;
-  auto interpreter = std::make_unique<ShaderInterpreter>(backend.state_, *backend.memory_);
+  auto interpreter = std::make_unique<ShaderInterpreter>(backend.state_);
   interpreter->SetShader(vs);
   interpreter->SetExportSink(&sink);
   const float* constants = reinterpret_cast<const float*>(backend.state_.float_constants);
   float affine[4][5];
   renut::hiz::Evaluate(model, constants, 0, affine);
-  const uint8_t* memory = backend.memory_->TranslatePhysical<const uint8_t*>(0);
+  const uint8_t* memory = renut::host::Physical<const uint8_t*>(0);
   for (uint32_t vertex : {vertex_a, vertex_b}) {
     sink.written = 0;
     interpreter->temp_registers()[0] = float(vertex);
@@ -157,7 +159,7 @@ bool HiZ::HizValidate(HostShader& vs, renut::hiz::Model& model,
         static uint32_t logged = 0;
         if (logged < 12) {
           ++logged;
-          REXLOG_WARN("Renut: Plume Hi-Z model of vs {:016X} rejected: vertex {} clip[{}] model {} interpreter {}",
+          REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume Hi-Z model of vs {:016X} rejected: vertex {} clip[{}] model {} interpreter {}",
                       vs.ucode_data_hash(), vertex, o, predicted, reference);
         }
         return false;
@@ -168,7 +170,7 @@ bool HiZ::HizValidate(HostShader& vs, renut::hiz::Model& model,
 }
 
 const HizBox* HiZ::HizBoxFor(
-    const renut::hiz::Model& model, const xenos::xe_gpu_vertex_fetch_t& fetch, const IndexBufferInfo* index_info,
+    const renut::hiz::Model& model, const xenos::VertexFetch& fetch, const IndexBufferInfo* index_info,
     uint32_t index_count, int32_t base_vertex) {
   backend.streams.DrainWatchHits();
   const bool indexed = index_info && index_info->guest_base;
@@ -214,7 +216,7 @@ const HizBox* HiZ::HizBoxFor(
     }
   }
 
-  const uint8_t* memory = backend.memory_->TranslatePhysical<const uint8_t*>(0);
+  const uint8_t* memory = renut::host::Physical<const uint8_t*>(0);
   auto checksum_of = [&](const HizBox& box) {
     uint64_t h = 0;
     auto add = [&](uint32_t base, uint32_t size) {
@@ -294,7 +296,7 @@ const HizBox* HiZ::HizBoxFor(
     }
     for (uint32_t i = 0; i < index_count; ++i) {
       uint32_t v = is32 ? words[i] : halves[i];
-      v = xenos::GpuSwap(v, endian);
+      v = xenos::GPUSwap(v, endian);
       if (!is32) v &= 0xFFFF;
       if (v == (is32 ? 0xFFFFFFFFu : 0xFFFFu)) continue;  // primitive restart
       v &= 0xFFFFFF;
@@ -348,16 +350,8 @@ const HizBox* HiZ::HizBoxFor(
   // What the box was made from must be watched, or a guest rewrite of the mesh
   // (streaming, a dynamic buffer) would leave it stale: the checksum above only
   // samples the ends.
-  const auto access = [&](uint32_t base, uint32_t size) {
-    return !size || backend.memory_->GetPhysicalHeap()->QueryRangeAccess(base, base + size - 1) ==
-                       rex::memory::PageAccess::kReadWrite;
-  };
-  if (!access(box.vertex_base, box.vertex_size) || !access(box.index_base, box.index_size)) {
-    // Made again for the next draw; the range is bounded above (20000 vertices).
-    return finish(true, false);
-  }
-  backend.memory_->EnablePhysicalMemoryAccessCallbacks(box.vertex_base, box.vertex_size, true, false);
-  if (box.index_size) backend.memory_->EnablePhysicalMemoryAccessCallbacks(box.index_base, box.index_size, true, false);
+  renut::host::WatchWrites(box.vertex_base, box.vertex_size);
+  if (box.index_size) renut::host::WatchWrites(box.index_base, box.index_size);
   return finish(true, true);
 }
 
@@ -396,7 +390,7 @@ bool HiZ::HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t i
     return false;
   }
   renut::hiz::Model& model = *entry->model;
-  const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(model.fetch.fetch_constant);
+  const xenos::VertexFetch fetch = regs.GetVertexFetch(model.fetch.fetch_constant);
   if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size) {
     ++backend.stats_.hiz_no_box[kind];
     return false;

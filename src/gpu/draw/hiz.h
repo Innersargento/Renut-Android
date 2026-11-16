@@ -46,9 +46,9 @@ struct HiZ {
   HizBox hiz_scratch_box_;
   std::array<HizFront, 8192> hiz_front_{};
   HizModelEntry* HizModelFor(HostShader& vs);
-  const HizBox* HizBoxFor(const renut::hiz::Model& model, const xenos::xe_gpu_vertex_fetch_t& fetch,
+  const HizBox* HizBoxFor(const renut::hiz::Model& model, const xenos::VertexFetch& fetch,
                           const IndexBufferInfo* index_info, uint32_t index_count, int32_t base_vertex);
-  bool HizValidate(HostShader& vs, renut::hiz::Model& model, const xenos::xe_gpu_vertex_fetch_t& fetch,
+  bool HizValidate(HostShader& vs, renut::hiz::Model& model, const xenos::VertexFetch& fetch,
                    uint32_t vertex_a, uint32_t vertex_b);
   // True when nothing of the draw can reach the target.
   bool HizCullDraw(HostShader& vs, xenos::PrimitiveType prim_type, uint32_t index_count,

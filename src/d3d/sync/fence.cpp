@@ -4,12 +4,12 @@
 // runs the list that carries it (d3d/frontend/sync.cpp, kOpFence), not by a render
 // thread, so the wait polls the completion word the backend writes.
 #include "d3d/sync/fence.h"
+#include "platform/log.h"
 
 #include <atomic>
 #include <chrono>
 #include <thread>
 
-#include <rex/logging.h>
 
 #include "d3d/device/internal.h"
 
@@ -95,7 +95,7 @@ void BlockOnFence(Device device, u32 fence, bool no_kick, const FenceHooks& hook
     // Every list has run and the fence still stands: nothing will complete it.
     // Complete it as the front end's stuck-wait watchdog does (native/sync.cpp).
     const u32 issued = device.W(off::FenceTag) - 2;
-    REXLOG_WARN("Renut: native fence: a wait for fence {:X} stood still 1.5 s with every list run "
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: native fence: a wait for fence {:X} stood still 1.5 s with every list run "
                 "(completed {:X}, issued {:X}); completing it",
                 fence, completed, issued);
     StoreBE32(renut::GuestPtr(device.base, device.W(kFenceCompletion)), issued);

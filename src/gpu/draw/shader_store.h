@@ -1,6 +1,7 @@
 #pragma once
 // Recompiled shaders: HostShader and the store that finds them.
 #include "gpu/core/base.h"
+#include "platform/log.h"
 
 namespace renut::gpu {
 
@@ -105,7 +106,7 @@ class ShaderStore {
       by_loose_.emplace(m.loose, m.container);
       container_loose_.emplace(m.container, m.loose);
     }
-    REXLOG_INFO("Renut: Plume shader cache: {} shaders, {} microcode keys, {} MB smol-v",
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume shader cache: {} shaders, {} microcode keys, {} MB smol-v",
                 g_shaderCacheEntryCount, by_ucode_.size(),
                 size_t(g_spirvCacheEnd - g_spirvCache) >> 20);
   }
@@ -160,7 +161,7 @@ class ShaderStore {
     // Debug: <files>/plume-spv/<container hash>.spv stands in for the cached
     // SPIR-V of that shader, to try a changed shader without rebuilding the cache.
     if (!g_miss_dump_directory.empty()) {
-      const std::string path = fmt::format("{}/plume-spv/{:016X}.spv",
+      const std::string path = std::format("{}/plume-spv/{:016X}.spv",
                                            g_miss_dump_directory.substr(0, g_miss_dump_directory.rfind('/')),
                                            entry->hash);
       if (FILE* file = std::fopen(path.c_str(), "rb")) {
@@ -171,7 +172,7 @@ class ShaderStore {
           spirv.assign(size_t(bytes) / 4, 0);
           if (std::fread(spirv.data(), 1, size_t(bytes), file) == size_t(bytes)) {
             size = size_t(bytes);
-            REXLOG_INFO("Renut: Plume shader {:016X} replaced by {} ({} bytes)", entry->hash, path, bytes);
+            REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume shader {:016X} replaced by {} ({} bytes)", entry->hash, path, bytes);
           }
         }
         std::fclose(file);

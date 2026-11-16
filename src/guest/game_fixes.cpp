@@ -2,10 +2,15 @@
 // are weak symbols, so a strong definition here replaces them at link time.
 
 #include "guest_address.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <format>
+#include <string>
 #include <map>
+#include <mutex>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -14,36 +19,24 @@
 #include <cstdint>
 #include <cstring>
 
-#include <rex/cvar.h>
-#include <rex/logging.h>
+#include <rex/kernel/object/kernel_thread.h>
 #include <rex/ppc/context.h>
-#include <rex/ppc/func.h>
-#include <rex/hook.h>
+#include <rex/ppc/recompiled_code.h>
+#include <rex/ppc/hook.h>
 
 #include "d3d/frontend/native_d3d.h"
 #include "plume/frame_pacing.h"
 #include "plume/plume_gpu.h"
 
-REXCVAR_DEFINE_INT32(renut_msaa, 0, "reNut/Plume",
-                     "Multisampling of the scene, drawn in one band (no predicated tiling): 0 off, 1 2x, 2 4x. "
-                     "The game's MSAA surfaces are kept at the screen's size and the host resolves their samples "
-                     "(colour averaged, depth from the first sample). Followed while the game runs")
-    .range(0, 2);
-REXCVAR_DEFINE_INT32(renut_fps_target, 30, "reNut/Plume",
-                     "Frame rate the game is held to: 30 is its own, 31-240 presents "
-                     "immediately and paces to that rate, 0 is unlimited. Changes live from the sidebar "
-                     "(plume/frame_pacing.h)")
-    .range(0, 240);
-REXCVAR_DEFINE_BOOL(renut_pace_original_fps, true, "reNut/Plume",
-                    "The game's own 30 FPS is held by the frame pacer with an immediate presentation "
-                    "interval, like every other target (and like reNut on PC, which has no vertical blank). "
-                    "Off: the game's presentation interval waits for the emulated vertical blank");
+
+
+
 
 namespace renut::pacing {
 void ApplyConfiguredTarget() {
-  int fps = REXCVAR_GET(renut_fps_target);
+  int fps = renut::GetSettings().fps_target.Get();
   SetTarget(fps);
-  PaceOriginalCell().store(REXCVAR_GET(renut_pace_original_fps), std::memory_order_relaxed);
+  PaceOriginalCell().store(renut::GetSettings().pace_original_fps.Get(), std::memory_order_relaxed);
 }
 }  // namespace renut::pacing
 
@@ -57,7 +50,7 @@ constexpr uint32_t kSceneMsaaMode = 0x82F9EC18;
 constexpr uint32_t kSceneColorMsaa = 0x82F9EB38, kSceneDepthMsaa = 0x82F9EB44;
 
 // The mode is the player's choice, whatever the game's own setting holds (its default is 2x).
-uint32_t WantedMsaaMode() { return uint32_t(std::clamp(REXCVAR_GET(renut_msaa), 0, 2)); }
+uint32_t WantedMsaaMode() { return uint32_t(std::clamp(renut::GetSettings().msaa.Get(), 0, 2)); }
 
 // The mode the game is in: what the hooks below go by. The option changes on another thread at any moment; the
 // game's word only in ApplySceneMsaa, together with the surfaces.
@@ -94,7 +87,7 @@ void ApplySceneMsaa(uint8_t* base) {
   if (*mode != wanted) {
     static std::atomic<uint32_t> logged{0};
     if (logged.fetch_add(1) < 8) {
-      REXLOG_INFO("Renut: scene MSAA mode {} -> {}: one band, no predicated tiling", __builtin_bswap32(*mode),
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: scene MSAA mode {} -> {}: one band, no predicated tiling", __builtin_bswap32(*mode),
                   wanted_mode);
     }
     // The type the game gives the mode (sub_823ED260): 2x is 4x when the word at 0x82F9EBE4 is 0.
@@ -121,7 +114,7 @@ REX_HOOK_RAW(rex_setParamInterval) {
   if (renut::pacing::ImmediatePresentation() && ctx.r3.u32 != 0) {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
-      REXLOG_INFO("Renut: presentation interval {} -> immediate (frame-rate target {})", ctx.r3.u32,
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: presentation interval {} -> immediate (frame-rate target {})", ctx.r3.u32,
                   renut::pacing::Target());
     ctx.r3.u32 = 0;
   }
@@ -136,12 +129,86 @@ REX_HOOK_RAW(rex_setParamInterval) {
 // that is a host null dereference about one launch in six, a few seconds in;
 // the cause is not known yet. A free that has no heap releases nothing and
 // reports success, as a free of NULL does: the block is leaked, not corrupted.
+// The other half of the same defect, one step earlier in the same function: meInternalFree (the game's
+// free) looks the block's owner up (sub_82240178 gives its index in the table of heaps at 0x82F84BC8,
+// 56 bytes an entry) and, when that entry has no heap (the word at +60), carries on with a null entry and
+// reads it at guest address 0x24. A free of a block no heap owns releases nothing, as above.
+// (The double frees seen under RexGlue 0.11 came from the race on the global pools, fixed below.)
+//
+// Every free of the game comes through here, and the original looks the owner up itself, so the check must not
+// cost a second lookup. sub_82240178 walks the five entries of the table and, for each one with a heap, asks
+// sub_82240200 for the block's size; that answer comes from the block's header alone (the heap only decides
+// whether a debug check runs first), and the entry owns the block when its tag (the word at +56) is the byte at
+// block + size - 2. The same reads are done here; only a block they find no owner for goes through the
+// recompiled lookup, which then decides.
+namespace {
+uint32_t GuestU16(const uint8_t* base, uint32_t address) {
+  return uint32_t(base[address]) << 8 | base[uint32_t(address + 1)];
+}
+uint32_t GuestU32(const uint8_t* base, uint32_t address) {
+  return GuestU16(base, address) << 16 | GuestU16(base, address + 2);
+}
+bool BlockHasOwner(const uint8_t* base, uint32_t block) {
+  constexpr uint32_t kHeapTable = 0x82F84BC8, kEntrySize = 56, kEntries = 5;
+  if (block < 0x1000) return false;
+  const uint8_t flags = base[block - 11];
+  uint32_t tag = 255;
+  if (flags & 1) {
+    const uint32_t size = (flags & 8) ? GuestU32(base, block - 24) - GuestU16(base, block - 16) - 48
+                                      : (GuestU16(base, block - 16) << 4) - base[block - 10];
+    if (size != 0xFFFFFFFFu) tag = base[uint32_t(block + size - 2)];
+  }
+  for (uint32_t i = 0; i < kEntries; ++i) {
+    const uint32_t entry = kHeapTable + i * kEntrySize;
+    if (GuestU32(base, entry + 60) && GuestU32(base, entry + 56) == tag) return true;
+  }
+  return false;
+}
+}  // namespace
+
+extern "C" void __imp__meInternalFree(PPCContext& __restrict, uint8_t*);
+extern "C" void __imp__sub_82240178(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(meInternalFree) {
+  if (BlockHasOwner(base, ctx.r3.u32)) {
+    __imp__meInternalFree(ctx, base);
+    return;
+  }
+  constexpr uint32_t kHeapTable = 0x82F84BC8, kEntrySize = 56, kImageEnd = 0x830A0000;
+  PPCContext probe = ctx;
+  __imp__sub_82240178(probe, base);
+  const uint32_t index = probe.r3.u32;
+  const uint32_t entry = kHeapTable + index * kEntrySize;
+  uint32_t heap = 0;
+  if (entry >= kHeapTable && entry + 64 <= kImageEnd) {  // the table's size is not known: anywhere in the image
+    const uint8_t* word = base + entry + 60;
+    heap = uint32_t(word[0]) << 24 | uint32_t(word[1]) << 16 | uint32_t(word[2]) << 8 | word[3];
+  }
+  if (!heap) {
+    static std::atomic<uint32_t> reported{0};
+    if (reported.fetch_add(1) < 8) {
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: free of a block no heap owns (block {:08X}, owner {}, caller {:08X}) skipped",
+                      ctx.r3.u32, index, uint32_t(ctx.lr));
+      // The bytes around the block: the owner is found by the tag byte at block-2, so what is there tells a
+      // stomped header from a pointer the heap never gave out. (Diagnostic.)
+      const uint32_t block = ctx.r3.u32;
+      if (block >= 0x40000100 && block < 0x80000000) {
+        std::string dump;
+        for (uint32_t i = block - 48; i < block + 16; ++i) dump += std::format("{:02X}{}", base[i], (i - (block - 48)) % 16 == 15 ? " |" : "");
+        REXLOG_CAT_WARN(rex::log::renut, "Renut:   bytes {:08X}..{:08X}: {}", block - 48, block + 16, dump);
+      }
+    }
+    ctx.r3.u32 = 0;
+    return;
+  }
+  __imp__meInternalFree(ctx, base);
+}
+
 extern "C" void __imp__sub_8223FD48(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(sub_8223FD48) {
   if (ctx.r3.u32 == 0) {
     static std::atomic<uint32_t> reported{0};
     if (reported.fetch_add(1) < 8)
-      REXLOG_WARN("Renut: heap free without an owning heap (block {:08X}) skipped", ctx.r5.u32);
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: heap free without an owning heap (block {:08X}) skipped", ctx.r5.u32);
     ctx.r3.u32 = 1;
     return;
   }
@@ -284,7 +351,7 @@ REX_HOOK_RAW(sub_8229B330) {
     pipeline_hold = false;
   } else if (GuestWord(base, scene + 16) == 2 && !pipeline_hold) {
     pipeline_hold = true;
-    REXLOG_INFO("Renut: scene {:08X} loaded; its loading screen held for its pipelines", scene);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: scene {:08X} loaded; its loading screen held for its pipelines", scene);
   }
 }
 
@@ -307,13 +374,8 @@ REX_HOOK_RAW(sub_8229B330) {
 // that sits in it (the main thread's tick, 22 s without one frame on the S23) left the loading screen standing still.
 extern "C" REX_FUNC(sub_8223C650);
 extern "C" void __imp__sub_821E04F0(PPCContext& __restrict, uint8_t*);
-REXCVAR_DEFINE_BOOL(renut_pump_loading_hold, true, "reNut/Plume",
-                    "While a scene start is held for its pipelines, call the game's own stall pump so the loading "
-                    "screen keeps animating (the Pong's ball) instead of standing still.");
-REXCVAR_DEFINE_BOOL(renut_pump_loading_waits, true, "reNut/Plume",
-                    "While a scene loads, the main thread's waits of the game's job system (sub_821E04F0) are cut into "
-                    "16 ms slices and the game's stall pump runs between them, so the loading screen draws frames "
-                    "during the world build as it does on a disc.");
+
+
 
 namespace {
 
@@ -338,7 +400,7 @@ void RunPump(PPCContext& ctx, uint8_t* base) {
 REX_HOOK_RAW(sub_821E04F0) {
   const uint32_t timeout = ctx.r4.u32;
   if (!t_game_main || t_in_pump || timeout == 0 || !g_scene_loading.load(std::memory_order_relaxed) ||
-      !REXCVAR_GET(renut_pump_loading_waits)) {
+      !renut::GetSettings().pump_loading_waits.Get()) {
     __imp__sub_821E04F0(ctx, base);
     return;
   }
@@ -375,14 +437,17 @@ REX_HOOK_RAW(sub_822BBE58) {
   if (in_scene_update && ctx.r4.u32 != 0 && scene_asked_since_boot.load()) {
     const auto start = std::chrono::steady_clock::now();
     uint32_t polls = 0;
-    const bool pump = REXCVAR_GET(renut_pump_loading_hold);
+    const bool pump = renut::GetSettings().pump_loading_hold.Get();
     while (!renut::PlumeSceneReady()) {
+      // A raw hook is not checked for a stop request, and the runtime's ForceStop only reaches a thread
+      // inside recompiled code: without this, closing the game during the hold waited up to 60 s.
+      rex::kernel::KernelThread::CheckStop();
       ++polls;
       if (pump) RunPump(ctx, base);
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (polls) {
-      REXLOG_INFO("Renut: scene start held its loading screen {} ms more for the pipelines of the models it loaded",
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: scene start held its loading screen {} ms more for the pipelines of the models it loaded",
                   std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
                       .count());
     }
@@ -473,7 +538,7 @@ REX_HOOK_RAW(sub_8227A9F0) {
   call.r4.u32 = depth;
   sub_8227AF40(call, base);
   static std::atomic<uint32_t> logged{0};
-  if (logged.fetch_add(1) < 3) REXLOG_INFO("Renut: scene ended; the device back on the single-sample pair {:08X} / {:08X}", color, depth);
+  if (logged.fetch_add(1) < 3) REXLOG_CAT_INFO(rex::log::renut, "Renut: scene ended; the device back on the single-sample pair {:08X} / {:08X}", color, depth);
 }
 
 // The pass begin @ 0x823DBEB8 (r3 the job, r4 the device, r5 no_tiling, r6 use_table), where a scene job's
@@ -501,7 +566,7 @@ REX_HOOK_RAW(sub_823DBEB8) {
   call.r4.u32 = depth;
   sub_8227AF40(call, base);
   static std::atomic<bool> logged{false};
-  if (!logged.exchange(true)) REXLOG_INFO("Renut: scene jobs bound to the MSAA surfaces {:08X} / {:08X}", color, depth);
+  if (!logged.exchange(true)) REXLOG_CAT_INFO(rex::log::renut, "Renut: scene jobs bound to the MSAA surfaces {:08X} / {:08X}", color, depth);
 }
 
 // Scene view job @ 0x823B18C8 (r3 the job; +40 its scene, +80 its band). The
@@ -530,7 +595,7 @@ REX_HOOK_RAW(sub_823B18C8) {
       std::memcpy(block + 192, block + 128, 64);
       std::memcpy(block + 256, block + 128, 64);
       static std::atomic<bool> logged{false};
-      if (!logged.exchange(true)) REXLOG_INFO("Renut: scene {:08X} band jobs given the whole-screen projection", scene);
+      if (!logged.exchange(true)) REXLOG_CAT_INFO(rex::log::renut, "Renut: scene {:08X} band jobs given the whole-screen projection", scene);
     }
   }
   __imp__sub_823B18C8(ctx, base);
@@ -548,7 +613,7 @@ REX_HOOK_RAW(sub_8265AB70) {
   static std::atomic<uint32_t> count{0};
   uint32_t n = ++count;
   if (n <= 3 || (n & (n - 1)) == 0) {
-    REXLOG_WARN("Renut: GPU fence wait exceeded the D3D hang timeout ({}x); still waiting", n);
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: GPU fence wait exceeded the D3D hang timeout ({}x); still waiting", n);
   }
   ctx.r3.u64 = 0;
 }
@@ -659,4 +724,83 @@ REX_HOOK_RAW(sub_82B673D0) {
     if (pair.vs_dwords && pair.vs_dwords < 65536 && pair.ps_dwords < 65536) predicted.push_back(pair);
   }
   if (!predicted.empty()) renut::PlumePredictPipelines(std::move(predicted));
+}
+
+// The title's audio engine init (sub_82664680, IDB 0x82667280) writes the headers of its static events in place
+// before it starts its mixer threads: 0x82FA7C3C (the render callback asks for a frame), 0x82FA7C18 (the mixer
+// has made it) and 0x82FA7C5C (the title ends), each with its signal state 0. The game makes a new engine when it
+// loads its first 3D scene. The old engine's leader thread (sub_82664508), told to stop, sets 0x82FA7C18 once
+// more as it leaves, with nobody waiting on it; on the console the new engine's header write clears that signal.
+// The SDK keeps an event's state in the host object behind the address and never reads the header again, so the
+// new engine's first callback found 0x82FA7C18 already set, returned at once and cleared its mark at engine+0x12C;
+// the new leader, woken by that callback's request, then found 0x12C clear, took it as its order to stop and
+// left after 4 ms. Nothing set 0x82FA7C18 again: the next callback waited for ever and the sound died. The events
+// are reset through the kernel before the init runs, as the header write does on the console. Only an event the
+// title has initialised before (its wait list points at itself) is touched: on the first init the headers are
+// still zero, and a kernel call then would make the SDK build the event from a type-0 header, as a manual-reset
+// one.
+extern "C" void __imp__KeResetEvent(PPCContext& __restrict, uint8_t*);
+extern "C" void __imp__sub_82664680(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_82664680) {
+  for (uint32_t event : {0x82FA7C3Cu, 0x82FA7C18u, 0x82FA7C5Cu}) {
+    uint32_t wait_list;  // X_DISPATCH_HEADER::wait_list_flink, at +8
+    std::memcpy(&wait_list, renut::GuestPtr(base, event + 8), sizeof(wait_list));
+    if (__builtin_bswap32(wait_list) != event + 8) continue;
+    PPCContext call = ctx;
+    call.r3.u64 = event;
+    __imp__KeResetEvent(call, base);
+  }
+  __imp__sub_82664680(ctx, base);
+}
+
+// The game's global pools at 0x82FAC600 and 0x82FAC604. Their getter (sub_82364A20, IDB 0x82367620) makes them
+// when 0x82FAC600 is 0, through sub_82364A88 (IDB 0x82367688), which destroys both pools (sub_82364BB8, IDB
+// 0x823677B8), zeroes the pointers and makes new ones; a scene change calls sub_82364A88 too, and a command of the
+// renderer destroys them in place (IDB 0x823D3594). None of it takes a lock. On the console the main thread and
+// the task worker that also asks for the pool do not run at the same instant (one hardware thread, one quantum);
+// here they do: the main thread zeroed 0x82FAC600 while remaking the pools, a worker's getter saw 0 and remade
+// them as well, and both destroyed the same pool and its buffer (the double free of block 438E1910 and its
+// owner, then a cyclic free list or a call through a dead object's table). The getter, the remake and the
+// destroy run under one lock, so a getter that comes in during a remake waits for it and takes the new pool.
+//
+// The getter is called all the time and the pools nearly always exist, so it takes the lock only when it has to:
+// it returns 0x82FAC604 when the low byte of r3 is set and 0x82FAC600 otherwise, and that is answered here
+// while both pools exist and no remake or destroy is under way (looked at before and after reading them).
+// Anything else goes through the lock to the original, as before.
+namespace {
+std::recursive_mutex g_pool_mutex;
+std::atomic<uint32_t> g_pool_changing{0};
+constexpr uint32_t kPoolA = 0x82FAC600, kPoolB = 0x82FAC604;
+uint32_t LoadPool(const uint8_t* base, uint32_t address) {
+  return __builtin_bswap32(__atomic_load_n(reinterpret_cast<const uint32_t*>(base + address), __ATOMIC_ACQUIRE));
+}
+// Held by the remake and the destroy: the lock, and the mark the getter's fast path looks at.
+struct PoolChange {
+  std::lock_guard<std::recursive_mutex> lock{g_pool_mutex};
+  PoolChange() { g_pool_changing.fetch_add(1); }
+  ~PoolChange() { g_pool_changing.fetch_sub(1); }
+};
+}  // namespace
+extern "C" void __imp__sub_82364A20(PPCContext& __restrict, uint8_t*);
+extern "C" void __imp__sub_82364A88(PPCContext& __restrict, uint8_t*);
+extern "C" void __imp__sub_82364BB8(PPCContext& __restrict, uint8_t*);
+REX_HOOK_RAW(sub_82364A20) {
+  if (g_pool_changing.load() == 0) {
+    const uint32_t a = LoadPool(base, kPoolA), b = LoadPool(base, kPoolB);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (a && b && g_pool_changing.load() == 0) {
+      ctx.r3.u64 = (ctx.r3.u32 & 0xFF) ? b : a;
+      return;
+    }
+  }
+  std::lock_guard lock(g_pool_mutex);
+  __imp__sub_82364A20(ctx, base);
+}
+REX_HOOK_RAW(sub_82364A88) {
+  PoolChange change;
+  __imp__sub_82364A88(ctx, base);
+}
+REX_HOOK_RAW(sub_82364BB8) {
+  PoolChange change;
+  __imp__sub_82364BB8(ctx, base);
 }

@@ -1,4 +1,6 @@
 #include "adpf.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 
 #include <dirent.h>
 #include <pthread.h>
@@ -19,14 +21,10 @@
 #include <thread>
 #include <vector>
 
-#include <rex/cvar.h>
-#include <rex/logging.h>
 
 #include "plume/frame_pacing.h"
 
-REXCVAR_DEFINE_BOOL(renut_adpf, true, "reNut/Performance",
-                    "Report each frame's work to Android's performance hint session (ADPF) so the system "
-                    "holds the CPU at the lowest clocks that keep the game's pace");
+
 
 // The kernel's swap path calls this when set (command_processor.cpp).
 extern "C" void (*renut_frame_hook)();
@@ -182,7 +180,7 @@ void BuildSession(const std::vector<Candidate>& before, const std::vector<Candid
   CloseSessionLocked();
   Session* session = g_api.create_session(g_manager, ids.data(), ids.size(), g_target_ns);
   if (!session) {
-    REXLOG_WARN("Renut: ADPF could not create a hint session for {} threads", ids.size());
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: ADPF could not create a hint session for {} threads", ids.size());
     return;
   }
   g_session = session;
@@ -198,7 +196,7 @@ void BuildSession(const std::vector<Candidate>& before, const std::vector<Candid
   g_last_frame = std::chrono::steady_clock::time_point{};
   std::string list;
   for (const int32_t tid : ids) list += (list.empty() ? "" : ",") + std::to_string(tid);
-  REXLOG_INFO("Renut: ADPF hint session over {} threads [{}], target {:.1f} ms per frame", ids.size(), list,
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: ADPF hint session over {} threads [{}], target {:.1f} ms per frame", ids.size(), list,
               double(g_target_ns) / 1e6);
 }
 
@@ -220,7 +218,7 @@ void Maintain() {
     std::vector<Candidate> after = ScanThreads();
     scanned = now;
     // Re-pick the set every round while the game runs; a paused game has none worth hinting.
-    if (REXCVAR_GET(renut_adpf) && g_active.load() && seconds > 0.5) {
+    if (renut::GetSettings().adpf.Get() && g_active.load() && seconds > 0.5) {
       BuildSession(before, after, seconds);
     } else {
       std::lock_guard<std::mutex> lock(g_mutex);
@@ -251,7 +249,7 @@ void Maintain() {
         }
       }
       ++log_round;
-      REXLOG_INFO(
+      REXLOG_CAT_INFO(rex::log::renut, 
           "Renut: ADPF {} frames in 10 s, work mean {:.1f} ms max {:.1f} ms of {:.1f} ms, {} over the target; "
           "thermal headroom {:.2f}{}",
           frames, mean_us / 1000.0, max_us / 1000.0, double(g_target_ns) / 1e6, over, headroom,
@@ -279,8 +277,8 @@ void Start() {
   if (g_started.exchange(true)) return;
   const int target = renut::pacing::Target();
   const double target_fps = target > 0 ? double(target) : 120.0;
-  if (!REXCVAR_GET(renut_adpf)) {
-    REXLOG_INFO("Renut: ADPF off (renut_adpf = false)");
+  if (!renut::GetSettings().adpf.Get()) {
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: ADPF off (renut_adpf = false)");
     g_started = false;
     return;
   }
@@ -301,13 +299,13 @@ void Start() {
   g_api.thermal_headroom =
       reinterpret_cast<decltype(g_api.thermal_headroom)>(sym("AThermal_getThermalHeadroom"));
   if (!g_api.get_manager || !g_api.create_session || !g_api.report_actual || !g_api.close_session) {
-    REXLOG_INFO("Renut: ADPF is not available on this Android version (needs API 33)");
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: ADPF is not available on this Android version (needs API 33)");
     g_started = false;
     return;
   }
   g_manager = g_api.get_manager();
   if (!g_manager) {
-    REXLOG_INFO("Renut: ADPF: the device has no performance hint manager");
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: ADPF: the device has no performance hint manager");
     g_started = false;
     return;
   }
@@ -316,7 +314,7 @@ void Start() {
   const int64_t rate = g_api.preferred_rate ? g_api.preferred_rate(g_manager) : 0;
   // Never slower than a few frames: the governor needs to see a load change quickly.
   g_report_interval_ns = rate > 0 ? std::min<int64_t>(rate, 100'000'000) : 0;
-  REXLOG_INFO("Renut: ADPF available: target {:.1f} ms ({:.0f} FPS), preferred update interval {:.1f} ms, thermal {}",
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: ADPF available: target {:.1f} ms ({:.0f} FPS), preferred update interval {:.1f} ms, thermal {}",
               double(g_target_ns) / 1e6, target_fps, double(rate) / 1e6, g_thermal ? "yes" : "no");
   g_stop = false;
   renut_frame_hook = &OnFrame;

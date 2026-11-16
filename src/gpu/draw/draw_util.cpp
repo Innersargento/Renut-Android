@@ -15,25 +15,27 @@
 #include <cmath>
 
 #include <rex/assert.h>
-#include <rex/cvar.h>
-#include <rex/graphics/pipeline/texture/info.h>
-#include <rex/graphics/pipeline/texture/util.h>
+#include <rex/xenos/texture.h>
 #include "gpu/core/state_bits.h"
 #include "gpu/draw/draw_util.h"
-#include <rex/graphics/xenos.h>
-#include <rex/logging.h>
+#include <rex/xenos/fetch.h>
+#include <rex/xenos/format.h>
+#include <rex/xenos/packet.h>
+#include <rex/xenos/register.h>
+#include <rex/xenos/state.h>
+#include <rex/xenos/texture.h>
+#include <rex/xenos/ucode.h>
+#include "platform/log.h"
 #include <rex/math.h>
 #include <rex/memory.h>
-#include <rex/ui/graphics_util.h>
 
 namespace renut::gpu::draw_util {
-using namespace rex::graphics;
+using namespace rex::xenos;
 namespace memory = rex::memory;
-namespace ui = rex::ui;
 
 
-bits::RB_DEPTHCONTROL GetNormalizedDepthControl(const DrawState& st, xenos::EdramMode edram_mode) {
-  if (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly) {
+bits::RB_DEPTHCONTROL GetNormalizedDepthControl(const DrawState& st, xenos::EDRAMMode edram_mode) {
+  if (edram_mode != xenos::EDRAMMode::kColorDepth && edram_mode != xenos::EDRAMMode::kDepthOnly) {
     // Both depth and stencil disabled (EDRAM depth and stencil ignored).
     bits::RB_DEPTHCONTROL disabled;
     disabled.value = 0;

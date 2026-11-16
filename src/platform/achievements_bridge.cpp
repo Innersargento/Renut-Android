@@ -7,15 +7,15 @@
 // together with the unlock file), and a callback tells RuntimeActivity which id was won.
 #include <jni.h>
 #include <android/log.h>
-#include <rex/runtime.h>
-#include <rex/logging.h>
-#include <rex/system/kernel_state.h>
-#include <rex/system/util/xdbf_utils.h>
+#include <rex/filesystem/xdbf.h>
+#include <rex/xam/achievement_manager.h>
+#include "platform/log.h"
+#include "platform/guest.h"
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
-#include <fmt/format.h>
+#include <format>
 
 namespace {
 
@@ -23,7 +23,8 @@ JavaVM* java_vm = nullptr;
 jclass activity_class = nullptr;
 jmethodID unlocked_method = nullptr;
 std::mutex bridge_mutex;
-rex::system::AchievementListenerHandle listener = 0;
+rex::ScopeGuard listener;
+bool listening = false;
 
 void appendJsonString(std::string& out, const std::string& value) {
   out += '"';
@@ -35,7 +36,7 @@ void appendJsonString(std::string& out, const std::string& value) {
       case '\r': out += "\\r"; break;
       case '\t': out += "\\t"; break;
       default:
-        if (c < 0x20) out += fmt::format("\\u{:04x}", c);
+        if (c < 0x20) out += std::format("\\u{:04x}", c);
         else out += char(c);
     }
   }
@@ -66,7 +67,7 @@ void notifyJava(uint32_t id) {
   }
 }
 
-void writeImage(const std::filesystem::path& path, const rex::system::util::XdbfBlock& image) {
+void writeImage(const std::filesystem::path& path, const rex::filesystem::XDBFBlock& image) {
   std::error_code ec;
   if (!image) return;
   if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) == image.size) return;
@@ -74,22 +75,22 @@ void writeImage(const std::filesystem::path& path, const rex::system::util::Xdbf
       .write(reinterpret_cast<const char*>(image.buffer), std::streamsize(image.size));
 }
 
-void writeCatalog(rex::Runtime& runtime, const std::filesystem::path& directory) {
-  auto* kernel = runtime.kernel_state();
-  const auto achievements = kernel->loaded_achievements();
-  const auto database = kernel->title_xdbf();
+void writeCatalog(rex::kernel::TitleRuntime& title, const std::filesystem::path& directory) {
+  const auto achievements = title.GetAchievementManager().ListAchievements();
+  const auto database_owner = title.GetTitleXDBF();
+  const rex::filesystem::IXDBFTitleData* database = database_owner.get();
   std::error_code ec;
   std::filesystem::create_directories(directory / "icons", ec);
   if (ec) {
-    REXSYS_WARN("Achievements: cannot create {}: {}", directory.string(), ec.message());
+    REXLOG_CAT_WARN(rex::log::renut, "Achievements: cannot create {}: {}", directory.string(), ec.message());
     return;
   }
-  std::string json = fmt::format("{{\"titleId\":\"{:08X}\",\"achievements\":[", kernel->title_id());
+  std::string json = std::format("{{\"titleId\":\"{:08X}\",\"achievements\":[", title.GetTitleID());
   bool first = true;
   for (const auto& info : achievements) {
     if (!first) json += ',';
     first = false;
-    json += fmt::format("{{\"id\":{},\"gamerscore\":{},\"flags\":{},\"image\":{},\"label\":",
+    json += std::format("{{\"id\":{},\"gamerscore\":{},\"flags\":{},\"image\":{},\"label\":",
                         info.id, info.gamerscore, info.flags, info.image_id);
     appendJsonString(json, info.label);
     json += ",\"description\":";
@@ -97,25 +98,25 @@ void writeCatalog(rex::Runtime& runtime, const std::filesystem::path& directory)
     json += ",\"lockedDescription\":";
     appendJsonString(json, info.unachieved_description);
     json += '}';
-    if (!database.is_valid()) continue;
-    writeImage(directory / "icons" / fmt::format("{}.png", info.image_id),
-               database.GetEntry(rex::system::util::XdbfSection::kImage, info.image_id));
+    if (!database) continue;
+    writeImage(directory / "icons" / std::format("{}.png", info.image_id),
+               database->GetEntry(rex::filesystem::XDBFSection::kImage, info.image_id));
   }
   // The game's own cover, for the launcher's play screen.
-  if (database.is_valid()) writeImage(directory / "title.png", database.icon());
+  if (database) writeImage(directory / "title.png", database->GetIcon());
   json += "]}";
   const auto temporary = directory / "catalog.json.tmp";
   {
     std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
     file << json;
     if (!file) {
-      REXSYS_WARN("Achievements: cannot write {}", temporary.string());
+      REXLOG_CAT_WARN(rex::log::renut, "Achievements: cannot write {}", temporary.string());
       return;
     }
   }
   std::filesystem::rename(temporary, directory / "catalog.json", ec);
-  if (ec) REXSYS_WARN("Achievements: rename failed: {}", ec.message());
-  else REXSYS_INFO("Achievements: {} entries exported", achievements.size());
+  if (ec) REXLOG_CAT_WARN(rex::log::renut, "Achievements: rename failed: {}", ec.message());
+  else REXLOG_CAT_INFO(rex::log::renut, "Achievements: {} entries exported", achievements.size());
 }
 
 }  // namespace
@@ -124,12 +125,12 @@ namespace renut {
 
 // Called with the XEX loaded (the catalog is read from it). `activity` supplies the
 // class whose static onAchievementUnlocked(int) receives the unlocks.
-void AchievementsStart(JNIEnv* env, jobject activity, rex::Runtime& runtime,
+void AchievementsStart(JNIEnv* env, jobject activity, rex::kernel::TitleRuntime& title,
                        const std::filesystem::path& files_directory) {
   try {
-    writeCatalog(runtime, files_directory / "achievements");
+    writeCatalog(title, files_directory / "achievements");
   } catch (const std::exception& error) {
-    REXSYS_WARN("Achievements: catalog not exported: {}", error.what());
+    REXLOG_CAT_WARN(rex::log::renut, "Achievements: catalog not exported: {}", error.what());
   }
   std::lock_guard<std::mutex> lock(bridge_mutex);
   if (!java_vm) env->GetJavaVM(&java_vm);
@@ -140,20 +141,21 @@ void AchievementsStart(JNIEnv* env, jobject activity, rex::Runtime& runtime,
     unlocked_method = env->GetStaticMethodID(activity_class, "onAchievementUnlocked", "(I)V");
     if (!unlocked_method) env->ExceptionClear();
   }
-  if (listener) return;
-  listener = runtime.kernel_state()->achievements().RegisterNotificationCallback(
-      [](const rex::system::AchievementEvent& event) { notifyJava(event.achievement.id); });
+  if (listening) return;
+  listening = true;
+  listener = title.GetAchievementManager().RegisterNotificationCallback(
+      [](const rex::xam::AchievementEvent& event) { notifyJava(event.achievement.id); });
 }
 
 // Before the runtime is torn down: no guest thread may call into Java afterwards.
-void AchievementsStop(rex::Runtime& runtime) {
-  rex::system::AchievementListenerHandle handle;
+void AchievementsStop() {
+  rex::ScopeGuard handle;
   {
     std::lock_guard<std::mutex> lock(bridge_mutex);
-    handle = listener;
-    listener = 0;
+    handle = std::move(listener);
+    listening = false;
   }
-  if (handle && runtime.kernel_state()) runtime.kernel_state()->achievements().UnregisterCallback(handle);
+  handle.Reset();
 }
 
 }  // namespace renut

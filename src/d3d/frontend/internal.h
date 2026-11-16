@@ -54,15 +54,14 @@
 #include <thread>
 #include <unordered_map>
 
-#include <fmt/format.h>
+#include <format>
 #include <xxhash.h>
 
-#include <rex/cvar.h>
-#include <rex/logging.h>
+#include "platform/log.h"
 #include <rex/ppc/context.h>
-#include <rex/ppc/func.h>
-#include <rex/system/kernel_state.h>
-#include <rex/system/xmemory.h>
+#include <rex/ppc/recompiled_code.h>
+#include "platform/guest.h"
+#include "platform/guest.h"
 
 
 // Guest functions the front end calls, as the Direct3D it replaces does.

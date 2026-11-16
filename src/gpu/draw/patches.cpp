@@ -1,5 +1,6 @@
 // Tessellation patch expansion.
 #include "gpu/core/internal.h"
+#include "platform/log.h"
 #include "plume/shaders/host_shaders.h"
 
 namespace renut::gpu {
@@ -158,7 +159,7 @@ bool Patches::CreatePatchPipelines() {
     if (vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &patch_pipelines_[i]) !=
         VK_SUCCESS) {
       patch_pipelines_[i] = VK_NULL_HANDLE;
-      REXLOG_WARN("Renut: Plume adaptive patch pipelines unavailable; patches stay on the grid");
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume adaptive patch pipelines unavailable; patches stay on the grid");
       return false;
     }
   }

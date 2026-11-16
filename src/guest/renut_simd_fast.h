@@ -23,19 +23,6 @@
 
 #include <arm_neon.h>
 
-// The vector tables lvlx/lvrx/lvsl and every lvx/stvx byte swap read, as
-// read-only data local to each translation unit. The SDK keeps them in mutable,
-// exported arrays: every access went through the GOT, was reloaded after each
-// store (the compiler cannot rule out that a store changed them), and the
-// shuffle mask was masked again each time. As constants the address is a
-// PC-relative load that is hoisted out of the function once, and the mask's
-// own `and` folds away. Copied from rex/ppc/intrinsics.h by CMake.
-#include "renut_vector_tables.h"
-#define VectorMaskL renut_VectorMaskL
-#define VectorMaskR renut_VectorMaskR
-#define VectorShiftTableL renut_VectorShiftTableL
-#define VectorShiftTableR renut_VectorShiftTableR
-
 #define RENUT_NEON_COMPARE(name, insn)                                                               \
   static inline __attribute__((always_inline)) uint32x4_t name(float32x4_t a, float32x4_t b) {       \
     uint32x4_t r;                                                                                    \

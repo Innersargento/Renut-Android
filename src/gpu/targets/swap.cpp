@@ -1,5 +1,8 @@
 // IssueSwap: the guest frame's present.
 #include "gpu/core/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 
 #include <unistd.h>
 
@@ -22,7 +25,7 @@ void ReportCallers(Draw& draw) {
     total.hiz_dropped += s.hiz_dropped;
     total.hiz_dropped_indices += s.hiz_dropped_indices;
   }
-  REXLOG_INFO("Renut: Plume callers: {} distinct, {} draws ({} depth-only), {} indices, hiz tested {} no-model {} dropped {} ({} indices)",
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume callers: {} distinct, {} draws ({} depth-only), {} indices, hiz tested {} no-model {} dropped {} ({} indices)",
               rows.size(), total.draws, total.depth_only, total.indices, total.hiz_tested, total.hiz_no_model,
               total.hiz_dropped, total.hiz_dropped_indices);
   for (size_t i = 0; i < rows.size() && i < 40; ++i) {
@@ -30,8 +33,8 @@ void ReportCallers(Draw& draw) {
     uint32_t frames[native_d3d::kCallerFrames] = {};
     native_d3d::CallerFrames(id, frames);
     std::string text;
-    for (uint32_t f : frames) text += fmt::format(" {:X}", f);
-    REXLOG_INFO("Renut: Plume caller {:08X}: draws {} depth-only {} indices {} hiz tested {} no-model {} dropped {} ({} indices) frames{}",
+    for (uint32_t f : frames) text += std::format(" {:X}", f);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume caller {:08X}: draws {} depth-only {} indices {} hiz tested {} no-model {} dropped {} ({} indices) frames{}",
                 id, s.draws, s.depth_only, s.indices, s.hiz_tested, s.hiz_no_model, s.hiz_dropped,
                 s.hiz_dropped_indices, text);
   }
@@ -51,7 +54,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   backend.recorder.FlushDeferred();
   if (skin_log_ && backend.swaps_ == 930) backend.resolve.LogSkinned();
   if (backend.draw.validate_windows_ && backend.swaps_ % 60 == 0) {
-    REXLOG_INFO("Renut: Plume validation at swap {}: {} ranges compared, {} stale", backend.swaps_, backend.resolve.validate_ranges_, backend.resolve.validate_stale_);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume validation at swap {}: {} ranges compared, {} stale", backend.swaps_, backend.resolve.validate_ranges_, backend.resolve.validate_stale_);
   }
   // Before anything is picked for presenting: the one that is moves on to
   // COPY_SOURCE below, which is a transition of its own.
@@ -68,6 +71,10 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     source = r.texture.get();
     frontbuffer_width = std::min(frontbuffer_width, r.width);
     frontbuffer_height = std::min(frontbuffer_height, r.height);
+  }
+  if (!source && (backend.swaps_ < 5 || backend.swaps_ % 600 == 0)) {
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume swap {}: front {:08X} {}x{} not among the {} resolved targets (nothing to show)",
+                backend.swaps_, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, backend.targets.resolved_.size());
   }
   bool snap_dump = false;
   if (snap_taken_ && backend.resolve.snap_) {
@@ -152,7 +159,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       snap_shader_ = 0;
     }
     snap_dump_.reset();
-    REXLOG_INFO("Renut: Plume snapshot written ({}x{}, format {})", snap_width_, snap_height_, uint32_t(snap_format_));
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume snapshot written ({}x{}, format {})", snap_width_, snap_height_, uint32_t(snap_format_));
   }
   if (depth_dump_ && renderer) {
     renderer->WaitForAllSlots();
@@ -168,7 +175,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     std::remove((root + "/plume-depth-dump").c_str());
     depth_dump_ps_ = 0;
     depth_dump_.reset();
-    REXLOG_INFO("Renut: Plume depth resolve written ({}x{}, {} bytes a texel)", depth_dump_w_, depth_dump_h_, bytes);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume depth resolve written ({}x{}, {} bytes a texel)", depth_dump_w_, depth_dump_h_, bytes);
   }
   const uint64_t cpu_now = ThreadCpuMicroseconds();
   if (cpu_at_swap_) backend.stats_.cp_cpu_us += cpu_now - cpu_at_swap_;
@@ -186,7 +193,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
             r.generation, r.written_frame);
     }
     for (const TracedStream& t : traced_streams_) {
-      const auto* now = backend.memory_->TranslatePhysical<const uint8_t*>(t.address);
+      const auto* now = renut::host::Physical<const uint8_t*>(t.address);
       uint32_t changed = 0, first = UINT32_MAX;
       for (uint32_t i = 0; i < t.bytes.size(); i += 4) {
         if (std::memcmp(now + i, t.bytes.data() + i, 4)) {
@@ -203,7 +210,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     std::fclose(backend.draw.trace_);
     backend.draw.trace_ = nullptr;
     traced_cascade_ps_.clear();
-    REXLOG_INFO("Renut: Plume frame trace written");
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume frame trace written");
     if (export_dump && renderer && !backend.miss_dump_directory_.empty()) {
       renderer->WaitForAllSlots();
       const std::string directory =
@@ -211,18 +218,18 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       renutMakeDirectory(directory);
       const auto* data = static_cast<const uint8_t*>(export_dump->map());
       for (const auto& [at, range] : export_dump_at) {
-        const std::string name = fmt::format("{}/{:08X}", directory, range->base);
+        const std::string name = std::format("{}/{:08X}", directory, range->base);
         if (FILE* file = std::fopen((name + ".gpu").c_str(), "wb")) {
           std::fwrite(data + at, 1, range->size, file);
           std::fclose(file);
         }
         if (FILE* file = std::fopen((name + ".guest").c_str(), "wb")) {
-          std::fwrite(backend.memory_->TranslatePhysical<const uint8_t*>(range->base), 1, range->size, file);
+          std::fwrite(renut::host::Physical<const uint8_t*>(range->base), 1, range->size, file);
           std::fclose(file);
         }
       }
       export_dump->unmap();
-      REXLOG_INFO("Renut: Plume wrote {} exported ranges", export_dump_at.size());
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume wrote {} exported ranges", export_dump_at.size());
     }
   }
   ++backend.swaps_;
@@ -233,23 +240,23 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   // The settings that can change while the game runs are cvars, read here each
   // frame (no file is touched): a change takes effect at the next swap.
   {
-    const int poly_offset = std::clamp(REXCVAR_GET(renut_plume_poly_offset_percent), 0, 1600);
+    const int poly_offset = std::clamp(renut::GetSettings().plume_poly_offset_percent.Get(), 0, 1600);
     if ((poly_offset != 0) != poly_offset_ || poly_offset * 0.01f != poly_offset_scale_) {
-      REXLOG_INFO("Renut: Plume polygon offset {} x{}", poly_offset ? "on" : "off", poly_offset * 0.01f);
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume polygon offset {} x{}", poly_offset ? "on" : "off", poly_offset * 0.01f);
     }
     poly_offset_ = poly_offset != 0;
     poly_offset_scale_ = poly_offset * 0.01f;
 
-    backend.draw.ui_depth_fix_ = REXCVAR_GET(renut_plume_ui_depth_fix);
-    const int hiz = std::clamp(REXCVAR_GET(renut_plume_hiz), 0, 2);
+    backend.draw.ui_depth_fix_ = renut::GetSettings().plume_ui_depth_fix.Get();
+    const int hiz = std::clamp(renut::GetSettings().plume_hiz.Get(), 0, 2);
     if (uint32_t(hiz) != backend.hiz.mode_) {
-      REXLOG_INFO("Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor/clip plane)", hiz);
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume Hi-Z mode {} (0 off, 1 counts, 2 frustum/scissor/clip plane)", hiz);
     }
     backend.hiz.mode_ = uint32_t(hiz);
 
-    const int bc = std::clamp(REXCVAR_GET(renut_plume_bc_textures), 0, 1);
+    const int bc = std::clamp(renut::GetSettings().plume_bc_textures.Get(), 0, 1);
     if (uint32_t(bc) != bc_mode_) {
-      REXLOG_INFO("Renut: Plume BC textures {}: the 2D guest textures are uploaded again", bc ? "on" : "off");
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume BC textures {}: the 2D guest textures are uploaded again", bc ? "on" : "off");
       bc_mode_ = uint32_t(bc);
       // Every 2D texture is rebuilt in the other form the next time it is drawn.
       for (auto& [key, texture] : backend.targets.guest_textures_) backend.targets.RetireGuestTexture(texture);
@@ -258,15 +265,15 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
       ++backend.targets.object_epoch_;
     }
 
-    const int quality = std::clamp(REXCVAR_GET(renut_plume_texture_quality), 0, 2);
+    const int quality = std::clamp(renut::GetSettings().plume_texture_quality.Get(), 0, 2);
     if (uint32_t(quality) != backend.texture_quality_) {
-      REXLOG_INFO("Renut: Plume texture quality {} (each texture is uploaded again when it is next drawn)",
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume texture quality {} (each texture is uploaded again when it is next drawn)",
                   quality == 0 ? "full" : quality == 1 ? "half" : "quarter");
       backend.texture_quality_ = uint32_t(quality);
     }
 
-    if (const uint32_t aniso = backend.AnisoLevel(REXCVAR_GET(renut_plume_aniso_max)); aniso != backend.aniso_max_) {
-      REXLOG_INFO("Renut: Plume anisotropic filtering: up to {}x (samplers are made again when next used)", aniso);
+    if (const uint32_t aniso = backend.AnisoLevel(renut::GetSettings().plume_aniso_max.Get()); aniso != backend.aniso_max_) {
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume anisotropic filtering: up to {}x (samplers are made again when next used)", aniso);
       backend.aniso_max_ = aniso;
     }
 
@@ -275,18 +282,18 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     // every 15 s otherwise): the process is usually killed, not shut down, and what only a pause saves
     // is compiled again at the next launch, which is what holds the loading screens.
     SavePlumePipelineCache();
-    backend.no_shadows_ = REXCVAR_GET(renut_plume_no_shadows);
-    backend.no_bloom_ = REXCVAR_GET(renut_plume_no_bloom);
+    backend.no_shadows_ = renut::GetSettings().plume_no_shadows.Get();
+    backend.no_bloom_ = renut::GetSettings().plume_no_bloom.Get();
     if (const uint32_t rebase =
-            PlumeArmDriver() ? uint32_t(std::clamp(REXCVAR_GET(renut_plume_mali_rebase_indices), 0, 2)) : 0u;
+            PlumeArmDriver() ? uint32_t(std::clamp(renut::GetSettings().plume_mali_rebase_indices.Get(), 0, 2)) : 0u;
         rebase != rebase_indices_) {
       rebase_indices_ = rebase;
-      REXLOG_INFO("Renut: Plume indices sent from zero, the smallest in the vertex offset: {}",
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume indices sent from zero, the smallest in the vertex offset: {}",
                   rebase == 0 ? "off" : rebase == 1 ? "the draws of shaders that fetch by the vertex index"
                                                     : "every indexed draw");
     }
     {
-      const bool callers = REXCVAR_GET(renut_plume_draw_callers);
+      const bool callers = renut::GetSettings().plume_draw_callers.Get();
       backend.draw.caller_trace_ = callers;
       native_d3d::g_draw_callers.store(callers, std::memory_order_relaxed);
       static uint64_t next_report = 0;
@@ -298,19 +305,19 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
         backend.draw.caller_stats_.clear();
       }
     }
-    const int adaptive = std::clamp(REXCVAR_GET(renut_plume_adaptive_patches), 0, 1);
+    const int adaptive = std::clamp(renut::GetSettings().plume_adaptive_patches.Get(), 0, 1);
     if (uint32_t(adaptive) != adaptive_mode_) {
-      REXLOG_INFO("Renut: Plume adaptive patches {}", adaptive ? "on" : "off");
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume adaptive patches {}", adaptive ? "on" : "off");
     }
     adaptive_mode_ = uint32_t(adaptive);
 
-    const uint32_t percent = uint32_t(std::clamp(REXCVAR_GET(renut_plume_water_tess_percent), 10, 100));
-    if (percent != patch_level_percent_) REXLOG_INFO("Renut: Plume water tessellation at {}%", percent);
+    const uint32_t percent = uint32_t(std::clamp(renut::GetSettings().plume_water_tess_percent.Get(), 10, 100));
+    if (percent != patch_level_percent_) REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume water tessellation at {}%", percent);
     patch_level_percent_ = percent;
 
     const uint32_t minimum =
-        backend.no_shadows_ ? UINT32_MAX : uint32_t(std::max(REXCVAR_GET(renut_plume_shadow_min_indices), 0));
-    if (minimum != shadow_min_indices_) REXLOG_INFO("Renut: Plume shadow casters under {} indices dropped", minimum);
+        backend.no_shadows_ ? UINT32_MAX : uint32_t(std::max(renut::GetSettings().plume_shadow_min_indices.Get(), 0));
+    if (minimum != shadow_min_indices_) REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume shadow casters under {} indices dropped", minimum);
     shadow_min_indices_ = minimum;
   }
   // A range nothing has exported into for a while goes back to guest memory.

@@ -1,5 +1,7 @@
 // Frame start, render targets, framebuffers and resolved images.
 #include "gpu/core/internal.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 
 namespace renut::gpu {
 
@@ -102,7 +104,7 @@ void Targets::EvictIdleTextures() {
   }
   if (kept_erased) backend.streams.kept_memo_.Clear();
   if (evicted) {
-    REXLOG_INFO("Renut: Plume evicted {} idle textures (free descriptors 2D {} 3D {} cube {})", evicted,
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume evicted {} idle textures (free descriptors 2D {} 3D {} cube {})", evicted,
                 free_2d, free_3d, free_cube);
   }
 }
@@ -141,16 +143,18 @@ void Targets::BeginFrame() {
     free_cube_descriptors_.push_back(index);
   }
   retired_cube_descriptor_slots_[backend.slot_].clear();
+  // A view is retired in the same frame as its texture, and ~VulkanTextureView reads its texture's device:
+  // framebuffers and views go before the textures they were made from (the delayed list frees in order too).
   if (retire_delay_) {
     // Debug: hold what the frames in flight no longer need a while longer.
     if (retire_mask_ & 1) for (auto& object : retired_framebuffer_slots_[backend.slot_]) delayed_buffers_.emplace_back(backend.swaps_, std::shared_ptr<void>(std::move(object)));
-    if (retire_mask_ & 2) for (auto& object : retired_slots_[backend.slot_]) delayed_buffers_.emplace_back(backend.swaps_, std::shared_ptr<void>(std::move(object)));
     if (retire_mask_ & 4) for (auto& object : retired_views_[backend.slot_]) delayed_buffers_.emplace_back(backend.swaps_, std::shared_ptr<void>(std::move(object)));
+    if (retire_mask_ & 2) for (auto& object : retired_slots_[backend.slot_]) delayed_buffers_.emplace_back(backend.swaps_, std::shared_ptr<void>(std::move(object)));
     if (retire_mask_ & 8) for (auto& object : backend.streams.retired_buffers_[backend.slot_]) delayed_buffers_.emplace_back(backend.swaps_, std::shared_ptr<void>(std::move(object)));
   }
   retired_framebuffer_slots_[backend.slot_].clear();
-  retired_slots_[backend.slot_].clear();
   retired_views_[backend.slot_].clear();
+  retired_slots_[backend.slot_].clear();
   backend.streams.retired_buffers_[backend.slot_].clear();
   backend.patches.patch_out_used_ = 0;
   backend.patches.patch_args_used_ = 0;
@@ -400,7 +404,7 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
   // The device refused the multisampled image (a format it cannot draw and sample with that many samples): one
   // sample, and the game's surface is resolved as it was before.
   if (samples > 1 && !static_cast<VulkanTexture*>(target.texture.get())->vk) {
-    REXLOG_WARN("Renut: Plume {}x multisampled {} {}x{} not created; single-sample instead", samples,
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume {}x multisampled {} {}x{} not created; single-sample instead", samples,
                 depth ? "depth" : "color", width, height);
     samples = 1;
     target.texture = make(1);
@@ -519,12 +523,12 @@ void Targets::EvictSurfaceTargets() {
 // runs: when one differs from what the targets were made with, every surface target goes and is made again
 // the next time it is drawn to (the game redraws its surfaces every frame).
 void Targets::RefreshQuality() {
-  const uint32_t shadow = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_shadow_quality), 0, 2));
-  const uint32_t internal = 4 - uint32_t(std::clamp(REXCVAR_GET(renut_plume_internal_resolution), 0, 2));
-  const int32_t msaa = std::clamp(REXCVAR_GET(renut_msaa), 0, 2);
+  const uint32_t shadow = 4 - uint32_t(std::clamp(renut::GetSettings().plume_shadow_quality.Get(), 0, 2));
+  const uint32_t internal = 4 - uint32_t(std::clamp(renut::GetSettings().plume_internal_resolution.Get(), 0, 2));
+  const int32_t msaa = std::clamp(renut::GetSettings().msaa.Get(), 0, 2);
   const uint32_t samples = msaa == 1 ? 2u : msaa == 2 ? 4u : 1u;
   if (shadow == shadow_scale_ && internal == internal_scale_ && samples == msaa_samples_) return;
-  REXLOG_INFO("Renut: Plume quality changed: shadow maps {}/4, scene {}/4, up to {}x samples; surface targets rebuilt",
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume quality changed: shadow maps {}/4, scene {}/4, up to {}x samples; surface targets rebuilt",
               shadow, internal, samples);
   shadow_scale_ = shadow;
   internal_scale_ = internal;
@@ -551,7 +555,7 @@ void Targets::RefreshQuality() {
 std::string Targets::SurfaceReport() {
   size_t count = 0;
   for (const auto& [key, t] : targets_) count += (key & kSurfaceTargetKey) ? 1 : 0;
-  std::string out = fmt::format(
+  std::string out = std::format(
       "== surfaces: {} targets now, {} created, {} grown, {} evicted; "
       "slots without a surface {}\n== resolves: {} into their texture object, {} into a volume (not copied)\n"
       "== executor: fences {}, presents {}, callbacks {}, "
@@ -562,10 +566,10 @@ std::string Targets::SurfaceReport() {
       native_wait_timeouts_, object_streams_, window_streams_);
   for (const auto& [key, t] : targets_) {
     if (!(key & kSurfaceTargetKey)) continue;
-    out += fmt::format("   surface {:08X} {} {}x{} format {} last frame {}\n", t.surface,
+    out += std::format("   surface {:08X} {} {}x{} format {} last frame {}\n", t.surface,
                        t.depth ? "depth" : "color", t.width, t.height,
                        t.depth ? (t.surface_info >> 16) & 1 : (t.surface_info >> 16) & 0xF, t.used_frame);
-    if (t.samples > 1) out.insert(out.size() - 1, fmt::format(" x{} samples", t.samples));
+    if (t.samples > 1) out.insert(out.size() - 1, std::format(" x{} samples", t.samples));
   }
   return out;
 }

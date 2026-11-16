@@ -1,5 +1,8 @@
 // IssueDraw: one guest draw, from register state to a recorded draw.
 #include "gpu/core/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 
 namespace renut::gpu {
 
@@ -64,8 +67,8 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   } in_draw(in_issue_draw_);
   if (g_predict.queued.load(std::memory_order_relaxed)) backend.pipelines.PredictPipelines();
   const DrawState& regs = backend.state_;
-  const auto edram_mode = xenos::EdramMode(backend.lists.draw_mode_);
-  if (edram_mode == xenos::EdramMode::kCopy) return true;  // resolves are records
+  const auto edram_mode = xenos::EDRAMMode(backend.lists.draw_mode_);
+  if (edram_mode == xenos::EDRAMMode::kCopy) return true;  // resolves are records
   ++backend.stats_.draws;
   const uint32_t draw_index = backend.swap.frame_draw_++;
   if (draw_index >= backend.swap.drawskip_first_ && draw_index < backend.swap.drawskip_end_) return true;
@@ -96,14 +99,14 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       auto* ps_miss = static_cast<HostShader*>(backend.active_pixel_shader());
       const uint64_t ps_hash = ps_miss && ps_miss->entry ? ps_miss->entry->hash : 0;
       if (missed_pairs_.insert(vs->ucode_data_hash() ^ ps_hash).second && missed_pairs_.size() <= 48) {
-        REXLOG_INFO("Renut: Plume missing VS {:016X} with PS {:016X}, mode {}, prim {}, {} indices",
+        REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume missing VS {:016X} with PS {:016X}, mode {}, prim {}, {} indices",
                     vs->ucode_data_hash(), ps_hash, uint32_t(edram_mode), uint32_t(prim_type), index_count);
       }
     }
     return true;
   }
   auto* ps = static_cast<HostShader*>(backend.active_pixel_shader());
-  const bool color_pass = edram_mode == xenos::EdramMode::kColorDepth;
+  const bool color_pass = edram_mode == xenos::EDRAMMode::kColorDepth;
   if (color_pass && (!ps || !ps->entry)) {
     ++backend.stats_.no_ps;
     return true;
@@ -181,7 +184,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if ((prim_type == xenos::PrimitiveType::kTrianglePatch || prim_type == xenos::PrimitiveType::kQuadPatch) &&
         patch_drop_logged_.insert(vs->entry->hash).second) {
       // Water with no domain form simply does not appear. tools/prepare.py dumps reads this line back.
-      REXLOG_INFO(
+      REXLOG_CAT_INFO(rex::log::renut, 
           "Renut: Plume patch draw dropped: vs={:016X} has no domain form (list it in "
           "tools/shaders/domain-shaders.txt)",
           vs->entry->hash);
@@ -279,7 +282,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     for (uint32_t i = 1; i < color_count; ++i) mixed |= colors[i]->samples != pass_samples;
     if (mixed) {
       if (++backend.stats_.msaa_mismatch <= 4) {
-        REXLOG_WARN("Renut: Plume draw dropped: its targets have different sample counts (color {}, depth {})",
+        REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume draw dropped: its targets have different sample counts (color {}, depth {})",
                     color_count ? colors[0]->samples : 0, depth ? depth->samples : 0);
       }
       return true;
@@ -338,7 +341,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   for (uint32_t remaining = used_slots; remaining;) {
     const uint32_t slot = uint32_t(__builtin_ctz(remaining));
     remaining &= remaining - 1;
-    xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
+    xenos::TextureFetch fetch = regs.GetTextureFetch(slot);
     if (fetch.type != xenos::FetchConstantType::kTexture) continue;
     sampler_descriptor[slot] = backend.textures.GetSampler(fetch);
     Resolved* found = FindResolved(fetch.base_address << 12);
@@ -448,28 +451,28 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
   }
   if (trace_) {
-    std::string line = fmt::format("draw #{} vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X} cm={:X} bm={:X}",
+    std::string line = std::format("draw #{} vs={:016X} ps={:016X} prim={} n={} mode={} pitch={} h={} cc={:X} cm={:X} bm={:X}",
                                    draw_index,
                                    vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type),
                                    index_count, uint32_t(edram_mode), pitch, height,
                                    regs.color_control.value, color_mask, uint32_t(0));
     for (uint32_t i = 0; i < color_count; ++i) {
       const auto& rt = backend.targets.native_surfaces_[i];
-      line += fmt::format(" rt{}={:X}/f{}", i, rt.object, (rt.info >> 16) & 0xF);
+      line += std::format(" rt{}={:X}/f{}", i, rt.object, (rt.info >> 16) & 0xF);
     }
     if (depth) {
-      line += fmt::format(" ds={:X}/f{} z={}{}{} f{}", backend.targets.native_surfaces_[4].object,
+      line += std::format(" ds={:X}/f{} z={}{}{} f{}", backend.targets.native_surfaces_[4].object,
                           (backend.targets.native_surfaces_[4].info >> 16) & 1,
                           depth_control.z_enable ? "t" : "", depth_control.z_write_enable ? "w" : "",
                           depth_control.stencil_enable ? "s" : "", uint32_t(depth_control.zfunc));
     }
     for (uint32_t slot = 0; slot < 32; ++slot) {
-      xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
+      xenos::TextureFetch fetch = regs.GetTextureFetch(slot);
       if (fetch.type != xenos::FetchConstantType::kTexture || !fetch.base_address) continue;
       uint32_t t_base, t_mip, t_top, t_last;
-      gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &t_base,
+      gfx::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &t_base,
                                                           &t_mip, &t_top, &t_last);
-      line += fmt::format(
+      line += std::format(
           " t{}={:08X}/f{}/{}x{}/d{}/L{}-{}/c{}{}{}/f{}{}{}/a{}/b{}{}{}/sw{:03X}", slot,
           fetch.base_address << 12,
           uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
@@ -477,7 +480,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           uint32_t(fetch.clamp_y), uint32_t(fetch.clamp_z), uint32_t(fetch.mag_filter),
           uint32_t(fetch.min_filter), uint32_t(fetch.mip_filter), uint32_t(fetch.aniso_filter),
           int32_t(fetch.lod_bias),
-          fetch.stacked ? fmt::format("/s{}", uint32_t(fetch.size_2d.stack_depth) + 1) : "",
+          fetch.stacked ? std::format("/s{}", uint32_t(fetch.size_2d.stack_depth) + 1) : "",
           FindResolved(fetch.base_address << 12) ? "/R" : "", uint32_t(fetch.swizzle) & 0xFFF);
     }
     Trace("{}", line);
@@ -496,14 +499,14 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (ps) {
       bool stacked = false;
       for (uint32_t slot = 0; slot < 32; ++slot) {
-        xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
+        xenos::TextureFetch fetch = regs.GetTextureFetch(slot);
         stacked = stacked || (fetch.type == xenos::FetchConstantType::kTexture && fetch.stacked &&
                               fetch.base_address);
       }
       if (stacked) {
         std::string constants;
         for (uint32_t i = 0; i < 4; ++i) {
-          constants += fmt::format(" c{}=({},{},{},{})", i,
+          constants += std::format(" c{}=({},{},{},{})", i,
                                    regs.PixelFloat(i * 4 + 0),
                                    regs.PixelFloat(i * 4 + 1),
                                    regs.PixelFloat(i * 4 + 2),
@@ -517,7 +520,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       // where the splits fall and how each cascade is addressed.
       bool cascades = false;
       for (uint32_t slot = 13; slot < 16; ++slot) {
-        xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
+        xenos::TextureFetch fetch = regs.GetTextureFetch(slot);
         const auto format = xenos::TextureFormat(uint32_t(fetch.format));
         cascades = cascades || (fetch.type == xenos::FetchConstantType::kTexture && fetch.base_address &&
                                 (format == xenos::TextureFormat::k_24_8 ||
@@ -533,7 +536,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           float c[4];
           for (uint32_t j = 0; j < 4; ++j) c[j] = regs.PixelFloat(i * 4 + j);
           if (!c[0] && !c[1] && !c[2] && !c[3]) continue;
-          constants += fmt::format(" c{}=({},{},{},{})", i, c[0], c[1], c[2], c[3]);
+          constants += std::format(" c{}=({},{},{},{})", i, c[0], c[1], c[2], c[3]);
         }
         Trace("  psconst ps{:016X}{}", ps->entry->hash, constants);
       }
@@ -639,14 +642,14 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   uint64_t streams[RENUT_VERTEX_STREAM_COUNT] = {};
   for (uint32_t stream = 0; stream < RENUT_VERTEX_STREAM_COUNT; ++stream) {
     // The last entry is fetch constant 0, which Direct3D's own Clear uses.
-    xenos::xe_gpu_vertex_fetch_t fetch =
+    xenos::VertexFetch fetch =
         regs.GetVertexFetch(stream == RENUT_DIRECT_FETCH_STREAM ? 0 : 95 - stream);
     if (fetch.type != xenos::FetchConstantType::kVertex) continue;
     uint64_t offset;
     RenderBuffer* buffer;
     Trace("  stream{} {:08X}+{:X} e{}", stream, fetch.address << 2, fetch.size << 2, uint32_t(fetch.endian));
     if (trace_ && fetch.size && (fetch.size << 2) <= (1u << 20)) {
-      const auto* guest = backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2);
+      const auto* guest = renut::host::Physical<const uint8_t*>(fetch.address << 2);
       backend.swap.traced_streams_.push_back({backend.swap.frame_draw_ - 1, stream, uint32_t(fetch.address << 2),
                                  std::vector<uint8_t>(guest, guest + (fetch.size << 2))});
     }
@@ -751,31 +754,31 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (validate_windows_) {
     for (uint32_t s = 0; s < RENUT_VERTEX_STREAM_COUNT; ++s) {
       if (!slot_sizes[s] || !slot_buffers[s]) continue;
-      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(s == RENUT_DIRECT_FETCH_STREAM ? 0 : 95 - s);
-      backend.resolve.ValidateRange(fmt::format("stream{}", s).c_str(), vs->entry->hash, slot_buffers[s], slot_offsets[s],
+      xenos::VertexFetch fetch = regs.GetVertexFetch(s == RENUT_DIRECT_FETCH_STREAM ? 0 : 95 - s);
+      backend.resolve.ValidateRange(std::format("stream{}", s).c_str(), vs->entry->hash, slot_buffers[s], slot_offsets[s],
                     fetch.address << 2, slot_sizes[s], fetch.endian);
     }
   }
   if (sync_draws_) {
     // What this draw hands the GPU, kept for the line a failure prints.
-    std::string info = fmt::format("vs={:016X} ps={:016X} index_count={} streams:", vs->entry->hash,
+    std::string info = std::format("vs={:016X} ps={:016X} index_count={} streams:", vs->entry->hash,
                                    ps ? ps->entry->hash : 0, index_count);
     for (uint32_t s = 0; s < slot_sizes.size(); ++s) {
       if (!slot_sizes[s]) continue;
-      info += fmt::format(" {}:{}B/{}@{:X}", s, slot_sizes[s], slot_buffers[s] == upload_.get() ? "ring" : "kept",
+      info += std::format(" {}:{}B/{}@{:X}", s, slot_sizes[s], slot_buffers[s] == upload_.get() ? "ring" : "kept",
                           s < RENUT_VERTEX_STREAM_COUNT ? streams[s] : 0);
     }
     for (uint32_t s = 0; s < RENUT_VERTEX_STREAM_COUNT; ++s) {
       if (s == RENUT_DIRECT_FETCH_STREAM || !slot_sizes[s] || slot_sizes[s] > 256) continue;
-      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - s);
+      xenos::VertexFetch fetch = regs.GetVertexFetch(95 - s);
       std::vector<uint8_t> bytes(slot_sizes[s]);
-      CopySwapped(bytes.data(), backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), slot_sizes[s],
+      CopySwapped(bytes.data(), renut::host::Physical<const uint8_t*>(fetch.address << 2), slot_sizes[s],
                   fetch.endian);
-      info += fmt::format(" data{}:", s);
+      info += std::format(" data{}:", s);
       for (uint32_t i = 0; i + 4 <= bytes.size() && i < 64; i += 4) {
         float f;
         std::memcpy(&f, bytes.data() + i, 4);
-        info += fmt::format(" {:.3g}", f);
+        info += std::format(" {:.3g}", f);
       }
     }
     // Whether each kept window still holds what the guest holds: the GPU reads
@@ -783,9 +786,9 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // would give the shader another mesh's bytes.
     for (uint32_t s = 0; s < RENUT_VERTEX_STREAM_COUNT; ++s) {
       if (s == RENUT_DIRECT_FETCH_STREAM || !slot_sizes[s] || !slot_buffers[s] || slot_buffers[s] == upload_.get()) continue;
-      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - s);
+      xenos::VertexFetch fetch = regs.GetVertexFetch(95 - s);
       std::vector<uint8_t> guest(slot_sizes[s]);
-      CopySwapped(guest.data(), backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2), slot_sizes[s], fetch.endian);
+      CopySwapped(guest.data(), renut::host::Physical<const uint8_t*>(fetch.address << 2), slot_sizes[s], fetch.endian);
       const auto* window = static_cast<const uint8_t*>(slot_buffers[s]->map());
       if (!window) continue;
       uint32_t differ = 0, first = UINT32_MAX;
@@ -797,7 +800,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       }
       slot_buffers[s]->unmap();
       if (differ) {
-        info += fmt::format(" STALE{}[{}B differ of {}, first at {}]", s, differ, guest.size(), first);
+        info += std::format(" STALE{}[{}B differ of {}, first at {}]", s, differ, guest.size(), first);
         ++backend.recorder.sync_stale_streams_;
       }
     }
@@ -810,7 +813,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       if (indexed) {
         const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
         std::vector<uint8_t> raw(size_t(index_count) * (is32 ? 4 : 2));
-        CopySwapped(raw.data(), backend.memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
+        CopySwapped(raw.data(), renut::host::Physical<const uint8_t*>(index_buffer_info->guest_base),
                     uint32_t(raw.size()), index_buffer_info->endianness);
         for (uint32_t i = 0; i < index_count; ++i) {
           used.push_back(is32 ? reinterpret_cast<const uint32_t*>(raw.data())[i]
@@ -822,13 +825,13 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       uint32_t max_vertex = 0;
       for (uint32_t v : used) max_vertex = std::max(max_vertex, v);
       const int32_t base_vertex = int32_t(regs.base_vertex);
-      info += fmt::format(" max_index={} base={} palette={}", max_vertex, base_vertex, slot_sizes[10] / 64);
+      info += std::format(" max_index={} base={} palette={}", max_vertex, base_vertex, slot_sizes[10] / 64);
       for (const LiveElement& e : vs->elements) {
         if (e.normalized || !e.stride || (e.format != 6 && e.format != 25 && e.format != 26)) continue;
-        xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - e.slot);
+        xenos::VertexFetch fetch = regs.GetVertexFetch(95 - e.slot);
         if (fetch.size == 0 || (fetch.size << 2) > (4u << 20)) continue;
         std::vector<uint8_t> stream(fetch.size << 2);
-        CopySwapped(stream.data(), backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2),
+        CopySwapped(stream.data(), renut::host::Physical<const uint8_t*>(fetch.address << 2),
                     uint32_t(stream.size()), fetch.endian);
         const uint32_t width = e.format == 6 ? 1 : 2;
         const uint32_t count = e.format == 26 ? 4 : (e.format == 25 ? 2 : 4);
@@ -854,7 +857,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
             hi = std::max(hi, value);
           }
         }
-        info += fmt::format(" L{}[f{} {}..{} outside={}]", e.location, e.format, lo, hi, outside);
+        info += std::format(" L{}[f{} {}..{} outside={}]", e.location, e.format, lo, hi, outside);
       }
     }
     backend.recorder.sync_draw_info_ = std::move(info);
@@ -910,7 +913,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (trace_) {
       std::string line = "  export";
       for (uint32_t r = 0; r < range_count; ++r) {
-        line += fmt::format(" {:08X}+{:X}", ranges[r * 4], ranges[r * 4 + 1]);
+        line += std::format(" {:08X}+{:X}", ranges[r * 4], ranges[r * 4 + 1]);
       }
       Trace("{}", line);
     }
@@ -980,15 +983,15 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   if (sync_draws_ && !patch_list && vs->compiled && sync_diag_[vs->entry->hash]++ < 1) {
     // One line per vertex shader: what its fetches can reach, for finding the
     // draw that reads past a stream (the Mali faults where other GPUs read on).
-    std::string diag = fmt::format("Renut: Plume draw diag vs={:016X} ps={:016X} count={} indexed={} streams:",
+    std::string diag = std::format("Renut: Plume draw diag vs={:016X} ps={:016X} count={} indexed={} streams:",
                                    vs->entry->hash, ps ? ps->entry->hash : 0, index_count,
                                    index_buffer_info && index_buffer_info->guest_base);
     for (uint32_t s = 0; s < slot_sizes.size(); ++s) {
-      if (slot_sizes[s]) diag += fmt::format(" {}:{}B@{:X}", s, slot_sizes[s], s < RENUT_VERTEX_STREAM_COUNT ? streams[s] : 0);
+      if (slot_sizes[s]) diag += std::format(" {}:{}B@{:X}", s, slot_sizes[s], s < RENUT_VERTEX_STREAM_COUNT ? streams[s] : 0);
     }
     diag += " live:";
     for (const auto& [k, entry] : vs->live_fetches) {
-      diag += fmt::format(" #{}(stream {} fmt {} stride {} off {})", k, entry[0] & 0xFF, (entry[0] >> 8) & 0xFF,
+      diag += std::format(" #{}(stream {} fmt {} stride {} off {})", k, entry[0] & 0xFF, (entry[0] >> 8) & 0xFF,
                           entry[1], entry[2]);
     }
     // The vertices the draw names, then the extremes of each integer attribute.
@@ -996,7 +999,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     if (index_buffer_info && index_buffer_info->guest_base) {
       const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
       std::vector<uint8_t> raw(size_t(index_count) * (is32 ? 4 : 2));
-      CopySwapped(raw.data(), backend.memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
+      CopySwapped(raw.data(), renut::host::Physical<const uint8_t*>(index_buffer_info->guest_base),
                   uint32_t(raw.size()), index_buffer_info->endianness);
       for (uint32_t i = 0; i < index_count; ++i) {
         used.push_back(is32 ? reinterpret_cast<const uint32_t*>(raw.data())[i]
@@ -1007,14 +1010,14 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     uint32_t max_vertex = 0;
     for (uint32_t v : used) max_vertex = std::max(max_vertex, v);
-    diag += fmt::format(" max_index={} base_vertex={} elements:", max_vertex, int32_t(regs.base_vertex));
+    diag += std::format(" max_index={} base_vertex={} elements:", max_vertex, int32_t(regs.base_vertex));
     for (const LiveElement& e : vs->elements) {
-      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(95 - e.slot);
-      diag += fmt::format(" L{}(slot {} fmt {}{} stride {} off {} cap {})", e.location, e.slot, e.format,
+      xenos::VertexFetch fetch = regs.GetVertexFetch(95 - e.slot);
+      diag += std::format(" L{}(slot {} fmt {}{} stride {} off {} cap {})", e.location, e.slot, e.format,
                           e.is_signed ? "s" : "", e.stride, e.offset, e.stride ? (fetch.size << 2) / e.stride : 0);
       if (e.format != 26 || e.normalized || !e.stride || fetch.size == 0) continue;
       std::vector<uint8_t> stream(fetch.size << 2);
-      CopySwapped(stream.data(), backend.memory_->TranslatePhysical<const uint8_t*>(fetch.address << 2),
+      CopySwapped(stream.data(), renut::host::Physical<const uint8_t*>(fetch.address << 2),
                   uint32_t(stream.size()), fetch.endian);
       int32_t lo = INT32_MAX, hi = INT32_MIN;
       for (uint32_t v : used) {
@@ -1026,9 +1029,9 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           hi = std::max<int32_t>(hi, comps[c]);
         }
       }
-      diag += fmt::format("[int16 range {}..{}]", lo, hi);
+      diag += std::format("[int16 range {}..{}]", lo, hi);
     }
-    REXLOG_INFO("{}", diag);
+    REXLOG_CAT_INFO(rex::log::renut, "{}", diag);
   }
   if (trace_) {
     std::string line = "  inputs";
@@ -1038,11 +1041,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         if (l.location == location) e = &l;
       }
       if (!e) {
-        line += fmt::format(" L{}{}=none", location, integer ? "u" : "f");
+        line += std::format(" L{}{}=none", location, integer ? "u" : "f");
         continue;
       }
       const auto fetch = regs.GetVertexFetch(95 - e->slot);
-      line += fmt::format(" L{}{}=u{}.{}/f{}{}{}/s{}+{}/e{}", location, integer ? "u" : "f", e->usage,
+      line += std::format(" L{}{}=u{}.{}/f{}{}{}/s{}+{}/e{}", location, integer ? "u" : "f", e->usage,
                           e->usage_index, e->format, e->is_signed ? "s" : "", e->normalized ? "n" : "",
                           e->stride, e->offset, uint32_t(fetch.endian));
     }
@@ -1052,17 +1055,17 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     for (uint32_t stream = 0; stream < slot_sizes.size(); ++stream) {
       if (!slot_sizes[stream] || slot_buffers[stream] != upload_.get()) continue;
       const auto* words = reinterpret_cast<const uint32_t*>(Pointer(slot_offsets[stream]));
-      line = fmt::format("  data{}", stream);
+      line = std::format("  data{}", stream);
       // All of it for the shader an armed trace is after.
       const uint32_t shown = vs->entry->hash == arm_target_ ? 4096 : 16;
       for (uint32_t i = 0; i < std::min<uint32_t>(shown, slot_sizes[stream] / 4); ++i) {
-        line += fmt::format(" {:08X}", words[i]);
+        line += std::format(" {:08X}", words[i]);
       }
       Trace("{}", line);
     }
     line = "  vsc";
     for (uint32_t i = 0; i < 8; ++i) {
-      line += fmt::format(" c{}=({},{},{},{})", i, regs.VertexFloat(i * 4 + 0),
+      line += std::format(" c{}=({},{},{},{})", i, regs.VertexFloat(i * 4 + 0),
                           regs.VertexFloat(i * 4 + 1),
                           regs.VertexFloat(i * 4 + 2),
                           regs.VertexFloat(i * 4 + 3));
@@ -1128,7 +1131,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   }
   const bool keep_pixel_center =
       backend.swap.pixel_center_debug_ == 0 ||
-      (backend.swap.pixel_center_debug_ == 1 && edram_mode != xenos::EdramMode::kDepthOnly);
+      (backend.swap.pixel_center_debug_ == 1 && edram_mode != xenos::EDRAMMode::kDepthOnly);
   if (keep_pixel_center && regs.vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero) {
     window_x += 0.5f;
     window_y += 0.5f;
@@ -1475,7 +1478,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // keep their keys. The reference and masks are dynamic: the game changes
   // them from draw to draw, and keying on them made thousands of pipelines.
   if (stencil_enabled) key_bytes.Put(uint32_t(depth_control.value & 0xFFFFFF81u));
-  if (REXCVAR_GET(renut_plume_decal_log) && (raster.poly_offset_front_enable || raster.poly_offset_back_enable ||
+  if (renut::GetSettings().plume_decal_log.Get() && (raster.poly_offset_front_enable || raster.poly_offset_back_enable ||
                                               raster.poly_offset_para_enable)) {
     // Every draw that asks for a polygon offset (ground decals, shadow maps):
     // each distinct state once, with the raw register values and what Vulkan got,
@@ -1492,7 +1495,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     HashCombine(sig, uint32_t(depth_bias));
     HashCombine(sig, uint32_t(blends[0].blendEnabled));
     if (bias_log_seen_.insert(sig).second) {
-      REXLOG_INFO(
+      REXLOG_CAT_INFO(rex::log::renut, 
           "Renut: Plume offset draw vs={:016X} ps={:016X} prim={} indices={} zfunc={} (0 never 1 less 2 equal 3 lequal 4 greater 5 notequal 6 gequal 7 always) zwrite={} depth={} blend={} "
           "alpha_test={} colors={} cull={} slope={:g} offset={:g} -> bias={} slope={:g} (poly offset {} x{})",
           vs->entry->hash, ps ? ps->entry->hash : 0, uint32_t(prim_type), index_count, uint32_t(depth_control.zfunc),
@@ -1502,7 +1505,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     }
     if (backend.swaps_ >= bias_log_next_) {
       bias_log_next_ = backend.swaps_ + 300;
-      REXLOG_INFO("Renut: Plume offset draws so far: {} asked, {} with a non-zero bias, {} distinct states",
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume offset draws so far: {} asked, {} with a non-zero bias, {} distinct states",
                   bias_log_draws_, bias_log_applied_, bias_log_seen_.size());
     }
   }
@@ -1663,7 +1666,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           pending_pipelines_.erase(pending);
           if (!pipeline) {
             failed_pipelines_.insert(key);
-            REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
+            REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
                         vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
           }
         }
@@ -1701,7 +1704,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
             // anyway; on this thread that is the stall the workers exist for.
             if (us > 40000 && backend.swaps_ > 300 && ++slow_lookups_ >= 5) {
               lookup_here_ = false;
-              REXLOG_WARN("Renut: Plume pipeline lookups at the draw compiled instead; left to the workers");
+              REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume pipeline lookups at the draw compiled instead; left to the workers");
             }
           } else {
             ++backend.stats_.lookups_missed;
@@ -1749,7 +1752,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
     // Said once a pipeline, and not tried again: one the driver refuses was made, and logged, again at every
     // draw (100 MB of log in a minute on a driver that refused a few dozen).
     if (!pipeline && !standin && failed_pipelines_.insert(key).second) {
-      REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
                   vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
     }
   }
@@ -1997,11 +2000,11 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
       lo = std::min(lo, v);
       hi = std::max(hi, v);
     }
-    std::string line = fmt::format("  indices {}..{} base={} count={}", lo, hi, base_vertex, vertex_count);
+    std::string line = std::format("  indices {}..{} base={} count={}", lo, hi, base_vertex, vertex_count);
     for (const LiveElement& e : vs->elements) {
       if (e.usage != 0 || !e.stride || !slot_sizes[e.slot] || slot_buffers[e.slot] != upload_.get()) continue;
       const uint32_t capacity = slot_sizes[e.slot] / e.stride;
-      line += fmt::format(" pos(slot {} fmt {} cap {})", e.slot, e.format, capacity);
+      line += std::format(" pos(slot {} fmt {} cap {})", e.slot, e.format, capacity);
       // Decode the referenced positions as the host will read them.
       float mn = 1e30f, mx = -1e30f;
       uint32_t bad = 0;
@@ -2026,7 +2029,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           else { mn = std::min(mn, f); mx = std::max(mx, f); }
         }
       }
-      line += fmt::format(" range [{}, {}] bad={}", mn, mx, bad);
+      line += std::format(" range [{}, {}] bad={}", mn, mx, bad);
     }
     Trace("{}", line);
   }

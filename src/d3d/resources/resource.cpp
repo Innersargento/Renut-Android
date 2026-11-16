@@ -14,6 +14,8 @@
 // allocator's physical memory, XMemFree for what the game allocated itself, and the
 // fence wait.
 #include "d3d/resources/resource.h"
+#include "platform/guest.h"
+#include "platform/log.h"
 
 #include <algorithm>
 #include <atomic>
@@ -22,8 +24,7 @@
 #include <mutex>
 #include <unordered_set>
 
-#include <rex/logging.h>
-#include <rex/system/kernel_state.h>
+#include "platform/guest.h"
 
 #include "d3d/device/getters.h"
 #include "d3d/frontend/native_d3d.h"
@@ -64,11 +65,7 @@ using mapped_u32 = Mapped;
 GuestCalls g_calls;
 
 uint8_t* GuestBase() {
-  static uint8_t* base = [] {
-    auto* memory = rex::system::kernel_memory();
-    return memory ? memory->virtual_membase() : nullptr;
-  }();
-  return base;
+  return renut::host::VirtualBase();
 }
 
 template <typename T>
@@ -130,10 +127,8 @@ std::unordered_set<u32> g_owned_headers;  // headers the native D3D allocated
 
 // A zeroed header (XMemAlloc 0x64800000: heap, 16-byte aligned, zeroed).
 u32 AllocHeader(u32 size) {
-  auto* memory = rex::system::kernel_memory();
-  if (!memory)
-    return 0;
-  const u32 va = memory->SystemHeapAlloc(size, 16);
+  const u32 va = renut::host::SystemAlloc(size, 16);
+  if (!va) return 0;
   if (!va)
     return 0;
   std::memset(Ptr<u8>(va), 0, size);
@@ -153,8 +148,7 @@ void FreeHeader(u32 va) {
     if (!g_owned_headers.erase(va))
       return;
   }
-  if (auto* memory = rex::system::kernel_memory())
-    memory->SystemHeapFree(va);
+  renut::host::SystemFree(va);
 }
 
 // Resource data: XMemAlloc's physical path for its attributes (0x82265B90: the
@@ -171,7 +165,7 @@ u32 AllocPhysical(u32 size, u32 attributes) {
     protect &= ~0x20000000u;
   const u32 va = g_calls.alloc_physical(size, protect, kAlignment[(attributes >> 24) & 0xF]);
   if (!va)
-    REXLOG_ERROR("D3D: {} bytes of physical memory not available", size);
+    REXLOG_CAT_ERROR(rex::log::renut, "D3D: {} bytes of physical memory not available", size);
   return va;
 }
 

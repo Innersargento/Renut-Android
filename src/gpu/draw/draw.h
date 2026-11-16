@@ -75,7 +75,7 @@ struct Draw {
   // renut_plume_ui_depth_fix (read each frame).
   bool ui_depth_fix_ = true;
   template <typename... Args>
-  void Trace(fmt::format_string<Args...> format, Args&&... args);
+  void Trace(std::format_string<Args...> format, Args&&... args);
   std::unique_ptr<RenderShader> rect_list_gs_;
   std::unique_ptr<RenderShader> point_list_gs_;
   // which classes: 1 framebuffers, 2 textures, 4 views, 8 buffers

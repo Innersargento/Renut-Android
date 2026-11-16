@@ -51,13 +51,11 @@ XEX_PACKAGE = "org.renut.android"
 # release for this platform to external/ (sha256 checked) the first time.
 
 # The code generator, from the SDK release the sources are pinned to (sha256 as published by GitHub).
-HOST_SDK_VERSION = "0.10.1"
+HOST_SDK_VERSION = "0.11.0"
 HOST_SDK = {
-    "win-amd64": "26dbcd19e6976a7ad349917bffc58c1a0f21ad43d71a963d16b623c8e70d1f4d",
-    "linux-amd64": "4a6feb3da8d4dbb49fe21434a623de6d02961d9d0c9be5ccbaadb808aca2a11b",
-    "linux-arm64": "ad802a5ff887d0af66f94381392e588fcbaccb020643a51a3e4dd134dc3753f5",
-    "mac-amd64": "966140fb56d4e59407b6c036724ad563f517d4e5236180b1b02c2b4fe6fc74f8",
-    "mac-arm64": "26bc321d7eef1f55a1d7222a0d9e389b5bf1bca0969a5cca08af17e5338a9e95",
+    "win-amd64": "11ab67a3b8d7abaef501e77ea6c0e7dd588efe207540b46f7a302a03827a6611",
+    "linux-amd64": "e7d543ab8dde2c7839836a0417bfe84691c10f93357ec2c023fa98d3d315803b",
+    "linux-arm64": "3a3ca09225a61db87a06f9380b957a951fb276d5f1128fc6979f964312d54850",
 }
 
 STEP = [0]
@@ -258,6 +256,40 @@ def find_android_sdk():
     return next((g for g in guesses if g and os.path.isdir(g)), None)
 
 
+# The SDK's CMake files need CMake 3.25 (the 3.22 of the Android SDK is too old); Gradle takes one from
+# `cmake.dir` in android/local.properties.
+MIN_CMAKE = (3, 25)
+
+
+def cmake_version(cmake_dir):
+    exe = os.path.join(cmake_dir, "bin", "cmake.exe" if IS_WINDOWS else "cmake")
+    if not os.path.isfile(exe):
+        return None
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
+        digits = out.split()[2].split("-")[0].split(".")
+        return int(digits[0]), int(digits[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def find_cmake_dir():
+    """The folder (with bin/cmake) of a CMake at least MIN_CMAKE: the Android SDK's, or the one on the PATH."""
+    candidates = []
+    sdk = find_android_sdk()
+    if sdk and os.path.isdir(os.path.join(sdk, "cmake")):
+        for name in sorted(os.listdir(os.path.join(sdk, "cmake")), reverse=True):
+            candidates.append(os.path.join(sdk, "cmake", name))
+    which = shutil.which("cmake")
+    if which:
+        candidates.append(os.path.dirname(os.path.dirname(os.path.realpath(which))))
+    for candidate in candidates:
+        version = cmake_version(candidate)
+        if version and version >= MIN_CMAKE:
+            return candidate
+    return None
+
+
 # ---- stage: doctor -------------------------------------------------------------------------------
 
 def stage_doctor(args):
@@ -295,7 +327,10 @@ def stage_doctor(args):
     sdk = find_android_sdk()
     row(sdk is not None, "Android SDK (%s)" % (sdk or "não encontrado"),
         "instale o Android Studio e abra-o uma vez; ele baixa o SDK. Sem o Studio: ferramentas de linha de comando "
-        "do Android. O Gradle baixa NDK 29 e CMake 3.22 sozinho")
+        "do Android. O Gradle baixa o NDK 29 sozinho")
+    cmake = find_cmake_dir()
+    row(cmake is not None, "CMake %d.%d ou mais novo (%s)" % (MIN_CMAKE + (cmake or "não encontrado",)),
+        "o SDK do RexGlue pede CMake 3.25: instale um (sdkmanager \"cmake;3.31.6\", ou o do seu sistema) e deixe-o no PATH")
     if sdk:
         row(os.path.isfile(os.path.join(sdk, "licenses", "android-sdk-license")), "licenças do Android SDK aceitas",
             "yes | %s --licenses" % os.path.join(sdk, "cmdline-tools", "latest", "bin", "sdkmanager"))
@@ -453,42 +488,6 @@ def stage_game(args):
 
 # ---- stage: codegen ------------------------------------------------------------------------------
 
-# cr_as_local turns ctx.cr6 into a plain local, so the same line is emitted without the "ctx." prefix.
-UNRESOLVED_BEFORES = ('if (!ctx.cr6.eq) REX_FATAL("Unresolved branch from 0x82C79F68 to 0x82C79EE4");',
-                      'if (!cr6.eq) REX_FATAL("Unresolved branch from 0x82C79F68 to 0x82C79EE4");')
-UNRESOLVED_AFTERS = ("if (!ctx.cr6.eq) goto loc_82C79EE4;", "if (!cr6.eq) goto loc_82C79EE4;")
-
-
-def fix_generated(folder):
-    """RexGlue 0.10.0 emits a fatal branch for a label inside the same function; replaces that one reviewed line."""
-    files = sorted(Path(folder).glob("*.cpp"))
-    texts = {}
-    for f in files:
-        text = f.read_text(encoding="utf-8", errors="replace")
-        if any(s in text for s in UNRESOLVED_BEFORES + UNRESOLVED_AFTERS):
-            texts[f] = text
-    hits = [f for f, t in texts.items() if any(s in t for s in UNRESOLVED_BEFORES)] or list(texts)
-    if len(hits) != 1:
-        fail("esperado exatamente um desvio conhecido em generated/android; encontrados %d. Regenere o código." % len(hits))
-    path = hits[0]
-    text = texts[path]
-    pairs = list(zip(UNRESOLVED_BEFORES, UNRESOLVED_AFTERS))
-    before, after = next(((b, a) for b, a in pairs if b in text), None) or next((b, a) for b, a in pairs if a in text)
-    needle = before if before in text else after
-    position = text.index(needle)
-    start = text.rfind("DEFINE_REX_FUNC(", 0, position)
-    body = text[start:position]
-    if not body.startswith("DEFINE_REX_FUNC(sub_82C79EE4)") or "loc_82C79EE4:" not in body:
-        fail("o destino do desvio não pertence à função esperada; correção não aplicada.")
-    if needle == before:
-        path.write_text(text.replace(before, after), encoding="utf-8", newline="")
-    for f in files:
-        if f != path and 'REX_FATAL("Unresolved' in f.read_text(encoding="utf-8", errors="replace"):
-            fail("há outros desvios não resolvidos em %s; revise antes de compilar." % f.name)
-    if 'REX_FATAL("Unresolved' in path.read_text(encoding="utf-8", errors="replace"):
-        fail("restam desvios não resolvidos em %s." % path.name)
-
-
 def stage_codegen(args):
     step("Recompilação do executável (C++ ARM64)")
     xex = ROOT / "assets" / "default.xex"
@@ -497,23 +496,11 @@ def stage_codegen(args):
     binary = host_sdk_binary()
     if not binary:
         fail("gerador de código ausente. Rode o passo 'deps'.")
-    helper = GENERATED / "rexglue.cmake"
-    saved = helper.read_bytes() if helper.is_file() else None
     # The generator skips a file it finds unchanged, which would keep the post-processing below
     # from a previous run (or the output of other flags) in place.
     for old in (GENERATED / "android").glob("*.cpp"):
         old.unlink()
-    try:
-        run([binary, "--log-level", "info", "codegen", "renut_android_manifest.toml"], cwd=ROOT, log="codegen.log")
-        # SDK 0.10 also overwrites the root helper regardless of the output directory.
-        (GENERATED / "android").mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(helper, GENERATED / "android" / "rexglue.cmake")
-    finally:
-        if saved is not None:
-            helper.write_bytes(saved)
-        elif helper.exists():
-            helper.unlink()
-    fix_generated(GENERATED / "android")
+    run([binary, "--log-level", "info", "codegen", "renut_android_manifest.toml"], cwd=ROOT, log="codegen.log")
     if re.search(r"(?m)^non_(argument|volatile)_as_local\s*=\s*true", (ROOT / "config" / "renut_funcs.toml").read_text(encoding="utf-8")):
         sys.path.insert(0, str(ROOT / "tools"))
         import codegen_handoff
@@ -768,6 +755,12 @@ def stage_apk(args):
     props = ROOT / "android" / "local.properties"
     if not props.is_file():
         props.write_text("sdk.dir=%s\n" % sdk.replace("\\", "\\\\").replace(":", "\\:"), encoding="utf-8")
+    if "cmake.dir=" not in props.read_text(encoding="utf-8"):
+        cmake = find_cmake_dir()
+        if not cmake:
+            fail("CMake 3.25 ou mais novo não encontrado (o SDK do RexGlue precisa). Rode 'prepare.py doctor'.")
+        with open(props, "a", encoding="utf-8") as f:
+            f.write("cmake.dir=%s\n" % cmake.replace("\\", "/").replace(":", "\\:"))
     env = {"JAVA_HOME": java}
     if IS_WINDOWS:
         # Gradle's socket directory may be remapped by packaged shells.

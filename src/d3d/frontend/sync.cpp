@@ -1,5 +1,7 @@
 // What the GPU writes back for the CPU: fences, callbacks, the swap's wait.
 #include "d3d/frontend/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
 #include "d3d/scene/command_buffers.h"
 #include "guest/host_support.h"
 
@@ -25,9 +27,8 @@ uint32_t RingSink() {
   static std::once_flag made;
   static uint32_t sink = 0;
   std::call_once(made, [] {
-    auto* memory = rex::system::kernel_memory();
-    sink = memory ? memory->SystemHeapAlloc(kRingSinkSize, 4096, rex::memory::kSystemHeapPhysical) : 0;
-    if (!sink) REXLOG_WARN("Renut: native Direct3D: no memory for the ring sink");
+    sink = renut::host::SystemAlloc(kRingSinkSize, 4096, true);
+    if (!sink) REXLOG_CAT_WARN(rex::log::renut, "Renut: native Direct3D: no memory for the ring sink");
   });
   return sink;
 }
@@ -37,8 +38,7 @@ uint32_t RingSink() {
 constexpr uint32_t kRingDataSize = 1u << 20;
 
 uint32_t GuestBlock(uint32_t bytes) {
-  auto* memory = rex::system::kernel_memory();
-  return memory ? memory->SystemHeapAlloc(bytes, 4096, rex::memory::kSystemHeapPhysical) : 0;
+  return renut::host::SystemAlloc(bytes, 4096, true);
 }
 
 // XMemAlloc(size, attributes), the allocator the original takes these two blocks from, so that
@@ -410,7 +410,7 @@ void WaitForBackend(uint32_t max_lists_ahead, uint32_t timeout_ms) {
     if (published <= executed + max_lists_ahead) return;
     if (std::chrono::steady_clock::now() >= until) {
       if (g_counts.brake_timeouts.fetch_add(1, std::memory_order_relaxed) == 0)
-        REXLOG_WARN("Renut: the command buffer brake timed out ({} lists ahead of the backend)", published - executed);
+        REXLOG_CAT_WARN(rex::log::renut, "Renut: the command buffer brake timed out ({} lists ahead of the backend)", published - executed);
       return;
     }
     FenceWait(FenceEpoch(), 1000);
@@ -533,7 +533,7 @@ void CheckWait(PPCContext& ctx, uint8_t* base) {
       g_counts.lists_executed.load(std::memory_order_relaxed) <
           g_counts.lists_published.load(std::memory_order_relaxed)) {
     // A wait that stands still while the executor still owes work: not stuck yet.
-    REXLOG_DEBUG("Renut: native sync: wait kind {} still after 1.5 s, executor busy {}, lists run {} of {} published, "
+    REXLOG_CAT_DEBUG(rex::log::renut, "Renut: native sync: wait kind {} still after 1.5 s, executor busy {}, lists run {} of {} published, "
                 "fence {:X} (issued {:X}), position {:X}",
                 U32(base, blocker + 4), g_executor_busy.load(std::memory_order_relaxed),
                 g_counts.lists_executed.load(std::memory_order_relaxed),
@@ -546,7 +546,7 @@ void CheckWait(PPCContext& ctx, uint8_t* base) {
   Bump(g_counts.stuck_waits);
   const uint32_t issued = U32(base, dev + 10908) - 2;
   const uint32_t position = (U32(base, dev + 13244) & 3) | U32(base, dev + 13240);
-  REXLOG_WARN("Renut: native sync: a wait (kind {}) stood still 1.5 s with every list run: fence {:X} of {:X}, "
+  REXLOG_CAT_WARN(rex::log::renut, "Renut: native sync: a wait (kind {}) stood still 1.5 s with every list run: fence {:X} of {:X}, "
               "position {:X} of {:X}; completing it",
               U32(base, blocker + 4), done, issued, U32(base, block + 4), position);
   S32(base, block + 4, position);

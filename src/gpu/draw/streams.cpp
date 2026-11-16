@@ -1,5 +1,7 @@
 // Upload ring, kept vertex streams, memory exports and the constant blocks.
 #include "gpu/core/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
 
 namespace renut::gpu {
 
@@ -27,7 +29,7 @@ bool Streams::UploadGuest(uint32_t address, uint32_t size, xenos::Endian endian,
   }
   offset = Allocate(size, 256);
   if (offset == UINT64_MAX) return false;
-  CopySwapped(backend.draw.Pointer(offset), backend.memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
+  CopySwapped(backend.draw.Pointer(offset), renut::host::Physical<const uint8_t*>(address), size, endian);
   backend.stats_.stream_bytes += size;
   uploaded_streams_.emplace(key, offset);
   return true;
@@ -40,7 +42,7 @@ bool Streams::UploadRepacked(uint32_t address, uint32_t size, xenos::Endian endi
   offset = Allocate(size, 256);
   if (offset == UINT64_MAX) return false;
   uint8_t* data = backend.draw.Pointer(offset);
-  CopySwapped(data, backend.memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
+  CopySwapped(data, renut::host::Physical<const uint8_t*>(address), size, endian);
   for (uint32_t i = 0; i < element_count; ++i) {
     const uint32_t stride = elements[i].second;
     if (!stride) continue;
@@ -185,9 +187,15 @@ bool Streams::RepackedStream(uint32_t address, uint32_t size, xenos::Endian endi
     return true;
   }
   const bool dynamic = kept.drops >= 3 && backend.swaps_ - kept.dropped_frame < 900;
-  if (dynamic || kept_bytes_ + size > kept_budget_ ||
-      backend.memory_->GetPhysicalHeap()->QueryRangeAccess(address, address + size - 1) !=
-          rex::memory::PageAccess::kReadWrite) {
+  if (dynamic || kept_bytes_ + size > kept_budget_) {
+    return UploadRepacked(address, size, endian, elements, element_count, offset);
+  }
+  // A page the guest has not committed writable gets no watch (see GuestStream): such a stream is
+  // copied each time, and looked at again once it would have stopped counting as dynamic.
+  if (!renut::host::PhysicalRangeWritable(address, size)) {
+    kept.drops = std::max<uint32_t>(kept.drops, 3);
+    kept.dropped_frame = backend.swaps_;
+    ++backend.stats_.kept_unwatchable;
     return UploadRepacked(address, size, endian, elements, element_count, offset);
   }
   auto made = backend.device_->createBuffer(RenderBufferDesc::UploadBuffer(
@@ -195,9 +203,9 @@ bool Streams::RepackedStream(uint32_t address, uint32_t size, xenos::Endian endi
                 RenderBufferFlag::STORAGE));
   if (!made) return UploadRepacked(address, size, endian, elements, element_count, offset);
   // Watch first, copy second: a write that lands during the copy still drops it.
-  backend.memory_->EnablePhysicalMemoryAccessCallbacks(address, size, true, false);
+  renut::host::WatchWrites(address, size);
   auto* data = static_cast<uint8_t*>(made->map());
-  CopySwapped(data, backend.memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
+  CopySwapped(data, renut::host::Physical<const uint8_t*>(address), size, endian);
   for (uint32_t i = 0; i < element_count; ++i) {
     const uint32_t stride = elements[i].second;
     if (!stride) continue;
@@ -282,8 +290,7 @@ bool Streams::GuestStream(uint32_t address, uint32_t size, xenos::Endian endian,
   // polygons with garbage textures, minutes into a level, until the window
   // happened to be dropped. Such a window goes through the ring, and is looked
   // at again once it would have stopped counting as dynamic.
-  if (backend.memory_->GetPhysicalHeap()->QueryRangeAccess(window_base, window_base + window_size - 1) !=
-      rex::memory::PageAccess::kReadWrite) {
+  if (!renut::host::PhysicalRangeWritable(window_base, window_size)) {
     kept.drops = std::max<uint32_t>(kept.drops, 3);
     kept.dropped_frame = backend.swaps_;
     ++backend.stats_.kept_unwatchable;
@@ -294,9 +301,9 @@ bool Streams::GuestStream(uint32_t address, uint32_t size, xenos::Endian endian,
                 RenderBufferFlag::STORAGE));
   if (!made) return UploadGuest(address, size, endian, offset);
   // Watch first, copy second: a write that lands during the copy still drops it.
-  backend.memory_->EnablePhysicalMemoryAccessCallbacks(window_base, window_size, true, false);
+  renut::host::WatchWrites(window_base, window_size);
   auto* data = static_cast<uint8_t*>(made->map());
-  CopySwapped(data, backend.memory_->TranslatePhysical<const uint8_t*>(window_base), window_size, endian);
+  CopySwapped(data, renut::host::Physical<const uint8_t*>(window_base), window_size, endian);
   made->unmap();
   kept.buffer = std::move(made);
   kept.base = window_base;
@@ -368,7 +375,7 @@ ExportRange* Streams::GetExport(uint32_t base, uint32_t size,
   fresh.address = fresh.buffer->getDeviceAddress();
   const uint64_t offset = Allocate(fresh.size, 256);
   if (offset == UINT64_MAX) return nullptr;
-  const uint8_t* memory = backend.memory_->TranslatePhysical<const uint8_t*>(lo);
+  const uint8_t* memory = renut::host::Physical<const uint8_t*>(lo);
   fresh.snapshot.assign(memory, memory + fresh.size);
   CopySwapped(backend.draw.Pointer(offset), memory, fresh.size, fresh.endian);
   bool pending = false;
@@ -395,7 +402,7 @@ ExportRange* Streams::GetExport(uint32_t base, uint32_t size,
   static uint32_t logged = 0;
   if (logged < 64) {
     ++logged;
-    REXLOG_INFO("Renut: Plume export range {:08X}+{:X} endian {} (asked {:08X}+{:X}, merged {})", lo,
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume export range {:08X}+{:X} endian {} (asked {:08X}+{:X}, merged {})", lo,
                 fresh.size, uint32_t(endian), base, size, merged.size());
   }
   ++backend.draw.export_epoch_;
@@ -447,7 +454,7 @@ void Streams::ApplyWritebacks(uint32_t slot) {
       continue;
     }
     ExportRange& range = found->second;
-    uint8_t* guest = backend.memory_->TranslatePhysical<uint8_t*>(range.base);
+    uint8_t* guest = renut::host::Physical<uint8_t*>(range.base);
     for (uint32_t at = 0; at < range.size; at += kBlock) {
       const uint32_t length = std::min(kBlock, range.size - at);
       // A block the CPU wrote since is left alone: its bytes win, and the
@@ -468,7 +475,7 @@ void Streams::ApplyWritebacks(uint32_t slot) {
 void Streams::RefreshExport(ExportRange& range) {
   if (range.checked_frame == backend.swaps_) return;
   range.checked_frame = backend.swaps_;
-  const uint8_t* memory = backend.memory_->TranslatePhysical<const uint8_t*>(range.base);
+  const uint8_t* memory = renut::host::Physical<const uint8_t*>(range.base);
   if (std::memcmp(memory, range.snapshot.data(), range.size) == 0) return;
   if (range.written) ExportBarrier();
   constexpr uint32_t kBlock = 256;
@@ -548,7 +555,7 @@ bool Streams::BindStream(uint32_t address, uint32_t size, xenos::Endian endian,
   if (!address || !size || size > (32u << 20)) return false;
   offset = Allocate(size, 256);
   if (offset == UINT64_MAX) return false;
-  CopySwapped(backend.draw.Pointer(offset), backend.memory_->TranslatePhysical<const uint8_t*>(address), size, endian);
+  CopySwapped(backend.draw.Pointer(offset), renut::host::Physical<const uint8_t*>(address), size, endian);
   bool pending = false;
   for (ExportRange* range : overlapping) {
     RefreshExport(*range);
@@ -674,7 +681,7 @@ const PatchGrid* Streams::GetPatchGrid(bool quad, uint32_t level,
   grid.patches = capacity;
   grid.points_per_patch = per_patch;
   grid.indices_per_patch = indices_per_patch;
-  REXLOG_INFO("Renut: Plume patch grid {} level {} for {} patches ({} points, {} indices each)",
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume patch grid {} level {} for {} patches ({} points, {} indices each)",
               quad ? "quad" : "triangle", level, capacity, per_patch, indices_per_patch);
   return &grid;
 }

@@ -1,17 +1,25 @@
-# CRT functions the SDK implements natively (rex/kernel/crt): codegen renames each address to
-# rexcrt_<Name>, leaves it out of the recompiled code and the SDK's host implementation runs instead
-# of a recompiled byte loop. Only memory and string functions are mapped here. Left out on purpose:
-#   - the heap group (RtlAllocateHeap, RtlFreeHeap, RtlSizeHeap, RtlReAllocateHeap, at 0x8223F478,
-#     0x8223FD48, 0x82240200, 0x82717428): all-or-nothing, it needs the ReXCRT heap started after the
-#     XEX loads (rex::kernel::crt::InitHeap) and the rexcrt_heap_enable cvar, and it moves every
-#     allocation of the game into a 256 MB o1heap;
-#   - wcscmp, wcsncmp, wcschr: the SDK reads the guest's big-endian UTF-16 as host int16, so the sign of the result
-#     is wrong and wcschr never finds a character (tried 18/10 with the geb project's list);
-#   - the file group (CreateFileA 0x82715378, ReadFile 0x827156E0, WriteFile 0x82715E50, ...): handle
-#     based and tied to the kernel's XFile objects, not measured.
-# Addresses are this build's (default.xex of the European disc); each was checked to be a function start
-# in generated/android and, for strchr and strlen, by its body.
-[rexcrt]
+# Library routines compiled into the XEX that the SDK replaces with host functions (shims, RexGlue 0.11:
+# docs/site/pages/runtime/shims.md, `rexglue list shim`). Codegen names each address rexshim_<Name>, emits no
+# body for it, and every call runs the SDK's host function instead of a recompiled byte loop.
+#
+# Left out on purpose:
+#   - the heap group (RtlAllocateHeap 0x8223F478, RtlFreeHeap 0x8223FD48, RtlSizeHeap 0x82240200,
+#     RtlReAllocateHeap 0x82717428): all four or none, and it moves every allocation of the game into the
+#     SDK's TLSF shim heap (runtime.heap_size_mb, 256 MB first segment, grows by 64 MB). The heap guards in
+#     guest/game_fixes.cpp (meInternalFree, sub_8223FD48) read the game heap's own block headers and table,
+#     which the shim heap does not have: enabling it means rewriting those first, then a device test.
+#     (reNut PC and reblue both run with it.)
+#   - the file group (CreateFileA 0x82715378, ReadFile 0x827156E0, WriteFile 0x82715E50, ...): the I/O goes
+#     through the SDK's filesystem either way, and nothing here was measured to be slow; reNut PC (without
+#     CloseHandle) and reblue use it.
+#   - atan2: not found in this build (the routine next to where reNut PC's would be is tan).
+# The wide string group, wrong in RexGlue 0.10 (big-endian halfwords read as host ones), is fixed in 0.11
+# (SDK commit 53bfe5d8) and on since then.
+#
+# Addresses are this build's (default.xex of the European disc). Each is a function start in
+# generated/android whose guest code was read there (the disassembly comments) before it was listed; the new
+# 0.11 entries were found by their place next to the routines reNut PC (TU3) lists and checked by body.
+[shim]
 # memory
 memcpy = 0x82BB4510
 memmove = 0x82BB2C70
@@ -34,7 +42,14 @@ lstrlenA = 0x82BCD2F0
 lstrcmpiA = 0x82BCD260
 _stricmp = 0x82BB6220  # case-insensitive compare, 73 call sites
 
-# wide string: a lhz loop returning the count of halfwords (144 call sites)
-wcslen = 0x82BB1798
-wcsstr = 0x82BB3508  # compares halfwords for equality only, so the guest's big-endian text is fine
-wcsncpy = 0x82BB4068  # copies halfwords as they are
+# wide string
+wcslen = 0x82BB1798  # a lhz loop returning the count of halfwords, 144 call sites
+wcsstr = 0x82BB3508
+wcsncpy = 0x82BB4068
+wcscmp = 0x82261560  # lhz pairs until they differ, returns -1, 0 or 1; 44 call sites
+wcsncmp = 0x82BB3960  # counted lhz compare, returns the difference; 20 call sites
+wcschr = 0x82BB4028  # lhz loop against r4's low halfword, the match or null; 12 call sites
+wcsncpy_s = 0x82BB3CA0  # (dst, size, src, count), count -1 truncates, EINVAL 22 / ERANGE 34; 28 call sites
+
+# math
+atof = 0x82BB18F0  # skips the C-locale spaces, then converts; 1 call site

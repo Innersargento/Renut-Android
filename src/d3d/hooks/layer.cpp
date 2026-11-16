@@ -1,4 +1,6 @@
 #include "d3d/hooks/layer.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 #include "d3d/frontend/native_d3d.h"
 #include "guest/guest_address.h"
 
@@ -14,24 +16,15 @@
 #include <utility>
 #include <vector>
 
-#include <fmt/format.h>
-#include <rex/cvar.h>
-#include <rex/logging.h>
-#include <rex/memory/utils.h>
-#include <rex/ppc/func.h>
-#include <rex/system/kernel_state.h>
-#include <rex/hook.h>
+#include <format>
+#include <rex/memory.h>
+#include <rex/ppc/recompiled_code.h>
+#include "platform/guest.h"
+#include <rex/ppc/hook.h>
 
-REXCVAR_DEFINE_INT32(renut_d3d_report_swaps, 0, "reNut",
-                     "Log the most called Direct3D functions every N swaps (0 = off). Off by "
-                     "default: the game polls D3D_CBlocker_Check tens of millions of times a "
-                     "second while it waits for a fence, and counting every call cost a quarter "
-                     "of the process's cycles in one atomic increment");
 
-REXCVAR_DEFINE_BOOL(renut_d3d_stats, false, "reNut",
-                    "Keep the per-call and per-draw counters of the native Direct3D report "
-                    "(files/native-d3d.txt). Off by default: they are atomic increments on arrays "
-                    "shared between threads, on every call and draw");
+
+
 
 namespace renut::d3d {
 namespace {
@@ -51,8 +44,8 @@ std::atomic<int32_t> report_every{-1};
 inline int32_t ReportEvery() {
   int32_t every = report_every.load(std::memory_order_relaxed);
   if (every < 0) {
-    every = std::max(0, REXCVAR_GET(renut_d3d_report_swaps));
-    g_stats.store(every > 0 || REXCVAR_GET(renut_d3d_stats), std::memory_order_relaxed);
+    every = std::max(0, renut::GetSettings().d3d_report_swaps.Get());
+    g_stats.store(every > 0 || renut::GetSettings().d3d_stats.Get(), std::memory_order_relaxed);
     report_every.store(every, std::memory_order_relaxed);
   }
   return every;
@@ -94,7 +87,7 @@ void DumpShaderObject(uint8_t* base, uint32_t object, bool vertex) {
   if (!container) {
     static std::atomic<int> warned{0};
     if (warned.fetch_add(1) < 8) {
-      REXLOG_WARN("Renut: shader object {:08X} has no container after it", object);
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: shader object {:08X} has no container after it", object);
     }
     return;
   }
@@ -125,7 +118,7 @@ void DumpShaderObject(uint8_t* base, uint32_t object, bool vertex) {
   if (dump_directory.empty() || !dumped.insert(hash).second) {
     return;
   }
-  auto path = fmt::format("{}/{}_{:016X}.bin", dump_directory, vertex ? "vs" : "ps", hash);
+  auto path = std::format("{}/{}_{:016X}.bin", dump_directory, vertex ? "vs" : "ps", hash);
   if (FILE* file = std::fopen(path.c_str(), "wb")) {
     std::fwrite(header, 1, virtual_size, file);
     std::fwrite(body, 1, physical_size, file);
@@ -144,11 +137,11 @@ void Report() {
     }
   }
   std::sort(sorted.rbegin(), sorted.rend());
-  std::string line = fmt::format("Renut: D3D calls ({} total, {} functions):", total, sorted.size());
+  std::string line = std::format("Renut: D3D calls ({} total, {} functions):", total, sorted.size());
   for (size_t i = 0; i < std::min<size_t>(sorted.size(), 40); ++i) {
-    line += fmt::format(" {}={}", kNames[sorted[i].second], sorted[i].first);
+    line += std::format(" {}={}", kNames[sorted[i].second], sorted[i].first);
   }
-  REXLOG_INFO("{}", line);
+  REXLOG_CAT_INFO(rex::log::renut, "{}", line);
 }
 
 // Called for every intercepted function. Returns true if a handler took it.

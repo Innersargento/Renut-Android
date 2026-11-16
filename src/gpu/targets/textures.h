@@ -10,13 +10,13 @@ struct Textures {
   explicit Textures(GpuBackend& owner) : backend(owner) {}
   GpuBackend& backend;
 
-  const FetchLayout* LayoutOf(const xenos::xe_gpu_texture_fetch_t& fetch);
-  const FetchLayout* LayoutOfByContents(const xenos::xe_gpu_texture_fetch_t& fetch);
-  uint32_t GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
-  uint32_t GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
-  uint32_t GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
-  uint32_t GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
-  uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch);
+  const FetchLayout* LayoutOf(const xenos::TextureFetch& fetch);
+  const FetchLayout* LayoutOfByContents(const xenos::TextureFetch& fetch);
+  uint32_t GetGuestTexture(const xenos::TextureFetch& fetch);
+  uint32_t GetGuestCubeTexture(const xenos::TextureFetch& fetch);
+  uint32_t GetGuestStackedTexture(const xenos::TextureFetch& fetch);
+  uint32_t GetGuestVolumeTexture(const xenos::TextureFetch& fetch);
+  uint32_t GetSampler(const xenos::TextureFetch& fetch);
   // Never invalidated: a fetch constant always describes the same layout. The
   // contents behind it are checked separately, once a frame, in GetGuestTexture.
   std::unordered_map<uint64_t, FetchLayout> fetch_layouts_;
@@ -25,7 +25,7 @@ struct Textures {
   // the next frame uses and writes each to <files>/texdump/ (raw RGBA).
   std::string texdump_directory_;
   std::unordered_set<uint64_t> dumped_;
-  void DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch, const std::vector<uint32_t>& rgba,
+  void DumpTexture(const xenos::TextureFetch& fetch, const std::vector<uint32_t>& rgba,
                    uint32_t width, uint32_t height, const char* kind);
   std::unordered_map<uint64_t, uint32_t> sampler_indices_;
   // Nothing is ever erased from sampler_indices_, so its nodes stay put.

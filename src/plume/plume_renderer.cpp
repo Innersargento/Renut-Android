@@ -1,4 +1,6 @@
 #include "plume_renderer.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 
 #include "frame_pacing.h"
 #include "plume_vulkan.h"
@@ -32,29 +34,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <rex/cvar.h>
-#include <rex/logging.h>
 
 // The session's own Vulkan loader (the bundled driver), opened by android_vulkan_loader.cpp.
 void* renutXenosVulkanSymbol(const char* name);
 void renutSetPlumeVulkanEntry(PFN_vkGetInstanceProcAddr entry);
 
-REXCVAR_DEFINE_BOOL(renut_plume_vsync, true, "reNut/Plume",
-                    "Present through the display's vertical sync (FIFO). Off asks for immediate "
-                    "presentation where the driver has it, so frames are not held to the refresh rate");
 
-REXCVAR_DEFINE_BOOL(renut_plume_present_pass, true, "reNut/Plume",
-                    "Show the frame with one render pass on the swapchain image (cleared as the pass begins, the "
-                    "frame drawn as a textured rectangle) instead of a clear and a blit of the whole image. Read "
-                    "at start.");
-REXCVAR_DEFINE_BOOL(renut_plume_present_fit, true, "reNut/Plume",
-                    "Make the swapchain at the size of the game's frame (the screen's shape, the frame's lines) "
-                    "and leave the scaling to the display's compositor, instead of filling a swapchain of the "
-                    "screen's own resolution every frame. Read at start.");
-REXCVAR_DEFINE_BOOL(renut_plume_present_prerotate, true, "reNut/Plume",
-                    "Draw the frame already turned the way the screen is mounted (the swapchain's preTransform is "
-                    "the surface's current one), so the compositor does not turn every frame itself, which on "
-                    "many phones it does with the GPU. Needs renut_plume_present_pass. Read at start.");
+
+
+
+
 
 namespace renut {
 using namespace plume;
@@ -621,9 +610,9 @@ VkPipelineCache LoadPipelineCaches(VkDevice device) {
     if (c.delta == VK_NULL_HANDLE) c.lookup = false;
   }
   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-  REXLOG_INFO("Renut: Plume pipeline cache {} ({} KB from disk, {} KB of it new since the last fold; {}{} ms; {})",
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume pipeline cache {} ({} KB from disk, {} KB of it new since the last fold; {}{} ms; {})",
               base_bytes || delta_bytes ? "carregado" : "criado", (base_bytes + delta_bytes) >> 10,
-              delta_bytes >> 10, folded ? fmt::format("folded into {} KB, ", folded >> 10) : std::string(), ms,
+              delta_bytes >> 10, folded ? std::format("folded into {} KB, ", folded >> 10) : std::string(), ms,
               c.lookup ? "lookups without compiling" : "one cache, written whole");
   c.device.store(device);
   c.shared.store(shared, std::memory_order_release);
@@ -765,7 +754,7 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
   if (!IsAvailable()) {
     const char* why = "Plume: nenhum carregador Vulkan neste sistema.";
     if (error) *error = why;
-    REXLOG_ERROR("Renut: {}", why);
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: {}", why);
     return false;
   }
   try {
@@ -812,7 +801,7 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     vkGetPhysicalDeviceFeatures(vulkan_device->physicalDevice, &features);
     layer.per_draw_textures.store(gpu::NeedsPerDrawTextures(limits), std::memory_order_relaxed);
     if (layer.per_draw_textures.load(std::memory_order_relaxed)) {
-      REXLOG_INFO("Renut: Plume {}: the bindless texture heaps are past its limits ({} sets, {} textures and {} "
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume {}: the bindless texture heaps are past its limits ({} sets, {} textures and {} "
                   "samplers a stage); each draw binds a set of its own textures",
                   s.gpu, limits.maxBoundDescriptorSets, limits.maxPerStageDescriptorSampledImages,
                   limits.maxPerStageDescriptorSamplers);
@@ -820,7 +809,7 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     if (const std::string missing = gpu::MissingDescriptorLimits(limits, features); !missing.empty()) {
       const std::string why = "Plume: a GPU " + s.gpu + " não comporta o modelo de texturas do renderizador (" +
                               missing + ").";
-      REXLOG_ERROR("Renut: {}", why);
+      REXLOG_CAT_ERROR(rex::log::renut, "Renut: {}", why);
       Require(false, why.c_str());
     }
     s.queue = s.device->createCommandQueue(RenderCommandListType::DIRECT);
@@ -847,25 +836,25 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     Require(s.format != RenderFormat::UNKNOWN, "Plume: superfície sem RGBA8/BGRA8.");
     // How frames reach the screen (renut_plume_present_*). Without the pass the frame is blitted as before, and
     // a blit cannot turn it: no pre-rotation then.
-    if (REXCVAR_GET(renut_plume_present_pass)) {
+    if (renut::GetSettings().plume_present_pass.Get()) {
       const VkFormat present_format =
           s.format == RenderFormat::R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
       if (!CreatePresentPass(s.pass, device->vk, present_format)) {
-        REXLOG_WARN("Renut: Plume present pass not made; frames are blitted to the swapchain");
+        REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume present pass not made; frames are blitted to the swapchain");
         s.pass.Destroy();
       }
     }
     s.samples = s.pass.ready;
-    s.fit = REXCVAR_GET(renut_plume_present_fit);
-    s.prerotate = s.pass.ready && REXCVAR_GET(renut_plume_present_prerotate);
-    REXLOG_INFO("Renut: Plume present: {}, swapchain {}, {}",
+    s.fit = renut::GetSettings().plume_present_fit.Get();
+    s.prerotate = s.pass.ready && renut::GetSettings().plume_present_prerotate.Get();
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume present: {}, swapchain {}, {}",
                 s.pass.ready ? "one render pass" : "clear and blit",
                 s.fit ? "fitted to the frame" : "at the surface's size",
                 s.prerotate ? "turned as the surface is" : "turned by the compositor");
     s.surface_w = uint32_t(std::max(ANativeWindow_getWidth(window), 0));
     s.surface_h = uint32_t(std::max(ANativeWindow_getHeight(window), 0));
     s.swap = s.queue->createSwapChain(RenderSwapChainDesc(ToRenderWindow(window), s.format, 3));
-    if (s.swap) s.swap->setVsyncEnabled(REXCVAR_GET(renut_plume_vsync));
+    if (s.swap) s.swap->setVsyncEnabled(renut::GetSettings().plume_vsync.Get());
     Require(s.swap && renderer->ResizeSwapchain() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
     for (auto& slot : s.slots) {
       slot.commands = s.queue->createCommandList();
@@ -877,7 +866,7 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     while (s.release.size() < s.swap->getTextureCount()) {
       s.release.push_back(s.device->createCommandSemaphore());
     }
-    REXLOG_INFO("Renut: Plume renderer started on {} ({}x{})", s.gpu, s.swap->getWidth(),
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume renderer started on {} ({}x{})", s.gpu, s.swap->getWidth(),
                 s.swap->getHeight());
     renderer->LogSurface("start");
     {
@@ -889,7 +878,7 @@ bool PlumeRenderer::Start(PlumeWindow* window, std::string* error) {
     return true;
   } catch (const std::exception& e) {
     if (error) *error = e.what();
-    REXLOG_ERROR("Renut: {}", e.what());
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: {}", e.what());
     return false;
   }
 }
@@ -923,7 +912,7 @@ void PlumeRenderer::Present() {
   uint32_t index = 0;
   if (!s.swap->acquireTexture(slot.acquire.get(), &index)) {
     const bool resized = ResizeSwapchain();
-    REXLOG_WARN("Renut: Plume acquire failed before the first frame; swapchain resize {} ({}x{})",
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume acquire failed before the first frame; swapchain resize {} ({}x{})",
                 resized ? "ok" : "FAILED", s.swap->getWidth(), s.swap->getHeight());
     return;
   }
@@ -947,7 +936,7 @@ void PlumeRenderer::Present() {
   s.swap->present(index, &signal, 1);
   s.queue->waitForCommandFence(slot.fence.get());
   if (s.frames.fetch_add(1) == 0) {
-    REXLOG_INFO("Renut: Plume presented its first frame");
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume presented its first frame");
   }
 }
 
@@ -1009,7 +998,7 @@ bool PlumeRenderer::ResizeSwapchain() {
   }
   s.blit_rect[0] = -1;
   if (resized) {
-    REXLOG_INFO("Renut: Plume swapchain images {}x{}, pre-transform {} (surface {}x{}, fitted to {}x{})",
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume swapchain images {}x{}, pre-transform {} (surface {}x{}, fitted to {}x{})",
                 s.extent.width, s.extent.height, TransformName(s.transform), s.surface_w, s.surface_h,
                 plan.frame_w, plan.frame_h);
   }
@@ -1031,7 +1020,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
     // Immediate shows it at once where the driver has that and not Mailbox.
     auto* chain = static_cast<VulkanSwapChain*>(s.swap.get());
     VkPresentModeKHR want = VK_PRESENT_MODE_FIFO_KHR;
-    if (!(pacing::PresentVsync() && REXCVAR_GET(renut_plume_vsync))) {
+    if (!(pacing::PresentVsync() && renut::GetSettings().plume_vsync.Get())) {
       if (chain->mailboxPresentModeSupported) {
         want = VK_PRESENT_MODE_MAILBOX_KHR;
       } else if (chain->immediatePresentModeSupported) {
@@ -1044,7 +1033,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
       WaitForAllSlots();
       chain->requiredPresentMode = want;
       if (ResizeSwapchain()) {
-        REXLOG_INFO("Renut: Plume presents {} (target {} FPS)",
+        REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume presents {} (target {} FPS)",
                     want == VK_PRESENT_MODE_FIFO_KHR      ? "on the vertical sync"
                     : want == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox"
                                                           : "immediate",
@@ -1052,7 +1041,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
       } else {
         chain->requiredPresentMode = chain->createdPresentMode;
         refused = want;
-        REXLOG_WARN("Renut: Plume could not change the present mode; keeping the current one");
+        REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume could not change the present mode; keeping the current one");
       }
     }
   }
@@ -1067,7 +1056,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
         s.fit_count = 0;
       }
       if (++s.fit_count >= 30) {
-        REXLOG_INFO("Renut: Plume frames are {}x{} now (the swapchain was fitted to {}x{}): recreating it", width,
+        REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume frames are {}x{} now (the swapchain was fitted to {}x{}): recreating it", width,
                     height, s.fit_w, s.fit_h);
         s.fit_w = width;
         s.fit_h = height;
@@ -1096,16 +1085,16 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
       // The surface is gone (Android answers a negative size): Plume would clamp that to the
       // largest extent and fail, leaving the swapchain's size at 4096x4096. The new surface
       // comes through AttachWindow.
-      REXLOG_WARN("Renut: Plume acquire failed (frame {}) on a dead surface ({}x{}); no resize", s.frames.load(),
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume acquire failed (frame {}) on a dead surface ({}x{}); no resize", s.frames.load(),
                   s.window ? ANativeWindow_getWidth(s.window) : -1, s.window ? ANativeWindow_getHeight(s.window) : -1);
     } else if (s.swap) {
       const bool resized = ResizeSwapchain();
-      REXLOG_WARN("Renut: Plume acquire failed (frame {}); swapchain resize {} ({}x{}, {} images)",
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume acquire failed (frame {}); swapchain resize {} ({}x{}, {} images)",
                   s.frames.load(), resized ? "ok" : "FAILED", s.swap->getWidth(), s.swap->getHeight(),
                   s.swap->getTextureCount());
       LogSurface("after a failed acquire");
     } else {
-      REXLOG_WARN("Renut: Plume present with no swapchain (frame {})", s.frames.load());
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume present with no swapchain (frame {})", s.frames.load());
     }
     return;
   }
@@ -1134,7 +1123,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
     w = int32_t(float(width) * scale), h = int32_t(float(height) * scale);
     x = (int32_t(sw) - w) / 2, y = (int32_t(sh) - h) / 2;
     if (s.blit_rect[0] != x || s.blit_rect[1] != y || s.blit_rect[2] != w || s.blit_rect[3] != h) {
-      REXLOG_INFO("Renut: Plume shows the {}x{} frame at {}x{}+{}+{} of the {}x{} picture (images {}x{}, {}; "
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume shows the {}x{} frame at {}x{}+{}+{} of the {}x{} picture (images {}x{}, {}; "
                   "frame {})",
                   width, height, w, h, x, y, uint32_t(sw), uint32_t(sh), extent.width, extent.height,
                   TransformName(s.transform), s.frames.load());
@@ -1148,7 +1137,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
   const PresentPass::Image* image =
       s.pass.ready ? s.pass.ImageFor(dst, chain->pickedSurfaceFormat.format, extent) : nullptr;
   if (s.pass.ready && !image) {
-    REXLOG_ERROR("Renut: Plume present pass: no framebuffer for a {}x{} swapchain image (format {}, pass {}); "
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume present pass: no framebuffer for a {}x{} swapchain image (format {}, pass {}); "
                  "frames are blitted from now on",
                  extent.width, extent.height, int(chain->pickedSurfaceFormat.format), int(s.pass.format));
     s.pass.ready = false;
@@ -1256,7 +1245,7 @@ void PlumeRenderer::SubmitAndPresent(RenderCommandList* frame, RenderTexture* so
   // No wait: the caller records the next frame while this one runs.
   slot.pending = true;
   if (s.frames.fetch_add(1) == 0) {
-    REXLOG_INFO("Renut: Plume presented its first frame");
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume presented its first frame");
   }
 }
 
@@ -1305,16 +1294,16 @@ bool PlumeRenderer::AttachWindow(PlumeWindow* window) {
     s.surface_w = uint32_t(std::max(ANativeWindow_getWidth(window), 0));
     s.surface_h = uint32_t(std::max(ANativeWindow_getHeight(window), 0));
     s.swap = s.queue->createSwapChain(RenderSwapChainDesc(ToRenderWindow(window), s.format, 3));
-    if (s.swap) s.swap->setVsyncEnabled(REXCVAR_GET(renut_plume_vsync));
+    if (s.swap) s.swap->setVsyncEnabled(renut::GetSettings().plume_vsync.Get());
     Require(s.swap && ResizeSwapchain() && s.swap->getTextureCount(), "Plume: swapchain inválida.");
-    REXLOG_INFO("Renut: Plume swapchain recreated ({}x{})", s.swap->getWidth(), s.swap->getHeight());
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume swapchain recreated ({}x{})", s.swap->getWidth(), s.swap->getHeight());
     // A new surface: whatever Java said about the old one no longer counts, and the next
     // size it reports for this one is taken again even if it equals an earlier one.
     s.size_serial = 0;
     s.blit_rect[0] = -1;
     LogSurface("new surface");
   } catch (const std::exception& e) {
-    REXLOG_ERROR("Renut: {}", e.what());
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: {}", e.what());
     return false;
   }
   {
@@ -1334,7 +1323,7 @@ void PlumeRenderer::SetSurfaceSize(PlumeWindow* window, uint32_t width, uint32_t
     surface_size.height = height;
     serial = ++surface_size.serial;
   }
-  REXLOG_INFO("Renut: surface {} reports {}x{} ({}; window says {}x{}, report {})", static_cast<const void*>(window),
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: surface {} reports {}x{} ({}; window says {}x{}, report {})", static_cast<const void*>(window),
               width, height, width >= height ? "landscape" : "portrait",
               window ? ANativeWindow_getWidth(window) : -1, window ? ANativeWindow_getHeight(window) : -1, serial);
 }
@@ -1342,25 +1331,25 @@ void PlumeRenderer::SetSurfaceSize(PlumeWindow* window, uint32_t width, uint32_t
 void PlumeRenderer::LogSurface(const char* when) {
   auto& s = *state_;
   if (!s.swap) {
-    REXLOG_INFO("Renut: Plume surface ({}): no swapchain", when);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume surface ({}): no swapchain", when);
     return;
   }
   auto* chain = static_cast<VulkanSwapChain*>(s.swap.get());
   auto* device = static_cast<VulkanDevice*>(s.device.get());
   VkSurfaceCapabilitiesKHR caps{};
   const VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device->physicalDevice, chain->surface, &caps);
-  REXLOG_INFO("Renut: Plume surface ({}): window {}x{} format {}; swapchain {}x{}, {} images, present mode {}",
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume surface ({}): window {}x{} format {}; swapchain {}x{}, {} images, present mode {}",
               when, s.window ? ANativeWindow_getWidth(s.window) : -1, s.window ? ANativeWindow_getHeight(s.window) : -1,
               s.window ? ANativeWindow_getFormat(s.window) : -1, s.swap->getWidth(), s.swap->getHeight(),
               s.swap->getTextureCount(), int(chain->createdPresentMode));
   if (result != VK_SUCCESS) {
-    REXLOG_WARN("Renut: Plume surface ({}): vkGetPhysicalDeviceSurfaceCapabilitiesKHR = {}", when, int(result));
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume surface ({}): vkGetPhysicalDeviceSurfaceCapabilitiesKHR = {}", when, int(result));
     return;
   }
   // The extent is the window's own shape (the Mali reports 1920x1200 under "rotate 90" on a
   // tablet held in landscape): the compositor turns the images after when preTransform is identity, and the
   // images are made turned when it is the surface's (renut_plume_present_prerotate, ResizeSwapchain).
-  REXLOG_INFO("Renut: Plume surface ({}): currentExtent {}x{}, extent {}x{}..{}x{}, transform {} "
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume surface ({}): currentExtent {}x{}, extent {}x{}..{}x{}, transform {} "
               "(supported {:#x}), images {}..{}",
               when, caps.currentExtent.width, caps.currentExtent.height, caps.minImageExtent.width, caps.minImageExtent.height, caps.maxImageExtent.width,
               caps.maxImageExtent.height, TransformName(caps.currentTransform), uint32_t(caps.supportedTransforms),
@@ -1384,17 +1373,17 @@ void PlumeRenderer::FollowSurfaceSize() {
     s.size_serial = serial;
     s.presents_since_check = 0;
     if (window != s.window) {
-      REXLOG_INFO("Renut: Plume ignores a size for surface {} (it presents to {})", static_cast<const void*>(window),
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume ignores a size for surface {} (it presents to {})", static_cast<const void*>(window),
                   static_cast<const void*>(s.window));
     } else if (!width || !height) {
-      REXLOG_WARN("Renut: Plume ignores an empty surface size {}x{}", width, height);
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume ignores an empty surface size {}x{}", width, height);
     } else if (width == s.swap->getWidth() && height == s.swap->getHeight() &&
                (!(s.fit || s.prerotate) || (width == s.surface_w && height == s.surface_h))) {
       s.surface_w = width;
       s.surface_h = height;
-      REXLOG_INFO("Renut: Plume swapchain already {}x{}, as the surface (frame {})", width, height, s.frames.load());
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume swapchain already {}x{}, as the surface (frame {})", width, height, s.frames.load());
     } else {
-      REXLOG_WARN("Renut: Plume swapchain is {}x{} but the surface is now {}x{} (frame {}): recreating it",
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume swapchain is {}x{} but the surface is now {}x{} (frame {}): recreating it",
                   s.swap->getWidth(), s.swap->getHeight(), width, height, s.frames.load());
       // Images the presentation engine may still hold go first.
       WaitForAllSlots();
@@ -1403,17 +1392,17 @@ void PlumeRenderer::FollowSurfaceSize() {
       const int32_t window_w = ANativeWindow_getWidth(s.window), window_h = ANativeWindow_getHeight(s.window);
       if (uint32_t(window_w) != width || uint32_t(window_h) != height) {
         const int32_t set = ANativeWindow_setBuffersGeometry(s.window, int32_t(width), int32_t(height), 0);
-        REXLOG_INFO("Renut: Plume window said {}x{}; buffers set to {}x{} (result {}, now {}x{})", window_w, window_h,
+        REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume window said {}x{}; buffers set to {}x{} (result {}, now {}x{})", window_w, window_h,
                     width, height, set, ANativeWindow_getWidth(s.window), ANativeWindow_getHeight(s.window));
       }
       s.surface_w = width;
       s.surface_h = height;
       const bool resized = ResizeSwapchain();
       if (resized && s.swap->getWidth() == width && s.swap->getHeight() == height) {
-        REXLOG_INFO("Renut: Plume swapchain recreated at {}x{} ({} images)", s.swap->getWidth(), s.swap->getHeight(),
+        REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume swapchain recreated at {}x{} ({} images)", s.swap->getWidth(), s.swap->getHeight(),
                     s.swap->getTextureCount());
       } else {
-        REXLOG_ERROR("Renut: Plume swapchain resize to {}x{} {}: it is {}x{}", width, height,
+        REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume swapchain resize to {}x{} {}: it is {}x{}", width, height,
                      resized ? "gave another size" : "FAILED", s.swap->getWidth(), s.swap->getHeight());
       }
       s.blit_rect[0] = -1;
@@ -1436,7 +1425,7 @@ void PlumeRenderer::FollowSurfaceSize() {
   // transform says it. The frames are turned the new way from the next swapchain on (until then the compositor
   // makes up the difference).
   if (s.prerotate && caps.currentTransform != s.surface_transform) {
-    REXLOG_INFO("Renut: Plume surface transform is {} now (the swapchain was made under {}): recreating it",
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume surface transform is {} now (the swapchain was made under {}): recreating it",
                 TransformName(caps.currentTransform), TransformName(s.surface_transform));
     ResizeSwapchain();
     // (whatever was made, this transform has been answered: one try each time it changes)
@@ -1451,7 +1440,7 @@ void PlumeRenderer::FollowSurfaceSize() {
   } else if (caps.currentExtent.width != s.logged_extent_w || caps.currentExtent.height != s.logged_extent_h) {
     s.logged_extent_w = caps.currentExtent.width;
     s.logged_extent_h = caps.currentExtent.height;
-    REXLOG_WARN("Renut: Plume surface extent {}x{} (transform {}) differs from the {}x{} swapchain (frame {})",
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume surface extent {}x{} (transform {}) differs from the {}x{} swapchain (frame {})",
                 caps.currentExtent.width, caps.currentExtent.height, TransformName(caps.currentTransform), sw, sh,
                 s.frames.load());
   }
@@ -1607,10 +1596,10 @@ VkShaderModule TypedVertexModule(VkDevice device, VkShaderModule module, const u
     if (layer.create_shader_module(device, &info, nullptr, &typed) != VK_SUCCESS) typed = VK_NULL_HANDLE;
   }
   if (typed != VK_NULL_HANDLE) {
-    if (++m.made == 1) REXLOG_INFO("Renut: Plume vertex modules are retyped for their integer attributes");
+    if (++m.made == 1) REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume vertex modules are retyped for their integer attributes");
     m.code[ModuleKey(typed)] = std::move(words);
   } else if (++m.refused <= 8) {
-    REXLOG_WARN("Renut: Plume vertex module not retyped for its integer attributes");
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume vertex module not retyped for its integer attributes");
   }
   m.typed.emplace(key, typed);
   return typed;
@@ -1634,11 +1623,11 @@ VkShaderModule PositionedVertexModule(VkDevice device, VkShaderModule module) {
   }
   if (positioned != VK_NULL_HANDLE) {
     if (++m.positioned_made == 1) {
-      REXLOG_INFO("Renut: Plume vertex modules of geometry-shader pipelines hand their position on at location {}",
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume vertex modules of geometry-shader pipelines hand their position on at location {}",
                   spirv::kPositionVaryingLocation);
     }
   } else if (++m.positioned_refused <= 8) {
-    REXLOG_WARN("Renut: Plume vertex module without its position at location {}: its geometry shader reads none",
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume vertex module without its position at location {}: its geometry shader reads none",
                 spirv::kPositionVaryingLocation);
   }
   m.positioned.emplace(ModuleKey(module), positioned);
@@ -1655,7 +1644,7 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateShaderModule(VkDevice device, const Vk
     edited.pCode = per_draw.data();
     edited.codeSize = per_draw.size() * sizeof(uint32_t);
     if (layer.per_draw_rewritten.fetch_add(1) == 0) {
-      REXLOG_INFO("Renut: Plume shader modules are rewritten for a texture set per draw (sets 0 and 1)");
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume shader modules are rewritten for a texture set per draw (sets 0 and 1)");
     }
   }
   if (layer.lower_int64.load(std::memory_order_relaxed) && edited.pCode &&
@@ -1664,10 +1653,10 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateShaderModule(VkDevice device, const Vk
       edited.pCode = lowered.data();
       edited.codeSize = lowered.size() * sizeof(uint32_t);
       if (layer.lowered.fetch_add(1) == 0) {
-        REXLOG_INFO("Renut: Plume shader modules with 64-bit addresses are rewritten for pairs of 32-bit integers");
+        REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume shader modules with 64-bit addresses are rewritten for pairs of 32-bit integers");
       }
     } else if (layer.not_lowered.fetch_add(1) < 8) {
-      REXLOG_WARN("Renut: Plume shader module with 64-bit integers not rewritten ({} words)",
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume shader module with 64-bit integers not rewritten ({} words)",
                   info->codeSize / sizeof(uint32_t));
     }
   }
@@ -1807,17 +1796,17 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, cons
     properties.pNext = &driver;
     vkGetPhysicalDeviceProperties2(physical, &properties);
     layer.cache_tag =
-        driver.driverID == VK_DRIVER_ID_MESA_TURNIP ? std::string() : fmt::format("-drv{}", uint32_t(driver.driverID));
+        driver.driverID == VK_DRIVER_ID_MESA_TURNIP ? std::string() : std::format("-drv{}", uint32_t(driver.driverID));
     {
       std::lock_guard lock(layer.driver_text_mutex);
-      layer.driver_text = fmt::format("{}\n{} {}\nVulkan {}.{}.{}", properties.properties.deviceName, driver.driverName,
+      layer.driver_text = std::format("{}\n{} {}\nVulkan {}.{}.{}", properties.properties.deviceName, driver.driverName,
                                       driver.driverInfo, VK_API_VERSION_MAJOR(properties.properties.apiVersion),
                                       VK_API_VERSION_MINOR(properties.properties.apiVersion),
                                       VK_API_VERSION_PATCH(properties.properties.apiVersion));
     }
     layer.qualcomm.store(driver.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY, std::memory_order_relaxed);
     layer.arm.store(driver.driverID == VK_DRIVER_ID_ARM_PROPRIETARY, std::memory_order_relaxed);
-    REXLOG_INFO("Renut: Plume Vulkan driver {} ({}, {}): scaled vertex formats {}; 64-bit integers in shaders {}",
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume Vulkan driver {} ({}, {}): scaled vertex formats {}; 64-bit integers in shaders {}",
                 uint32_t(driver.driverID), driver.driverName, driver.driverInfo,
                 scaled ? "taken by the device" : "missing, the vertex modules get integer inputs",
                 features.shaderInt64 ? "available" : "missing, addresses become pairs of 32-bit integers");
@@ -2081,7 +2070,7 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateSwapchain(VkDevice device, const VkSwa
                                edited.imageExtent.height != info->imageExtent.height ||
                                edited.preTransform != info->preTransform)) {
     // The driver would not make it as planned: as Plume asked, then, which is what it always made.
-    REXLOG_WARN("Renut: Plume swapchain {}x{} with pre-transform {} refused ({}); made as the window is instead",
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume swapchain {}x{} with pre-transform {} refused ({}); made as the window is instead",
                 edited.imageExtent.width, edited.imageExtent.height, TransformName(edited.preTransform), int(result));
     edited = *info;
     result = layer.create_swapchain(device, &edited, allocator, swapchain);

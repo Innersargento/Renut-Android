@@ -1,13 +1,15 @@
 // The kernel exports reNut replaces (see kernel_overrides.cpp). Each one is
 // defined there as renut_imp_<name>; the build renames the game's calls to it.
 X(VdSwap)
-// The GPU is hosted by the app, not by the SDK's Runtime (plume_gpu.h): the video export
-// that would reach the SDK's graphics system lands in the app's GPU.
-X(VdSetGraphicsInterruptCallback)
-X(XAudioGetVoiceCategoryVolumeChangeMask)
+// The SDK's XAM keeps a reference to the title workspace from before the kernel recreates it at the size the XEX declares.
+X(XamAlloc)
+X(XamAllocEx)
+X(XamFree)
+// The console does not return from unregistering an audio render client while its callback is running.
 X(XAudioRegisterRenderDriverClient)
 X(XAudioUnregisterRenderDriverClient)
-X(XAudioSubmitRenderDriverFrame)
+// The graphics driver of the app (plume_gpu.h) needs the interrupt callback's user data.
+X(VdSetGraphicsInterruptCallback)
 // The player's pause parks a guest thread at its next wait, delay or yield.
 X(KeDelayExecutionThread)
 X(NtYieldExecution)
@@ -18,8 +20,6 @@ X(NtWaitForMultipleObjectsEx)
 X(NtSignalAndWaitForSingleObjectEx)
 // The game's text entry (the Xbox keyboard) goes to the app's text box: text_input_bridge.cpp.
 X(XamShowKeyboardUI)
-// A static KEVENT the title initialises again while a thread waits on it.
-X(KeInitializeEvent)
 // Local multiplayer (xam_users.cpp): a second gamepad is a second signed-in guest user.
 X(XamUserGetXUID)
 X(XamUserGetSigninState)
@@ -39,8 +39,3 @@ X(XamInputGetState)
 X(XamInputGetKeystroke)
 X(XamInputGetKeystrokeEx)
 X(XamUserGetDeviceContext)
-// The thread that signals what the audio worker waits on is the mixer (host_support.h).
-X(KeSetEvent)
-X(KeReleaseSemaphore)
-X(NtSetEvent)
-X(NtReleaseSemaphore)

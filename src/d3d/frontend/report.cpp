@@ -1,5 +1,6 @@
 // The report written to files/native-d3d.txt.
 #include "d3d/frontend/internal.h"
+#include "platform/guest.h"
 
 namespace renut::native_d3d {
 
@@ -18,11 +19,11 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
   if (frame < last_frame + 300) return;
   const double f = double(frame - last_frame);
   auto c = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
-  std::string out = fmt::format(
+  std::string out = std::format(
       "native Direct3D lists - frames {}..{}\n\n== per frame: draws {:.1f}; "
       "problems so far {}\n",
       last_frame, frame, (draws - last_draws) / f, bad);
-  out += fmt::format(
+  out += std::format(
       "== front end (total): draws {}, flushes {}, shader loads {}, patched loads {}, begin vertices {}, "
       "runs {} (unknown {}), recordings {}, recording devices {}, immediate calls on another device {}, publishes {}, "
       "screen extent {}, predicated tiling {}, SetPending_Predicated {}, no scratch {}\n",
@@ -31,7 +32,7 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
       c(g_counts.recordings), c(g_counts.devices), c(g_counts.foreign_immediate), c(g_counts.publishes),
       c(g_counts.screen_extent), c(g_counts.predicated_tiling), c(g_counts.set_pending_predicated),
       c(g_counts.no_scratch));
-  out += fmt::format(
+  out += std::format(
       "== sync (total): {} doorbells ({} with native sync), fences {}, presents {}, callbacks {}, lists {} "
       "published / {} run, stuck waits {}; BeginIndexedVertices {}\n",
       c(g_counts.doorbells), c(g_counts.native_doorbells), c(g_counts.fences), c(g_counts.presents),
@@ -39,7 +40,7 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
       c(g_counts.indexed_up));
   {
     const uint64_t clip = g_foreign_clip.load(std::memory_order_relaxed);
-    out += fmt::format(
+    out += std::format(
         "== other devices' immediate calls: last device {:08X}, doorbells {}, last surface clip "
         "({},{})-({},{}); per frame by function:",
         g_foreign_device.load(), c(g_foreign_doorbells), clip >> 48, (clip >> 32) & 0xFFFF,
@@ -47,12 +48,12 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
     static std::array<uint64_t, renut::d3d::kFunctionCount> last{};
     for (uint32_t i = 0; i < g_foreign.size(); ++i) {
       const uint64_t n = c(g_foreign[i]);
-      if (n != last[i]) out += fmt::format(" {} {:.1f};", kFunctionNames[i], double(n - last[i]) / f);
+      if (n != last[i]) out += std::format(" {} {:.1f};", kFunctionNames[i], double(n - last[i]) / f);
       last[i] = n;
     }
     out += "\n";
   }
-  out += fmt::format("== sync records: {} callback records, {} of {} doorbells without a ring packet, "
+  out += std::format("== sync records: {} callback records, {} of {} doorbells without a ring packet, "
                      "worker runs {}\n",
                      c(g_counts.effect_records), c(g_counts.doorbells_skipped), c(g_counts.doorbells),
                      c(g_counts.worker_runs));
@@ -63,7 +64,7 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
     for (uint32_t i = 0; i < renut::d3d::kFunctionCount; ++i) {
       uint64_t taken = 0, original = 0;
       renut::d3d::CallCounts(renut::d3d::Function(i), taken, original);
-      if (taken || original) out += fmt::format(" {} {}/{};", kFunctionNames[i], taken, original);
+      if (taken || original) out += std::format(" {} {}/{};", kFunctionNames[i], taken, original);
     }
     out += '\n';
   }
@@ -86,7 +87,7 @@ void NativeReport(uint64_t frame, uint64_t draws, uint64_t bad,
 bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height) {
   std::lock_guard lock(g_front.mutex);
   if (!g_front.sync_recording || !g_front.main_device) return false;
-  uint8_t* base = rex::system::kernel_memory() ? rex::system::kernel_memory()->virtual_membase() : nullptr;
+  uint8_t* base = renut::host::VirtualBase();
   if (!base) return false;
   const uint32_t dev = g_front.main_device, block = U32(base, dev + 10896);
   if (!block) return false;
@@ -98,7 +99,7 @@ bool RecordPresent(uint32_t frontbuffer, uint32_t width, uint32_t height) {
   const bool stamped = next - U32(base, dev + 21624) < 6;
   List& list = *g_front.immediate;
   list.words.push_back(kOpPresent);
-  list.words.push_back(frontbuffer);
+  list.words.push_back(Phys(frontbuffer));
   list.words.push_back(width);
   list.words.push_back(height);
   list.words.push_back(stamped ? Phys(block + (16 + (next & 7)) * 4) : 0);

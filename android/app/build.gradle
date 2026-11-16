@@ -17,10 +17,15 @@ android {
         ndk { abiFilters 'arm64-v8a' }
         externalNativeBuild { cmake {
             arguments '-DANDROID_STL=c++_shared', '-DCMAKE_JOB_POOLS=compile_pool=4', '-DCMAKE_JOB_POOL_COMPILE=compile_pool'
+            // Only what the app loads: the runtime (which pulls in the SDK modules it links) and the
+            // libadrenotools hooks it dlopens. The SDK's CMake always adds its SDL3 driver modules
+            // (rexapu-sdl3, rexhid-sdl3, rexui-sdl3) and with them SDL3, which the app never selects
+            // (its drivers are android, aaudio and touch), so they are left unbuilt and out of the APK.
+            targets 'renut_runtime', 'hook_impl', 'main_hook', 'file_redirect_hook', 'gsl_alloc_hook'
         } }
     }
     externalNativeBuild {
-        cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' }
+        cmake { path 'src/main/cpp/CMakeLists.txt' }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -28,7 +33,6 @@ android {
     }
     kotlinOptions { jvmTarget = '17' }
     buildFeatures { compose true }
-    sourceSets.main.java.srcDir '../../thirdparty/rexglue-sdk/thirdparty/sdl3/android-project/app/src/main/java'
     packaging { jniLibs { useLegacyPackaging true } }
     // The release key is read from android/keystore.properties (not in Git: storeFile, storePassword,
     // keyAlias, keyPassword). Without that file the release APK comes out unsigned.

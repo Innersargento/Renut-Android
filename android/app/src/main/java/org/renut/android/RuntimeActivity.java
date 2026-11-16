@@ -571,7 +571,8 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             try {
                 RecipeSeed.sync(this);  // before the renderer reads the recipe lists
                 LogStorage.prepareLaunch(this);  // the configuration kept in Documents, and where the log goes
-                System.loadLibrary("SDL3");org.libsdl.app.SDL.setupJNI();org.libsdl.app.SDL.initialize();org.libsdl.app.SDL.setContext(this);
+                // First native library of the process: the SDK's allocator (installed by librenut_runtime) must reach libc++_shared,
+                // which only happens when libc++_shared is loaded as a dependency of it.
                 System.loadLibrary("renut_runtime");loaded=true;
                 pushSurfaceSize("library loaded");
                 runOnUiThread(this::syncSecondPlayer);  // a second pad that was already plugged in

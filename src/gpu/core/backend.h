@@ -1,6 +1,8 @@
 #pragma once
 // The GPU backend: the lists of d3d/frontend/, executed on Plume. It owns the subsystems.
 #include "gpu/draw/pipelines.h"
+#include "platform/guest.h"
+#include "guest/host_support.h"
 #include "gpu/draw/streams.h"
 #include "gpu/targets/targets.h"
 #include "gpu/targets/textures.h"
@@ -17,9 +19,9 @@ namespace renut::gpu {
 
 class GpuBackend final {
  public:
-  GpuBackend(rex::memory::Memory* memory, rex::system::KernelState* kernel);
-  // Starts the worker ("GPU Commands"): SetupContext runs on it, then the loop.
-  bool Initialize();
+  GpuBackend();
+  // Starts the worker ("GPU Commands", a host thread of the kernel): SetupContext runs on it, then the loop.
+  bool Initialize(rex::IGuestInterrupts& interrupts);
   void Shutdown();
   // Wakes the worker: a list was published.
   void Wake();
@@ -29,8 +31,6 @@ class GpuBackend final {
   DrawState& state() { return state_; }
   Shader* active_vertex_shader() const;
   Shader* active_pixel_shader() const;
-  rex::memory::Memory* memory_ = nullptr;
-  rex::system::KernelState* kernel_state_ = nullptr;
   // Calls a guest callback (function, context) as the CPU it names: a callback record of a list.
   std::function<void(uint32_t, uint32_t, uint32_t)> dispatch_callback_;
   // Brings the vertical blank's clock up to date (host.cpp TickVblank): called before a present or a
@@ -39,9 +39,27 @@ class GpuBackend final {
   // The state the lists write and the draws read (gpu/core/draw_state.h).
   DrawState state_;
   std::atomic<bool> worker_running_;
-  rex::system::object_ref<rex::system::XHostThread> worker_thread_;
+  rex::ScopeGuard worker_thread_;
   uint32_t counter_ = 0;
-  std::unique_ptr<rex::thread::Event> wake_;
+  // An event that wakes the worker once: Set, and WaitFor takes it.
+  class WakeEvent {
+   public:
+    void Set() {
+      { std::lock_guard lock(mutex_); set_ = true; }
+      condition_.notify_one();
+    }
+    bool WaitFor(std::chrono::milliseconds timeout) {
+      std::unique_lock lock(mutex_);
+      const bool woke = condition_.wait_for(lock, timeout, [this] { return set_; });
+      set_ = false;
+      return woke;
+    }
+   private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool set_ = false;
+  };
+  WakeEvent wake_;
   bool SetupContext();
   void ShutdownContext();
   // The GPU backend's work loop. The SDK runs its own on the worker
@@ -85,7 +103,19 @@ class GpuBackend final {
     while (level * 2 <= uint32_t(std::clamp(option, 1, 16))) level *= 2;
     return level;
   }
-  void* watch_handle_ = nullptr;
+  // Hears of the guest's writes to the physical memory the streams and textures were made from.
+  class WriteListener final : public rex::IPhysicalWriteListener {
+   public:
+    explicit WriteListener(Streams& streams) : streams_(streams) {}
+    rex::PhysicalRange OnPhysicalWrite(rex::PhysicalRange range, bool exact) override {
+      const auto kept = Streams::WatchHitThunk(&streams_, range.address, range.length, exact);
+      return {kept.first, kept.second};
+    }
+   private:
+    Streams& streams_;
+  };
+  WriteListener write_listener_{streams};
+  rex::ScopeGuard watch_handle_;
   RenderDevice* device_ = nullptr;
   RenderCommandQueue* queue_ = nullptr;
   std::string miss_dump_directory_;
@@ -170,39 +200,34 @@ class GpuBackend final {
 };
 
 
-inline GpuBackend::GpuBackend(rex::memory::Memory* memory, rex::system::KernelState* kernel)
-      : memory_(memory),
-        kernel_state_(kernel),
-        worker_running_(true),
-        wake_(rex::thread::Event::CreateAutoResetEvent(false)) {}
+inline GpuBackend::GpuBackend() : worker_running_(true) {}
 
-inline bool GpuBackend::Initialize() {
+inline bool GpuBackend::Initialize(rex::IGuestInterrupts& interrupts) {
     worker_running_ = true;
-    worker_thread_ = rex::system::object_ref<rex::system::XHostThread>(
-        new rex::system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
-          if (!SetupContext()) {
-            rex::FatalError("Unable to setup GPU backend internal state");
-            return 0;
-          }
-          RunWorkerLoop();
-          ShutdownContext();
-          return 0;
-        }));
-    worker_thread_->set_name("GPU Commands");
-    worker_thread_->Create();
+    auto started = interrupts.StartHostThread("GPU Commands", [this](std::stop_token) {
+      renut::MarkHostThread();
+      if (!SetupContext()) {
+        REXLOG_CAT_ERROR(rex::log::renut, "Unable to setup GPU backend internal state");
+        std::abort();
+      }
+      RunWorkerLoop();
+      ShutdownContext();
+    });
+    if (!started) {
+      REXLOG_CAT_ERROR(rex::log::renut, "GPU Commands thread: {}", started.error().message);
+      return false;
+    }
+    worker_thread_ = std::move(*started);
     return true;
   }
 
 inline void GpuBackend::Shutdown() {
     worker_running_ = false;
-    wake_->Set();
-    if (worker_thread_) {
-      worker_thread_->Wait(0, 0, 0, nullptr);
-      worker_thread_.reset();
-    }
+    wake_.Set();
+    worker_thread_.Reset();  // asks the thread to stop and waits for it
   }
 
-inline void GpuBackend::Wake() { wake_->Set(); }
+inline void GpuBackend::Wake() { wake_.Set(); }
 
 inline uint32_t GpuBackend::counter() const { return counter_; }
 
@@ -244,7 +269,7 @@ inline void Lists::StoreConstants(uint32_t first, const uint32_t* values, uint32
 
 inline void Lists::StoreBig(uint32_t physical, uint32_t value) {
     const uint32_t big = __builtin_bswap32(value);
-    std::memcpy(backend.memory_->TranslatePhysical<uint8_t*>(physical), &big, 4);
+    std::memcpy(renut::host::Physical<uint8_t*>(physical), &big, 4);
   }
 
 inline bool GpuBackend::NativeWorkPending() { return native_d3d::WorkPending(); }
@@ -268,9 +293,10 @@ inline void Streams::IndexBlocks(std::unordered_multimap<uint32_t, uint64_t>& in
   }
 
 inline template <typename... Args>
-  void Draw::Trace(fmt::format_string<Args...> format, Args&&... args) {
+  void Draw::Trace(std::format_string<Args...> format, Args&&... args) {
     if (trace_) {
-      fmt::print(trace_, format, std::forward<Args>(args)...);
+      const std::string line = std::format(format, std::forward<Args>(args)...);
+      std::fwrite(line.data(), 1, line.size(), trace_);
       std::fputc(10, trace_);
     }
   }

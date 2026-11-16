@@ -8,23 +8,20 @@
 // The last two hold the game at 30 FPS while they run (plume/frame_pacing.h, SetHold).
 
 #include "guest_address.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 
-#include <rex/cvar.h>
-#include <rex/hook.h>
-#include <rex/logging.h>
+#include <rex/ppc/hook.h>
 #include <rex/ppc/context.h>
-#include <rex/ppc/func.h>
+#include <rex/ppc/recompiled_code.h>
 
 #include "plume/frame_pacing.h"
 
-REXCVAR_DEFINE_BOOL(renut_physics_whole_steps, true, "reNut",
-                    "Advance physics by whole 1/60 s steps each frame, carrying the remainder, as the console's "
-                    "30 fps did. Off: the game's own stepping, which flings Banjo about on ledges, tightropes "
-                    "and ladders at 60 fps. At 30 fps both are the same.");
+
 
 namespace {
 
@@ -34,7 +31,7 @@ uint32_t Load32(const uint8_t* base, uint32_t address) {
 
 void Hold(uint32_t reason, const char* what, bool on) {
   if (renut::pacing::SetHold(reason, on))
-    REXLOG_INFO("Renut: {} {} the game at 30 fps (target {})", what, on ? "holds" : "releases",
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: {} {} the game at 30 fps (target {})", what, on ? "holds" : "releases",
                 renut::pacing::UserTarget());
 }
 
@@ -63,7 +60,7 @@ extern "C" void __imp__sub_8227D3B8(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(sub_8227D3B8) {
   const uint32_t game = ctx.r3.u32;
   const bool due = Load32(base, game + kPhysicsWorldOffset) && Load32(base, game + kPhysicsDueOffset);
-  if (!due || !REXCVAR_GET(renut_physics_whole_steps)) {
+  if (!due || !renut::GetSettings().physics_whole_steps.Get()) {
     __imp__sub_8227D3B8(ctx, base);
     return;
   }

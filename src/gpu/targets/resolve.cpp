@@ -1,5 +1,7 @@
 // Resolves and depth copies.
 #include "gpu/core/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
 
 namespace renut::gpu {
 
@@ -11,7 +13,7 @@ bool Resolve::DecodeResolve(const uint32_t* w, ResolveCopy& out) {
   bits::RB_COPY_CONTROL control;
   control.value = w[5];
   if (control.copy_command != xenos::CopyCommand::kRaw && control.copy_command != xenos::CopyCommand::kConvert) {
-    REXLOG_INFO("Renut: Plume resolve with copy command {} dropped", uint32_t(control.copy_command));
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume resolve with copy command {} dropped", uint32_t(control.copy_command));
     return false;
   }
   bits::RB_COPY_DEST_INFO dest_info;
@@ -21,7 +23,7 @@ bool Resolve::DecodeResolve(const uint32_t* w, ResolveCopy& out) {
   // surface's own format.
   // (the depth surface's format is bit 16 of its info word: 0 D24S8, 1 D24FS8)
   const auto depth_format = xenos::DepthRenderTargetFormat((backend.targets.native_surfaces_[4].info >> 16) & 1);
-  out.dest_format = uint32_t(is_depth ? rex::graphics::DepthRenderTargetToTextureFormat(depth_format)
+  out.dest_format = uint32_t(is_depth ? rex::xenos::DepthRenderTargetToTextureFormat(depth_format)
                                       : xenos::TextureFormat(dest_info.copy_dest_format));
   out.depth = is_depth;
   out.clear_depth = control.depth_clear_enable != 0;
@@ -84,12 +86,12 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
   // copy is not made (the clears below still are). Counted by the surface report.
   if (!surfaces.object_base && volume_logged_ < 4) {
     ++volume_logged_;
-    REXLOG_INFO("Renut: Plume resolve into a volume's slice not copied ({}x{})", width, height);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume resolve into a volume's slice not copied ({}x{})", width, height);
   }
   if (source && surfaces.object_base && x < source->width && y < source->height) {
     uint32_t sx = x, sy = y;
     uint32_t w = std::min(width, source->width - x), h = std::min(copy_height, source->height - y);
-    const auto* dest_info = rex::graphics::FormatInfo::Get(xenos::TextureFormat(copy.dest_format));
+    const auto* dest_info = rex::xenos::FormatInfo::Get(xenos::TextureFormat(copy.dest_format));
     const uint32_t dest_bpp = dest_info ? std::max(1u, dest_info->bits_per_pixel / 8) : 4;
     // Depth resolves become R32_FLOAT textures holding the depth, which is what
     // a k_24_8 / k_24_8_FLOAT fetch returns in x (shadow maps, and the scene
@@ -204,7 +206,7 @@ bool Resolve::ExecuteResolve(const ResolveCopy& copy, const ResolveSurfaces& sur
             ResolveDepthStencil(*source, sx, sy, w, h, dest.texture.get(), dest.layout, dest_x, dest_y))) {
         if (multisampled) {
           if (++backend.stats_.msaa_depth_skipped <= 4) {
-            REXLOG_WARN("Renut: Plume multisampled depth resolve not made (stencil {}, pipeline {})", packed,
+            REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume multisampled depth resolve not made (stencil {}, pipeline {})", packed,
                         backend.patches.dres_ms_pipeline_ != VK_NULL_HANDLE);
           }
         } else {
@@ -316,7 +318,7 @@ void Resolve::NativePhoto(const uint32_t* w) {
   const bool rgba8 = source->format == RenderFormat::R8G8B8A8_UNORM;
   const bool half = source->format == RenderFormat::R16G16B16A16_FLOAT;
   if (!rgba8 && !half) {
-    REXLOG_INFO("Renut: Plume photo capture skipped: host format {}", uint32_t(source->format));
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume photo capture skipped: host format {}", uint32_t(source->format));
     return;
   }
   const uint32_t scale = source->scale;
@@ -348,7 +350,7 @@ void Resolve::NativePhoto(const uint32_t* w) {
   backend.targets.Flush();
   const auto* pixels = static_cast<const uint8_t*>(buffer->map());
   if (!pixels) return;
-  uint8_t* guest = backend.memory_->TranslatePhysical<uint8_t*>(address);
+  uint8_t* guest = renut::host::Physical<uint8_t*>(address);
   auto to8 = [](uint16_t bits) -> uint8_t {
     const uint32_t exp = (bits >> 10) & 0x1F, mant = bits & 0x3FF;
     if (bits & 0x8000) return 0;
@@ -397,7 +399,7 @@ void Resolve::NativePhoto(const uint32_t* w) {
     }
   }
   ++photo_captures_;
-  REXLOG_INFO("Renut: Plume photo capture {}: {}x{} guest texels into {:08X}, pitch {}, from a {}x{} {} target at scale {}",
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume photo capture {}: {}x{} guest texels into {:08X}, pitch {}, from a {}x{} {} target at scale {}",
               photo_captures_, guest_w, guest_h, address, pitch, host_w, host_h, rgba8 ? "8888" : "16f", scale);
 }
 
@@ -419,7 +421,7 @@ bool Resolve::CopyDepth(Target& source, uint32_t x, uint32_t y, uint32_t w, uint
     stencil_staging_ = backend.device_->createBuffer(RenderBufferDesc::DefaultBuffer(kStagingSize / 4, flags));
     packed_staging_ = backend.device_->createBuffer(RenderBufferDesc::DefaultBuffer(kStagingSize * 2, flags));
     if (!stencil_staging_ || !packed_staging_ || !backend.patches.CreatePackPipeline()) {
-      REXLOG_WARN("Renut: Plume cannot keep the stencil of depth resolves");
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume cannot keep the stencil of depth resolves");
       stencil_staging_.reset();
       packed_staging_.reset();
     }
@@ -591,9 +593,9 @@ void Resolve::FlushImagesForNextFrame() {
 
 void Resolve::LogSkinned() {
   std::lock_guard<std::mutex> lock(backend.swap.skinned_mutex_);
-  REXLOG_ERROR("Renut: Plume skinned vertex shaders seen: {}", skinned_seen_.size());
+  REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume skinned vertex shaders seen: {}", skinned_seen_.size());
   for (const auto& [hash, seen] : skinned_seen_) {
-    REXLOG_ERROR("Renut: Plume   skinned vs={:016X} draws={} frames {}..{}", hash, seen.draws, seen.first_frame,
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume   skinned vs={:016X} draws={} frames {}..{}", hash, seen.draws, seen.first_frame,
                  seen.last_frame);
   }
 }
@@ -602,7 +604,7 @@ void Resolve::ValidateRange(const char* what, uint64_t draw_hash, RenderBuffer* 
                                           uint32_t guest_address, uint32_t size, xenos::Endian endian) {
   if (!buffer || buffer == backend.draw.upload_.get() || !size) return;
   std::vector<uint8_t> guest(size);
-  CopySwapped(guest.data(), backend.memory_->TranslatePhysical<const uint8_t*>(guest_address), size, endian);
+  CopySwapped(guest.data(), renut::host::Physical<const uint8_t*>(guest_address), size, endian);
   const auto* window = static_cast<const uint8_t*>(buffer->map());
   if (!window) return;
   uint32_t differ = 0, first = UINT32_MAX;
@@ -623,7 +625,7 @@ void Resolve::ValidateRange(const char* what, uint64_t draw_hash, RenderBuffer* 
   ++validate_stale_;
   if (validate_logged_ < 120) {
     ++validate_logged_;
-    REXLOG_ERROR("Renut: Plume STALE {} at draw: frame {} vs/ps hash {:016X} guest {:08X}+{:X}: {} bytes differ, first at +{:X}",
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: Plume STALE {} at draw: frame {} vs/ps hash {:016X} guest {:08X}+{:X}: {} bytes differ, first at +{:X}",
                  what, backend.swaps_, draw_hash, guest_address, size, differ, first);
   }
 }

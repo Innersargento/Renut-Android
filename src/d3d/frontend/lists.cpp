@@ -1,5 +1,7 @@
 // The recording lists, publishing and scratch guest memory.
 #include "d3d/frontend/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
 
 namespace renut::native_d3d {
 
@@ -59,11 +61,9 @@ void Publish() {
 
 uint32_t ScratchAlloc(uint32_t bytes) {
   std::call_once(g_scratch.made, [] {
-    auto* memory = rex::system::kernel_memory();
-    g_scratch.base =
-        memory ? memory->SystemHeapAlloc(g_scratch.size, 4096, rex::memory::kSystemHeapPhysical) : 0;
+    g_scratch.base = renut::host::SystemAlloc(g_scratch.size, 4096, true);
     if (g_scratch.base) {
-      REXLOG_INFO("Renut: native Direct3D scratch {:08X} ({} MB)", g_scratch.base, g_scratch.size >> 20);
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: native Direct3D scratch {:08X} ({} MB)", g_scratch.base, g_scratch.size >> 20);
     }
   });
   if (!g_scratch.base) {
@@ -82,7 +82,7 @@ uint32_t ScratchAlloc(uint32_t bytes) {
 uint32_t ProgramSlot() {
   thread_local uint32_t slot = 0;
   if (!slot) {
-    if (auto* memory = rex::system::kernel_memory()) slot = memory->SystemHeapAlloc(16, 16);
+    slot = renut::host::SystemAlloc(16, 16);
   }
   return slot;
 }

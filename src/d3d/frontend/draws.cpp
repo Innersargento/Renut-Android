@@ -1,5 +1,6 @@
 // Draws, clears and resolves.
 #include "d3d/frontend/internal.h"
+#include "platform/guest.h"
 #include "d3d/resources/resource.h"
 
 #include <dlfcn.h>
@@ -355,7 +356,7 @@ uint32_t ResolveScratch() {
   // One block a thread: two threads resolving at once must not share the lookup's outputs.
   thread_local uint32_t block = 0;
   if (!block) {
-    if (auto* memory = rex::system::kernel_memory()) block = memory->SystemHeapAlloc(256, 16);
+    block = renut::host::SystemAlloc(256, 16);
   }
   return block;
 }

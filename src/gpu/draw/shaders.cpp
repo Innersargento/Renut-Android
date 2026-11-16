@@ -1,5 +1,6 @@
 // Register writes, shader lookup and pipeline statistics.
 #include "gpu/core/internal.h"
+#include "platform/log.h"
 
 namespace renut::gpu {
 
@@ -93,7 +94,7 @@ HostShader* Shaders::FindOrMakeShader(xenos::ShaderType shader_type, uint64_t ha
         if (logged < 16) {
           ++logged;
           const ShaderCacheEntry* by_key = backend.pipelines.store_->Find(shader->ucode_key, shader->loose_key);
-          REXLOG_INFO("Renut: Plume {} shader of container {:016X} is not the container's own microcode, found by key: "
+          REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume {} shader of container {:016X} is not the container's own microcode, found by key: "
                       "{} dwords, key {:016X}, loose key {:016X}, the keys find container {:016X}",
                       shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", container, dword_count,
                       shader->ucode_key, shader->loose_key, by_key ? by_key->hash : 0);
@@ -103,10 +104,10 @@ HostShader* Shaders::FindOrMakeShader(xenos::ShaderType shader_type, uint64_t ha
     if (!shader->entry) shader->entry = backend.pipelines.store_->Find(shader->ucode_key, shader->loose_key);
     if (shader->entry) shader->entry_hash = shader->entry->hash;
     if (!shader->entry && missed_.insert(hash).second && missed_.size() <= 32) {
-      REXLOG_WARN("Renut: Plume has no recompiled {} shader for microcode {:016X} ({} dwords)",
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume has no recompiled {} shader for microcode {:016X} ({} dwords)",
                   shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash, dword_count);
       if (!backend.miss_dump_directory_.empty()) {
-        auto path = fmt::format("{}/{}_{:016X}.ucode", backend.miss_dump_directory_,
+        auto path = std::format("{}/{}_{:016X}.ucode", backend.miss_dump_directory_,
                                 shader_type == xenos::ShaderType::kVertex ? "vs" : "ps", hash);
         if (FILE* file = std::fopen(path.c_str(), "wb")) {
           std::fwrite(host_address, 4, dword_count, file);

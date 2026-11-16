@@ -7,6 +7,7 @@
 // and the present record (VdSwap, RecordPresent) carries the frame. What stays is the device's
 // swap state, the history slots, the scaler and the calls into the kernel's video code.
 #include "d3d/scene/swap.h"
+#include "platform/log.h"
 
 #include <array>
 #include <chrono>
@@ -18,11 +19,8 @@
 #include "d3d/device/guest_frame.h"
 #include "d3d/device/retail.h"
 #include "guest/host_support.h"
+#include "platform/guest.h"
 
-#include <rex/cvar.h>
-#include <rex/kernel/xboxkrnl/video.h>
-#include <rex/logging.h>
-#include <rex/system/xvideo.h>
 #include <rex/ppc/context.h>
 
 extern "C" {
@@ -175,11 +173,10 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
     // The original sets the display mode (VdSetDisplayMode, which the kernel here answers with 0 and
     // does nothing) and asks what the display is (VdGetCurrentDisplayInformation, whose width, height
     // and actual width are the configured video mode's: the swap takes those three).
-    rex::system::X_VIDEO_MODE mode;
-    rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
-    d.SetW(0x5428, u16(mode.display_width));
-    d.SetW(0x542C, u16(mode.display_height));
-    d.SetW(0x5430, u16(mode.display_width));
+    const rex::VideoMode mode = renut::host::GetVideoMode();
+    d.SetW(0x5428, u16(mode.width));
+    d.SetW(0x542C, u16(mode.height));
+    d.SetW(0x5430, u16(mode.width));
     f.Kick(dev);
   }
 
@@ -272,7 +269,7 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
         last_presented = d.W(0x40B8);
         last_progress = now;
       } else if (now - last_progress > std::chrono::milliseconds(1500) && renut::native_d3d::ExecutorIdle()) {
-        REXLOG_WARN("Renut: native swap: {} swaps ahead of the presented ones with every list run; going on",
+        REXLOG_CAT_WARN(rex::log::renut, "Renut: native swap: {} swaps ahead of the presented ones with every list run; going on",
                     d.W(0x40B0) - d.W(0x40B8));
         break;
       }

@@ -5,13 +5,19 @@
 #include <cstring>
 #include <unordered_map>
 
-#include <rex/graphics/format/ucode.h>
-#include <rex/graphics/xenos.h>
+#include <rex/xenos/ucode.h>
+#include <rex/xenos/fetch.h>
+#include <rex/xenos/format.h>
+#include <rex/xenos/packet.h>
+#include <rex/xenos/register.h>
+#include <rex/xenos/state.h>
+#include <rex/xenos/texture.h>
+#include <rex/xenos/ucode.h>
 
 namespace renut::hiz {
 
-namespace ucode = rex::graphics::ucode;
-namespace xenos = rex::graphics::xenos;
+namespace ucode = rex::xenos::ucode;
+namespace xenos = rex::xenos;
 
 namespace {
 
@@ -295,21 +301,21 @@ class Executor {
 
   // Source operand i (1..3) as four components, swizzled, negated, absolute.
   void Source(const ucode::AluInstruction& alu, uint32_t i, Val out[4]) {
-    const uint32_t reg = alu.src_reg(i);
-    const uint32_t swizzle = alu.src_swizzle(i);
-    const bool negate = alu.src_negate(i);
+    const uint32_t reg = alu.GetSrcReg(i);
+    const uint32_t swizzle = alu.GetSrcSwizzle(i);
+    const bool negate = alu.IsSrcNegated(i);
     Val base[4];
     bool absolute = false;
-    if (alu.src_is_temp(i)) {
-      const uint32_t index = ucode::AluInstruction::src_temp_reg(reg);
-      absolute = ucode::AluInstruction::is_src_temp_value_absolute(reg);
-      if (ucode::AluInstruction::is_src_temp_relative(reg) || index >= 128) {
+    if (alu.IsSrcTemp(i)) {
+      const uint32_t index = ucode::AluInstruction::GetSrcTempReg(reg);
+      absolute = ucode::AluInstruction::IsSrcTempValueAbsolute(reg);
+      if (ucode::AluInstruction::IsSrcTempRelative(reg) || index >= 128) {
         for (auto& v : base) v = Taint(kRel);
       } else {
         for (int c = 0; c < 4; ++c) base[c] = temps_[index][c];
       }
-    } else if (alu.src_const_is_addressed(i)) {
-      for (int c = 0; c < 4; ++c) base[c] = AddressedConst(alu.is_const_address_register_relative(), reg, c);
+    } else if (alu.IsSrcConstAddressed(i)) {
+      for (int c = 0; c < 4; ++c) base[c] = AddressedConst(alu.IsConstAddressRegisterRelative(), reg, c);
     } else {
       for (int c = 0; c < 4; ++c) base[c] = ConstVal(builder.Const((reg & 0xFF) * 4 + c));
     }
@@ -322,21 +328,21 @@ class Executor {
   }
 
   void ExecAlu(const ucode::AluInstruction& alu) {
-    if (alu.is_predicated()) {
+    if (alu.IsPredicated()) {
       if (!pred_known_) {
         fail_ = true;
         fail_why_ = Why::kPredicate;
         return;
       }
-      if (alu.predicate_condition() != pred_value_) return;
+      if (alu.GetPredicateCondition() != pred_value_) return;
     }
     // Vector operation.
     Val vr[4] = {Taint(kNonlin), Taint(kNonlin), Taint(kNonlin), Taint(kNonlin)};
-    const ucode::AluVectorOpcode vop = alu.vector_opcode();
+    const ucode::AluVectorOpcode vop = alu.GetVectorOpcode();
     Val a[4], b[4], c[4];
     {
       // Operands the opcode reads.
-      const ucode::AluVectorOpcodeInfo& info = ucode::GetAluVectorOpcodeInfo(vop);
+      const ucode::AluVectorOpcodeTraits& info = ucode::GetAluVectorOpcodeTraits(vop);
       Val* operands[3] = {a, b, c};
       for (uint32_t o = 0; o < 3; ++o) {
         if (info.operand_components_used[o]) Source(alu, o + 1, operands[o]);
@@ -399,30 +405,30 @@ class Executor {
         for (auto& v : vr) v = Taint(from_operands());
         break;
     }
-    if (alu.vector_clamp()) {
+    if (alu.IsVectorClamped()) {
       for (auto& v : vr) v = Taint(uint8_t(v.src | kNonlin));
     }
 
     // Scalar operation (sees the registers as they were before this
     // instruction's vector write).
-    const ucode::AluScalarOpcode sop = alu.scalar_opcode();
-    const ucode::AluScalarOpcodeInfo& info = ucode::GetAluScalarOpcodeInfo(sop);
+    const ucode::AluScalarOpcode sop = alu.GetScalarOpcode();
+    const ucode::AluScalarOpcodeTraits& info = ucode::GetAluScalarOpcodeTraits(sop);
     Val so[2] = {Taint(kNonlin), Taint(kNonlin)};
     if (info.operand_count == 1) {
-      const uint32_t reg = alu.src_reg(3);
-      const uint32_t swizzle = alu.src_swizzle(3);
+      const uint32_t reg = alu.GetSrcReg(3);
+      const uint32_t swizzle = alu.GetSrcSwizzle(3);
       Val base[4];
       bool absolute = false;
-      if (alu.src_is_temp(3)) {
-        const uint32_t index = ucode::AluInstruction::src_temp_reg(reg);
-        absolute = ucode::AluInstruction::is_src_temp_value_absolute(reg);
-        if (ucode::AluInstruction::is_src_temp_relative(reg) || index >= 128) {
+      if (alu.IsSrcTemp(3)) {
+        const uint32_t index = ucode::AluInstruction::GetSrcTempReg(reg);
+        absolute = ucode::AluInstruction::IsSrcTempValueAbsolute(reg);
+        if (ucode::AluInstruction::IsSrcTempRelative(reg) || index >= 128) {
           for (auto& v : base) v = Taint(kRel);
         } else {
           for (int k = 0; k < 4; ++k) base[k] = temps_[index][k];
         }
-      } else if (alu.src_const_is_addressed(3)) {
-        for (int k = 0; k < 4; ++k) base[k] = AddressedConst(alu.is_const_address_register_relative(), reg, k);
+      } else if (alu.IsSrcConstAddressed(3)) {
+        for (int k = 0; k < 4; ++k) base[k] = AddressedConst(alu.IsConstAddressRegisterRelative(), reg, k);
       } else {
         for (int k = 0; k < 4; ++k) base[k] = ConstVal(builder.Const((reg & 0xFF) * 4 + k));
       }
@@ -430,23 +436,23 @@ class Executor {
       for (uint32_t i = 0; i < count; ++i) {
         Val v = base[ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, (3 + i) & 3)];
         if (absolute) v = VAbs(v);
-        if (alu.src_negate(3)) v = VNeg(v);
+        if (alu.IsSrcNegated(3)) v = VNeg(v);
         so[i] = v;
       }
     } else if (info.operand_count == 2) {
-      const uint32_t swizzle = alu.src_swizzle(3);
+      const uint32_t swizzle = alu.GetSrcSwizzle(3);
       Val k;
-      if (alu.src_const_is_addressed(3)) {
-        k = AddressedConst(alu.is_const_address_register_relative(), alu.src_reg(3),
+      if (alu.IsSrcConstAddressed(3)) {
+        k = AddressedConst(alu.IsConstAddressRegisterRelative(), alu.GetSrcReg(3),
                            ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, 3));
       } else {
-        k = ConstVal(builder.Const((alu.src_reg(3) & 0xFF) * 4 +
+        k = ConstVal(builder.Const((alu.GetSrcReg(3) & 0xFF) * 4 +
                                    ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, 3)));
       }
-      const uint32_t temp = alu.scalar_const_reg_op_src_temp_reg();
+      const uint32_t temp = alu.GetScalarConstRegOpSrcTempReg();
       Val r = temp < 128 ? temps_[temp][ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, 0)]
                          : Taint(kNonlin);
-      if (alu.src_negate(3)) {
+      if (alu.IsSrcNegated(3)) {
         k = VNeg(k);
         r = VNeg(r);
       }
@@ -493,12 +499,12 @@ class Executor {
       default: prev_ = Taint(uint8_t(so[0].src | so[1].src | kNonlin)); break;
     }
     Val scalar = prev_;
-    if (alu.scalar_clamp()) scalar = Taint(uint8_t(scalar.src | kNonlin));
+    if (alu.IsScalarClamped()) scalar = Taint(uint8_t(scalar.src | kNonlin));
 
     const uint32_t vmask = alu.GetVectorOpResultWriteMask();
     const uint32_t smask = alu.GetScalarOpResultWriteMask();
-    if (alu.is_export()) {
-      if (alu.vector_dest() == uint32_t(ucode::ExportRegister::kVSPosition)) {
+    if (alu.IsExport()) {
+      if (alu.GetVectorDest() == uint32_t(ucode::ExportRegister::kVSPosition)) {
         const uint32_t c1 = alu.GetConstant1WriteMask();
         const uint32_t all = vmask | smask | alu.GetConstant0WriteMask() | c1;
         for (int i = 0; i < 4; ++i) {
@@ -514,33 +520,33 @@ class Executor {
       return;
     }
     if (vmask) {
-      if (alu.is_vector_dest_relative() || alu.vector_dest() >= 128) {
+      if (alu.IsVectorDestRelative() || alu.GetVectorDest() >= 128) {
         fail_ = true;
         return;
       }
       for (int i = 0; i < 4; ++i)
-        if (vmask & (1u << i)) temps_[alu.vector_dest()][i] = vr[i];
+        if (vmask & (1u << i)) temps_[alu.GetVectorDest()][i] = vr[i];
     }
     if (smask) {
-      if (alu.is_scalar_dest_relative() || alu.scalar_dest() >= 128) {
+      if (alu.IsScalarDestRelative() || alu.GetScalarDest() >= 128) {
         fail_ = true;
         return;
       }
       for (int i = 0; i < 4; ++i)
-        if (smask & (1u << i)) temps_[alu.scalar_dest()][i] = scalar;
+        if (smask & (1u << i)) temps_[alu.GetScalarDest()][i] = scalar;
     }
   }
 
   void ExecVertexFetch(const ucode::VertexFetchInstruction& vf) {
-    if (vf.is_predicated()) {
+    if (vf.IsPredicated()) {
       if (!pred_known_) {
         fail_ = true;
         fail_why_ = Why::kPredicate;
         return;
       }
-      if (vf.predicate_condition() != pred_value_) return;
+      if (vf.GetPredicateCondition() != pred_value_) return;
     }
-    if (!vf.is_mini_fetch()) {
+    if (!vf.IsMiniFetch()) {
       last_full_ = vf;
       have_full_ = true;
     }
@@ -551,17 +557,17 @@ class Executor {
     const uint32_t id = fetch_count_++;
     if (target_ < 0) {
       FetchInstance f;
-      f.desc.fetch_constant = last_full_.fetch_constant_index();
-      f.desc.format = uint32_t(vf.data_format());
-      f.desc.is_signed = vf.is_signed();
-      f.desc.normalized = vf.is_normalized();
-      f.desc.signed_no_zero = vf.signed_rf_mode() == xenos::SignedRepeatingFractionMode::kNoZero;
-      f.desc.index_rounded = last_full_.is_index_rounded();
-      f.desc.exp_adjust = vf.exp_adjust();
-      f.desc.stride_dwords = last_full_.stride();
-      f.desc.offset_dwords = vf.offset();
-      f.dest_swizzle = vf.dest_swizzle();
-      switch (vf.data_format()) {
+      f.desc.fetch_constant = last_full_.GetFetchConstantIndex();
+      f.desc.format = uint32_t(vf.GetDataFormat());
+      f.desc.is_signed = vf.IsSigned();
+      f.desc.normalized = vf.IsNormalized();
+      f.desc.signed_no_zero = vf.GetSignedRFMode() == xenos::SignedRepeatingFractionMode::kNoZero;
+      f.desc.index_rounded = last_full_.IsIndexRounded();
+      f.desc.exp_adjust = vf.GetExpAdjust();
+      f.desc.stride_dwords = last_full_.GetStride();
+      f.desc.offset_dwords = vf.GetOffset();
+      f.dest_swizzle = vf.GetDestSwizzle();
+      switch (vf.GetDataFormat()) {
         case xenos::VertexFormat::k_32_32_32_FLOAT:
         case xenos::VertexFormat::k_32_32_32_32_FLOAT:
         case xenos::VertexFormat::k_32_32_FLOAT:
@@ -578,7 +584,7 @@ class Executor {
       }
       fetches.push_back(f);
     }
-    if (vf.is_dest_relative() || vf.dest() >= 128) {
+    if (vf.IsDestRelative() || vf.GetDest() >= 128) {
       fail_ = true;
       return;
     }
@@ -587,21 +593,21 @@ class Executor {
       // The index register, before the destination can overwrite it: when it holds
       // a function of the vertex index other than the index itself (the instance
       // number of an instanced mesh), the model records it.
-      const uint32_t reg = last_full_.src();
-      if (!last_full_.is_src_relative() && reg < 128) {
-        const Val& index = temps_[reg][last_full_.src_swizzle() & 3];
+      const uint32_t reg = last_full_.GetSrcReg();
+      if (!last_full_.IsSrcRelative() && reg < 128) {
+        const Val& index = temps_[reg][last_full_.GetSrcSwizzle() & 3];
         if (!index.taint && index.vid && Independent(index) && index.k[0] != vid_node_) index_node_ = index.k[0];
       }
     }
     uint32_t used = 0;
     for (uint32_t i = 0; i < 4; ++i) {
       Val v;
-      switch (ucode::GetFetchDestinationComponentSwizzle(vf.dest_swizzle(), i)) {
+      switch (ucode::GetFetchDestinationComponentSwizzle(vf.GetDestSwizzle(), i)) {
         case ucode::FetchDestinationSwizzle::kX:
         case ucode::FetchDestinationSwizzle::kY:
         case ucode::FetchDestinationSwizzle::kZ:
         case ucode::FetchDestinationSwizzle::kW: {
-          const uint32_t c = uint32_t(ucode::GetFetchDestinationComponentSwizzle(vf.dest_swizzle(), i));
+          const uint32_t c = uint32_t(ucode::GetFetchDestinationComponentSwizzle(vf.GetDestSwizzle(), i));
           if (symbolic) {
             v.k[1 + c] = builder.Imm(1.f);
             used |= 1u << c;
@@ -614,7 +620,7 @@ class Executor {
         case ucode::FetchDestinationSwizzle::kKeep: continue;
         default: break;  // zero
       }
-      temps_[vf.dest()][i] = v;
+      temps_[vf.GetDest()][i] = v;
     }
     if (symbolic) symbolic_used_ |= used;
   }
@@ -648,12 +654,12 @@ class Executor {
         instr.dword_0 = pair[0];
         instr.dword_1 = pair[1] & 0xFFFF;
       }
-      const ucode::ControlFlowOpcode opcode = instr.opcode();
+      const ucode::ControlFlowOpcode opcode = instr.GetOpcode();
       auto bool_value = [&](uint32_t address) { return (bools_[(address >> 5) & 7] >> (address & 31)) & 1; };
       switch (opcode) {
         case ucode::ControlFlowOpcode::kNop:
         case ucode::ControlFlowOpcode::kAlloc:
-        case ucode::ControlFlowOpcode::kMarkVsFetchDone: break;
+        case ucode::ControlFlowOpcode::kMarkVSFetchDone: break;
         case ucode::ControlFlowOpcode::kExec:
         case ucode::ControlFlowOpcode::kExecEnd:
         case ucode::ControlFlowOpcode::kCondExec:
@@ -670,7 +676,7 @@ class Executor {
             case ucode::ControlFlowOpcode::kCondExecPredClean:
             case ucode::ControlFlowOpcode::kCondExecPredCleanEnd: {
               const auto cond = *reinterpret_cast<const ucode::ControlFlowCondExecInstruction*>(&exec);
-              run = cond.condition() == bool(bool_value(cond.bool_address()));
+              run = cond.GetCondition() == bool(bool_value(cond.GetBoolAddress()));
               break;
             }
             case ucode::ControlFlowOpcode::kCondExecPred:
@@ -681,26 +687,26 @@ class Executor {
                 fail_why_ = Why::kPredicate;
                 return;
               }
-              run = cond.condition() == pred_value_;
+              run = cond.GetCondition() == pred_value_;
               break;
             }
             default: break;
           }
           if (run) {
-            for (uint32_t n = 0; n < exec.count() && !fail_; ++n) {
-              const size_t at = size_t(3) * (exec.address() + n);
+            for (uint32_t n = 0; n < exec.GetCount() && !fail_; ++n) {
+              const size_t at = size_t(3) * (exec.GetAddress() + n);
               if (at + 2 >= dwords_) {
                 fail_ = true;
                 return;
               }
               const uint32_t* words = &ucode_[at];
-              if ((exec.sequence() >> (n << 1)) & 1) {
+              if ((exec.GetSequence() >> (n << 1)) & 1) {
                 const auto& fetch = *reinterpret_cast<const ucode::FetchInstruction*>(words);
-                if (fetch.opcode() == ucode::FetchOpcode::kVertexFetch) {
-                  ExecVertexFetch(fetch.vertex_fetch());
+                if (fetch.GetOpcode() == ucode::FetchOpcode::kVertexFetch) {
+                  ExecVertexFetch(fetch.GetVertexFetch());
                 } else {
                   // A texture fetch: its result is unknown.
-                  if (fetch.is_predicated() && !pred_known_) {
+                  if (fetch.IsPredicated() && !pred_known_) {
                     fail_ = true;
                     return;
                   }
@@ -710,22 +716,22 @@ class Executor {
               }
             }
           }
-          if (ucode::DoesControlFlowOpcodeEndShader(opcode)) ended = true;
+          if (ucode::IsControlFlowOpcodeEnd(opcode)) ended = true;
           break;
         }
         case ucode::ControlFlowOpcode::kCondCall: {
           const auto call = *reinterpret_cast<const ucode::ControlFlowCondCallInstruction*>(&instr);
           bool take = true;
-          if (!call.is_unconditional()) {
-            if (call.is_predicated()) {
+          if (!call.IsUnconditional()) {
+            if (call.IsPredicated()) {
               if (!pred_known_) {
                 fail_ = true;
                 fail_why_ = Why::kPredicate;
                 return;
               }
-              take = call.condition() == pred_value_;
+              take = call.GetCondition() == pred_value_;
             } else {
-              take = call.condition() == bool(bool_value(call.bool_address()));
+              take = call.GetCondition() == bool(bool_value(call.GetBoolAddress()));
             }
           }
           if (take) {
@@ -734,7 +740,7 @@ class Executor {
               return;
             }
             stack[depth++] = cf + 1;
-            next = call.address();
+            next = call.GetAddress();
           }
           break;
         }
@@ -744,19 +750,19 @@ class Executor {
         case ucode::ControlFlowOpcode::kCondJmp: {
           const auto jmp = *reinterpret_cast<const ucode::ControlFlowCondJmpInstruction*>(&instr);
           bool take = true;
-          if (!jmp.is_unconditional()) {
-            if (jmp.is_predicated()) {
+          if (!jmp.IsUnconditional()) {
+            if (jmp.IsPredicated()) {
               if (!pred_known_) {
                 fail_ = true;
                 fail_why_ = Why::kPredicate;
                 return;
               }
-              take = jmp.condition() == pred_value_;
+              take = jmp.GetCondition() == pred_value_;
             } else {
-              take = jmp.condition() == bool(bool_value(jmp.bool_address()));
+              take = jmp.GetCondition() == bool(bool_value(jmp.GetBoolAddress()));
             }
           }
-          if (take) next = jmp.address();
+          if (take) next = jmp.GetAddress();
           break;
         }
         case ucode::ControlFlowOpcode::kLoopStart:
@@ -984,7 +990,7 @@ bool FetchVertex(const FetchDesc& f, const uint8_t* memory, uint32_t address_dwo
     if (!(needed & (1u << i))) continue;
     const uint32_t a = at + i;
     if (a < address_dwords || a >= end) return false;  // outside the stream: the interpreter reads 0
-    data[i] = xenos::GpuSwap(dwords[a], xenos::Endian(endian));
+    data[i] = xenos::GPUSwap(dwords[a], xenos::Endian(endian));
   }
   uint32_t packed = 0;
   uint32_t widths[4] = {}, offsets[4] = {};

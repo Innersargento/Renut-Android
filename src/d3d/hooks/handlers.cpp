@@ -33,7 +33,6 @@
 #include <cmath>
 #include <cstring>
 
-#include <rex/cvar.h>
 #include <rex/ppc/context.h>
 
 // The recompiled originals UnsetAll hands the shaders to.

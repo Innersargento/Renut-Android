@@ -28,10 +28,16 @@
 #include <cstdlib>
 
 #include <rex/assert.h>
-#include <rex/graphics/xenos.h>
+#include <rex/xenos/fetch.h>
+#include <rex/xenos/format.h>
+#include <rex/xenos/packet.h>
+#include <rex/xenos/register.h>
+#include <rex/xenos/state.h>
+#include <rex/xenos/texture.h>
+#include <rex/xenos/ucode.h>
 
 namespace renut::gpu {
-namespace xenos = rex::graphics::xenos;
+namespace xenos = rex::xenos;
 
 
 namespace bits {
@@ -62,7 +68,7 @@ union alignas(uint32_t) SQ_VS_CONST {
     uint32_t _pad_21 : 11;  // +21
   };
 };
-static_assert_size(SQ_VS_CONST, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(SQ_VS_CONST, sizeof(uint32_t));
 
 // Same as SQ_VS_CONST.
 /*******************************************************************************
@@ -111,7 +117,7 @@ union alignas(uint32_t) VGT_DRAW_INITIATOR {
     uint32_t num_indices : 16;          // +16
   };
 };
-static_assert_size(VGT_DRAW_INITIATOR, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(VGT_DRAW_INITIATOR, sizeof(uint32_t));
 
 // Unlike on R6xx (but closer to R5xx), and according to the Adreno 200 header,
 // the registers related to the vertex index are 24-bit. Vertex indices are
@@ -130,7 +136,7 @@ union alignas(uint32_t) VGT_OUTPUT_PATH_CNTL {
     uint32_t _pad_2 : 30;                  // +2
   };
 };
-static_assert_size(VGT_OUTPUT_PATH_CNTL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(VGT_OUTPUT_PATH_CNTL, sizeof(uint32_t));
 
 union alignas(uint32_t) VGT_HOS_CNTL {
   uint32_t value;
@@ -139,7 +145,7 @@ union alignas(uint32_t) VGT_HOS_CNTL {
     uint32_t _pad_2 : 30;                   // +2
   };
 };
-static_assert_size(VGT_HOS_CNTL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(VGT_HOS_CNTL, sizeof(uint32_t));
 
 /*******************************************************************************
   ___ ___ ___ __  __ ___ _____ _____   _____
@@ -162,7 +168,7 @@ union alignas(uint32_t) PA_SU_POINT_MINMAX {
     uint32_t max_size : 16;  // +16
   };
 };
-static_assert_size(PA_SU_POINT_MINMAX, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SU_POINT_MINMAX, sizeof(uint32_t));
 
 union alignas(uint32_t) PA_SU_POINT_SIZE {
   uint32_t value;
@@ -172,7 +178,7 @@ union alignas(uint32_t) PA_SU_POINT_SIZE {
     uint32_t width : 16;   // +16
   };
 };
-static_assert_size(PA_SU_POINT_SIZE, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SU_POINT_SIZE, sizeof(uint32_t));
 
 // Setup Unit / Scanline Converter mode cntl
 union alignas(uint32_t) PA_SU_SC_MODE_CNTL {
@@ -208,7 +214,7 @@ union alignas(uint32_t) PA_SU_SC_MODE_CNTL {
     uint32_t _pad_25 : 7;  // +25
   };
 };
-static_assert_size(PA_SU_SC_MODE_CNTL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SU_SC_MODE_CNTL, sizeof(uint32_t));
 
 // Setup Unit Vertex Control
 union alignas(uint32_t) PA_SU_VTX_CNTL {
@@ -220,7 +226,7 @@ union alignas(uint32_t) PA_SU_VTX_CNTL {
     uint32_t _pad_6 : 26;                      // +6
   };
 };
-static_assert_size(PA_SU_VTX_CNTL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SU_VTX_CNTL, sizeof(uint32_t));
 
 // Scanline converter viz query, used by D3D for gpu side conditional rendering
 union alignas(uint32_t) PA_SC_VIZ_QUERY {
@@ -236,7 +242,7 @@ union alignas(uint32_t) PA_SC_VIZ_QUERY {
     uint32_t _pad_9 : 23;                    // +9
   };
 };
-static_assert_size(PA_SC_VIZ_QUERY, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SC_VIZ_QUERY, sizeof(uint32_t));
 
 // Clipper clip control
 union alignas(uint32_t) PA_CL_CLIP_CNTL {
@@ -267,7 +273,7 @@ union alignas(uint32_t) PA_CL_CLIP_CNTL {
     uint32_t ucp_ena : 6;
   };
 };
-static_assert_size(PA_CL_CLIP_CNTL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_CL_CLIP_CNTL, sizeof(uint32_t));
 
 // Viewport transform engine control
 union alignas(uint32_t) PA_CL_VTE_CNTL {
@@ -287,7 +293,7 @@ union alignas(uint32_t) PA_CL_VTE_CNTL {
     uint32_t _pad_12 : 20;            // +12
   };
 };
-static_assert_size(PA_CL_VTE_CNTL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_CL_VTE_CNTL, sizeof(uint32_t));
 
 union alignas(uint32_t) PA_SC_SCREEN_SCISSOR_TL {
   uint32_t value;
@@ -298,7 +304,7 @@ union alignas(uint32_t) PA_SC_SCREEN_SCISSOR_TL {
     uint32_t _pad_31 : 1;  // +31
   };
 };
-static_assert_size(PA_SC_SCREEN_SCISSOR_TL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SC_SCREEN_SCISSOR_TL, sizeof(uint32_t));
 
 union alignas(uint32_t) PA_SC_SCREEN_SCISSOR_BR {
   uint32_t value;
@@ -309,7 +315,7 @@ union alignas(uint32_t) PA_SC_SCREEN_SCISSOR_BR {
     uint32_t _pad_31 : 1;  // +31
   };
 };
-static_assert_size(PA_SC_SCREEN_SCISSOR_BR, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SC_SCREEN_SCISSOR_BR, sizeof(uint32_t));
 
 union alignas(uint32_t) PA_SC_WINDOW_OFFSET {
   uint32_t value;
@@ -320,7 +326,7 @@ union alignas(uint32_t) PA_SC_WINDOW_OFFSET {
     uint32_t _pad_31 : 1;          // +31
   };
 };
-static_assert_size(PA_SC_WINDOW_OFFSET, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SC_WINDOW_OFFSET, sizeof(uint32_t));
 
 union alignas(uint32_t) PA_SC_WINDOW_SCISSOR_TL {
   uint32_t value;
@@ -332,7 +338,7 @@ union alignas(uint32_t) PA_SC_WINDOW_SCISSOR_TL {
     uint32_t window_offset_disable : 1;  // +31
   };
 };
-static_assert_size(PA_SC_WINDOW_SCISSOR_TL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SC_WINDOW_SCISSOR_TL, sizeof(uint32_t));
 
 union alignas(uint32_t) PA_SC_WINDOW_SCISSOR_BR {
   uint32_t value;
@@ -343,7 +349,7 @@ union alignas(uint32_t) PA_SC_WINDOW_SCISSOR_BR {
     uint32_t _pad_30 : 2;  // +30
   };
 };
-static_assert_size(PA_SC_WINDOW_SCISSOR_BR, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(PA_SC_WINDOW_SCISSOR_BR, sizeof(uint32_t));
 
 /*******************************************************************************
   ___ ___ _  _ ___  ___ ___
@@ -361,22 +367,22 @@ static_assert_size(PA_SC_WINDOW_SCISSOR_BR, sizeof(uint32_t));
 union alignas(uint32_t) RB_MODECONTROL {
   uint32_t value;
   struct {
-    xenos::EdramMode edram_mode : 3;  // +0
+    xenos::EDRAMMode edram_mode : 3;  // +0
     uint32_t _pad_3 : 29;             // +3
   };
 };
-static_assert_size(RB_MODECONTROL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_MODECONTROL, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_SURFACE_INFO {
   uint32_t value;
   struct {
     uint32_t surface_pitch : 14;          // +0 in pixels.
     uint32_t _pad_14 : 2;                 // +14
-    xenos::MsaaSamples msaa_samples : 2;  // +16
+    xenos::MSAASamples msaa_samples : 2;  // +16
     uint32_t hiz_pitch : 14;              // +18
   };
 };
-static_assert_size(RB_SURFACE_INFO, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_SURFACE_INFO, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_COLORCONTROL {
   uint32_t value;
@@ -429,7 +435,7 @@ union alignas(uint32_t) RB_COLORCONTROL {
     uint32_t alpha_to_mask_offset3 : 2;  // +30
   };
 };
-static_assert_size(RB_COLORCONTROL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_COLORCONTROL, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_COLOR_INFO {
   uint32_t value;
@@ -446,7 +452,7 @@ union alignas(uint32_t) RB_COLOR_INFO {
   };
   // RB_COLOR[1-3]_INFO also use this format.
 };
-static_assert_size(RB_COLOR_INFO, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_COLOR_INFO, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_COLOR_MASK {
   uint32_t value;
@@ -470,7 +476,7 @@ union alignas(uint32_t) RB_COLOR_MASK {
     uint32_t _pad_16 : 16;      // +16
   };
 };
-static_assert_size(RB_COLOR_MASK, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_COLOR_MASK, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_BLENDCONTROL {
   uint32_t value;
@@ -487,7 +493,7 @@ union alignas(uint32_t) RB_BLENDCONTROL {
   };
   // RB_BLENDCONTROL[0-3] use this format.
 };
-static_assert_size(RB_BLENDCONTROL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_BLENDCONTROL, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_DEPTHCONTROL {
   uint32_t value;
@@ -509,7 +515,7 @@ union alignas(uint32_t) RB_DEPTHCONTROL {
     xenos::StencilOp stencilzfail_bf : 3;       // +29
   };
 };
-static_assert_size(RB_DEPTHCONTROL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_DEPTHCONTROL, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_STENCILREFMASK {
   uint32_t value;
@@ -521,7 +527,7 @@ union alignas(uint32_t) RB_STENCILREFMASK {
   };
   // RB_STENCILREFMASK_BF also uses this format.
 };
-static_assert_size(RB_STENCILREFMASK, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_STENCILREFMASK, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_DEPTH_INFO {
   uint32_t value;
@@ -536,7 +542,7 @@ union alignas(uint32_t) RB_DEPTH_INFO {
     uint32_t _pad_17 : 15;                            // +17
   };
 };
-static_assert_size(RB_DEPTH_INFO, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_DEPTH_INFO, sizeof(uint32_t));
 
 // Copy registers are very different than on Adreno.
 
@@ -554,7 +560,7 @@ union alignas(uint32_t) RB_COPY_CONTROL {
     uint32_t _pad_22 : 10;                           // +22
   };
 };
-static_assert_size(RB_COPY_CONTROL, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_COPY_CONTROL, sizeof(uint32_t));
 
 union alignas(uint32_t) RB_COPY_DEST_INFO {
   uint32_t value;
@@ -570,7 +576,7 @@ union alignas(uint32_t) RB_COPY_DEST_INFO {
     uint32_t _pad_25 : 7;                             // +25
   };
 };
-static_assert_size(RB_COPY_DEST_INFO, sizeof(uint32_t));
+REX_STATIC_ASSERT_SIZE(RB_COPY_DEST_INFO, sizeof(uint32_t));
 
 /*******************************************************************************
   ___ ___ ___ ___ _      ___   __

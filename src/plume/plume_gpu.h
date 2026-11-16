@@ -8,23 +8,19 @@
 #include <string>
 #include <vector>
 
-namespace rex::system {
-class KernelState;
-}
-namespace rex::runtime {
-class FunctionDispatcher;
+#include <memory>
+
+namespace rex {
+class IDriver;
 }
 
 namespace renut {
 
-// The GPU, hosted by the app: the Runtime is set up with no graphics system
-// (the SDK's native-rendering boundary) and the app starts this after
-// Runtime::Setup (it needs PlumeRenderer::Start to have succeeded) and stops it
-// before Runtime::Shutdown. The Vd export the SDK would have routed to its
-// graphics system (the interrupt callback) is overridden in kernel_overrides.cpp
-// and lands in the function below.
-bool StartPlumeGpu(rex::runtime::FunctionDispatcher* dispatcher, rex::system::KernelState* kernel);
-void StopPlumeGpu();
+// The graphics driver of the app (gpu/core/host.cpp), registered as "plume" in the graphics family of the
+// Xenos: the SDK's graphics system runs it. It needs PlumeRenderer::Start to have succeeded. The Vd export
+// that carries the interrupt callback is overridden in kernel_overrides.cpp and lands in the last function
+// below.
+std::unique_ptr<rex::IDriver> CreatePlumeGraphicsDriver();
 bool PlumeGpuHosted();
 void PlumeGpuSetInterruptCallback(uint32_t callback, uint32_t user_data);
 

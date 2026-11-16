@@ -59,15 +59,19 @@ LABEL_RE = re.compile(r"^(loc_[0-9A-F]+):$")
 GOTO_RE = re.compile(r"^goto (loc_[0-9A-F]+);$")
 IF_GOTO_RE = re.compile(r"^if \(.*\) goto (loc_[0-9A-F]+);$")
 IF_RETURN_RE = re.compile(r"^if \(.*\) return;$")
-# `mflr r12; stw r12,-8(r1)` (and the same store inside __savegprlr_N).
-LR_SAVE = "REX_STORE_U32(ctx.r1.u32 + -8, r12.u32);"
+# `mflr r12; stw r12,-8(r1)` (and the same store inside __savegprlr_N). RexGlue 0.10 wrote it as
+# REX_STORE_U32, 0.11 as REX_STACK_STORE_U32; with forward_stack_stores it is two statements,
+# `fwdN.u32 = r12.u32;` and the store of fwdN (see is_lr_save). Missing it makes r12 look live into
+# every function with a frame, and the pass then hands a dead r12 through ctx around every call.
+LR_SAVE_RE = re.compile(r"^REX_(?:STACK_)?STORE_U32\(ctx\.r1\.u32 \+ -8, r12\.u32\);$")
+LR_SAVE_FWD_RE = re.compile(r"^(fwd\d+)\.u32 = r12\.u32;$")
 # A prologue saving a non-volatile on the stack (std r31,-8(r1); stfd f31,-16(r1)): it stores the
 # caller's value only to put it back in the epilogue, which a local makes pointless, so it is no read.
 # stvx128 v127,r1,r12 with r12 = -224, before the stack pointer moves: a vector save.
 VECTOR_SAVE_RE = re.compile(r"^simde_mm_store_si128\(\(simde__m128i\*\)REX_RAW_ADDR\(ea\), "
                             r"simde_mm_shuffle_epi8\(simde_mm_load_si128\(\(simde__m128i\*\)(%s)\.u8\), "
                             r"simde_mm_load_si128\(\(simde__m128i\*\)VectorMaskL\)\)\);$" % REG_ALT)
-NONVOL_SAVE_RE = re.compile(r"^REX_STORE_U(?:32|64)\(ctx\.r1\.u32 \+ -?\d+, (%s)\.u(?:32|64)\);$" % REG_ALT)
+NONVOL_SAVE_RE = re.compile(r"^REX_(?:STACK_)?STORE_U(?:32|64)\(ctx\.r1\.u32 \+ -?\d+, (%s)\.u(?:32|64)\);$" % REG_ALT)
 GENERATOR_SYNC_RE = re.compile(r"^ctx\.(\w+) = \1;$")
 NOT_POINTER_TARGETS = {"appMainBoot"}
 for _key in ("setjmp_address", "longjmp_address"):
@@ -77,6 +81,15 @@ for _key in ("setjmp_address", "longjmp_address"):
         NOT_POINTER_TARGETS.add("sub_%s" % _m.group(1).upper())
 SETJMP_SAVE = "env = ctx;"
 SETJMP_RESTORE = "if (temp.s64 != 0) ctx = env;"
+
+
+def is_lr_save(stmts, idx):
+    s = stmts[idx][1]
+    if LR_SAVE_RE.match(s):
+        return True
+    m = LR_SAVE_FWD_RE.match(s)
+    return bool(m and idx + 1 < len(stmts) and
+                stmts[idx + 1][1] == "REX_STACK_STORE_U32(ctx.r1.u32 + -8, %s.u32);" % m.group(1))
 
 
 def mask_of(names):
@@ -221,7 +234,7 @@ def build(fn, lines):
                 d = BIT[m.group(1)]
                 if uses.count(m.group(1)) == 1:
                     u &= ~d
-        if s == LR_SAVE or GENERATOR_SYNC_RE.match(s):
+        if is_lr_save(stmts, idx) or GENERATOR_SYNC_RE.match(s):
             # skip_lr: mflr emits nothing, so this stores a dead link register. And the copies the
             # generator writes into ctx for an SEH funclet hand over every local the owner has,
             # set or not: the funclet reads the ones that matter, which the owner set.
@@ -565,17 +578,23 @@ def expand_shared_helpers(folder, texts):
                     if not e or int(e.group(1), 16) not in helper_at:
                         continue
                     helper = helper_at[int(e.group(1), 16)]
-                    nxt = block[k + 1].strip() if k + 1 < len(block) else ""
+                    # The call is still there when the generator left it: after the hand-ins it writes
+                    # (`ctx.r12 = r12;`) since 0.11, right after the comment before.
+                    ahead = k + 1
+                    while ahead < len(block) and re.match(r"^\s*ctx\.\w+ = \w+;$", block[ahead]):
+                        ahead += 1
+                    nxt = block[ahead].strip() if ahead < len(block) else ""
                     if nxt.startswith(helper + "(") or helper not in bodies:
                         continue
                     text = " ".join(bodies[helper])
                     if not has_r12:
                         text = re.sub(r"(?<![\w.])r12\.", "ctx.r12.", text)
-                    decls = [d for d in ("r0", "r11") if re.search(r"(?<![\w.])%s\." % d, text)]
+                    decls = [d for d in ("r0", "r11")
+                             if re.search(r"(?<![\w.])%s\." % d, text) and "PPCRegister %s{}" % d not in text]
                     head = "".join("PPCRegister %s{}; " % d for d in decls)
-                    if re.search(r"(?<![\w.])ea\b", text):
+                    if re.search(r"(?<![\w.])ea\b", text) and not re.search(r"\b(?:u32|uint32_t) ea\b", text):
                         head += "uint32_t ea{}; "
-                    if re.search(r"(?<![\w.])temp\.", text):
+                    if re.search(r"(?<![\w.])temp\.", text) and "PPCRegister temp{}" not in text:
                         head += "PPCRegister temp{}; "
                     out.append("\t{ %s// %s, through ctx (shared registers)" % (head, helper))
                     out.extend("\t\t" + s for s in bodies[helper])

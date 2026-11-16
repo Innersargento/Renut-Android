@@ -1,5 +1,7 @@
 // The native lists the D3D front end records, executed.
 #include "gpu/core/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
 
 namespace renut::gpu {
 
@@ -94,7 +96,7 @@ bool Lists::RunNative(uint32_t until) {
         }
         const auto type = xenos::ShaderType(w[1] & 3);
         const uint32_t address = w[1] & ~3u, dwords = w[2];
-        const auto* ucode = backend.memory_->TranslatePhysical<const uint32_t*>(address);
+        const auto* ucode = renut::host::Physical<const uint32_t*>(address);
         const uint64_t hash = uint64_t(w[3]) | uint64_t(w[4]) << 32;
         Shader* shader;
         if (fetch_count && dwords) {
@@ -185,7 +187,7 @@ bool Lists::RunNative(uint32_t until) {
         if (w[5]) StoreBig(w[5], backend.counter());
         ++native_presents_;
         if (native_presents_ <= 3 || native_presents_ % 600 == 0) {
-          REXLOG_INFO("Renut: native present {} ({:08X} {}x{}); fences {}, callbacks {}",
+          REXLOG_CAT_INFO(rex::log::renut, "Renut: native present {} ({:08X} {}x{}); fences {}, callbacks {}",
                       native_presents_, w[1], w[2], w[3], native_fences_, native_callbacks_);
         }
         break;
@@ -243,7 +245,7 @@ bool Lists::RunNative(uint32_t until) {
         f.pos += 4;
         // As the GPU would, until the vertical-blank handler (another thread)
         // writes the value; never longer than a few frames.
-        const auto* word = backend.memory_->TranslatePhysical<const uint32_t*>(w[1]);
+        const auto* word = renut::host::Physical<const uint32_t*>(w[1]);
         const auto start = std::chrono::steady_clock::now();
         ++backend.targets.native_waits_;
         while ((__builtin_bswap32(__atomic_load_n(word, __ATOMIC_ACQUIRE)) & w[3]) != w[2]) {

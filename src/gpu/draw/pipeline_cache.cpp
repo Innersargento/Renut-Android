@@ -1,5 +1,8 @@
 // Pipeline workers, the recipe file and pipeline prediction.
 #include "gpu/core/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
+#include "platform/settings.h"
 
 namespace renut::gpu {
 
@@ -28,7 +31,7 @@ void Pipelines::StartPipelineWorker() {
   const uint32_t urgent_only = cores >= 8 ? 1 : 0;
   for (uint32_t i = 0; i < count + urgent_only; ++i) {
     pipeline_workers_.emplace_back([this, i, urgent = i >= count] {
-      pthread_setname_np(pthread_self(), fmt::format("PlumePipeline{}", i).c_str());
+      pthread_setname_np(pthread_self(), std::format("PlumePipeline{}", i).c_str());
       int nice = INT32_MIN;
       for (;;) {
         std::shared_ptr<PipelineJob> job;
@@ -101,7 +104,7 @@ void Pipelines::StartPipelineWorker() {
           }
         }
         try { job->result = CreateGraphicsPipeline(backend.device_, job->desc); }
-        catch (const std::exception& e) { REXLOG_WARN("Renut: Plume async pipeline failed: {}", e.what()); }
+        catch (const std::exception& e) { REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume async pipeline failed: {}", e.what()); }
         const uint64_t program = job->program;
         finish();
         bool requeued = false;
@@ -174,14 +177,14 @@ void Pipelines::ReapPipelines() {
       backend.draw.standins_[job.family] = slot.get();
     } else {
       backend.draw.failed_pipelines_.insert(it->first);
-      REXLOG_WARN("Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})", job.vs_hash, job.ps_hash);
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})", job.vs_hash, job.ps_hash);
     }
     it = backend.draw.pending_pipelines_.erase(it);
   }
 }
 
 void Pipelines::StartRecipes() {
-  recipes_ = REXCVAR_GET(renut_plume_precompile) && !g_miss_dump_directory.empty();
+  recipes_ = renut::GetSettings().plume_precompile.Get() && !g_miss_dump_directory.empty();
   if (!recipes_) return;
   const std::string files = g_miss_dump_directory.substr(0, g_miss_dump_directory.rfind('/'));
   const std::string path = files + "/plume-recipes.bin";
@@ -258,7 +261,7 @@ void Pipelines::StartRecipes() {
   const std::vector<uint8_t> bytes = read_file(path);
   const size_t good_end = parse(bytes);
   const bool valid = good_end != 0;
-  if (seeded) REXLOG_INFO("Renut: Plume pipeline recipes: {} shipped, {} more recorded here", seeded,
+  if (seeded) REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume pipeline recipes: {} shipped, {} more recorded here", seeded,
                           recipes->size() - seeded);
   if (!valid) {
     if ((recipe_file_ = std::fopen(path.c_str(), "wb"))) {
@@ -269,9 +272,9 @@ void Pipelines::StartRecipes() {
     if (good_end != bytes.size()) truncate(path.c_str(), off_t(good_end));
     recipe_file_ = std::fopen(path.c_str(), "ab");
   }
-  if (!recipe_file_) REXLOG_WARN("Renut: Plume pipeline recipes cannot be written to {}", path);
+  if (!recipe_file_) REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume pipeline recipes cannot be written to {}", path);
   if (backend.low_memory_) {
-    REXLOG_INFO("Renut: Plume pipeline recipes: {} in {}; not built ahead in low-memory mode", recipes->size(), path);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume pipeline recipes: {} in {}; not built ahead in low-memory mode", recipes->size(), path);
     return;
   }
 
@@ -326,7 +329,7 @@ void Pipelines::StartRecipes() {
   stop_precompile_ = false;
   const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
   const uint32_t count = std::clamp(cores * 2 / 3, 2u, 6u);
-  REXLOG_INFO("Renut: Plume knows {} pipelines ({} programs, {} tags over {} scenes, {} engine pass states) from {}; "
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume knows {} pipelines ({} programs, {} tags over {} scenes, {} engine pass states) from {}; "
               "each scene's are built while it loads, on {} threads",
               recipes->size(), p.groups.size(), tags.size(), p.scene_groups.size(), pass_states, path, count);
   recipes->clear();
@@ -335,7 +338,7 @@ void Pipelines::StartRecipes() {
   // arrive as models load.
   for (uint32_t t = 0; t < count; ++t) {
     precompile_threads_.emplace_back([this, t] {
-      pthread_setname_np(pthread_self(), fmt::format("PlumePrebuild{}", t).c_str());
+      pthread_setname_np(pthread_self(), std::format("PlumePrebuild{}", t).c_str());
       PrecompileState& p = g_precompile;
       int nice = INT32_MIN;
       for (;;) {
@@ -350,7 +353,7 @@ void Pipelines::StartRecipes() {
             if (g != UINT32_MAX) break;
             if (p.busy == 0 && p.running && p.urgent.empty() && p.background.empty()) {
               p.running = false;
-              REXLOG_INFO("Renut: Plume built {} of {} pipelines ahead in {} ms", p.done.load() - p.batch_failed,
+              REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume built {} of {} pipelines ahead in {} ms", p.done.load() - p.batch_failed,
                           p.total.load(),
                           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
                                                                                 p.batch_start)
@@ -484,7 +487,7 @@ void Pipelines::LearnPassState(uint8_t pass, const Recipe& recipe) {
   if (states.size() >= kMaxPassStates) return;
   learned.uses = 1;
   WriteRecord(kRecipePassBit | uint32_t(learned.bytes.size()), learned.bytes.data());
-  REXLOG_INFO("Renut: Plume engine pass {} draws with a new render state ({} targets, depth {}{}, {} pixel shader); "
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume engine pass {} draws with a new render state ({} targets, depth {}{}, {} pixel shader); "
               "{} known for it",
               pass - 1, s.desc.renderTargetCount, s.desc.depthEnabled ? "on" : "off",
               s.desc.depthWriteEnabled ? " written" : "", s.ps ? "with a" : "without a", states.size() + 1);
@@ -525,11 +528,11 @@ bool Pipelines::PredictPipelines() {
       predict_desc_set_[1] = true;
     }
     auto* vs = static_cast<HostShader*>(backend.shaders.LoadShaderByContents(
-        xenos::ShaderType::kVertex, backend.memory_->TranslatePhysical<const uint32_t*>(pair.vs_address), pair.vs_dwords));
+        xenos::ShaderType::kVertex, renut::host::Physical<const uint32_t*>(pair.vs_address), pair.vs_dwords));
     HostShader* ps = nullptr;
     if (pair.ps_dwords) {
       ps = static_cast<HostShader*>(backend.shaders.LoadShaderByContents(
-          xenos::ShaderType::kPixel, backend.memory_->TranslatePhysical<const uint32_t*>(pair.ps_address), pair.ps_dwords));
+          xenos::ShaderType::kPixel, renut::host::Physical<const uint32_t*>(pair.ps_address), pair.ps_dwords));
     }
     if (!vs || !vs->entry || (pair.ps_dwords && (!ps || !ps->entry))) {
       ++unknown;
@@ -721,7 +724,7 @@ bool Pipelines::PredictPipelines() {
   predict_exact_ += exact;
   predict_raised_ += raised;
   if (done && (added || unknown || raised)) {
-    REXLOG_INFO("Renut: Plume predicted {} new programs from {} shader pairs ({} already known, of which {} listed "
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume predicted {} new programs from {} shader pairs ({} already known, of which {} listed "
                 "ones the loading scene now waits for; {} without a recompiled shader; {} whole pipelines from pass "
                 "states); {} new, {} known, {} whole so far; draws so far used {} programs, {} built ahead",
                 added, done, known, raised, unknown, exact, predict_added_, predict_known_, predict_exact_,

@@ -9,7 +9,7 @@
 #include "d3d/device/internal.h"
 
 #include <rex/ppc/context.h>
-#include <rex/ppc/func.h>
+#include <rex/ppc/recompiled_code.h>
 
 extern "C" {
 __attribute__((weak)) void __imp__VdQueryVideoFlags(PPCContext& __restrict, uint8_t*);  // the video flags

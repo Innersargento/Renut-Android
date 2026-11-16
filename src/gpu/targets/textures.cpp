@@ -1,5 +1,7 @@
 // Guest textures and samplers.
 #include "gpu/core/internal.h"
+#include "platform/guest.h"
+#include "platform/log.h"
 #include "plume/etc2_transcode.h"
 
 namespace renut::gpu {
@@ -133,7 +135,7 @@ void BoxShrink(std::vector<uint32_t>& pixels, uint32_t& width, uint32_t& height,
 // came to, and only a different constant (or a bumped object_epoch_) goes on to
 // hash them.
 const FetchLayout* Textures::LayoutOf(
-    const xenos::xe_gpu_texture_fetch_t& fetch) {
+    const xenos::TextureFetch& fetch) {
   static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
   if (!objkeys_ || fetch_slot_ < 0) return LayoutOfByContents(fetch);
   SlotObject& object = slot_objects_[uint32_t(fetch_slot_) & 31];
@@ -150,7 +152,7 @@ const FetchLayout* Textures::LayoutOf(
 }
 
 const FetchLayout* Textures::LayoutOfByContents(
-    const xenos::xe_gpu_texture_fetch_t& fetch) {
+    const xenos::TextureFetch& fetch) {
   // The memo key: six words mixed by multiply and fold. Six XXH3 calls for one
   // small input each were a visible slice of the command thread (this runs for
   // every texture slot of every draw whose constant differs from the slot's
@@ -179,7 +181,7 @@ const FetchLayout* Textures::LayoutOfByContents(
   HashCombine(key, uint32_t(fetch.mip_min_level));
   HashCombine(key, uint32_t(fetch.mip_address));
   uint32_t base_page, mip_page, top_level, last_level;
-  gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
+  gfx::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
       &base_page, &mip_page, &top_level, &last_level);
   layout.levels = last_level - top_level + 1;
   layout.top_level = top_level;
@@ -201,7 +203,7 @@ const FetchLayout* Textures::LayoutOfByContents(
   return &layout;
 }
 
-uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetGuestTexture(const xenos::TextureFetch& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address) return 0;
   const FetchLayout* fetch_layout = LayoutOf(fetch);
@@ -212,7 +214,7 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   std::array<const uint8_t*, 14> data{};
   uint64_t content = 0;
   for (uint32_t i = 0; i < levels; ++i) {
-    data[i] = backend.memory_->TranslatePhysical<const uint8_t*>(fetch_layout->starts[i]);
+    data[i] = renut::host::Physical<const uint8_t*>(fetch_layout->starts[i]);
   }
   // The guest's top mips a low-memory host does not keep: a texture a side of
   // 2048 held as RGBA8 is 21 MB with its chain and 1.4 MB from 512 down, and
@@ -286,9 +288,7 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
         texture.watch_begin[which] = texture.watch_end[which] = 0;
         continue;
       }
-      backend.memory_->EnablePhysicalMemoryAccessCallbacks(texture.watch_begin[which],
-                                                   texture.watch_end[which] - texture.watch_begin[which],
-                                                   true, false);
+      renut::host::WatchWrites(texture.watch_begin[which], texture.watch_end[which] - texture.watch_begin[which]);
       backend.streams.IndexBlocks(backend.streams.texture_block_index_, texture.watch_begin[which],
                   texture.watch_end[which] - texture.watch_begin[which], key);
     }
@@ -332,7 +332,7 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
     texture.failed = true;
     ++backend.stats_.texture_failures;
     if (unsupported_formats_.insert(uint32_t(fetch.format)).second) {
-      REXLOG_WARN("Renut: Plume does not decode texture format {} yet", uint32_t(fetch.format));
+      REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume does not decode texture format {} yet", uint32_t(fetch.format));
     }
     return 0;
   }
@@ -440,11 +440,11 @@ uint32_t Textures::GetGuestTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   return texture.descriptor;
 }
 
-void Textures::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+void Textures::DumpTexture(const xenos::TextureFetch& fetch,
                                         const std::vector<uint32_t>& rgba, uint32_t width,
                                         uint32_t height, const char* kind) {
   static uint32_t serial = 0;
-  const auto path = fmt::format(
+  const auto path = std::format(
       "{}/{:04}_{}_{:08X}_f{}_{}x{}_t{}_e{}_p{}_sw{:03X}_s{}{}{}{}_n{}_m{}_mn{}_ma{:08X}_pk{}.rgba", texdump_directory_, serial++,
       kind, fetch.base_address << 12, uint32_t(fetch.format), width, height, uint32_t(fetch.tiled),
       uint32_t(fetch.endianness), uint32_t(fetch.pitch), uint32_t(fetch.swizzle), uint32_t(fetch.sign_x),
@@ -466,7 +466,7 @@ void Textures::DumpTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
 // A stacked texture's Z picks a slice of an array and follows the fetch
 // constant's mode like any other axis: the water's runs far past the end of its
 // stack with the clock and relies on repeating.
-uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetSampler(const xenos::TextureFetch& fetch) {
   const bool stack_wrap = fetch.stacked;
   // The anisotropy the fetch gets: what it asks for within renut_plume_aniso_max, which a change of the option
   // moves live, so the sampler made for another maximum is another sampler (a fetch without anisotropy has one).
@@ -558,7 +558,7 @@ uint32_t Textures::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
 // Texture quality and the largest side apply as to a 2D texture: a stack with
 // mips drops its top ones, one without (the terrain's) is halved on the CPU,
 // which needs the pixels, so it is RGBA8 then.
-uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetGuestStackedTexture(const xenos::TextureFetch& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address) return 0;
   const uint32_t depth = uint32_t(fetch.size_2d.stack_depth) + 1;
@@ -570,7 +570,7 @@ uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& f
   HashCombine(key, uint32_t(fetch.mip_min_level));
   HashCombine(key, uint32_t(fetch.mip_address));
   uint32_t base_page, mip_page, top_level, last_level;
-  gfx::texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
+  gfx::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
       &base_page, &mip_page, &top_level, &last_level);
   if (depth > 1) last_level = top_level;
   const uint32_t levels = last_level - top_level + 1;
@@ -583,7 +583,7 @@ uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& f
     if (!LocateTextureLevel(fetch, top_level + i, level)) return 0;
     const uint64_t start = (uint64_t(level.from_mips ? mip_page : base_page) << 12) + level.offset;
     if (!start || start + level.extent > 0x20000000ull) return 0;
-    data[i] = backend.memory_->TranslatePhysical<const uint8_t*>(uint32_t(start));
+    data[i] = renut::host::Physical<const uint8_t*>(uint32_t(start));
   }
   // What the host keeps: mips dropped (a stack with a chain), or halvings of the pixels (one without).
   const bool base_map = fetch.mip_filter == xenos::TextureFilter::kBaseMap;
@@ -737,7 +737,7 @@ uint32_t Textures::GetGuestStackedTexture(const xenos::xe_gpu_texture_fetch_t& f
 // off along one diagonal into sheets across the screen. Only the base level:
 // the vertex shaders that sample these do so at level 0, and a host 3D image
 // would halve its depth at each mip anyway.
-uint32_t Textures::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetGuestVolumeTexture(const xenos::TextureFetch& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address) return 0;
   std::vector<uint32_t> rgba;
@@ -751,7 +751,7 @@ uint32_t Textures::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fe
   HashCombine(key, fetch.dword_1);
   HashCombine(key, fetch.dword_2);
   HashCombine(key, fetch.swizzle);
-  const uint8_t* data = backend.memory_->TranslatePhysical<const uint8_t*>(address);
+  const uint8_t* data = renut::host::Physical<const uint8_t*>(address);
   GuestTexture& texture = guest_volumes_[key];
   if (texture.failed) return 0;
   if (texture.texture && texture.checked_frame == backend.swaps_) {
@@ -767,7 +767,7 @@ uint32_t Textures::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fe
   if (!DecodeTexture3D(fetch, data, rgba, width, height, depth, extent)) {
     texture.failed = true;
     ++backend.stats_.texture_failures;
-    REXLOG_WARN("Renut: Plume could not decode volume texture {:08X} f{} {}x{}x{}", address,
+    REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume could not decode volume texture {:08X} f{} {}x{}x{}", address,
                 uint32_t(fetch.format), width, height, depth);
     return 0;
   }
@@ -788,7 +788,7 @@ uint32_t Textures::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fe
       texture.failed = true;
       return 0;
     }
-    REXLOG_INFO("Renut: Plume volume texture {:08X} f{} {}x{}x{} tiled={}", address, uint32_t(fetch.format),
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume volume texture {:08X} f{} {}x{}x{} tiled={}", address, uint32_t(fetch.format),
                 width, height, depth, uint32_t(fetch.tiled));
   }
   texture.content = content;
@@ -809,7 +809,7 @@ uint32_t Textures::GetGuestVolumeTexture(const xenos::xe_gpu_texture_fetch_t& fe
 
 // Cube maps (the sky dome): six 2D faces, +X -X +Y -Y +Z -Z, one after the
 // other at a 4 KB aligned stride, each decoded like a 2D texture.
-uint32_t Textures::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t Textures::GetGuestCubeTexture(const xenos::TextureFetch& fetch) {
   const uint32_t address = fetch.base_address << 12;
   if (!address) return 0;
   uint64_t key = 0;
@@ -817,7 +817,7 @@ uint32_t Textures::GetGuestCubeTexture(const xenos::xe_gpu_texture_fetch_t& fetc
   HashCombine(key, fetch.dword_1);
   HashCombine(key, fetch.dword_2);
   HashCombine(key, fetch.swizzle);
-  const uint8_t* data = backend.memory_->TranslatePhysical<const uint8_t*>(address);
+  const uint8_t* data = renut::host::Physical<const uint8_t*>(address);
   const uint32_t face_stride = (TextureBaseSpan(fetch) + 4095) & ~4095u;
   GuestTexture& texture = backend.targets.guest_cubes_[key];
   if (texture.failed) return 0;

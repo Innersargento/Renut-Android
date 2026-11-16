@@ -7,7 +7,7 @@
 #include "d3d/device/device.h"
 
 #include <rex/ppc/context.h>
-#include <rex/ppc/func.h>
+#include <rex/ppc/recompiled_code.h>
 
 namespace renut::d3d::port {
 
@@ -63,7 +63,7 @@ struct GuestFrame {
     call.r5.u32 = args[2];
     call.r6.u32 = args[3];
     call.last_indirect_target = target;
-    rex::runtime::ResolveIndirectFunction(target)(call, base);
+    rex::ppc::ResolveFunction(target)(call, base);
     return call.r3.u32;
   }
 };

@@ -88,13 +88,13 @@ struct DrawState {
   const uint32_t* VertexConstants() const { return float_constants; }
   const uint32_t* PixelConstants() const { return float_constants + kPixelConstants; }
 
-  xenos::xe_gpu_vertex_fetch_t GetVertexFetch(uint32_t index) const {
-    xenos::xe_gpu_vertex_fetch_t result;
+  xenos::VertexFetch GetVertexFetch(uint32_t index) const {
+    xenos::VertexFetch result;
     std::memcpy(&result, &fetch[(sizeof(result) / sizeof(uint32_t)) * index], sizeof(result));
     return result;
   }
-  xenos::xe_gpu_texture_fetch_t GetTextureFetch(uint32_t index) const {
-    xenos::xe_gpu_texture_fetch_t result;
+  xenos::TextureFetch GetTextureFetch(uint32_t index) const {
+    xenos::TextureFetch result;
     std::memcpy(&result, &fetch[(sizeof(result) / sizeof(uint32_t)) * index], sizeof(result));
     return result;
   }

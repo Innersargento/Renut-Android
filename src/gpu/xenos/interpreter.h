@@ -18,25 +18,30 @@
 #include <cstdint>
 
 #include <rex/assert.h>
-#include <rex/graphics/format/ucode.h>
+#include <rex/xenos/ucode.h>
 #include "gpu/xenos/shader.h"
 #include "gpu/core/draw_state.h"
-#include <rex/graphics/xenos.h>
+#include <rex/xenos/fetch.h>
+#include <rex/xenos/format.h>
+#include <rex/xenos/packet.h>
+#include <rex/xenos/register.h>
+#include <rex/xenos/state.h>
+#include <rex/xenos/texture.h>
+#include <rex/xenos/ucode.h>
 #include <rex/memory.h>
 
 namespace renut::gpu {
 // The interpreter has its own namespace: the aliases below would hide renut::ucode.
 namespace interp {
-namespace xenos = rex::graphics::xenos;
-namespace ucode = rex::graphics::ucode;
+namespace xenos = rex::xenos;
+namespace ucode = rex::xenos::ucode;
 namespace memory = rex::memory;
 using xshader::Shader;
 
 
 class ShaderInterpreter {
  public:
-  ShaderInterpreter(const DrawState& state, const memory::Memory& memory)
-      : state_constants_(state), memory_(memory) {}
+  ShaderInterpreter(const DrawState& state) : state_constants_(state) {}
 
   class ExportSink {
    public:
@@ -53,7 +58,7 @@ class ShaderInterpreter {
   float* temp_registers() { return &temp_registers_[0][0]; }
 
   static bool CanInterpretShader(const Shader& shader) {
-    assert_true(shader.is_ucode_analyzed());
+    REX_ASSERT(shader.is_ucode_analyzed());
     // Texture instructions are not very common in vertex shaders (and not used
     // in Direct3D 9's internal rectangles such as clears) and are extremely
     // complex, not implemented.
@@ -67,7 +72,7 @@ class ShaderInterpreter {
     ucode_ = ucode;
   }
   void SetShader(const Shader& shader) {
-    assert_true(CanInterpretShader(shader));
+    REX_ASSERT(CanInterpretShader(shader));
     SetShader(shader.type(), shader.ucode_dwords());
   }
 
@@ -89,7 +94,7 @@ class ShaderInterpreter {
     void Reset() { std::memset(this, 0, sizeof(*this)); }
 
     int32_t GetLoopAddress() const {
-      assert_true(loop_stack_depth && loop_stack_depth < 4);
+      REX_ASSERT(loop_stack_depth && loop_stack_depth < 4);
       if (!loop_stack_depth || loop_stack_depth >= 4) {
         return 0;
       }
@@ -128,7 +133,6 @@ class ShaderInterpreter {
   void ExecuteVertexFetchInstruction(ucode::VertexFetchInstruction instr);
 
   const DrawState& state_constants_;
-  const memory::Memory& memory_;
 
   ExportSink* export_sink_ = nullptr;
 

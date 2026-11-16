@@ -1,6 +1,7 @@
 // Free helpers of the Plume GPU: format and blend translation, shader inputs, pipeline
 // creation and the recipe codec. Declared in internal.h.
 #include "gpu/core/internal.h"
+#include "platform/log.h"
 
 namespace renut::gpu {
 
@@ -126,7 +127,7 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
       static uint32_t logged = 0;
       if (logged < 32) {
         ++logged;
-        REXLOG_WARN("Renut: Plume vs {:016X} fetch @{} reads swizzle {:03X}, recompiled with {:03X}",
+        REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume vs {:016X} fetch @{} reads swizzle {:03X}, recompiled with {:03X}",
                     shader.ucode_data_hash(), e.fetchAddress, f[1] & 0xFFF, uint32_t(e.dstSwizzle));
       }
     }
@@ -147,7 +148,7 @@ void DecodeLiveElements(HostShader& shader, const ShaderCacheEntry* entry,
       static uint32_t logged = 0;
       if (logged < 32) {
         ++logged;
-        REXLOG_WARN("Renut: Plume vs {:016X} fetch @{} scales by 2^{}, which its attribute ignores",
+        REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume vs {:016X} fetch @{} scales by 2^{}, which its attribute ignores",
                     shader.ucode_data_hash(), e.fetchAddress, exp_adjust);
       }
     }

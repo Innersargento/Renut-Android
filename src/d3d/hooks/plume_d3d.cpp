@@ -17,10 +17,9 @@
 #include <string>
 #include <thread>
 
-#include <rex/cvar.h>
-#include <rex/logging.h>
-#include <rex/ppc/func.h>
-#include <rex/system/xthread.h>
+#include "platform/log.h"
+#include <rex/ppc/recompiled_code.h>
+#include "platform/guest.h"
 
 namespace renut::d3d {
 namespace {

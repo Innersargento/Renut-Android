@@ -1,12 +1,13 @@
 #pragma once
 // Includes, constants and small helpers shared by the whole Plume GPU.
 #include "plume/plume_gpu.h"
+#include "platform/settings.h"
 #include "d3d/hooks/layer.h"
 #include "d3d/frontend/native_d3d.h"
 
 #include "plume/frame_pacing.h"
 #include "plume/plume_renderer.h"
-#include <rex/chrono/clock.h>
+#include <rex/chrono.h>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -57,26 +58,26 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 
 #include <xxhash.h>
 
-#include <rex/system/function_dispatcher.h>
-#include <rex/system/xthread.h>
-#include <rex/thread.h>
+#include "platform/guest.h"
+#include "platform/guest.h"
 #include "gpu/xenos/interpreter.h"
 #include "gpu/xenos/shader.h"
-#include <rex/graphics/pipeline/texture/info.h>
-#include <rex/graphics/pipeline/texture/util.h>
+#include <rex/xenos/texture.h>
 #include "gpu/core/draw_state.h"
 #include "gpu/core/state_bits.h"
 #include "gpu/draw/draw_util.h"
-#include <rex/graphics/xenos.h>
-#include <rex/kernel/xboxkrnl/video.h>
-#include <rex/logging.h>
-#include <rex/cvar.h>
+#include <rex/xenos/fetch.h>
+#include <rex/xenos/format.h>
+#include <rex/xenos/packet.h>
+#include <rex/xenos/register.h>
+#include <rex/xenos/state.h>
+#include <rex/xenos/texture.h>
+#include <rex/xenos/ucode.h>
+#include "platform/log.h"
 #include <rex/memory.h>
-#include <rex/system/kernel_state.h>
-#include <rex/memory/ring_buffer.h>
-#include <rex/thread.h>
+#include "platform/guest.h"
 
-#include <fmt/format.h>
+#include <format>
 
 #include <cstdio>
 #include <filesystem>
@@ -88,37 +89,15 @@ static inline void renutMakeDirectory(const std::string& path) { mkdir(path.c_st
 // (the SDL driver in rexglue).
 extern "C" uint64_t renut_audio_silent_frames();
 
-REXCVAR_DECLARE(int32_t, renut_plume_pipeline_lookup_ms);
-REXCVAR_DECLARE(int32_t, renut_plume_hiz);
-REXCVAR_DECLARE(int32_t, renut_plume_poly_offset_percent);
-REXCVAR_DECLARE(bool, renut_plume_decal_log);
-REXCVAR_DECLARE(int32_t, renut_plume_adaptive_patches);
-REXCVAR_DECLARE(int32_t, renut_plume_water_tess_percent);
-REXCVAR_DECLARE(int32_t, renut_plume_shadow_min_indices);
-REXCVAR_DECLARE(bool, renut_plume_no_shadows);
-REXCVAR_DECLARE(bool, renut_plume_no_bloom);
-REXCVAR_DECLARE(bool, renut_plume_draw_callers);
-REXCVAR_DECLARE(bool, renut_plume_ui_depth_fix);
-REXCVAR_DECLARE(int32_t, renut_plume_low_memory);
-REXCVAR_DECLARE(int32_t, renut_plume_texture_max_dim);
-REXCVAR_DECLARE(int32_t, renut_plume_bc_textures);
-REXCVAR_DECLARE(int32_t, renut_plume_mali_rebase_indices);
-REXCVAR_DECLARE(int32_t, renut_plume_texture_quality);
-REXCVAR_DECLARE(int32_t, renut_plume_aniso_max);
-REXCVAR_DECLARE(int32_t, renut_plume_shadow_quality);
-REXCVAR_DECLARE(int32_t, renut_plume_internal_resolution);
-REXCVAR_DECLARE(bool, renut_plume_precompile);
 
-REXCVAR_DECLARE(int32_t, renut_msaa);  // game_fixes.cpp: scene multisampling, 0 off, 1 2x, 2 4x
-REXCVAR_DECLARE(bool, vsync);  // the SDK's: off ticks the guest's vblank every millisecond
 
 namespace renut::gpu {
 
 using namespace plume;
-namespace gfx = rex::graphics;
-namespace xenos = rex::graphics::xenos;
+namespace gfx = rex::xenos;
+namespace xenos = rex::xenos;
 
-using namespace rex::graphics;
+using namespace rex::xenos;
 using xshader::Shader;  // the Xenos shader analysis (xenos/shader.h)
 
 

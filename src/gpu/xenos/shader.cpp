@@ -10,7 +10,7 @@
 
 namespace renut::gpu {
 namespace xshader {
-namespace ucode = rex::graphics::ucode;
+namespace ucode = rex::xenos::ucode;
 
 using namespace ucode;
 
@@ -36,7 +36,7 @@ void Shader::AnalyzeUcode() {
     ControlFlowInstruction cf_ab[2];
     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
     for (uint32_t j = 0; j < 2; ++j) {
-      if (IsControlFlowOpcodeExec(cf_ab[j].opcode())) bound = std::min(bound, uint32_t(cf_ab[j].exec.address()));
+      if (IsControlFlowOpcodeExec(cf_ab[j].GetOpcode())) bound = std::min(bound, uint32_t(cf_ab[j].exec.GetAddress()));
     }
   }
 
@@ -46,27 +46,27 @@ void Shader::AnalyzeUcode() {
     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
     for (uint32_t j = 0; j < 2; ++j) {
       const ControlFlowInstruction& cf = cf_ab[j];
-      switch (cf.opcode()) {
+      switch (cf.GetOpcode()) {
         case ControlFlowOpcode::kCondExec:
         case ControlFlowOpcode::kCondExecEnd:
         case ControlFlowOpcode::kCondExecPredClean:
         case ControlFlowOpcode::kCondExecPredCleanEnd:
-          test_bool(cf.cond_exec.bool_address());
-          GatherExec(cf.cond_exec.address(), cf.cond_exec.count(), cf.cond_exec.sequence());
+          test_bool(cf.cond_exec.GetBoolAddress());
+          GatherExec(cf.cond_exec.GetAddress(), cf.cond_exec.GetCount(), cf.cond_exec.GetSequence());
           break;
         case ControlFlowOpcode::kExec:
         case ControlFlowOpcode::kExecEnd:
-          GatherExec(cf.exec.address(), cf.exec.count(), cf.exec.sequence());
+          GatherExec(cf.exec.GetAddress(), cf.exec.GetCount(), cf.exec.GetSequence());
           break;
         case ControlFlowOpcode::kCondExecPred:
         case ControlFlowOpcode::kCondExecPredEnd:
-          GatherExec(cf.cond_exec_pred.address(), cf.cond_exec_pred.count(), cf.cond_exec_pred.sequence());
+          GatherExec(cf.cond_exec_pred.GetAddress(), cf.cond_exec_pred.GetCount(), cf.cond_exec_pred.GetSequence());
           break;
         case ControlFlowOpcode::kCondCall:
-          if (!cf.cond_call.is_unconditional() && !cf.cond_call.is_predicated()) test_bool(cf.cond_call.bool_address());
+          if (!cf.cond_call.IsUnconditional() && !cf.cond_call.IsPredicated()) test_bool(cf.cond_call.GetBoolAddress());
           break;
         case ControlFlowOpcode::kCondJmp:
-          if (!cf.cond_jmp.is_unconditional() && !cf.cond_jmp.is_predicated()) test_bool(cf.cond_jmp.bool_address());
+          if (!cf.cond_jmp.IsUnconditional() && !cf.cond_jmp.IsPredicated()) test_bool(cf.cond_jmp.GetBoolAddress());
           break;
         default:
           break;
@@ -82,14 +82,14 @@ void Shader::GatherExec(uint32_t address, uint32_t count, uint32_t sequence) {
     if ((uint64_t(offset) + 1) * 3 > ucode_data_.size()) break;
     if (!(sequence & 0b01)) continue;
     const auto& fetch = *reinterpret_cast<const FetchInstruction*>(ucode_data_.data() + offset * 3);
-    switch (fetch.opcode()) {
+    switch (fetch.GetOpcode()) {
       case FetchOpcode::kTextureFetch:
       case FetchOpcode::kGetTextureBorderColorFrac:
-      case FetchOpcode::kGetTextureComputedLod:
+      case FetchOpcode::kGetTextureComputedLOD:
       case FetchOpcode::kGetTextureGradients:
       case FetchOpcode::kGetTextureWeights: {
         // A destination component taken from the fetched value (x to w), not a constant or a keep.
-        const uint32_t swizzle = fetch.texture_fetch().dest_swizzle();
+        const uint32_t swizzle = fetch.GetTextureFetch().GetDestSwizzle();
         for (uint32_t c = 0; c < 4; ++c) {
           if (uint32_t(GetFetchDestinationComponentSwizzle(swizzle, c)) <= uint32_t(FetchDestinationSwizzle::kW)) {
             uses_texture_fetch_instruction_results_ = true;

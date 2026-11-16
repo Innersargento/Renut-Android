@@ -36,7 +36,7 @@ struct Lists {
   uint64_t native_draws_ = 0, native_bad_ = 0;
   // The engine pass of the draw being issued (native_d3d::kDrawPassShift).
   uint8_t draw_pass_ = 0;
-  // The EDRAM mode of the draw being issued (native_d3d::kDrawModeShift), an xenos::EdramMode.
+  // The EDRAM mode of the draw being issued (native_d3d::kDrawModeShift), an xenos::EDRAMMode.
   uint8_t draw_mode_ = 0;
 };
 

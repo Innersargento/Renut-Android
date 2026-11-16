@@ -8,11 +8,12 @@ longjmp_address = 0x82BB59B0
 # value crosses a call and writes it through ctx:
 #   non_argument_as_local: r12 into the save/restore helpers, __chkstk and the SEH handlers, r11 into 15
 #     functions, r11/v60 out of 9. Without the hand-offs the game hangs at the 3D title.
-#   non_volatile_as_local: the Xbox compiler's whole-program allocation passes values in non-volatiles (r19-r31,
-#     v21, v31 out of a few functions; v65-v77, v123, v126 into thousands), so v14-v31 and v64-v127 stay in ctx
-#     (their save/restore helpers called again), r14-r31 and f14-f31 are local with hand-offs, the SEH funclets
-#     that keep registers in ctx get their save/restore back, and setjmp snapshots the locals. Without the
-#     output hand-offs the title draws only the sky.
+#   non_volatile_as_local: left off. RexGlue 0.11 makes it drop every call to the save and restore helpers
+#     (a restore exit becomes a plain return), which suits titles that keep the calling convention; this
+#     one's whole-program allocation passes values in non-volatiles (r19-r31, v21, v31 out of a few
+#     functions; v65-v77, v123, v126 into thousands), and a callee that no longer restores r31 hands its
+#     own frame pointer back through the hand-offs: the heap creation (sub_82716E80) then wrote through a
+#     null pointer at the first frame. With the flag off r14-r31 stay in ctx and the helpers are called.
 # `prepare.py codegen` deletes generated/android/*.cpp first: the generator skips files it finds unchanged.
 skip_lr = true
 skip_msr = true
@@ -21,7 +22,13 @@ xer_as_local = true
 reserved_as_local = false
 cr_as_local = true
 non_argument_as_local = true
-non_volatile_as_local = true
+non_volatile_as_local = false
+# New in RexGlue 0.11: a load through r1 takes the value of an earlier store through r1 at the same offset
+# and width in the same basic block from a local (fwdN) instead of reading guest memory. Every store not
+# through r1, every branch or call, sync/eieio and mid-function hooks forget what was held, so a stack slot
+# written another way is never forwarded stale. reblue ships with it on. tools/codegen_handoff.py knows the
+# forwarded form of the link register save (`fwdN.u32 = r12.u32;` + its store).
+forward_stack_stores = true
 
 [functions]
 0x82B100E8 = {}

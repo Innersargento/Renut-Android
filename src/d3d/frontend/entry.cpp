@@ -1,5 +1,6 @@
 // The public entry points (native_d3d.h).
 #include "d3d/frontend/internal.h"
+#include "platform/log.h"
 #include "d3d/resources/microcode.h"
 
 namespace renut::native_d3d {
@@ -129,7 +130,7 @@ void RingBufferParameters(PPCContext& ctx, uint32_t dev, uint8_t* base) {
   if (!g_front.main_device) g_front.main_device = dev;
   if (!g_front.sync_recording) {
     g_front.sync_recording = true;
-    REXLOG_INFO("Renut: native sync on from the device's first act (swap {})", g_front.swaps_seen);
+    REXLOG_CAT_INFO(rex::log::renut, "Renut: native sync on from the device's first act (swap {})", g_front.swaps_seen);
   }
 }
 

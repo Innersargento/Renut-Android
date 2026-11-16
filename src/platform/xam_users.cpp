@@ -13,12 +13,12 @@
 #include <cstring>
 #include <string>
 
-#include <rex/input/input_system.h>
-#include <rex/memory/utils.h>
+#include <rex/hid/input_system.h>
+#include <rex/kernel/thread_registry.h>
+#include <rex/kernel/object/notification_broadcaster.h>
+#include <rex/kernel/types/status.h>
 #include <rex/ppc/context.h>
-#include <rex/runtime.h>
-#include <rex/system/kernel_state.h>
-#include <rex/system/xtypes.h>
+#include "platform/guest.h"
 
 #include "guest/guest_address.h"
 #include "touch_input.h"
@@ -27,15 +27,13 @@
 #include "guest/kernel_overrides.h"
 #undef X
 
-using rex::X_RESULT;
-using rex::X_STATUS;
-using rex::X_HRESULT;
+using namespace rex::kernel;  // X_E_*, X_ERROR_*
 
 namespace {
 
 constexpr uint32_t kXInputFlagGamepad = 0x01;
 constexpr uint32_t kXInputFlagAnyUser = 1u << 30;
-constexpr uint32_t kUsers = rex::input::kMaxGuestUsers;
+constexpr uint32_t kUsers = rex::hid::IInputSystem::kMaxUsers;
 
 // User 0 (the touch controller) is always there; the others exist while a pad is attached.
 bool UserConnected(uint32_t user) { return user == 0 || (user < kUsers && renut::PlayerAttached(int(user))); }
@@ -43,12 +41,9 @@ bool UserConnected(uint32_t user) { return user == 0 || (user < kUsers && renut:
 // A guest user the SDK would not know: attached, and not user 0.
 bool IsGuest(uint32_t user) { return user != 0 && user < kUsers && renut::PlayerAttached(int(user)); }
 
-rex::input::InputSystem* Input() {
-  auto* kernel = rex::system::kernel_state();
-  return kernel && kernel->emulator()
-             ? static_cast<rex::input::InputSystem*>(kernel->emulator()->input_system())
-             : nullptr;
-}
+rex::hid::IInputSystem* Input() { return rex::AppInterfaces::Get<rex::hid::IInputSystem>(); }
+
+bool AnyUser(uint32_t user, uint32_t flags) { return (user & 0xFF) == 0xFF || (flags & kXInputFlagAnyUser); }
 
 uint64_t LoadBE64(const uint8_t* p) {
   uint64_t v = 0;
@@ -185,9 +180,9 @@ extern "C" void renut_imp_XamUserWriteProfileSettings(PPCContext& __restrict ctx
   const uint32_t user = ctx.r4.u32;
   if (IsGuest(user)) {
     const uint32_t overlapped = ctx.r7.u32;
-    auto* kernel = rex::system::kernel_state();
-    if (overlapped && kernel) {
-      kernel->CompleteOverlappedImmediate(overlapped, X_ERROR_SUCCESS);
+    auto* overlaps = rex::AppInterfaces::Get<rex::kernel::IOverlappedDispatcher>();
+    if (overlapped && overlaps) {
+      overlaps->Complete(overlapped, {.result = X_ERROR_SUCCESS});
       ctx.r3.u64 = uint32_t(X_ERROR_IO_PENDING);
     } else {
       ctx.r3.u64 = uint32_t(X_ERROR_SUCCESS);
@@ -222,9 +217,9 @@ extern "C" void renut_imp_XamUserAreUsersFriends(PPCContext& __restrict ctx, uin
 // carries every user that is signed in (the SDK's carries user 0 alone), and the
 // UI notification says it is gone. Games sit and loop until they see both.
 extern "C" void renut_imp_XamShowSigninUI(PPCContext& __restrict ctx, uint8_t*) {
-  if (auto* kernel = rex::system::kernel_state()) {
-    kernel->BroadcastNotification(0x0000000A, SignedInMask());  // XN_SYS_SIGNINCHANGED
-    kernel->BroadcastNotification(0x00000009, 0);                // XN_SYS_UI (off)
+  if (rex::kernel::TitleRuntime* title = renut::host::Title()) {
+    title->GetNotificationBroadcaster().BroadcastNotification(0x0000000A, SignedInMask());  // XN_SYS_SIGNINCHANGED
+    title->GetNotificationBroadcaster().BroadcastNotification(0x00000009, 0);                // XN_SYS_UI (off)
   }
   ctx.r3.u64 = uint32_t(X_ERROR_SUCCESS);
 }
@@ -232,54 +227,38 @@ extern "C" void renut_imp_XamShowSigninUI(PPCContext& __restrict ctx, uint8_t*) 
 // ---- XamInput* ----
 
 // XamInputGetState(user, flags, state*): "any user" is the first pad that is
-// attached (user 0 always is), as on the console, not user 0 alone.
+// attached (user 0 always is), as on the console; the SDK's export pins it to user 0, so it
+// is asked for that user.
 extern "C" void renut_imp_XamInputGetState(PPCContext& __restrict ctx, uint8_t* base) {
   const uint32_t user = ctx.r3.u32, flags = ctx.r4.u32;
-  if ((flags & 0xFF) && !(flags & kXInputFlagGamepad)) {
-    ctx.r3.u64 = uint32_t(X_ERROR_DEVICE_NOT_CONNECTED);
-    return;
-  }
-  auto* input = Input();
-  if (input && ((user & 0xFF) == 0xFF || (flags & kXInputFlagAnyUser))) {
-    auto* state = ctx.r5.u32 ? reinterpret_cast<rex::input::X_INPUT_STATE*>(renut::GuestPtr(base, ctx.r5.u32))
-                             : nullptr;
+  if (auto* input = Input(); input && AnyUser(user, flags) && !((flags & 0xFF) && !(flags & kXInputFlagGamepad))) {
     for (uint32_t u = 0; u < kUsers; ++u) {
-      if (input->GetState(u, state) == X_ERROR_SUCCESS) {
-        ctx.r3.u64 = uint32_t(X_ERROR_SUCCESS);
-        return;
+      if (input->GetState(u)) {
+        ctx.r3.u64 = u;
+        break;
       }
     }
-    ctx.r3.u64 = uint32_t(X_ERROR_DEVICE_NOT_CONNECTED);
-    return;
   }
   __imp__XamInputGetState(ctx, base);
 }
 
-namespace {
-
-// XUSER_INDEX_ANY for keystrokes: the first user with a pending one, as on the
-// console. The title reads which user it came from out of the result.
-X_RESULT KeystrokeFromAnyUser(rex::input::InputSystem* input, uint32_t flags,
-                              rex::input::X_INPUT_KEYSTROKE* keystroke) {
-  X_RESULT first_error = X_ERROR_DEVICE_NOT_CONNECTED;
-  for (uint32_t u = 0; u < kUsers; ++u) {
-    const X_RESULT result = input->GetKeystroke(u, flags, keystroke);
-    if (result == X_ERROR_SUCCESS) return result;
-    if (result == X_ERROR_EMPTY) first_error = result;
-  }
-  return first_error;
-}
-
-}  // namespace
-
-// XamInputGetKeystroke(user, flags, keystroke*)
+// XamInputGetKeystroke(user, flags, keystroke*): "any user" is the first user with a pending
+// keystroke, as on the console. The title reads which user it came from out of the result.
 extern "C" void renut_imp_XamInputGetKeystroke(PPCContext& __restrict ctx, uint8_t* base) {
   const uint32_t user = ctx.r3.u32, flags = ctx.r4.u32;
-  auto* input = Input();
-  if (input && ctx.r5.u32 && !((flags & 0xFF) && !(flags & kXInputFlagGamepad)) &&
-      ((user & 0xFF) == 0xFF || (flags & kXInputFlagAnyUser))) {
-    auto* keystroke = reinterpret_cast<rex::input::X_INPUT_KEYSTROKE*>(renut::GuestPtr(base, ctx.r5.u32));
-    ctx.r3.u64 = uint32_t(KeystrokeFromAnyUser(input, flags, keystroke));
+  const uint64_t keystroke = ctx.r5.u64;
+  if (AnyUser(user, flags) && !((flags & 0xFF) && !(flags & kXInputFlagGamepad))) {
+    uint32_t first_error = X_ERROR_DEVICE_NOT_CONNECTED;
+    for (uint32_t u = 0; u < kUsers; ++u) {
+      ctx.r3.u64 = u;
+      ctx.r4.u64 = flags;
+      ctx.r5.u64 = keystroke;
+      __imp__XamInputGetKeystroke(ctx, base);
+      const uint32_t result = ctx.r3.u32;
+      if (result == X_ERROR_SUCCESS) return;
+      if (result == X_ERROR_EMPTY) first_error = result;
+    }
+    ctx.r3.u64 = first_error;
     return;
   }
   __imp__XamInputGetKeystroke(ctx, base);
@@ -289,21 +268,27 @@ extern "C" void renut_imp_XamInputGetKeystroke(PPCContext& __restrict ctx, uint8
 // keystroke came from is written back through the pointer.
 extern "C" void renut_imp_XamInputGetKeystrokeEx(PPCContext& __restrict ctx, uint8_t* base) {
   const uint32_t user_address = ctx.r3.u32, flags = ctx.r4.u32;
-  auto* input = Input();
-  if (input && user_address && ctx.r5.u32 && !((flags & 0xFF) && !(flags & kXInputFlagGamepad))) {
+  const uint64_t keystroke = ctx.r5.u64;
+  if (user_address && !((flags & 0xFF) && !(flags & kXInputFlagGamepad))) {
     uint8_t* user_word = renut::GuestPtr(base, user_address);
     const uint32_t user = uint32_t(user_word[0]) << 24 | uint32_t(user_word[1]) << 16 |
                           uint32_t(user_word[2]) << 8 | user_word[3];
-    auto* keystroke = reinterpret_cast<rex::input::X_INPUT_KEYSTROKE*>(renut::GuestPtr(base, ctx.r5.u32));
-    X_RESULT result;
-    if ((user & 0xFF) == 0xFF || (flags & kXInputFlagAnyUser)) {
-      result = KeystrokeFromAnyUser(input, flags, keystroke);
-    } else {
-      result = input->GetKeystroke(user, flags, keystroke);
+    if (AnyUser(user, flags)) {
+      uint32_t first_error = X_ERROR_DEVICE_NOT_CONNECTED;
+      for (uint32_t u = 0; u < kUsers; ++u) {
+        StoreBE32(user_word, u);
+        ctx.r3.u64 = user_address;
+        ctx.r4.u64 = flags;
+        ctx.r5.u64 = keystroke;
+        __imp__XamInputGetKeystrokeEx(ctx, base);
+        const uint32_t result = ctx.r3.u32;
+        if (result == X_ERROR_SUCCESS) return;
+        if (result == X_ERROR_EMPTY) first_error = result;
+      }
+      StoreBE32(user_word, user);
+      ctx.r3.u64 = first_error;
+      return;
     }
-    if (result == X_ERROR_SUCCESS) StoreBE32(user_word, keystroke->user_index);
-    ctx.r3.u64 = uint32_t(result);
-    return;
   }
   __imp__XamInputGetKeystrokeEx(ctx, base);
 }

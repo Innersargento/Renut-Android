@@ -22,6 +22,7 @@
 // All three leave the original to run when the cvar is off, when the stub of the recording ring (the
 // stub_command_buffers cvar of sync.cpp) is off, or for what they do not cover.
 #include "d3d/scene/command_buffers.h"
+#include "platform/guest.h"
 
 #include "d3d/frontend/native_d3d.h"
 #include "d3d/hooks/layer.h"
@@ -32,9 +33,8 @@
 #include <cstring>
 #include <mutex>
 
-#include <rex/cvar.h>
-#include <rex/system/kernel_state.h>
-#include <rex/system/xmemory.h>
+#include "platform/guest.h"
+#include "platform/guest.h"
 
 // The brake of BeginCommandBuffer: a thread that starts recording a buffer waits (at most 50 ms)
 // while more than this many published lists are waiting for the GPU backend. The console made it
@@ -87,10 +87,9 @@ u32 EmptyCallList() {
   static std::once_flag made;
   static u32 node = 0;
   std::call_once(made, [] {
-    auto* memory = rex::system::kernel_memory();
-    node = memory ? memory->SystemHeapAlloc(64, 16, rex::memory::kSystemHeapPhysical) : 0;
+    node = renut::host::SystemAlloc(64, 16, true);
     if (!node) return;
-    u8* bytes = renut::GuestPtr(memory->virtual_membase(), node);
+    u8* bytes = renut::GuestPtr(renut::host::VirtualBase(), node);
     std::memset(bytes, 0, 64);
     StoreBE32(bytes + 4, 1);  // one call, {0, 0}
   });
