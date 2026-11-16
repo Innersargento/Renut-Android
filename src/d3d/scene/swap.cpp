@@ -30,15 +30,11 @@ REX_FUNC(sub_8265F688);  // D3DDevice_SetScalerParameters
 REX_FUNC(sub_822873E8);  // CDevice::StartNewSegment
 REX_FUNC(sub_8228F558);  // CDevice::BlockOnFence
 REX_FUNC(sub_8264DCD0);  // D3D_CBlocker_Check
-__attribute__((weak)) void sub_821ED560(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82287D38(PPCContext& __restrict, uint8_t*);
-// The kernel imports the original calls. 0x82D0827C, 0x82D0820C, 0x82D0821C, 0x82D08B2C,
-// 0x82D08B6C, 0x82D08A6C and 0x82D088EC are their import thunks in the title, not functions of the
-// recompiled code: they are the exports themselves here (the port used to name the thunk addresses,
-// found no function there and so never ran). VdSwap is reNut's own (guest/kernel_overrides.cpp), the
-// one the recompiled code reaches; the process type and the system command buffer are done below.
-void renut_imp_VdSwap(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8264DC08(PPCContext& __restrict, uint8_t*);  // CBlocker cleanup
+void sub_821ED560(PPCContext& __restrict, uint8_t*);
+void sub_82287D38(PPCContext& __restrict, uint8_t*);
+// The kernel's video calls the original makes (VdSwap, VdGetSystemCommandBuffer, ...) are not made: the
+// present is recorded directly and the process type and the system command buffer are done below.
+void sub_8264DC08(PPCContext& __restrict, uint8_t*);  // CBlocker cleanup
 }
 
 namespace renut::d3d::port {
@@ -60,10 +56,6 @@ u32 InsertMasked(u32 target, u32 source, u32 rotate, u32 mask) {
   return (rotated & mask) | (target & ~mask);
 }
 
-bool HaveAll() {
-  return sub_821ED560 && sub_82287D38;
-}
-
 // KeGetCurrentProcessType, as the kernel answers it for the calling thread: the type its DPC set while
 // one is running (the PCR, r13, holds the processor block at +0x100: dpc_active at +0x50, the type in
 // the DPC at PCR + 0xC), otherwise the current thread's (processor block +0, type at thread + 0x73).
@@ -83,8 +75,6 @@ void SystemCommandBuffer(const GuestFrame& f, u32 buffer, u32 id) {
 
 // D3DDevice_Swap(device, front buffer, scaler parameters)
 bool Swap(PPCContext& ctx, uint8_t* base) {
-  if (!HaveAll())
-    return false;
   Frame f(ctx, base, 0x230);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
@@ -150,15 +140,11 @@ bool Swap(PPCContext& ctx, uint8_t* base) {
   if (d.W(0x541C)) {
     f.Put(d.W(0x2A90) + 8, f.Get(f.sp + 0x74));
   } else {
-    // VdSwap takes the buffer its swap packet goes to. Nothing reads the ring, so the packet goes
-    // to the scratch block (the present is recorded from VdSwap's arguments, RecordPresent) and
-    // the ring is left alone.
-    const u32 sink = renut::native_d3d::RingSinkAddress();
-    const u32 buffer = sink ? sink : d.W(0x30);
-    f.Put(f.sp + 0x54, f.sp + 0x60);
-    f.Put(f.sp + 0x5C, f.sp + 0x64);
-    f.Call(renut_imp_VdSwap, {buffer + 4, f.sp + 0xA0, d.W(0x2A90) + 8, f.sp + 0xD0, f.Get(f.sp + 0x74),
-                          f.sp + 0x70, f.sp + 0x6C, f.sp + 0x68});
+    // The original calls VdSwap here, which only writes a swap packet into the ring for the GPU. Nothing
+    // reads the ring: the frame goes into the swapping device's list instead, from the front buffer's
+    // virtual address and size the swap wrote above (RecordPresent turns the address into the GPU one
+    // the resolves are keyed by).
+    renut::native_d3d::RecordPresent(f.Get(f.sp + 0x70), f.Get(f.sp + 0x60), f.Get(f.sp + 0x64));
   }
   d.SetW(0x5B34, f.Get(f.sp + 0xD4));
 

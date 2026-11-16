@@ -30,7 +30,7 @@ REX_FUNC(sub_822108B8);  // CDevice::CreateInvalidateBuffer
 REX_FUNC(sub_822052C8);  // D3D::InsertCallback
 REX_FUNC(sub_82278528);  // CDevice::SetFence
 REX_FUNC(sub_821F7C18);  // room in the ring
-__attribute__((weak)) void __imp__VdQueryVideoMode(PPCContext& __restrict, uint8_t*);  // kernel: display mode change
+void __imp__VdQueryVideoMode(PPCContext& __restrict, uint8_t*);  // kernel: display mode change
 
 REX_FUNC(sub_8228F558);  // CDevice::BlockOnFence
 REX_FUNC(sub_8227AF40);  // D3DDevice_SetDepthStencilSurface
@@ -39,9 +39,9 @@ REX_FUNC(sub_82208720);  // D3DResource_Release
 REX_FUNC(sub_8222F410);  // D3DDevice_SetTexture
 REX_FUNC(sub_82658988);  // D3DDevice_SetScreenExtentQueryMode
 REX_FUNC(sub_82220B20);  // D3DDevice_SetShaderGPRAllocation
-__attribute__((weak)) void sub_822399D8(PPCContext& __restrict, uint8_t*);  // the game's XMemFree
-__attribute__((weak)) void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
-__attribute__((weak)) void sub_82660E00(PPCContext& __restrict, uint8_t*);  // the device's trace flush
+void sub_822399D8(PPCContext& __restrict, uint8_t*);  // the game's XMemFree
+void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
+void sub_82660E00(PPCContext& __restrict, uint8_t*);  // the device's trace flush
 
 }
 
@@ -374,8 +374,6 @@ bool SwapNotify(PPCContext& ctx, uint8_t* base) {
   const bool callbacks = (d.W(0x5420) & 0x40000000u) != 0;
   if (callbacks && scan_format == 0 && !(d.B(0x2ABD) & 2))
     return false;  // 0x8265C4B8 builds the callback's context
-  if ((changes & 8) && !__imp__VdQueryVideoMode)
-    return false;
   u32 context = ctx.r6.u32;  // r30
   d.SetW(0x54B0, ctx.r7.u32);
   d.SetW(0x54B4, ctx.r8.u32);

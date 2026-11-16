@@ -98,8 +98,6 @@ class Settings final : public rex::SettingOwner {
               "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                "next start; a scene load waits until they are built. Not in low-memory mode, which only "
                "records.");
-  REX_SETTING(bool, vsync, true,
-              "Enable vertical sync");
   REX_SETTING(bool, cheats, false,
               "Master switch of the cheats below; none applies while it is off");
   REX_SETTING(bool, cheat_infinite_health, false,
@@ -132,10 +130,6 @@ class Settings final : public rex::SettingOwner {
               "Frame rate the game is held to: 30 is its own, 31-240 presents "
                "immediately and paces to that rate, 0 is unlimited. Changes live from the sidebar "
                "(plume/frame_pacing.h)", rex::Range{0, 240});
-  REX_SETTING(bool, pace_original_fps, true,
-              "The game's own 30 FPS is held by the frame pacer with an immediate presentation "
-               "interval, like every other target (and like reNut on PC, which has no vertical blank). "
-               "Off: the game's presentation interval waits for the emulated vertical blank");
   REX_SETTING(bool, pump_loading_hold, true,
               "While a scene start is held for its pipelines, call the game's own stall pump so the loading "
                "screen keeps animating (the Pong's ball) instead of standing still.");

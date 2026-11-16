@@ -26,9 +26,6 @@
 #include "platform/audio_threads.h"
 #include "platform/log.h"
 #include "host_support.h"
-#include "d3d/frontend/native_d3d.h"
-#include "plume/plume_gpu.h"
-
 
 #define X(name) extern "C" void __imp__##name(PPCContext& __restrict ctx, uint8_t* base);
 #include "kernel_overrides.h"
@@ -36,41 +33,11 @@
 
 namespace {
 
-uint32_t LoadBE32(const uint8_t* p) {
-  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
-}
-
 void StoreBE32(uint8_t* p, uint32_t v) {
   p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
 }
 
 }  // namespace
-
-// VdSwap(buffer, fetch, unk2, unk3, unk4, frontbuffer, format, color space,
-// width, height): the game's present. With native sync the frame goes into the
-// swapping device's list and the buffer is left as it is: the ring is a stub that
-// nothing reads, so no swap packet is needed. The rest is the SDK's.
-extern "C" void renut_imp_VdSwap(PPCContext& __restrict ctx, uint8_t* base) {
-  const uint32_t buffer_address = ctx.r3.u32;
-  const uint32_t fetch_address = ctx.r4.u32;
-  // The ninth and tenth arguments are on the stack (r1 + 0x54 and + 0x5C, the
-  // ABI the SDK's own argument translator reads): they are not r11 and r12,
-  // which are scratch at the call and held a pointer into the device.
-  const uint32_t width_address = LoadBE32(renut::GuestPtr(base, ctx.r1.u32 + 0x54));
-  const uint32_t height_address = LoadBE32(renut::GuestPtr(base, ctx.r1.u32 + 0x5C));
-  if (buffer_address && fetch_address && width_address && height_address) {
-    // The texture header's fetch constant holds the virtual address of the
-    // frontbuffer, shifted right 12 (dword 1, bits 12 and up).
-    const uint32_t virtual_base = (LoadBE32(renut::GuestPtr(base, fetch_address) + 4) >> 12) << 12;
-    const uint32_t width = LoadBE32(renut::GuestPtr(base, width_address));
-    const uint32_t height = LoadBE32(renut::GuestPtr(base, height_address));
-    // RecordPresent turns the virtual address into the GPU address the resolves are keyed by.
-    if (renut::native_d3d::RecordPresent(virtual_base, width, height)) {
-      return;
-    }
-  }
-  __imp__VdSwap(ctx, base);
-}
 
 // XamAlloc, XamAllocEx and XamFree on the title workspace. RexGlue 0.11.0 hands XAM a reference to the
 // workspace when the title is created, and the kernel later builds a new workspace at the size the XEX
@@ -177,23 +144,16 @@ REX_HOOK_RAW(sub_82664B70) {
   }
 }
 
-// The video export that carries the graphics interrupt callback (xboxkrnl_video.cpp). The app's GPU driver
-// (plume_gpu.h) needs the callback's user data, the device the vertical blank updates; the kernel keeps the
-// callback itself for the interrupts the driver raises.
-// (The ring buffer exports are not overridden: the ring is a stub, and the only code that
-// called them, D3DDevice_SetRingBufferParameters, no longer runs.)
-// (callback, user data)
-extern "C" void renut_imp_VdSetGraphicsInterruptCallback(PPCContext& __restrict ctx, uint8_t* base) {
-  renut::PlumeGpuSetInterruptCallback(ctx.r3.u32, ctx.r4.u32);
-  __imp__VdSetGraphicsInterruptCallback(ctx, base);  // the kernel's dispatcher runs it for RaiseGraphicsInterrupt
-}
-
 // The player's pause (host_support.h): a guest thread parks here, at the point
 // where it would have waited, delayed or yielded anyway, and carries on into
 // the SDK's own function when the pause is released. Parking a thread anywhere
 // else could leave it holding the allocator or a kernel lock that the threads
 // still running need.
-#define RENUT_PAUSE_POINT(name)                                                    extern "C" void renut_imp_##name(PPCContext& __restrict ctx, uint8_t* base) {        renut::WaitIfTitlePaused();                                                        __imp__##name(ctx, base);                                                        }
+#define RENUT_PAUSE_POINT(name)                                                 \
+  extern "C" void renut_imp_##name(PPCContext& __restrict ctx, uint8_t* base) { \
+    renut::WaitIfTitlePaused();                                                 \
+    __imp__##name(ctx, base);                                                   \
+  }
 RENUT_PAUSE_POINT(KeDelayExecutionThread)
 RENUT_PAUSE_POINT(NtYieldExecution)
 RENUT_PAUSE_POINT(KeWaitForSingleObject)

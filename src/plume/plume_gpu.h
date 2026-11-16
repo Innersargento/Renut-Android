@@ -22,7 +22,6 @@ namespace renut {
 // below.
 std::unique_ptr<rex::IDriver> CreatePlumeGraphicsDriver();
 bool PlumeGpuHosted();
-void PlumeGpuSetInterruptCallback(uint32_t callback, uint32_t user_data);
 
 // Microcode the GPU backend meets without a recompiled shader is saved
 // here (first 32), to extend the capture.

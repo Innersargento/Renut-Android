@@ -10,7 +10,7 @@ namespace {
 std::mutex loader_mutex;
 void* loader=nullptr; // Retained until the isolated runtime process exits.
 }
-void renutConfigureXenosDriver(const std::string& hooks,const std::string& directory,const std::string& library,bool one_ui_fix,
+void renutConfigureVulkanDriver(const std::string& hooks,const std::string& directory,const std::string& library,bool one_ui_fix,
                                const std::string& tu_debug) {
   std::lock_guard lock(loader_mutex);
   if(loader)throw std::runtime_error("O driver já foi inicializado nesta sessão.");

@@ -137,12 +137,10 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   }
   frame_start_ = submit_end;
   // The frame is on its way: hold the command thread, and with it the game
-  // behind its fences, to the rate the player chose. While the vblank holds the
-  // game (its own 30 FPS and an interval that waits for it) that is its job, and
-  // unlimited has nothing to wait for; both make this a no-op.
+  // behind its fences, to the rate the player chose (unlimited has nothing to wait for).
   {
     static pacing::Pacer pacer;
-    pacer.Wait(pacing::VblankPaces() ? 0 : pacing::Target());
+    pacer.Wait(pacing::Target());
   }
   if (snap_dump && renderer) {
     renderer->WaitForAllSlots();

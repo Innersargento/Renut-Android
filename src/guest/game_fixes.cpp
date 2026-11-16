@@ -36,7 +36,6 @@ namespace renut::pacing {
 void ApplyConfiguredTarget() {
   int fps = renut::GetSettings().fps_target.Get();
   SetTarget(fps);
-  PaceOriginalCell().store(renut::GetSettings().pace_original_fps.Get(), std::memory_order_relaxed);
 }
 }  // namespace renut::pacing
 
@@ -103,22 +102,19 @@ void ApplySceneMsaa(uint8_t* base) {
 }  // namespace
 
 // The game selects a presentation interval through this routine. Index 0 is its
-// immediate mode; preserve the original routine's device bookkeeping. Anything
-// but the game's own 30 FPS asks for the immediate one here, as before the
-// frame-rate slider; a target that changes later is also applied per frame at the
-// swap's synchronization point (d3d/frontend/sync.cpp SynchronizeToPresentationInterval).
-// What the game ends up with is noted, so that the command thread paces the frames
-// itself whenever the vblank does not (frame_pacing.h VblankPaces).
+// immediate mode; preserve the original routine's device bookkeeping. Every target asks for
+// the immediate one, its own 30 FPS included: the command thread's Pacer holds the rate
+// (frame_pacing.h), and the swap's synchronization point is immediate too
+// (d3d/frontend/sync.cpp SynchronizeToPresentationInterval).
 extern "C" void __imp__rex_setParamInterval(PPCContext& __restrict, uint8_t*);
 REX_HOOK_RAW(rex_setParamInterval) {
-  if (renut::pacing::ImmediatePresentation() && ctx.r3.u32 != 0) {
+  if (ctx.r3.u32 != 0) {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
       REXLOG_CAT_INFO(rex::log::renut, "Renut: presentation interval {} -> immediate (frame-rate target {})", ctx.r3.u32,
                   renut::pacing::Target());
     ctx.r3.u32 = 0;
   }
-  renut::pacing::NoteGameInterval(ctx.r3.u32);
   __imp__rex_setParamInterval(ctx, base);
 }
 

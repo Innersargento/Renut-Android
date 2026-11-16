@@ -27,15 +27,14 @@ REX_FUNC(sub_82656208);  // D3DDevice_BeginIndexedVertices
 REX_FUNC(sub_82223560);  // D3D::ClearF
 REX_FUNC(sub_822811A0);  // D3DDevice_ClearF
 REX_FUNC(sub_822052C8);  // D3D::InsertCallback
-// Recompiled leaves; weak, and a handler that needs one declines when it is missing.
-__attribute__((weak)) void sub_82222F20(PPCContext& __restrict, uint8_t*);  // the viewport from floats
-__attribute__((weak)) void sub_826593F8(PPCContext& __restrict, uint8_t*);  // gamma ramp -> table
-__attribute__((weak)) void sub_82659490(PPCContext& __restrict, uint8_t*);  // PWL gamma -> table
-__attribute__((weak)) void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
-__attribute__((weak)) void sub_8265F3B0(PPCContext& __restrict, uint8_t*);  // scaler fit
-__attribute__((weak)) void __imp__VdCallGraphicsNotificationRoutines(PPCContext& __restrict, uint8_t*);  // the video scaler call
-__attribute__((weak)) void sub_82654FD8(PPCContext& __restrict, uint8_t*);  // export fence packet
-__attribute__((weak)) void sub_82655130(PPCContext& __restrict, uint8_t*);  // export fence packet, end
+void sub_82222F20(PPCContext& __restrict, uint8_t*);  // the viewport from floats
+void sub_826593F8(PPCContext& __restrict, uint8_t*);  // gamma ramp -> table
+void sub_82659490(PPCContext& __restrict, uint8_t*);  // PWL gamma -> table
+void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
+void sub_8265F3B0(PPCContext& __restrict, uint8_t*);  // scaler fit
+void __imp__VdCallGraphicsNotificationRoutines(PPCContext& __restrict, uint8_t*);  // the video scaler call
+void sub_82654FD8(PPCContext& __restrict, uint8_t*);  // export fence packet
+void sub_82655130(PPCContext& __restrict, uint8_t*);  // export fence packet, end
 }
 
 namespace renut::d3d::port {
@@ -61,8 +60,6 @@ u32 GpuOf(u32 address) {
 // D3DDevice_Present(device): the back buffer is resolved to the front buffer and
 // swapped, with the viewport and scissor that were set put back afterwards.
 bool Present(PPCContext& ctx, uint8_t* base) {
-  if (!sub_82222F20)
-    return false;
   Frame f(ctx, base, 0xD0);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
@@ -118,8 +115,6 @@ bool Present(PPCContext& ctx, uint8_t* base) {
 // D3DDevice_SetScalerParameters(device, parameters): the scaler's rectangles are
 // fitted to the source size, stored in the device and handed to the video kernel.
 bool SetScalerParameters(PPCContext& ctx, uint8_t* base) {
-  if (!sub_8265F3B0 || !__imp__VdCallGraphicsNotificationRoutines)
-    return false;
   Frame f(ctx, base, 0x100);
   Device d = DeviceAt(base, ctx.r3.u32);
   const u32 params = ctx.r4.u32;
@@ -207,16 +202,10 @@ u32 ExportBase(const Frame& f, u32 resource) {
   }
 }
 
-bool HaveExport() {
-  return sub_82654FD8 && sub_82655130;
-}
-
 // D3DDevice_BeginExport(device, index, resource, kind). The original also writes the export's
 // registers into the ring; the ring is a stub nothing reads, so only the device's state is kept:
 // the export base, the dirty bit, and the settle (which marks the registers dirty).
 bool BeginExport(PPCContext& ctx, uint8_t* base) {
-  if (!HaveExport())
-    return false;
   Frame f(ctx, base, 0x80);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
@@ -236,8 +225,6 @@ bool BeginExport(PPCContext& ctx, uint8_t* base) {
 // the resource gets the current fence (or goes on the list of resources the buffer being
 // recorded names), its range is invalidated, and the settle runs.
 bool EndExport(PPCContext& ctx, uint8_t* base) {
-  if (!HaveExport())
-    return false;
   Frame f(ctx, base, 0xD0);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)

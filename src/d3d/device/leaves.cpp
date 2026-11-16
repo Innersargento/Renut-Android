@@ -12,7 +12,7 @@
 #include <rex/ppc/recompiled_code.h>
 
 extern "C" {
-__attribute__((weak)) void __imp__VdQueryVideoFlags(PPCContext& __restrict, uint8_t*);  // the video flags
+void __imp__VdQueryVideoFlags(PPCContext& __restrict, uint8_t*);  // the video flags
 }
 
 namespace renut::d3d::port {
@@ -23,8 +23,6 @@ namespace {
 // empty) and the destination size filled in: the width as asked or the device's, the
 // height from the aspect ratio unless it does not fit.
 bool FitScalerParameters(PPCContext& ctx, uint8_t* base) {
-  if (!__imp__VdQueryVideoFlags)
-    return false;
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
     return false;

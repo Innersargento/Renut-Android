@@ -27,7 +27,7 @@
 #include "touch_input.h"
 
 std::string renutCheatsSummary();
-void renutConfigureXenosDriver(const std::string&, const std::string&, const std::string&, bool, const std::string&);
+void renutConfigureVulkanDriver(const std::string&, const std::string&, const std::string&, bool, const std::string&);
 // Own this entry point so the loader cannot resolve SDL's JNI_OnLoad through
 // our transitive dependencies. SDL is explicitly loaded/initialized by Java.
 // Android drops a native process's stderr unless a system property asks for it,
@@ -259,7 +259,7 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       setenv("IR3_SHADER_DEBUG", ir3.c_str(), 1);
       note("IR3_SHADER_DEBUG: " + (ir3.empty() ? std::string("desativado") : ir3));
       plume_env += "IR3_SHADER_DEBUG=" + ir3 + "\n";
-      renutConfigureXenosDriver(javaString(env, hooks), javaString(env, driverDirectory), javaString(env, driverLibrary),
+      renutConfigureVulkanDriver(javaString(env, hooks), javaString(env, driverDirectory), javaString(env, driverLibrary),
                                 oneUiFix, javaString(env, tuDebug));
       note("Driver solicitado: " + (javaString(env, driverLibrary).empty() ? std::string("sistema") : javaString(env, driverLibrary)));
       if (!javaString(env, tuDebug).empty()) note("TU_DEBUG: " + javaString(env, tuDebug));

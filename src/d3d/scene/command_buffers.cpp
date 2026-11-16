@@ -44,8 +44,8 @@ constexpr uint32_t kListsAhead = 32;
 
 extern "C" {
 REX_FUNC(sub_82223270);  // D3D::SetSurfaceClip (hooked: the front end records the clip)
-__attribute__((weak)) void sub_82658818(PPCContext& __restrict, uint8_t*);  // the one-pass Z pass set-up
-__attribute__((weak)) void sub_8264E1A8(PPCContext& __restrict, uint8_t*);  // unbinds the targets, shaders, streams
+void sub_82658818(PPCContext& __restrict, uint8_t*);  // the one-pass Z pass set-up
+void sub_8264E1A8(PPCContext& __restrict, uint8_t*);  // unbinds the targets, shaders, streams
 }
 
 namespace renut::d3d::port {
@@ -97,7 +97,7 @@ u32 EmptyCallList() {
 }
 
 bool Enabled() {
-  return sub_82658818 && sub_8264E1A8 && EmptyCallList();
+  return EmptyCallList();
 }
 
 // sub_82223270's arguments: a signed 16-bit field of the window scissor words.

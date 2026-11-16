@@ -1,6 +1,5 @@
 // The kernel exports reNut replaces (see kernel_overrides.cpp). Each one is
 // defined there as renut_imp_<name>; the build renames the game's calls to it.
-X(VdSwap)
 // The SDK's XAM keeps a reference to the title workspace from before the kernel recreates it at the size the XEX declares.
 X(XamAlloc)
 X(XamAllocEx)
@@ -8,8 +7,6 @@ X(XamFree)
 // The console does not return from unregistering an audio render client while its callback is running.
 X(XAudioRegisterRenderDriverClient)
 X(XAudioUnregisterRenderDriverClient)
-// The graphics driver of the app (plume_gpu.h) needs the interrupt callback's user data.
-X(VdSetGraphicsInterruptCallback)
 // The player's pause parks a guest thread at its next wait, delay or yield.
 X(KeDelayExecutionThread)
 X(NtYieldExecution)

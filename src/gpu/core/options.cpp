@@ -22,7 +22,5 @@
 
 
 
-// The SDK's `vsync` cvar (rex/graphics/flags.h): the Xenos GPU plugin defined it, and this app
-// has no plugin. Off ticks the guest's vertical blank every millisecond.
 
 

@@ -39,21 +39,19 @@
 extern "C" {
 REX_FUNC(sub_82223270);  // D3D_SetSurfaceClip
 REX_FUNC(sub_82210AB0);  // D3D_CDevice_KickOff
-// Weak, so a build without them still links: the resource port checks before it calls.
-__attribute__((weak)) void __imp__MmAllocatePhysicalMemoryEx(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void __imp__MmFreePhysicalMemory(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_822399D8(PPCContext& __restrict, uint8_t*);  // the game's XMemFree
-// What the device's creation and the ring call; weak, and the handlers decline when one is missing.
-__attribute__((weak)) void sub_82265B90(PPCContext& __restrict, uint8_t*);  // the game's XMemAlloc
-__attribute__((weak)) void sub_822402A8(PPCContext& __restrict, uint8_t*);  // the calling thread's id
-__attribute__((weak)) void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
-__attribute__((weak)) void sub_82657160(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82663208(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_826597C8(PPCContext& __restrict, uint8_t*);  // D3D::InitializeApiState
-__attribute__((weak)) void sub_82659F30(PPCContext& __restrict, uint8_t*);  // D3D::InitializeHardwareDevice
-__attribute__((weak)) void D3D__UninitializeDevice(PPCContext& __restrict, uint8_t*);  // 0x8265A198
-__attribute__((weak)) void sub_822873E8(PPCContext& __restrict, uint8_t*);  // CDevice::StartNewSegment
-__attribute__((weak)) void sub_8222CC50(PPCContext& __restrict, uint8_t*);  // D3DDevice_BeginVertices
+void __imp__MmAllocatePhysicalMemoryEx(PPCContext& __restrict, uint8_t*);
+void __imp__MmFreePhysicalMemory(PPCContext& __restrict, uint8_t*);
+void sub_822399D8(PPCContext& __restrict, uint8_t*);  // the game's XMemFree
+void sub_82265B90(PPCContext& __restrict, uint8_t*);  // the game's XMemAlloc
+void sub_822402A8(PPCContext& __restrict, uint8_t*);  // the calling thread's id
+void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
+void sub_82657160(PPCContext& __restrict, uint8_t*);
+void sub_82663208(PPCContext& __restrict, uint8_t*);
+void sub_826597C8(PPCContext& __restrict, uint8_t*);  // D3D::InitializeApiState
+void sub_82659F30(PPCContext& __restrict, uint8_t*);  // D3D::InitializeHardwareDevice
+void D3D__UninitializeDevice(PPCContext& __restrict, uint8_t*);  // 0x8265A198
+void sub_822873E8(PPCContext& __restrict, uint8_t*);  // CDevice::StartNewSegment
+void sub_8222CC50(PPCContext& __restrict, uint8_t*);  // D3DDevice_BeginVertices
 REX_FUNC(sub_822084F0);  // D3D_DestroyResource (D3DResource_Destroy)
 void __imp__sub_8222A0A8(PPCContext& __restrict, uint8_t*);  // D3DDevice_SetVertexShader
 void __imp__sub_82226730(PPCContext& __restrict, uint8_t*);  // D3DDevice_SetPixelShader
@@ -363,7 +361,7 @@ FenceHooks MakeFenceHooks(KickCall& kick) {
 // The recompiled functions resource memory goes through, run on a copy of the context
 // of the call being served.
 u32 AllocPhysicalCall(u32 size, u32 protect, u32 alignment) {
-  if (!active_call.ctx || !__imp__MmAllocatePhysicalMemoryEx)
+  if (!active_call.ctx)
     return 0;
   PPCContext call = *active_call.ctx;
   call.r3.u32 = 0;
@@ -377,7 +375,7 @@ u32 AllocPhysicalCall(u32 size, u32 protect, u32 alignment) {
 }
 
 void FreePhysicalCall(u32 address) {
-  if (!active_call.ctx || !__imp__MmFreePhysicalMemory)
+  if (!active_call.ctx)
     return;
   PPCContext call = *active_call.ctx;
   call.r3.u32 = 0;
@@ -386,7 +384,7 @@ void FreePhysicalCall(u32 address) {
 }
 
 void XMemFreeCall(u32 address, u32 attributes) {
-  if (!active_call.ctx || !sub_822399D8)
+  if (!active_call.ctx)
     return;
   PPCContext call = *active_call.ctx;
   call.r3.u32 = address;
@@ -644,8 +642,6 @@ bool ShaderRegisterPixel(PPCContext& ctx, uint8_t* base) {
 }
 
 bool ShaderCreateVertex(PPCContext& ctx, uint8_t* base) {
-  if (!sub_82265B90 || !sub_822399D8)
-    return false;
   GameCall game{&ctx, base};
   u32 result = 0;
   if (!CreateVertexShader(base, ctx.r3.u32, MakeShaderCalls(game), result))
@@ -655,8 +651,6 @@ bool ShaderCreateVertex(PPCContext& ctx, uint8_t* base) {
 }
 
 bool ShaderCreatePixel(PPCContext& ctx, uint8_t* base) {
-  if (!sub_82265B90 || !sub_822399D8)
-    return false;
   GameCall game{&ctx, base};
   u32 result = 0;
   if (!CreatePixelShader(base, ctx.r3.u32, MakeShaderCalls(game), result))
@@ -666,8 +660,6 @@ bool ShaderCreatePixel(PPCContext& ctx, uint8_t* base) {
 }
 
 bool ShaderCreateDeclaration(PPCContext& ctx, uint8_t* base) {
-  if (!sub_82265B90 || !sub_822399D8)
-    return false;
   GameCall game{&ctx, base};
   ctx.r3.u64 = CreateVertexDeclaration(base, ctx.r3.u32, MakeShaderCalls(game));
   return true;
@@ -690,8 +682,6 @@ bool MiscGetDeviceCaps(PPCContext& ctx, uint8_t* base) {
 }
 
 bool MiscGetResourceDevice(PPCContext& ctx, uint8_t* base) {
-  if (!__imp__KeGetCurrentProcessType)
-    return false;
   GameCall game{&ctx, base};
   GetResourceDevice(base, RunGame(&game, __imp__KeGetCurrentProcessType, 0), ctx.r4.u32);
   return true;
@@ -774,8 +764,6 @@ bool StoreGamma(PPCContext& ctx, uint8_t* base) {
 // D3DDevice_DrawVerticesUP(device, primitive, vertex count, data, stride): room for
 // the vertices from BeginVertices (the native front end's), then the data.
 bool MiscDrawVerticesUP(PPCContext& ctx, uint8_t* base) {
-  if (!sub_8222CC50)
-    return false;
   const u32 device_va = ctx.r3.u32, count = ctx.r5.u32, data = ctx.r6.u32, stride = ctx.r7.u32;
   PPCContext call = ctx;
   call.r6.u32 = stride;

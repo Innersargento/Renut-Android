@@ -34,7 +34,6 @@
 #include "platform/settings.h"
 
 std::string renutCheatsSummary();
-void renutConfigureXenosDriver(const std::string&, const std::string&, const std::string&, bool, const std::string&);
 namespace renut {
 void AchievementsStart(JNIEnv*, jobject, rex::kernel::TitleRuntime&, const std::filesystem::path&);
 void AchievementsStop();
@@ -56,6 +55,10 @@ void AddLegacyNames(rex::SettingsRegistry& settings) {
     const std::string& full = setting->GetName();
     settings.AddAlias("renut_" + full.substr(full.find('.') + 1), full);
   }
+  // Removed settings (an empty new name: a value in an old file is ignored). The flat log_level is one of
+  // the SDK's own old names.
+  for (const char* removed : {"renut_pace_original_fps", "renut.pace_original_fps", "renut_vsync", "renut.vsync"})
+    settings.AddAlias(removed, "");
 }
 
 class RenutApp final : public rex::app::TitleApp {

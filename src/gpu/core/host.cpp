@@ -1,5 +1,6 @@
 // The graphics driver of the app (PlumeGraphicsDriver) and the public API of plume_gpu.h.
 #include "gpu/core/internal.h"
+#include "d3d/frontend/native_d3d.h"
 #include "platform/guest.h"
 #include "guest/host_support.h"
 #include "platform/log.h"
@@ -13,12 +14,17 @@
 // Graphics driver
 // ---------------------------------------------------------------------------
 
-// The GPU the app hosts, as the SDK's graphics system runs it: the guest's video hardware as the game's
-// Direct3D and the kernel see it - the vertical blank and its interrupt, the GPU backend behind the
-// native front end. The SDK's Xenos command processor has no part in it; the ring buffer exports reach
-// this driver and are ignored (the front end of d3d/frontend records the lists itself), and the Vd
-// exports that matter are overridden in kernel_overrides.cpp. The frame is presented by Plume itself, to the
-// window the app hands it (PlumeRenderer::Start), so BeginPresent has nothing to do.
+// The GPU the app hosts, as the SDK's graphics system runs it. The graphics driver slot is how RexGlue hands
+// a title's physical-memory write watch and its host threads to the app (driver-context.md), which the GPU
+// backend needs; the rest of the Xenos driver contract has nothing to do here. The SDK's command processor
+// has no part in it: the ring buffer and register calls are ignored (the native front end of d3d/frontend
+// records the lists itself), and the frame is presented by Plume, to the window the app hands it
+// (PlumeRenderer::Start), so BeginPresent has nothing to do.
+//
+// There is no vertical blank thread. The game's swaps never wait for one (every frame-rate target is held by
+// the Pacer with an immediate presentation interval, frame_pacing.h), so the vblank only has a clock to keep:
+// the counter the backend and the device read, brought up to date at the swaps and the callback records
+// (TickVblank), which are the only moments it is read.
 
 namespace renut::gpu {
 
@@ -26,12 +32,7 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
  public:
   std::string_view GetName() const override { return "plume"; }
 
-  rex::Result<void> Initialize(rex::IDriverContext& context) override {
-    if (auto found = context.GetSettingsRegistry().Find("gpu.vsync")) {
-      vsync_ = static_cast<rex::Setting<bool>*>(*found);
-    }
-    return rex::Ok();
-  }
+  rex::Result<void> Initialize(rex::IDriverContext&) override { return rex::Ok(); }
 
   void Shutdown() override { DetachTitle(); }
 
@@ -50,27 +51,10 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
       backend_.reset();
       return rex::Err(rex::ErrorCategory::kRuntime, "the GPU backend did not start");
     }
-    // The frame pacer makes every swap immediate when the game's own 30 FPS is paced too
-    // (renut_pace_original_fps); then the vertical blank only has a clock to keep, which TickVblank
-    // does at the swaps. Otherwise a swap can be queued behind a vblank and the thread must deliver it.
-    stub_vsync_ = renut::GetSettings().pace_original_fps.Get();
-    if (stub_vsync_) {
-      REXLOG_CAT_INFO(rex::log::renut, "Renut: no GPU VSync thread (the vblank clock is kept at the swaps)");
-      return rex::Ok();
-    }
-    vsync_running_ = true;
-    auto started = interrupts.StartHostThread("GPU VSync", [this](std::stop_token) {
-      renut::MarkHostThread();
-      VblankClock();
-    });
-    if (!started) return rex::Err(rex::ErrorCategory::kRuntime, started.error().message);
-    vsync_thread_ = std::move(*started);
     return rex::Ok();
   }
 
   void DetachTitle() override {
-    vsync_running_ = false;
-    vsync_thread_.Reset();
     if (backend_) {
       backend_->Shutdown();
       backend_.reset();
@@ -79,13 +63,13 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
     interrupts_ = nullptr;
   }
 
-  // The game swapped since the last call, or the wait is over.
+  // The game swapped since the last call, or the wait is over. The SDK's present thread counts a frame for
+  // each true answer (GetFrameStats).
   rex::gpu::FrameStatus WaitForFrame(rex::u32 timeout_ms) override {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    const uint64_t seen = seen_swaps_;
     for (;;) {
       const uint64_t now = renut_guest_swap_count();
-      if (now != seen) {
+      if (now != seen_swaps_) {
         seen_swaps_ = now;
         return {.new_frame = true};
       }
@@ -99,30 +83,14 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
   void EndPresent() override {}
   void RenderOverlays(ImDrawData&) override {}
 
-  // The ring buffer and the register window: the game's front end does not use them any more (a session of
-  // the native front end logged no access), so reads are 0 and writes are dropped.
+  // The ring buffer and the register window: the game's front end does not use them, so reads are 0 and
+  // writes are dropped.
   void InitializeRingBuffer(rex::u32, rex::u32) override {}
   void EnableReadPointerWriteBack(rex::u32, rex::u32) override {}
-  rex::u32 ReadRegister(rex::u32 index) override {
-    NoteRegister(index, false, 0);
-    return 0;
-  }
-  void WriteRegister(rex::u32 index, rex::u32 value) override { NoteRegister(index, true, value); }
-
-  void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
-    interrupt_callback_data_ = user_data;
-    REXLOG_CAT_INFO(rex::log::renut, "SetInterruptCallback({:08X}, {:08X})", callback, user_data);
-  }
+  rex::u32 ReadRegister(rex::u32) override { return 0; }
+  void WriteRegister(rex::u32, rex::u32) override {}
 
  private:
-  // Runs the guest's interrupt callback on the calling thread, as the console's GPU interrupt would on the
-  // CPU it names.
-  void DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
-    if (!interrupts_) return;
-    if (cpu == 0xFFFFFFFF) cpu = 2;
-    (void)interrupts_->RaiseGraphicsInterrupt(source, cpu);
-  }
-
   // A callback record of a list: function(context) on the backend's thread.
   void RunCallback(uint32_t function, uint32_t context, uint32_t) {
     if (!function) return;
@@ -130,17 +98,17 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
     host::RunGuest(function, args, 1);
   }
 
-  // The vblank handler (sub_826541C8, source 0 of sub_826573F0) with nothing for it to do besides the
-  // device's clock: it adds one to the vblank counter (+16548), stamps the time (+16552, and
-  // +21676 in milliseconds-ish units, timebase >> 10), presents the swaps queued behind a vblank
-  // (the queue at +16572, read index +16700, write index +16704) and calls the game's vblank
-  // callback (+16544). With the frame pacer holding the game its swaps are immediate and queue
-  // nothing, and nothing in the title sets a vblank callback, so the counter and the stamps are what
-  // is left. False when the queue is not empty or a callback is set (the handler runs).
-  bool RunVblankNatively(uint32_t vblanks = 1) {
-    if (!interrupt_callback_data_) return false;
+  // The vblank handler (sub_826541C8, source 0 of the graphics interrupt sub_826573F0) with nothing for it to
+  // do besides the device's clock: it adds the vblanks to the counter (+16548), stamps the time (+16552, and
+  // +21676 in milliseconds-ish units, timebase >> 10), presents the swaps queued behind a vblank (the queue
+  // at +16572, read index +16700, write index +16704) and calls the game's vblank callback (+16544). The swaps
+  // are immediate and queue nothing, and nothing in the title sets a vblank callback, so the counter and the
+  // stamps are what is left. False when the queue is not empty or a callback is set: then the game's handler
+  // runs, through the interrupt callback the kernel keeps.
+  bool RunVblankNatively(uint32_t device, uint32_t vblanks) {
+    if (!device) return false;
     auto word = [&](uint32_t offset) {
-      return reinterpret_cast<uint32_t*>(host::Virtual<uint8_t*>(interrupt_callback_data_ + offset));
+      return reinterpret_cast<uint32_t*>(host::Virtual<uint8_t*>(device + offset));
     };
     auto load = [&](uint32_t offset) { return __builtin_bswap32(std::atomic_ref<uint32_t>(*word(offset)).load()); };
     auto store = [&](uint32_t offset, uint32_t value) {
@@ -154,13 +122,10 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
     return true;
   }
 
-  // Without the thread: the vblanks since the last call, by the clock of the video mode (the guest's, which
-  // crawls while the game is paused), are added to the backend's counter and to the device's words. Called
-  // on the GPU backend's thread when a present or a callback record is reached, which are the only
-  // moments the counter or the words are read. A queue of swaps or a vblank callback cannot be here
-  // (the presentation is immediate and nothing sets one), but if there is one the handler runs.
+  // The vblanks since the last call, by the clock of the video mode (the guest's, which crawls while the game
+  // is paused), added to the backend's counter and to the device's words. Called on the GPU backend's thread
+  // (a kernel thread) when a present or a callback record is reached.
   void TickVblank() {
-    if (!stub_vsync_) return;
     using pacing::Clock;
     const auto now = Clock::now();
     if (!tick_origin_.time_since_epoch().count()) {
@@ -174,83 +139,15 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
     if (vblanks <= 0) return;
     tick_origin_ += period * vblanks;
     if (backend_) backend_->add_counter(uint32_t(vblanks));
-    if (!RunVblankNatively(uint32_t(vblanks))) DispatchInterruptCallback(0, 2);
+    if (!RunVblankNatively(native_d3d::MainDevice(), uint32_t(vblanks)) && interrupts_)
+      (void)interrupts_->RaiseGraphicsInterrupt(0, 2);
   }
 
-  void MarkVblank() {
-    // The counter the game sees move, then the interrupt that runs its handler.
-    if (backend_) backend_->increment_counter();
-    if (pacing::ImmediatePresentation() && RunVblankNatively()) return;
-    DispatchInterruptCallback(0, 2);
-  }
-
-  // The guest's vertical blank: one MarkVblank per refresh of the video mode the
-  // game set (60 Hz), which is what its presentation interval counts and so what
-  // holds it at 30 FPS.
-  //
-  // The SDK's worker polled every millisecond and, when it found itself late,
-  // marked every vblank it owed in a row: a wake-up that overslept (common on a
-  // phone's timer slack and under load) came out as two vblanks back to back and
-  // then a gap, which the game showed as alternating short and long frames. This
-  // one sleeps to an absolute deadline, spins the last stretch, marks exactly one
-  // vblank per deadline, and when it fell more than two periods behind (the
-  // process was descheduled, the interrupt ran long) it forgets the debt rather
-  // than paying it as a burst. The deadlines are in the guest's clock: while the
-  // game is paused its time crawls, and so do the vblanks.
-  void VblankClock() {
-    using pacing::Clock;
-    const double hz = refresh_hz_;
-    auto next = Clock::now();
-    bool first = true;
-    while (vsync_running_) {
-      // Host time per vblank: a guest period stretched by the guest clock's scale.
-      const double scale = std::max(0.001, rex::Clock::GetGuestTimeScalar());
-      const double seconds = (!vsync_ || vsync_->Get()) ? 1.0 / hz : 0.001;
-      const auto period = std::chrono::nanoseconds(int64_t(seconds / scale * 1e9));
-      if (first) {
-        next += period;
-        first = false;
-      }
-      // Waits in slices so that a long period (paused) still notices the stop.
-      for (;;) {
-        if (!vsync_running_) return;
-        const auto now = Clock::now();
-        if (now >= next) break;
-        const auto remaining = next - now;
-        if (remaining > pacing::kSpinTail * 2) {
-          std::this_thread::sleep_for(
-              std::min<Clock::duration>(remaining - pacing::kSpinTail, std::chrono::milliseconds(4)));
-        } else {
-          std::this_thread::yield();
-        }
-      }
-      MarkVblank();
-      next = pacing::NextTick(next, Clock::now(), period);
-    }
-  }
-
-  // The first read and the first write of each register are logged, to say so if something reaches them.
-  void NoteRegister(uint32_t r, bool write, uint32_t value) {
-    if (r >= seen_registers_.size()) return;
-    std::atomic<uint8_t>& seen = seen_registers_[r];
-    const uint8_t bit = write ? 2 : 1;
-    if (seen.load(std::memory_order_relaxed) & bit) return;
-    if (seen.fetch_or(bit, std::memory_order_relaxed) & bit) return;
-    REXLOG_CAT_INFO(rex::log::renut, "Renut: MMIO register {:04X} first {}{}", r, write ? "written, value " : "read",
-                write ? std::format("{:08X}", value) : std::string());
-  }
-
-  std::array<std::atomic<uint8_t>, 0x4000> seen_registers_{};
   rex::IGuestInterrupts* interrupts_ = nullptr;
-  rex::Setting<bool>* vsync_ = nullptr;
   std::unique_ptr<GpuBackend> backend_;
-  uint32_t interrupt_callback_data_ = 0;
   double refresh_hz_ = 60.0;
   uint64_t seen_swaps_ = 0;
-  std::atomic<bool> vsync_running_{false};
-  bool stub_vsync_ = false;  // no thread: TickVblank at the swaps
   pacing::Clock::time_point tick_origin_{};
-  rex::ScopeGuard vsync_thread_;
 };
 
 }  // namespace renut::gpu
@@ -272,10 +169,6 @@ std::unique_ptr<rex::IDriver> CreatePlumeGraphicsDriver() {
 }
 
 bool PlumeGpuHosted() { return g_driver.load() != nullptr; }
-
-void PlumeGpuSetInterruptCallback(uint32_t callback, uint32_t user_data) {
-  if (auto* driver = g_driver.load()) driver->SetInterruptCallback(callback, user_data);
-}
 
 void SetPlumeMissDumpDirectory(const std::string& directory) {
   std::error_code error;

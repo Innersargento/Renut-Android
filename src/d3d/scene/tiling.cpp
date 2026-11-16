@@ -22,17 +22,17 @@ REX_FUNC(sub_822899D0);  // D3DDevice_SetRenderState_HiZWriteEnable
 REX_FUNC(sub_8222D6C8);  // D3DDevice_Resolve
 REX_FUNC(sub_826572C8);  // CDevice::QueueIndirectBuffers
 REX_FUNC(sub_82210138);  // D3D::EndTilingLists
-__attribute__((weak)) void sub_82222F20(PPCContext& __restrict, uint8_t*);  // the viewport from floats
-__attribute__((weak)) void sub_8220F610(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82287D38(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8222D0E8(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8222BF10(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8226AAB8(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8222CB90(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8222AB88(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_8220E2B0(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82657A20(PPCContext& __restrict, uint8_t*);
-__attribute__((weak)) void sub_82657978(PPCContext& __restrict, uint8_t*);
+void sub_82222F20(PPCContext& __restrict, uint8_t*);  // the viewport from floats
+void sub_8220F610(PPCContext& __restrict, uint8_t*);
+void sub_82287D38(PPCContext& __restrict, uint8_t*);
+void sub_8222D0E8(PPCContext& __restrict, uint8_t*);
+void sub_8222BF10(PPCContext& __restrict, uint8_t*);
+void sub_8226AAB8(PPCContext& __restrict, uint8_t*);
+void sub_8222CB90(PPCContext& __restrict, uint8_t*);
+void sub_8222AB88(PPCContext& __restrict, uint8_t*);
+void sub_8220E2B0(PPCContext& __restrict, uint8_t*);
+void sub_82657A20(PPCContext& __restrict, uint8_t*);
+void sub_82657978(PPCContext& __restrict, uint8_t*);
 }
 
 namespace renut::d3d::port {
@@ -77,8 +77,6 @@ void SetTiledBit(Device d, u32 tiled) {
 // A viewport restored from the 7 words at `saved` (the floats of the original viewport and
 // the last word in r10).
 void RestoreViewport(const GuestFrame& f, u32 dev, u32 saved) {
-  if (!sub_82222F20)
-    return;
   PPCContext call = *f.ctx;
   call.r1.u32 = f.sp;
   call.r3.u32 = dev;
@@ -94,14 +92,8 @@ void RestoreViewport(const GuestFrame& f, u32 dev, u32 saved) {
 
 // --- BeginTiling ----------------------------------------------------------------
 
-bool HaveBegin() {
-  return sub_82222F20 && sub_8220F610 && sub_82287D38;
-}
-
 // D3DDevice_BeginTiling(device, flags, count, tile rects, clear colour [vector])
 bool BeginTiling(PPCContext& ctx, uint8_t* base) {
-  if (!HaveBegin())
-    return false;
   GuestFrame f(ctx, base, 0xC0);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)
@@ -189,10 +181,6 @@ bool BeginTiling(PPCContext& ctx, uint8_t* base) {
 
 // --- EndTiling --------------------------------------------------------------------
 
-bool HaveEnd() {
-  return sub_82287D38;
-}
-
 // HRESULT D3DDevice_EndTiling(device, flags, ?, destination texture, clear colour)
 //
 // Each tile's rect is resolved from the full-size target on the host, so what the original leaves
@@ -201,8 +189,6 @@ bool HaveEnd() {
 // the predication and render state around them, the kick, the device's flags and the fence that
 // covers the pass (EndTilingLists).
 bool EndTiling(PPCContext& ctx, uint8_t* base) {
-  if (!HaveEnd())
-    return false;
   GuestFrame f(ctx, base, 0xD0);
   Device d = DeviceAt(base, ctx.r3.u32);
   if (!d)

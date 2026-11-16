@@ -271,7 +271,8 @@ inline struct FrontEnd {
   // record on devices of their own (the job's context +68), several at once
   // on different threads; the immediate list is the swapping device's.
   std::unordered_map<uint32_t, std::shared_ptr<List>> recording;
-  uint32_t main_device = 0;
+  // Atomic so MainDevice reads it without the mutex (the GPU backend's vblank clock asks for it).
+  std::atomic<uint32_t> main_device{0};
   std::unordered_map<uint32_t, std::shared_ptr<const List>> command_buffers;
   // Words each command buffer took last time, reserved when it is recorded
   // again (most are recorded every frame).

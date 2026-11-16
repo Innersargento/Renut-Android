@@ -376,7 +376,7 @@ bool InsertCallback(PPCContext& ctx, uint8_t* base) {
 }
 
 bool SynchronizeToPresentationInterval(PPCContext& ctx, uint8_t* base) {
-  if (renut::pacing::ImmediatePresentation()) ctx.r4.u32 = 1;
+  ctx.r4.u32 = 1;  // the swap never waits for a vertical blank: the Pacer holds every target (frame_pacing.h)
   const uint32_t dev = ctx.r3.u32, immediate = ctx.r4.u32;
   std::unique_lock lock(g_front.mutex);
   if (!g_front.sync_recording) return false;
@@ -417,10 +417,7 @@ void WaitForBackend(uint32_t max_lists_ahead, uint32_t timeout_ms) {
   }
 }
 
-uint32_t MainDevice() {
-  std::lock_guard lock(g_front.mutex);
-  return g_front.main_device;
-}
+uint32_t MainDevice() { return g_front.main_device.load(std::memory_order_relaxed); }
 
 bool ExecutorIdle() {
   return g_executor_busy.load(std::memory_order_relaxed) <= 0 &&
