@@ -20,8 +20,9 @@ namespace renut::gpu {
 class GpuBackend final {
  public:
   GpuBackend();
-  // Starts the worker ("GPU Commands", a host thread of the kernel): SetupContext runs on it, then the loop.
-  bool Initialize(rex::IGuestInterrupts& interrupts);
+  // Starts the worker ("GPU Commands", a host thread of the title's kernel, host::StartHostThread): SetupContext
+  // runs on it, then the loop.
+  bool Initialize();
   void Shutdown();
   // Wakes the worker: a list was published.
   void Wake();
@@ -202,9 +203,9 @@ class GpuBackend final {
 
 inline GpuBackend::GpuBackend() : worker_running_(true) {}
 
-inline bool GpuBackend::Initialize(rex::IGuestInterrupts& interrupts) {
+inline bool GpuBackend::Initialize() {
     worker_running_ = true;
-    auto started = interrupts.StartHostThread("GPU Commands", [this](std::stop_token) {
+    auto started = renut::host::StartHostThread("GPU Commands", [this](std::stop_token) {
       renut::MarkHostThread();
       if (!SetupContext()) {
         REXLOG_CAT_ERROR(rex::log::renut, "Unable to setup GPU backend internal state");

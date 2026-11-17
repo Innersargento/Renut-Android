@@ -1,8 +1,19 @@
 #include "platform/guest.h"
 
 #include <atomic>
+#include <cstring>
+#include <memory>
+#include <mutex>
 
+#include <rex/gpu/graphics_system.h>
+#include <rex/kernel/heap.h>
+#include <rex/kernel/module.h>
+#include <rex/kernel/object/kernel_thread.h>
+#include <rex/kernel/object/module_object.h>
+#include <rex/kernel/object/object_table.h>
+#include <rex/kernel/thread_registry.h>
 #include <rex/kernel/thread_state.h>
+#include <rex/kernel/xboxkrnl.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/recompiled_code.h>
 
@@ -16,19 +27,91 @@ namespace {
 std::atomic<rex::kernel::TitleRuntime*> g_title{nullptr};
 std::atomic<uint8_t*> g_base{nullptr};
 std::atomic<rex::IPhysicalWriteWatch*> g_watch{nullptr};
+
+// The physical write watch of the title, as the SDK's title context gives one to a graphics driver: the guest
+// address space's invalidation callbacks and page watches, whose access faults the address space handles
+// itself.
+class TitleWriteWatch final : public rex::IPhysicalWriteWatch {
+ public:
+  explicit TitleWriteWatch(rex::kernel::GuestAddressSpace& memory) : memory_(memory) {}
+
+  rex::ScopeGuard AddWriteListener(rex::IPhysicalWriteListener& listener) override {
+    void* registration = memory_.RegisterPhysicalMemoryInvalidationCallback(&WriteThunk, &listener);
+    return rex::ScopeGuard(
+        [&memory = memory_, registration] { memory.UnregisterPhysicalMemoryInvalidationCallback(registration); });
+  }
+
+  void WatchPhysicalWrites(rex::PhysicalRange range) override {
+    if (uint64_t(range.address) + range.length > 0x20000000u) return;
+    memory_.EnablePhysicalMemoryAccessCallbacks(range.address, range.length, true, false);
+  }
+
+  rex::ScopeGuard LockWriteWatches() override {
+    return rex::ScopeGuard([lock = memory_.LockWatches()]() mutable { lock.unlock(); });
+  }
+
+ private:
+  static std::pair<rex::u32, rex::u32> WriteThunk(void* context, rex::u32 start, rex::u32 length, bool exact) {
+    const rex::PhysicalRange unwatch =
+        static_cast<rex::IPhysicalWriteListener*>(context)->OnPhysicalWrite(rex::PhysicalRange{start, length}, exact);
+    return {unwatch.address, unwatch.length};
+  }
+
+  rex::kernel::GuestAddressSpace& memory_;
+};
+std::unique_ptr<TitleWriteWatch> g_watch_owner;
+
+// The guest address space, through the title's executable module (whose processor module keeps it).
+rex::kernel::GuestAddressSpace* AddressSpaceOf(rex::kernel::TitleRuntime& title) {
+  const auto executable = title.GetModuleRegistry().GetExecutable();
+  if (!executable) return nullptr;
+  auto module = title.GetObjectTable().Get<rex::kernel::ModuleObject>(*executable);
+  if (!module || !module->processor_module.get()) return nullptr;
+  return module->processor_module->GetAddressSpace();
+}
 }  // namespace
 
 void Bind(rex::kernel::TitleRuntime& title) {
   g_base.store(title.GetGuestMemory().GetView().GetVirtualMembase());
+  if (rex::kernel::GuestAddressSpace* memory = AddressSpaceOf(title)) {
+    g_watch_owner = std::make_unique<TitleWriteWatch>(*memory);
+    g_watch.store(g_watch_owner.get());
+  } else {
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: the title's executable has no address space; guest writes are not watched");
+  }
   g_title.store(&title);
 }
 
 void Unbind() {
   g_title.store(nullptr);
+  g_watch.store(nullptr);
+  g_watch_owner.reset();
   g_base.store(nullptr);
 }
 
 rex::kernel::TitleRuntime* Title() { return g_title.load(); }
+
+rex::Result<rex::ScopeGuard> StartHostThread(std::string_view name, rex::MoveOnlyFunction<void(std::stop_token)> fn) {
+  rex::kernel::TitleRuntime* title = g_title.load();
+  if (!title) return rex::Err<rex::ScopeGuard>(rex::ErrorCategory::kRuntime, "no title is bound");
+  constexpr rex::u32 kStackSize = 128 * 1024;
+  auto stop = std::make_shared<std::stop_source>();
+  auto body = std::make_shared<rex::MoveOnlyFunction<void(std::stop_token)>>(std::move(fn));
+  auto thread = std::make_unique<rex::kernel::KernelThread>(*title, kStackSize, 0,
+                                                            [body, token = stop->get_token()]() {
+                                                              (*body)(token);
+                                                              return 0;
+                                                            });
+  thread->SetName(name);
+  auto launched = title->GetThreadRegistry().Launch(std::move(thread));
+  if (!launched) return std::unexpected(launched.error());
+  const rex::kernel::X_HANDLE handle = *launched;
+  return rex::ScopeGuard([title, stop, handle] {
+    stop->request_stop();
+    title->GetThreadRegistry().GetObjectWaiter().WaitGuestObject(handle, 0, 0, 0, nullptr);
+    rex::kernel::CloseOwned(title->GetObjectTable(), handle);
+  });
+}
 
 uint8_t* VirtualBase() { return g_base.load(); }
 
@@ -110,22 +193,43 @@ bool PhysicalRangeWritable(uint32_t address, uint32_t length) {
 }
 
 namespace {
-std::atomic<uint32_t> g_mode_width{1280}, g_mode_height{720};
+std::mutex g_mode_mutex;
+rex::VideoMode g_mode;
 }  // namespace
 
 void SetVideoMode(const rex::VideoMode& mode) {
-  g_mode_width.store(mode.width);
-  g_mode_height.store(mode.height);
+  std::lock_guard lock(g_mode_mutex);
+  g_mode = mode;
 }
 
 rex::VideoMode GetVideoMode() {
-  rex::VideoMode mode;
-  mode.width = g_mode_width.load();
-  mode.height = g_mode_height.load();
-  return mode;
+  std::lock_guard lock(g_mode_mutex);
+  return g_mode;
 }
 
-void SetWriteWatch(rex::IPhysicalWriteWatch* watch) { g_watch.store(watch); }
+void FillGuestVideoMode(uint32_t address) {
+  rex::kernel::X_VIDEO_MODE mode;
+  rex::kernel::FillXVideoMode(GetVideoMode(), mode);
+  std::memcpy(Virtual(address), &mode, sizeof(mode));
+}
+
+uint32_t VideoFlags() {
+  const rex::VideoMode mode = GetVideoMode();
+  rex::kernel::X_VIDEO_MODE x;
+  rex::kernel::FillXVideoMode(mode, x);
+  return (uint32_t(x.is_widescreen) ? 1u : 0u) | (mode.width >= 1024 ? 2u : 0u) | (mode.width >= 1920 ? 4u : 0u);
+}
+
+namespace {
+std::atomic<rex::gpu::IGraphicsSystem*> g_graphics{nullptr};
+}  // namespace
+
+void SetGraphics(rex::gpu::IGraphicsSystem* graphics) { g_graphics.store(graphics); }
+
+void ReportFrame() {
+  if (rex::gpu::IGraphicsSystem* graphics = g_graphics.load()) graphics->ReportFrame();
+}
+
 rex::IPhysicalWriteWatch* WriteWatch() { return g_watch.load(); }
 
 }  // namespace renut::host

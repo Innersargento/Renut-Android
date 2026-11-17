@@ -13,7 +13,7 @@ d3d/            the game's Direct3D, taken over from the recompiled code
   sync/         fences
   frontend/     the native front end: draws, clears and resolves recorded as host lists
 gpu/            the GPU backend that runs those lists on Plume (renut::gpu)
-  core/         the backend object, the graphics driver of the SDK (host.cpp), options, context, shared types; draw_state.h is the state a draw reads
+  core/         the backend object and its host (host.cpp: started with the game's device, the native vblank), options, context, shared types; draw_state.h is the state a draw reads
                 (the front end's records write it by word, there is no register file), state_bits.h the bit
                 layouts of its words
   exec/         executes the lists (native_exec.cpp), records Vulkan commands

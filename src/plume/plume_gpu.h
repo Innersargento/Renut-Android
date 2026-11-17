@@ -8,20 +8,15 @@
 #include <string>
 #include <vector>
 
-#include <memory>
-
-namespace rex {
-class IDriver;
-}
-
 namespace renut {
 
-// The graphics driver of the app (gpu/core/host.cpp), registered as "plume" in the graphics family of the
-// Xenos: the SDK's graphics system runs it. It needs PlumeRenderer::Start to have succeeded. The Vd export
-// that carries the interrupt callback is overridden in kernel_overrides.cpp and lands in the last function
-// below.
-std::unique_ptr<rex::IDriver> CreatePlumeGraphicsDriver();
-bool PlumeGpuHosted();
+// The GPU backend (gpu/core/host.cpp). The app runs without a graphics driver of the SDK: the backend is started
+// when the game creates its Direct3D device (the native InitializeHardwareDevice, d3d/scene/startup.cpp, on the
+// game's thread) and stopped by the app after the game's threads have stopped and before the title unloads
+// (RunSession). Start needs PlumeRenderer::Start to have succeeded; a second Start does nothing, and Stop without
+// a Start does nothing.
+bool PlumeGpuStart();
+void PlumeGpuStop();
 
 // Microcode the GPU backend meets without a recompiled shader is saved
 // here (first 32), to extend the capture.

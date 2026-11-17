@@ -18,6 +18,7 @@
 #include "d3d/resources/resource.h"
 #include "d3d/resources/shader.h"
 #include "d3d/scene/command_buffers.h"
+#include "d3d/scene/startup.h"
 #include "d3d/scene/swap.h"
 #include "d3d/scene/tiling.h"
 #include "d3d/device/internal.h"
@@ -48,8 +49,6 @@ void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the d
 void sub_82657160(PPCContext& __restrict, uint8_t*);
 void sub_82663208(PPCContext& __restrict, uint8_t*);
 void sub_826597C8(PPCContext& __restrict, uint8_t*);  // D3D::InitializeApiState
-void sub_82659F30(PPCContext& __restrict, uint8_t*);  // D3D::InitializeHardwareDevice
-void D3D__UninitializeDevice(PPCContext& __restrict, uint8_t*);  // 0x8265A198
 void sub_822873E8(PPCContext& __restrict, uint8_t*);  // CDevice::StartNewSegment
 void sub_8222CC50(PPCContext& __restrict, uint8_t*);  // D3DDevice_BeginVertices
 REX_FUNC(sub_822084F0);  // D3D_DestroyResource (D3DResource_Destroy)
@@ -1005,6 +1004,7 @@ void RegisterStateHandlers() {
   RegisterMisc();
   RegisterFrame();
   RegisterSwap();
+  RegisterStartup();
   RegisterTiling();
   RegisterCommandBuffers();
   RegisterEdram();

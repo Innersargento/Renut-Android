@@ -271,8 +271,8 @@ Java_org_renut_android_RuntimeActivity_nativeValidate(JNIEnv* env, jobject activ
       ANativeWindow_release(window);  // the window driver holds its own reference
       renut::d3d::SetShaderDumpDirectory((root / "shader-dump").string());
       renut::native_d3d::SetFilesDirectory(root.string());
-      // The SDK's graphics system keeps fences, vertical blank and swaps (the app's driver, gpu/core/host.cpp)
-      // but does not present: the native Plume renderer owns the window.
+      // The SDK runs no graphics driver: the native Plume renderer owns the window, and the GPU backend that
+      // feeds it (gpu/core/host.cpp) starts when the game creates its Direct3D device.
       std::string plume_error;
       if (!renut::PlumeRenderer::Start(renut::android::Surface(), &plume_error)) throw std::runtime_error(plume_error);
       renut::d3d::RegisterPlumeHandlers();

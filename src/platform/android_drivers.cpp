@@ -18,7 +18,6 @@
 #include <rex/module.h>
 #include <rex/ui/ui_driver.h>
 
-#include "plume/plume_gpu.h"
 #include "platform/log.h"
 #include "platform/touch_input.h"
 
@@ -110,8 +109,8 @@ class WindowDriver final : public rex::ui::IUIDriver {
   bool HasFocus() const override { return focused_.load(); }
   void SetTextInputActive(bool) override {}
 
-  // The graphics driver is handed the surface by the app (PlumeRenderer::Start), not through the SDK's
-  // native window description, which has no Android window.
+  // Plume is handed the surface by the app (PlumeRenderer::Start), not through the SDK's native window
+  // description, which has no Android window.
   rex::Result<rex::NativeWindow> GetNativeWindow() const override {
     return rex::Err<rex::NativeWindow>(rex::ErrorCategory::kNotFound, "the window is an Android surface");
   }
@@ -298,12 +297,12 @@ std::unique_ptr<rex::IDriver> CreateWindow() { return std::make_unique<WindowDri
 std::unique_ptr<rex::IDriver> CreateAudio() { return std::make_unique<AAudioOutput>(); }
 std::unique_ptr<rex::IDriver> CreateInput() { return std::make_unique<TouchInput>(); }
 
-const std::array<rex::DriverRegistration, 4> kDrivers = {
+// No graphics driver: the app runs without one (GraphicsFamily::kNone) and hosts its GPU backend itself
+// (gpu/core/host.cpp).
+const std::array<rex::DriverRegistration, 3> kDrivers = {
     rex::DriverRegistration{rex::DriverType::kUI, "android", {}, &CreateWindow},
     rex::DriverRegistration{rex::DriverType::kAudio, "aaudio", {}, &CreateAudio},
     rex::DriverRegistration{rex::DriverType::kInput, "touch", {}, &CreateInput},
-    rex::DriverRegistration{rex::DriverType::kGraphics, "plume", rex::GraphicsFamily::kXenos,
-                            &renut::CreatePlumeGraphicsDriver},
 };
 
 class Drivers final : public rex::IModule, public rex::IDriverModule {

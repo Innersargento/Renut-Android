@@ -1,6 +1,7 @@
 // The app's drivers for the SDK's systems on Android, served by one module the app registers in code
 // (RenutApp::OnRegisterModules): the window (ui "android"), the audio output (apu "aaudio"), the
-// controllers (hid "touch", touch_input.h) and the graphics driver (gpu "plume", gpu/core/host.cpp).
+// controllers (hid "touch", touch_input.h). There is no graphics driver: the app hosts its GPU backend itself
+// (gpu/core/host.cpp).
 #pragma once
 #include <android/native_window.h>
 

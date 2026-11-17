@@ -15,6 +15,7 @@
 #include "d3d/device/guest_frame.h"
 #include "d3d/device/internal.h"
 #include "d3d/resources/resource.h"
+#include "platform/guest.h"
 
 extern "C" {
 REX_FUNC(sub_82210AB0);  // CDevice::KickOff
@@ -30,7 +31,6 @@ REX_FUNC(sub_822108B8);  // CDevice::CreateInvalidateBuffer
 REX_FUNC(sub_822052C8);  // D3D::InsertCallback
 REX_FUNC(sub_82278528);  // CDevice::SetFence
 REX_FUNC(sub_821F7C18);  // room in the ring
-void __imp__VdQueryVideoMode(PPCContext& __restrict, uint8_t*);  // kernel: display mode change
 
 REX_FUNC(sub_8228F558);  // CDevice::BlockOnFence
 REX_FUNC(sub_8227AF40);  // D3DDevice_SetDepthStencilSurface
@@ -383,7 +383,7 @@ bool SwapNotify(PPCContext& ctx, uint8_t* base) {
   const u32 extra = f.Get(ctx.r1.u32 + 0x54);
   d.SetW(0x54C4, extra);
   if (changes & 8)
-    f.Call(__imp__VdQueryVideoMode, {d.va + 0x54C8});
+    renut::host::FillGuestVideoMode(d.va + 0x54C8);  // VdQueryVideoMode
   if (!callbacks)
     return true;
   std::memset(f.G(f.sp + 0x54), 0, 0x18);

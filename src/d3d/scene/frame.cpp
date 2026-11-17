@@ -32,7 +32,6 @@ void sub_826593F8(PPCContext& __restrict, uint8_t*);  // gamma ramp -> table
 void sub_82659490(PPCContext& __restrict, uint8_t*);  // PWL gamma -> table
 void __imp__KeGetCurrentProcessType(PPCContext& __restrict, uint8_t*);  // the device type
 void sub_8265F3B0(PPCContext& __restrict, uint8_t*);  // scaler fit
-void __imp__VdCallGraphicsNotificationRoutines(PPCContext& __restrict, uint8_t*);  // the video scaler call
 void sub_82654FD8(PPCContext& __restrict, uint8_t*);  // export fence packet
 void sub_82655130(PPCContext& __restrict, uint8_t*);  // export fence packet, end
 }
@@ -113,7 +112,7 @@ bool Present(PPCContext& ctx, uint8_t* base) {
 // --- Scaler ----------------------------------------------------------------
 
 // D3DDevice_SetScalerParameters(device, parameters): the scaler's rectangles are
-// fitted to the source size, stored in the device and handed to the video kernel.
+// fitted to the source size and stored in the device.
 bool SetScalerParameters(PPCContext& ctx, uint8_t* base) {
   Frame f(ctx, base, 0x100);
   Device d = DeviceAt(base, ctx.r3.u32);
@@ -143,14 +142,28 @@ bool SetScalerParameters(PPCContext& ctx, uint8_t* base) {
   std::memcpy(f.G(stored), f.G(local), 0x38);
   d.SetB(0x2ABE, d.B(0x2ABE) | 0x10);
   f.Call(sub_8265F3B0, {d.va, width, height, stored, local, 0});
+  // The original then hands the source and display sizes and the fitted scaler to the video kernel
+  // (VdCallGraphicsNotificationRoutines), which programs the display's scaler: the host's display does the
+  // scaling, so there is nobody to tell.
+  return true;
+}
 
-  const u32 packet = f.sp + 0x90;
-  StoreBE16(f.G(packet), u16(width));
-  StoreBE16(f.G(packet + 2), u16(height));
-  StoreBE16(f.G(packet + 4), u16(d.W(0x5428)));
-  StoreBE16(f.G(packet + 6), u16(d.W(0x542C)));
-  std::memcpy(f.G(packet + 8), f.G(local), 0x38);
-  f.Call(__imp__VdCallGraphicsNotificationRoutines, {1, packet});
+// --- InsertCallback --------------------------------------------------------
+
+// D3DDevice_InsertCallback(device, flags, function, context) (0x821FB688): the ring is kicked when its cursor
+// (+48) is past its limit (+56), then D3D::InsertCallback puts the callback at the cursor and returns the new
+// one, which the device keeps. Both calls are the native front end's.
+bool InsertCallback(PPCContext& ctx, uint8_t* base) {
+  Frame f(ctx, base, 0x80);
+  Device d = DeviceAt(base, ctx.r3.u32);
+  if (!d)
+    return false;
+  u32 ring = d.W(48);
+  if (ring > d.W(56))
+    ring = f.Kick(d.va);
+  const u32 cursor = f.Call(sub_822052C8, {d.va, ring, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32});
+  d.SetW(48, cursor);
+  ctx.r3.u64 = cursor;
   return true;
 }
 
@@ -251,7 +264,7 @@ bool EndExport(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-// --- ClearF / InsertCallback -------------------------------------------------
+// --- ClearF -----------------------------------------------------------------
 
 // D3DDevice_ClearF(device, flags, rects, colour, depth [f1], r7, stencil): with no
 // rectangles, one over the render target (or depth surface), or over the tiling extent
@@ -332,6 +345,7 @@ void RegisterFrame() {
   SetHandler(kD3DDevice_ClearF, ClearF);
   SetHandler(kD3DDevice_Present, Present);
   SetHandler(kD3DDevice_SetScalerParameters, SetScalerParameters);
+  SetHandler(kD3DDevice_InsertCallback, InsertCallback);
   SetHandler(kD3DDevice_DrawIndexedVerticesUP, DrawIndexedVerticesUP);
   SetHandler(kD3DDevice_BeginExport, BeginExport);
   SetHandler(kD3DDevice_EndExport, EndExport);

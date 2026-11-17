@@ -8,12 +8,10 @@
 #include "d3d/hooks/layer.h"
 #include "d3d/device/internal.h"
 
+#include "platform/guest.h"
+
 #include <rex/ppc/context.h>
 #include <rex/ppc/recompiled_code.h>
-
-extern "C" {
-void __imp__VdQueryVideoFlags(PPCContext& __restrict, uint8_t*);  // the video flags
-}
 
 namespace renut::d3d::port {
 namespace {
@@ -45,11 +43,8 @@ bool FitScalerParameters(PPCContext& ctx, uint8_t* base) {
     // divwu, which the original follows with a trap on a zero divisor.
     height = source_width ? (width * source_height) / source_width : 0;
     bool use_maximum = (d.W(0x3514) & 1) != 0;
-    if (!use_maximum) {
-      PPCContext call = ctx;
-      __imp__VdQueryVideoFlags(call, base);
-      use_maximum = (call.r3.u32 & 1) != 0;
-    }
+    // VdQueryVideoFlags: bit 0, a widescreen mode.
+    if (!use_maximum) use_maximum = (renut::host::VideoFlags() & 1) != 0;
     if (use_maximum || !source_width || height > source_height || height > d.W(0x542C))
       height = d.W(0x542C);
   }

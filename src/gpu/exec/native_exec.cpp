@@ -181,6 +181,7 @@ bool Lists::RunNative(uint32_t until) {
         if (w[4]) StoreBig(w[4], backend.counter());
         native_presenting_ = true;
         renut_note_guest_swap();
+        renut::host::ReportFrame();  // the SDK's frame count, which no graphics driver keeps here
         backend.swap.IssueSwap(w[1], w[2], w[3]);
         native_presenting_ = false;
         backend.increment_counter();

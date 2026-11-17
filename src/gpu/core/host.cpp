@@ -1,4 +1,4 @@
-// The graphics driver of the app (PlumeGraphicsDriver) and the public API of plume_gpu.h.
+// The app's GPU host (GpuHost) and the public API of plume_gpu.h.
 #include "gpu/core/internal.h"
 #include "d3d/frontend/native_d3d.h"
 #include "platform/guest.h"
@@ -6,89 +6,54 @@
 #include "platform/log.h"
 #include "platform/settings.h"
 
-#include <rex/driver_context.h>
-#include <rex/gpu/xenos_graphics_driver.h>
-#include <rex/settings_registry.h>
+#include <rex/chrono.h>
+
+#include <atomic>
+#include <memory>
+#include <mutex>
 
 // ---------------------------------------------------------------------------
-// Graphics driver
+// The GPU host
 // ---------------------------------------------------------------------------
 
-// The GPU the app hosts, as the SDK's graphics system runs it. The graphics driver slot is how RexGlue hands
-// a title's physical-memory write watch and its host threads to the app (driver-context.md), which the GPU
-// backend needs; the rest of the Xenos driver contract has nothing to do here. The SDK's command processor
-// has no part in it: the ring buffer and register calls are ignored (the native front end of d3d/frontend
-// records the lists itself), and the frame is presented by Plume, to the window the app hands it
-// (PlumeRenderer::Start), so BeginPresent has nothing to do.
+// The GPU backend, run by the app itself: the SDK starts no graphics driver (GraphicsFamily::kNone, renut_app.cpp),
+// so nothing of its graphics system is in the way. The backend's worker is a host thread of the title's kernel
+// (host::StartHostThread), started when the game creates its Direct3D device (d3d/scene/startup.cpp) and stopped
+// by the app once the game's threads are (RunSession), before the title unloads. Guest writes are watched through
+// host::WriteWatch. The frame is presented by Plume, to the window the app hands it (PlumeRenderer::Start).
 //
-// There is no vertical blank thread. The game's swaps never wait for one (every frame-rate target is held by
-// the Pacer with an immediate presentation interval, frame_pacing.h), so the vblank only has a clock to keep:
-// the counter the backend and the device read, brought up to date at the swaps and the callback records
-// (TickVblank), which are the only moments it is read.
+// There is no vertical blank thread and no graphics interrupt: the device's start does not register the game's
+// interrupt handler (sub_826573F0), so its vblank handler (sub_826541C8) is done here, natively, when the clock is
+// read: at the presents and the callback records (TickVblank).
 
 namespace renut::gpu {
 
-class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
+class GpuHost {
  public:
-  std::string_view GetName() const override { return "plume"; }
-
-  rex::Result<void> Initialize(rex::IDriverContext&) override { return rex::Ok(); }
-
-  void Shutdown() override { DetachTitle(); }
-
-  rex::Result<void> AttachTitle(const rex::TitleInfo& info, rex::IPhysicalMemory&,
-                                rex::IPhysicalWriteWatch& watch, rex::IGuestInterrupts& interrupts) override {
-    interrupts_ = &interrupts;
-    host::SetWriteWatch(&watch);
-    host::SetVideoMode(info.video_mode);
-    refresh_hz_ = std::max(1.0, double(info.video_mode.refresh_rate));
+  bool Start() {
+    refresh_hz_ = std::max(1.0, double(host::GetVideoMode().refresh_rate));
     backend_ = std::make_unique<GpuBackend>();
     backend_->dispatch_callback_ = [this](uint32_t function, uint32_t context, uint32_t cpu) {
       RunCallback(function, context, cpu);
     };
     backend_->tick_vblank_ = [this] { TickVblank(); };
-    if (!backend_->Initialize(interrupts)) {
+    if (!backend_->Initialize()) {
       backend_.reset();
-      return rex::Err(rex::ErrorCategory::kRuntime, "the GPU backend did not start");
+      return false;
     }
-    return rex::Ok();
+    return true;
   }
 
-  void DetachTitle() override {
+  void Stop() {
     if (backend_) {
       backend_->Shutdown();
       backend_.reset();
     }
-    host::SetWriteWatch(nullptr);
-    interrupts_ = nullptr;
-  }
-
-  // The game swapped since the last call, or the wait is over. The SDK's present thread counts a frame for
-  // each true answer (GetFrameStats).
-  rex::gpu::FrameStatus WaitForFrame(rex::u32 timeout_ms) override {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    for (;;) {
-      const uint64_t now = renut_guest_swap_count();
-      if (now != seen_swaps_) {
-        seen_swaps_ = now;
-        return {.new_frame = true};
-      }
-      if (std::chrono::steady_clock::now() >= deadline) return {};
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (vblank_block_) {
+      host::SystemFree(vblank_block_);
+      vblank_block_ = 0;
     }
   }
-
-  void ResizeSurface(rex::u32, rex::u32) override {}
-  bool BeginPresent() override { return false; }
-  void EndPresent() override {}
-  void RenderOverlays(ImDrawData&) override {}
-
-  // The ring buffer and the register window: the game's front end does not use them, so reads are 0 and
-  // writes are dropped.
-  void InitializeRingBuffer(rex::u32, rex::u32) override {}
-  void EnableReadPointerWriteBack(rex::u32, rex::u32) override {}
-  rex::u32 ReadRegister(rex::u32) override { return 0; }
-  void WriteRegister(rex::u32, rex::u32) override {}
 
  private:
   // A callback record of a list: function(context) on the backend's thread.
@@ -98,28 +63,42 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
     host::RunGuest(function, args, 1);
   }
 
-  // The vblank handler (sub_826541C8, source 0 of the graphics interrupt sub_826573F0) with nothing for it to
-  // do besides the device's clock: it adds the vblanks to the counter (+16548), stamps the time (+16552, and
-  // +21676 in milliseconds-ish units, timebase >> 10), presents the swaps queued behind a vblank (the queue
-  // at +16572, read index +16700, write index +16704) and calls the game's vblank callback (+16544). The swaps
-  // are immediate and queue nothing, and nothing in the title sets a vblank callback, so the counter and the
-  // stamps are what is left. False when the queue is not empty or a callback is set: then the game's handler
-  // runs, through the interrupt callback the kernel keeps.
-  bool RunVblankNatively(uint32_t device, uint32_t vblanks) {
-    if (!device) return false;
-    auto word = [&](uint32_t offset) {
-      return reinterpret_cast<uint32_t*>(host::Virtual<uint8_t*>(device + offset));
-    };
-    auto load = [&](uint32_t offset) { return __builtin_bswap32(std::atomic_ref<uint32_t>(*word(offset)).load()); };
-    auto store = [&](uint32_t offset, uint32_t value) {
-      std::atomic_ref<uint32_t>(*word(offset)).store(__builtin_bswap32(value));
-    };
-    if (load(16700) != load(16704) || load(16544) != 0) return false;
-    const uint64_t time = rex::Clock::QueryGuestTickCount();
-    store(16548, load(16548) + vblanks);
-    store(16552, uint32_t(time));
-    store(21676, uint32_t(time >> 10));
-    return true;
+  // The game's vblank handler (sub_826541C8) for `vblanks` vertical blanks, on the device's words: the counter
+  // (+16548) and its time stamp (+16552); the swaps queued behind a vblank (the queue at +16572, eight bytes an
+  // entry, read index +16700, write index +16704), each counted as presented (+16568) once the counter reaches
+  // its vblank; the game's vblank callback (+16544), given {counter, presented, 0}; and the time in the
+  // timebase's units >> 10 (+21676). A queued swap with a front buffer is the hardware's to show (the display
+  // register 0x6110): here it is only counted. The swaps are immediate and the title sets no vblank callback, so
+  // in practice it is the counter and the stamps.
+  void RunVblank(uint32_t device, uint32_t vblanks) {
+    if (!device) return;
+    auto word = [](uint32_t address) { return std::atomic_ref<uint32_t>(*host::Virtual<uint32_t*>(address)); };
+    auto load = [&](uint32_t offset) { return __builtin_bswap32(word(device + offset).load()); };
+    auto store = [&](uint32_t offset, uint32_t value) { word(device + offset).store(__builtin_bswap32(value)); };
+    const uint32_t counter = load(16548) + vblanks;
+    store(16548, counter);
+    store(16552, uint32_t(rex::Clock::QueryGuestTickCount()));
+    for (uint32_t guard = 0; load(16700) != load(16704) && guard < 16; ++guard) {
+      const uint32_t entry = 16572 + (load(16700) & 0xF) * 8;
+      if (load(entry + 4) > counter) break;
+      store(16568, load(16568) + 1);
+      if (!load(entry)) {
+        if (const uint32_t writeback = load(10900)) word(writeback + 4).store(0);
+      }
+      store(23376, uint32_t(rex::Clock::QueryGuestTickCount()));
+      store(16700, load(16700) + 1);
+    }
+    if (const uint32_t callback = load(16544)) {
+      if (!vblank_block_) vblank_block_ = host::SystemAlloc(16, 16);
+      if (vblank_block_) {
+        word(vblank_block_).store(__builtin_bswap32(counter));
+        word(vblank_block_ + 4).store(__builtin_bswap32(load(16568)));
+        word(vblank_block_ + 8).store(0);
+        const uint64_t args[] = {vblank_block_};
+        host::RunGuest(callback, args, 1);
+      }
+    }
+    store(21676, uint32_t(rex::Clock::QueryGuestTickCount() >> 10));
   }
 
   // The vblanks since the last call, by the clock of the video mode (the guest's, which crawls while the game
@@ -139,14 +118,12 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
     if (vblanks <= 0) return;
     tick_origin_ += period * vblanks;
     if (backend_) backend_->add_counter(uint32_t(vblanks));
-    if (!RunVblankNatively(native_d3d::MainDevice(), uint32_t(vblanks)) && interrupts_)
-      (void)interrupts_->RaiseGraphicsInterrupt(0, 2);
+    RunVblank(native_d3d::MainDevice(), uint32_t(vblanks));
   }
 
-  rex::IGuestInterrupts* interrupts_ = nullptr;
   std::unique_ptr<GpuBackend> backend_;
   double refresh_hz_ = 60.0;
-  uint64_t seen_swaps_ = 0;
+  uint32_t vblank_block_ = 0;
   pacing::Clock::time_point tick_origin_{};
 };
 
@@ -155,20 +132,30 @@ class PlumeGraphicsDriver : public rex::gpu::IXenosGraphicsDriver {
 namespace renut {
 using namespace gpu;
 
-// The driver in use (plume_gpu.h).
 namespace {
-std::atomic<PlumeGraphicsDriver*> g_driver{nullptr};
+std::mutex g_host_mutex;
+std::unique_ptr<GpuHost> g_host;
 }  // namespace
 
-std::unique_ptr<rex::IDriver> CreatePlumeGraphicsDriver() {
-  struct Owned final : PlumeGraphicsDriver {
-    Owned() { g_driver.store(this); }
-    ~Owned() override { g_driver.store(nullptr); }
-  };
-  return std::make_unique<Owned>();
+bool PlumeGpuStart() {
+  std::lock_guard lock(g_host_mutex);
+  if (g_host) return true;
+  auto host = std::make_unique<GpuHost>();
+  if (!host->Start()) {
+    REXLOG_CAT_ERROR(rex::log::renut, "Renut: the GPU backend did not start");
+    return false;
+  }
+  g_host = std::move(host);
+  REXLOG_CAT_INFO(rex::log::renut, "Renut: GPU backend started with the game's Direct3D device");
+  return true;
 }
 
-bool PlumeGpuHosted() { return g_driver.load() != nullptr; }
+void PlumeGpuStop() {
+  std::lock_guard lock(g_host_mutex);
+  if (!g_host) return;
+  g_host->Stop();
+  g_host.reset();
+}
 
 void SetPlumeMissDumpDirectory(const std::string& directory) {
   std::error_code error;

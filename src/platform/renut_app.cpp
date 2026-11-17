@@ -13,11 +13,14 @@
 #include <rex/apu/audio_system.h>
 #include <rex/app/title_app.h>
 #include <rex/chrono.h>
+#include <rex/driver.h>
+#include <rex/kernel/title_exit.h>
 #include <rex/kernel/title_paths.h>
 #include <rex/logging/logger.h>
 #include <rex/memory/virtual_memory.h>
 #include <rex/platform/thread.h>
 #include <rex/settings_registry.h>
+#include <rex/ui/ui_system.h>
 
 #include "renut_android_init.h"  // the generated image of the game: kPPCImageConfig
 #include "adpf.h"
@@ -90,7 +93,6 @@ class RenutApp final : public rex::app::TitleApp {
     // game's mixer, slowed by a load, a pipeline build or a hot phone, ran out of now and then (a crackle).
     // zolaware's reblue found the same with 8.
     REX_TRY_VOID(set("apu.max_queued_frames", "16"));
-    REX_TRY_VOID(set("gpu.driver", "plume"));
     // The game keeps variables in the pages of its code and read-only data, which the SDK loaded
     // writable before 0.11 and now loads read-only unless asked.
     REX_TRY_VOID(set("runtime.writable_code_segments", "true"));
@@ -103,11 +105,24 @@ class RenutApp final : public rex::app::TitleApp {
     return rex::Ok();
   }
 
+  // No graphics driver (GraphicsFamily::kNone): the game's Direct3D runs natively (d3d/), and the GPU backend that
+  // executes what it records is the app's own (gpu/core/host.cpp), started with the game's device. The SDK's
+  // graphics system is left with nothing to drive: its register window answers the few register accesses left
+  // in the recompiled code, which the native Direct3D no longer reaches.
+  rex::AppSysRequirements GetRequirements() const override {
+    rex::AppSysRequirements needs = TitleApp::GetRequirements();
+    needs.graphics_family = rex::GraphicsFamily::kNone;
+    return needs;
+  }
+
   void OnRegisterModules(std::vector<rex::IModule*>& modules) override {
     modules.push_back(android::DriverModule());
   }
 
   rex::Result<void> OnTitleLaunch(rex::kernel::TitleRuntime& title) override {
+    // The mode the SDK hands the kernel when the title launches, which the game queries (VdQueryVideoMode).
+    host::SetVideoMode(GetUI().GetVideoMode());
+    host::SetGraphics(&GetGraphics());
     audio::SetSystem(&GetAudio());
     host::Bind(title);
     if (session_.env && session_.activity) {
@@ -205,8 +220,15 @@ void RunSession(Session& session) {
         renut::TextInputStop();
         renut::adpf::Stop();
         renut::AchievementsStop();
+        // The game's threads stop first (and its terminate notifications run, which may still wait on the GPU),
+        // then the GPU backend, whose worker is a kernel thread of the title: it must be gone before the title
+        // unloads (Shutdown). The unload's own TerminateTitle then finds nothing left to stop.
+        rex::kernel::TitleRuntime& title = app.GetTitleRuntime();
+        if (title.IsRunning()) title.GetTitleExit().TerminateTitle();
+        renut::PlumeGpuStop();
         renut::audio::SetSystem(nullptr);
         (void)app.Shutdown();
+        host::SetGraphics(nullptr);
         host::Unbind();
       }
     } teardown{app};
