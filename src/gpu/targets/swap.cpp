@@ -53,6 +53,22 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                            [this] { return backend.targets.SurfaceReport(); });
   backend.recorder.FlushDeferred();
   if (skin_log_ && backend.swaps_ == 930) backend.resolve.LogSkinned();
+  // The draws that waited for their pipeline over the last 300 frames, when there were any.
+  if (backend.swaps_ % 300 == 0) {
+    static uint64_t last_skips = 0, last_standins = 0, last_waits = 0;
+    const uint64_t skips = backend.stats_.pipeline_skips - last_skips;
+    const uint64_t standins = backend.stats_.pipeline_standins - last_standins;
+    const uint64_t waits = backend.stats_.pipeline_waits - last_waits;
+    if (skips || standins || waits) {
+      REXLOG_CAT_INFO(rex::log::renut,
+                      "Renut: Plume draws whose pipeline was compiling in the last 300 frames: {} waited for it, {} "
+                      "drawn with a stand-in, {} not drawn",
+                      waits, standins, skips);
+    }
+    last_skips = backend.stats_.pipeline_skips;
+    last_standins = backend.stats_.pipeline_standins;
+    last_waits = backend.stats_.pipeline_waits;
+  }
   if (backend.draw.validate_windows_ && backend.swaps_ % 60 == 0) {
     REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume validation at swap {}: {} ranges compared, {} stale", backend.swaps_, backend.resolve.validate_ranges_, backend.resolve.validate_stale_);
   }
@@ -234,6 +250,7 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
   if (g_predict.queued.load(std::memory_order_relaxed)) backend.pipelines.PredictPipelines();
   if (!backend.draw.pending_pipelines_.empty()) backend.pipelines.ReapPipelines();
   backend.draw.lookup_spent_us_ = 0;
+  backend.draw.wait_spent_us_ = 0;
   pipeline_frame_.store(backend.swaps_, std::memory_order_relaxed);
   // The settings that can change while the game runs are cvars, read here each
   // frame (no file is touched): a change takes effect at the next swap.

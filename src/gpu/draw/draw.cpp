@@ -4,6 +4,9 @@
 #include "platform/log.h"
 #include "platform/settings.h"
 
+#include <chrono>
+#include <thread>
+
 namespace renut::gpu {
 
 const Draw::OutputState& Draw::Output() {
@@ -1643,6 +1646,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         auto found = standins_.find(family);
         if (found == standins_.end()) return false;
         standin = found->second;
+        ++backend.stats_.pipeline_standins;
         return true;
       };
       // A draw that goes without its pipeline says so to the job, which
@@ -1654,21 +1658,48 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
         job.demand.fetch_add(weight, std::memory_order_relaxed);
         job.wanted_frame.store(backend.swaps_, std::memory_order_relaxed);
       };
+      // A finished job's pipeline becomes the draw's (and its family's stand-in).
+      auto take_finished = [&](decltype(pending_pipelines_)::iterator finished) {
+        backend.pipelines.CountJob(*finished->second);
+        pipeline = std::move(finished->second->result);
+        if (pipeline) standins_[finished->second->family] = pipeline.get();
+        pending_pipelines_.erase(finished);
+        if (!pipeline) {
+          failed_pipelines_.insert(key);
+          REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
+                      vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
+        }
+      };
+      // A draw with neither its pipeline nor a stand-in waits for its job within the frame's budget
+      // (renut_plume_pipeline_wait_ms) instead of going undrawn: dropped, it was missing from the screen for as
+      // many frames as the compile took, which on a driver that compiles slowly (Samsung's) showed as a flicker.
+      auto wait_for = [&](PipelineJob& job) {
+        if (job.done.load(std::memory_order_acquire)) return true;
+        if (wait_spent_us_ >= wait_budget_us_) return false;
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + std::chrono::microseconds(wait_budget_us_ - wait_spent_us_);
+        bool done = false;
+        while (!(done = job.done.load(std::memory_order_acquire)) && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        wait_spent_us_ += uint64_t(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        if (done) ++backend.stats_.pipeline_waits;
+        return done;
+      };
       auto pending = pending_pipelines_.find(key);
       if (pending != pending_pipelines_.end()) {
         if (!pending->second->done.load(std::memory_order_acquire)) {
           missed(*pending->second);
-          if (!use_standin(pending->second->family)) return backend.shaders.Drop("pipeline compiling", vs, ps);
-        } else {
-          backend.pipelines.CountJob(*pending->second);
-          pipeline = std::move(pending->second->result);
-          if (pipeline) standins_[pending->second->family] = pipeline.get();
-          pending_pipelines_.erase(pending);
-          if (!pipeline) {
-            failed_pipelines_.insert(key);
-            REXLOG_CAT_WARN(rex::log::renut, "Renut: Plume pipeline creation failed (vs {:016X}, ps {:016X})",
-                        vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
+          if (!use_standin(pending->second->family)) {
+            if (!wait_for(*pending->second)) {
+              ++backend.stats_.pipeline_skips;
+              return backend.shaders.Drop("pipeline compiling", vs, ps);
+            }
+            take_finished(pending);
           }
+        } else {
+          take_finished(pending);
         }
       } else if (!failed_pipelines_.count(key)) {
         KeyBytes family_bytes = key_bytes;
@@ -1729,7 +1760,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
           missed(*job);
           backend.pipelines.StartPipelineWorker();
           ++backend.pipelines.pending_programs_[program];
-          pending_pipelines_.emplace(key, job);
+          const auto queued = pending_pipelines_.emplace(key, job).first;
           {
             std::lock_guard lock(backend.pipelines.pipeline_mutex_);
             (!looked_up && backend.pipelines.lookup_on_workers_ ? backend.pipelines.pipeline_lookup_queue_
@@ -1737,7 +1768,13 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                               : backend.pipelines.pipeline_urgent_queue_).push_back(std::move(job));
           }
           backend.pipelines.pipeline_ready_.notify_all();
-          if (!covered) return backend.shaders.Drop("pipeline compiling", vs, ps);
+          if (!covered) {
+            if (!wait_for(*queued->second)) {
+              ++backend.stats_.pipeline_skips;
+              return backend.shaders.Drop("pipeline compiling", vs, ps);
+            }
+            take_finished(queued);
+          }
         }
       }
     }

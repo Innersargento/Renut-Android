@@ -272,9 +272,13 @@ bool GpuBackend::SetupContext() {
   }
   draw.lookup_budget_us_ = uint64_t(renut::GetSettings().plume_pipeline_lookup_ms.Get()) * 1000;
   draw.lookup_here_ = draw.lookup_budget_us_ && PlumePipelineLookupSupported();
-  REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume pipelines: async compile, {}, boolean registers read from the shared block",
+  draw.wait_budget_us_ = uint64_t(renut::GetSettings().plume_pipeline_wait_ms.Get()) * 1000;
+  REXLOG_CAT_INFO(rex::log::renut,
+              "Renut: Plume pipelines: async compile, {}, a draw waits up to {} ms a frame for its own, boolean "
+              "registers read from the shared block",
               draw.lookup_here_ ? std::format("cache lookups at the draw up to {} ms a frame", draw.lookup_budget_us_ / 1000)
-                           : std::string("no cache lookups at the draw"));
+                           : std::string("no cache lookups at the draw"),
+              draw.wait_budget_us_ / 1000);
   targets.BeginFrame();
   REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume GPU backend ready ({} frames in flight, upload {} MB at {:X})",
               kPlumeFramesInFlight, upload_bytes >> 20, upload_address_);

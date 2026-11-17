@@ -172,6 +172,10 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             WindowManager.LayoutParams windowParams=getWindow().getAttributes();
             windowParams.preferredRefreshRate=gameRefreshRate;
             getWindow().setAttributes(windowParams);
+            // The display at one rate while playing. Android 15 raises a touched window to its highest rate and
+            // drops it again when the boost times out: with the on-screen controls that was every few seconds, and
+            // on the S26's variable-rate panel each switch showed as a quick flicker.
+            if(android.os.Build.VERSION.SDK_INT>=35)getWindow().setFrameRateBoostOnTouchEnabled(false);
             FrameLayout root=new FrameLayout(this);root.setBackgroundColor(Color.BLACK);
             surface=new SurfaceView(this);surface.getHolder().addCallback(this);
             root.addView(surface,new FrameLayout.LayoutParams(-1,-1));
@@ -422,6 +426,18 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
     }
     public int uiFpsTarget(){return fpsTarget;}
     /**
+     * The game surface's vote for the display rate: a source of frames at a fixed cadence (the game's paced
+     * frames), so the system keeps the display at that rate or a multiple of it and does not move it with the
+     * other votes of the window.
+     */
+    private static void voteFrameRate(Surface s,float rate){
+        if(android.os.Build.VERSION.SDK_INT<30||s==null||!s.isValid())return;
+        try{
+            if(android.os.Build.VERSION.SDK_INT>=31)s.setFrameRate(rate,Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,Surface.CHANGE_FRAME_RATE_ALWAYS);
+            else s.setFrameRate(rate,Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+        }catch(Exception ignored){}
+    }
+    /**
      * Live while the slider moves: the game takes the new rate at its next frame, and the screen
      * is asked for the refresh rate that goes with it. Nothing is saved (uiSaveFpsTarget does that
      * when the finger lifts).
@@ -436,9 +452,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
         WindowManager.LayoutParams params=getWindow().getAttributes();
         params.preferredRefreshRate=rate;
         getWindow().setAttributes(params);
-        if(android.os.Build.VERSION.SDK_INT>=30&&surface!=null&&surface.getHolder().getSurface().isValid()){
-            try{surface.getHolder().getSurface().setFrameRate(rate,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(Exception ignored){}
-        }
+        if(surface!=null)voteFrameRate(surface.getHolder().getSurface(),rate);
     }
     public void uiSaveFpsTarget(int fps){
         try{RuntimeOptions.set(this,RuntimeOptions.FPS_TARGET,Integer.toString(fps));}
@@ -635,9 +649,7 @@ public final class RuntimeActivity extends androidx.activity.ComponentActivity i
             +" background="+inBackground+" "+displayState());
         // Request the selected display rate for the game surface as well as
         // the window; the default 60 Hz keeps an even cadence for 30 FPS.
-        if(launch&&android.os.Build.VERSION.SDK_INT>=30){
-            try{h.getSurface().setFrameRate(gameRefreshRate,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(Exception ignored){}
-        }
+        if(launch)voteFrameRate(h.getSurface(),gameRefreshRate);
         if(launch&&started&&loaded&&inBackground){
             // Back on screen with a new surface: the game was kept alive, give it the window.
             if(nativeForeground(h.getSurface())){

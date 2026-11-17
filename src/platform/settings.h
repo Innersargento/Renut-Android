@@ -25,6 +25,11 @@ class Settings final : public rex::SettingOwner {
               "Milliseconds per frame the command thread may spend asking the driver's cache for "
                "new pipelines it already has, so their draws appear at once; past it they go to the "
                "workers. 0 leaves every new pipeline to the workers.", rex::Range{0, 33});
+  REX_SETTING(rex::i32, plume_pipeline_wait_ms, 8,
+              "Milliseconds per frame the command thread may wait for the pipelines of draws that have neither "
+               "theirs nor a ready sibling's, instead of leaving them undrawn for as long as the compile takes "
+               "(a flicker on drivers that compile slowly, such as Samsung's Xclipse). 0 never waits. Read at "
+               "start.", rex::Range{0, 33});
   REX_SETTING(rex::i32, plume_hiz, 2,
               "Hi-Z culling: 0 off, 1 only counts what could be dropped, 2 drops the draws whose bounding box "
                "lies wholly outside the view frustum, the scissor or an enabled user clip plane (docs/performance/HIZ.md)");

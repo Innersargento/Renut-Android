@@ -216,6 +216,10 @@ struct Stats {
   // Streams served from a kept buffer, bytes copied into new kept buffers, and
   // kept streams the guest wrote over.
   uint64_t kept_hits = 0, kept_bytes_made = 0, kept_drops = 0, kept_unwatchable = 0;
+  // Draws whose pipeline was still compiling: drawn with a ready sibling's (a stand-in), not drawn at all, which
+  // shows as the object missing for that frame (a flicker where the driver compiles slowly), or drawn after
+  // waiting for it within the frame's budget.
+  uint64_t pipeline_standins = 0, pipeline_skips = 0, pipeline_waits = 0;
   uint64_t band_skipped = 0, band_moved = 0, band_widened = 0;
   // Resolves by what became of them: copies of colour and of depth (and the pixels they moved), depth maps
   // taken in place, resolves into a texture nothing had sampled since the last one wrote it, and the

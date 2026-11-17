@@ -142,6 +142,9 @@ struct Draw {
   // lookups that took a compile's time (a driver ignoring the request).
   bool lookup_here_ = false;
   uint64_t lookup_budget_us_ = 0, lookup_spent_us_ = 0;
+  // Waits for a compiling pipeline at the draw (renut_plume_pipeline_wait_ms): the budget per frame and what
+  // this frame has spent of it.
+  uint64_t wait_budget_us_ = 0, wait_spent_us_ = 0;
   uint32_t slow_lookups_ = 0;
   // The newest ready pipeline of each family, drawn in place of a sibling
   // that is still compiling. Points into pipelines_, which never erases.
