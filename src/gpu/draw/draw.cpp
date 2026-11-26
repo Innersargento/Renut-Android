@@ -3,6 +3,7 @@
 #include "platform/guest.h"
 #include "platform/log.h"
 #include "platform/settings.h"
+#include "guest/widescreen.h"
 
 #include <chrono>
 #include <thread>
@@ -298,7 +299,7 @@ bool Draw::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
   // no shadow. Only depth-only draws that write depth into a target that is not
   // the screen's: a stencil mark, a memory export or the scene's own depth is
   // never dropped. Off (0) by default.
-  if (backend.swap.shadow_min_indices_ && !color_count && index_count < backend.swap.shadow_min_indices_ && pitch != 1280 &&
+  if (backend.swap.shadow_min_indices_ && !color_count && index_count < backend.swap.shadow_min_indices_ && !widescreen::IsScreenWidth(pitch) &&
       depth_control.z_write_enable && !depth_control.stencil_enable &&
       !(vs->entry->specConstantsMask & RENUT_SHADER_FLAG_MEMEXPORT) && !(backend.no_shadows_ && pitch == 512)) {
     // The far cascade (slot 15, 2048x2048, a colour resolve) is not drawn in one go: the game fills it from

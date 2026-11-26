@@ -99,6 +99,11 @@ class Settings final : public rex::SettingOwner {
               "Internal resolution of the scene: 0 full, 1 three quarters (960x540), 2 half (640x360) of "
                "the guest's 1280x720. The scene's colour and depth surfaces are drawn smaller, resolved "
                "smaller and shown stretched. Read at start.", rex::Range{0, 2});
+  REX_SETTING(std::string, aspect_ratio, "16:9",
+              "Aspect ratio the game renders at (guest/widescreen.cpp): the height stays 720 and the width grows, "
+               "so a wider screen sees more of the world at the sides and the interface stays centred at 16:9. "
+               "\"device\" takes the shape of the game's surface. Narrower than 16:9 stays 16:9. Read at start.",
+              rex::Allowed("16:9", "18:9", "19.5:9", "20:9", "21:9", "device"));
   REX_SETTING(bool, plume_precompile, true,
               "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                "next start; a scene load waits until they are built. Not in low-memory mode, which only "

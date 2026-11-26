@@ -2,6 +2,7 @@
 #include "gpu/core/internal.h"
 #include "platform/log.h"
 #include "platform/settings.h"
+#include "guest/widescreen.h"
 
 namespace renut::gpu {
 
@@ -376,7 +377,7 @@ Target* Targets::SurfaceTarget(uint32_t slot) {
   uint32_t scale = 4;
   if (depth && format == 0 && shadow_scale_ != 4 && std::min(width, height) >= 640) {
     scale = shadow_scale_;
-  } else if (internal_scale_ != 4 && width == 1280 && height >= 704 && height <= 736) {
+  } else if (internal_scale_ != 4 && widescreen::IsScreenWidth(width) && height >= 704 && height <= 736) {
     // The scene's colour and depth: the internal resolution option.
     scale = internal_scale_;
   }

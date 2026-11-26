@@ -754,6 +754,17 @@ private val SKIN_LABELS = listOf(
     var msaa by remember {
         mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.MSAA, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
     }
+    // The values of RuntimeOptions.ASPECT_RATIOS, labelled: the first is the game's own, the last the device's.
+    val aspectLabels = RuntimeOptions.ASPECT_RATIOS.map {
+        when (it) {
+            "16:9" -> stringResource(R.string.aspect_ratio_original)
+            "device" -> stringResource(R.string.aspect_ratio_device, RuntimeOptions.deviceRatioLabel(activity))
+            else -> it
+        }
+    }
+    var aspect by remember {
+        mutableStateOf(RuntimeOptions.ASPECT_RATIOS.indexOf(activity.uiRuntimeOption(RuntimeOptions.ASPECT_RATIO, "16:9")).coerceAtLeast(0))
+    }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
             Row(verticalAlignment = Alignment.Top) {
@@ -831,6 +842,11 @@ private val SKIN_LABELS = listOf(
                     val level = resolutionLevels.indexOf(choice).coerceAtLeast(0)
                     internalResolution = level
                     activity.uiSetRuntimeOption(RuntimeOptions.INTERNAL_RESOLUTION, level.toString())
+                }
+                SingleChoiceSelector(stringResource(R.string.settings_aspect_ratio), aspectLabels[aspect], aspectLabels, !busy) { choice ->
+                    val level = aspectLabels.indexOf(choice).coerceAtLeast(0)
+                    aspect = level
+                    activity.uiSetRuntimeOption(RuntimeOptions.ASPECT_RATIO, RuntimeOptions.ASPECT_RATIOS[level])
                 }
                 SingleChoiceSelector(stringResource(R.string.settings_msaa), msaaLevels[msaa],
                     msaaLevels, !busy) { choice ->
