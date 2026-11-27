@@ -29,6 +29,14 @@ final class RuntimeOptions {
     /** The shape the game renders at: 16:9 (its own), a wider ratio, or "device" (the surface's); read at start. */
     static final String ASPECT_RATIO = "renut_aspect_ratio";
     static final String[] ASPECT_RATIOS = {"16:9", "18:9", "19.5:9", "20:9", "21:9", "device"};
+    /** The vertical field of view, in percent of the game's own; followed live. */
+    static final String FIELD_OF_VIEW = "renut_field_of_view";
+    static final String[] FIELDS_OF_VIEW = {"100", "110", "120", "130", "140", "150"};
+
+    /** A field of view's label: the game's own, or its percentage. */
+    static String fieldOfViewLabel(Context context, String value) {
+        return value.equals("100") ? context.getString(R.string.field_of_view_original) : value + "%";
+    }
 
     /** The whole display's shape in landscape, as "N:9" (one decimal at most): what "device" gives on this phone. */
     static String deviceRatioLabel(android.app.Activity activity) {
@@ -151,7 +159,8 @@ final class RuntimeOptions {
                 || key.equals(MSAA))
                 && (value.equals("0") || value.equals("1") || value.equals("2"))
             || key.equals(CHEAT_SKIN) && java.util.Arrays.asList(SKINS).contains(value)
-            || key.equals(ASPECT_RATIO) && java.util.Arrays.asList(ASPECT_RATIOS).contains(value)))
+            || key.equals(ASPECT_RATIO) && java.util.Arrays.asList(ASPECT_RATIOS).contains(value)
+            || key.equals(FIELD_OF_VIEW) && java.util.Arrays.asList(FIELDS_OF_VIEW).contains(value)))
             throw new IllegalArgumentException("Opção inválida: " + key);
         File file = config(context);
         List<String> lines = file.isFile()

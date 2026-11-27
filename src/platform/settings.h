@@ -104,6 +104,9 @@ class Settings final : public rex::SettingOwner {
                "so a wider screen sees more of the world at the sides and the interface stays centred at 16:9. "
                "\"device\" takes the shape of the game's surface. Narrower than 16:9 stays 16:9. Read at start.",
               rex::Allowed("16:9", "18:9", "19.5:9", "20:9", "21:9", "device"));
+  REX_SETTING(rex::i32, field_of_view, 100,
+              "Field of view, in percent of the game's own (guest/field_of_view.cpp): 100 is the game's, up to 150 "
+               "shows more of the world. Cutscenes widen too. Followed live.", rex::Range{100, 150});
   REX_SETTING(bool, plume_precompile, true,
               "Record every pipeline the game uses (files/plume-recipes.bin) and build them all at the "
                "next start; a scene load waits until they are built. Not in low-memory mode, which only "

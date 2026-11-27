@@ -215,6 +215,8 @@ add("internal_resolution_half", "Metade · 360p", "Half · 360p", "一半 · 360
 add("settings_aspect_ratio", "Proporção da tela", "Aspect ratio", "宽高比", "Relación de aspecto")
 add("aspect_ratio_original", "16:9 (original)", "16:9 (Original)", "16:9（原版）", "16:9 (original)")
 add("aspect_ratio_device", "Aparelho · %1$s", "Device · %1$s", "设备 · %1$s", "Dispositivo · %1$s")
+add("settings_field_of_view", "Campo de visão", "Field of view", "视野", "Campo de visión")
+add("field_of_view_original", "Original", "Original", "原版", "Original")
 add("settings_shadow_quality","Qualidade das sombras", "Shadow quality", "阴影质量", "Calidad de sombras")
 add("shadow_quality_full", "Completa", "Full", "完整", "Completa")
 add("shadow_quality_medium", "Média · 3/4", "Medium · 3/4", "中 · 3/4", "Media · 3/4")
