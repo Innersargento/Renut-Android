@@ -800,3 +800,48 @@ REX_HOOK_RAW(sub_82364BB8) {
   PoolChange change;
   __imp__sub_82364BB8(ctx, base);
 }
+
+// The Xbox 360 CRT's memcpy (0x82BB4510) copies low-to-high, so game and D3DX code legitimately uses it
+// on overlapping ranges — most notably sub_8292C000 (the D3DX9 shader compiler's array remove_at, called
+// by sub_8290F690 during appMainBoot), which shifts elements left with memcpy(p, p + 4, n). Forwarding
+// rexshim_memcpy to std::memcpy is undefined behaviour and corrupts the array on Android 13 Bionic's
+// ARM64 memcpy (crashing in sub_8290F690+804 with a null virtual call at 0x00000000). Override the
+// copy shims locally in librenut_runtime.so (-Wl,-Bsymbolic-functions) with std::memmove, which is safe
+// on overlapping ranges and takes the same fast path when non-overlapping, without touching thirdparty/.
+REX_HOOK_RAW(rexshim_memcpy) {
+  const uint32_t dst = ctx.r3.u32;
+  const uint32_t src = ctx.r4.u32;
+  const uint32_t n = ctx.r5.u32;
+  if (n != 0) std::memmove(base + dst, base + src, n);
+  ctx.r3.u64 = dst;
+}
+
+REX_HOOK_RAW(rexshim_XMemCpy) {
+  const uint32_t dst = ctx.r3.u32;
+  const uint32_t src = ctx.r4.u32;
+  const uint32_t n = ctx.r5.u32;
+  if (n != 0) std::memmove(base + dst, base + src, n);
+  ctx.r3.u64 = dst;
+}
+
+REX_HOOK_RAW(rexshim_memcpy_s) {
+  const uint32_t dst = ctx.r3.u32;
+  const uint32_t dstsz = ctx.r4.u32;
+  const uint32_t src = ctx.r5.u32;
+  const uint32_t count = ctx.r6.u32;
+  if (count == 0) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  if (!dst) {
+    ctx.r3.u64 = 22;  // EINVAL
+    return;
+  }
+  if (!src || dstsz < count) {
+    if (dstsz != 0) std::memset(base + dst, 0, dstsz);
+    ctx.r3.u64 = src ? 34 : 22;  // ERANGE : EINVAL
+    return;
+  }
+  std::memmove(base + dst, base + src, count);
+  ctx.r3.u64 = 0;
+}
