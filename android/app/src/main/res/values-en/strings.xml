@@ -138,6 +138,11 @@
     <string name="msaa_off">Off</string>
     <string name="msaa_2x">2x</string>
     <string name="msaa_4x">4x</string>
+    <string name="settings_aspect_ratio">Aspect ratio</string>
+    <string name="aspect_ratio_original">16:9 (Original)</string>
+    <string name="aspect_ratio_device">Device · %1$s</string>
+    <string name="settings_field_of_view">Field of view</string>
+    <string name="field_of_view_original">Original</string>
     <string name="settings_shadow_quality">Shadow quality</string>
     <string name="shadow_quality_full">Full</string>
     <string name="shadow_quality_medium">Medium · 3/4</string>

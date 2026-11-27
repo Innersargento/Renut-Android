@@ -31,6 +31,8 @@ non_volatile_as_local = false
 forward_stack_stores = true
 
 [functions]
+# XuiRenderSetViewTransform, a leaf without a .pdata entry, hooked by guest/widescreen.cpp.
+0x82205C88 = {}
 0x82B100E8 = {}
 0x82AEC718 = {}
 0x82B2F210 = {}

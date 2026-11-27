@@ -26,6 +26,36 @@ final class RuntimeOptions {
     static final String SHADOW_QUALITY = "renut_plume_shadow_quality";
     /** 0 full, 1 three quarters, 2 half: the resolution the scene is drawn at (gpu). */
     static final String INTERNAL_RESOLUTION = "renut_plume_internal_resolution";
+    /** The shape the game renders at: 16:9 (its own), a wider ratio, or "device" (the surface's); read at start. */
+    static final String ASPECT_RATIO = "renut_aspect_ratio";
+    static final String[] ASPECT_RATIOS = {"16:9", "18:9", "19.5:9", "20:9", "21:9", "device"};
+    /** The vertical field of view, in percent of the game's own; followed live. */
+    static final String FIELD_OF_VIEW = "renut_field_of_view";
+    static final String[] FIELDS_OF_VIEW = {"100", "110", "120", "130", "140", "150"};
+
+    /** A field of view's label: the game's own, or its percentage. */
+    static String fieldOfViewLabel(Context context, String value) {
+        return value.equals("100") ? context.getString(R.string.field_of_view_original) : value + "%";
+    }
+
+    /** The whole display's shape in landscape, as "N:9" (one decimal at most): what "device" gives on this phone. */
+    static String deviceRatioLabel(android.app.Activity activity) {
+        int width, height;
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            android.graphics.Rect bounds = activity.getWindowManager().getMaximumWindowMetrics().getBounds();
+            width = bounds.width();
+            height = bounds.height();
+        } else {
+            android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
+            activity.getWindowManager().getDefaultDisplay().getRealMetrics(metrics);
+            width = metrics.widthPixels;
+            height = metrics.heightPixels;
+        }
+        int longSide = Math.max(width, height), shortSide = Math.min(width, height);
+        if (shortSide <= 0) return "16:9";
+        double ninths = Math.round(longSide * 90.0 / shortSide) / 10.0;
+        return (ninths == Math.rint(ninths) ? Long.toString(Math.round(ninths)) : Double.toString(ninths)) + ":9";
+    }
     /** 1 (off), 2, 4, 8 or 16: the most anisotropic filtering a texture fetch gets (gpu); default 4. */
     static final String ANISO = "renut_plume_aniso_max";
     /** The values the aniso option takes, in the order of its levels. */
@@ -114,7 +144,7 @@ final class RuntimeOptions {
     }
 
     static void set(Context context, String key, String value) throws IOException {
-        boolean text = key.equals("log_level") || key.equals(CHEAT_SKIN);
+        boolean text = key.equals("log_level") || key.equals(CHEAT_SKIN) || key.equals(ASPECT_RATIO);
         boolean fps = false;
         if (key.equals(FPS_TARGET)) {
             try {
@@ -128,7 +158,9 @@ final class RuntimeOptions {
             || (key.equals(TEXTURE_QUALITY) || key.equals(SHADOW_QUALITY) || key.equals(INTERNAL_RESOLUTION)
                 || key.equals(MSAA))
                 && (value.equals("0") || value.equals("1") || value.equals("2"))
-            || key.equals(CHEAT_SKIN) && java.util.Arrays.asList(SKINS).contains(value)))
+            || key.equals(CHEAT_SKIN) && java.util.Arrays.asList(SKINS).contains(value)
+            || key.equals(ASPECT_RATIO) && java.util.Arrays.asList(ASPECT_RATIOS).contains(value)
+            || key.equals(FIELD_OF_VIEW) && java.util.Arrays.asList(FIELDS_OF_VIEW).contains(value)))
             throw new IllegalArgumentException("Opção inválida: " + key);
         File file = config(context);
         List<String> lines = file.isFile()

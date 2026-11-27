@@ -754,6 +754,21 @@ private val SKIN_LABELS = listOf(
     var msaa by remember {
         mutableStateOf((activity.uiRuntimeOption(RuntimeOptions.MSAA, "0").toIntOrNull() ?: 0).coerceIn(0, 2))
     }
+    // The values of RuntimeOptions.ASPECT_RATIOS, labelled: the first is the game's own, the last the device's.
+    val aspectLabels = RuntimeOptions.ASPECT_RATIOS.map {
+        when (it) {
+            "16:9" -> stringResource(R.string.aspect_ratio_original)
+            "device" -> stringResource(R.string.aspect_ratio_device, RuntimeOptions.deviceRatioLabel(activity))
+            else -> it
+        }
+    }
+    var aspect by remember {
+        mutableStateOf(RuntimeOptions.ASPECT_RATIOS.indexOf(activity.uiRuntimeOption(RuntimeOptions.ASPECT_RATIO, "16:9")).coerceAtLeast(0))
+    }
+    val fovLabels = RuntimeOptions.FIELDS_OF_VIEW.map { RuntimeOptions.fieldOfViewLabel(activity, it) }
+    var fov by remember {
+        mutableStateOf(RuntimeOptions.FIELDS_OF_VIEW.indexOf(activity.uiRuntimeOption(RuntimeOptions.FIELD_OF_VIEW, "100")).coerceAtLeast(0))
+    }
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
             Row(verticalAlignment = Alignment.Top) {
@@ -831,6 +846,16 @@ private val SKIN_LABELS = listOf(
                     val level = resolutionLevels.indexOf(choice).coerceAtLeast(0)
                     internalResolution = level
                     activity.uiSetRuntimeOption(RuntimeOptions.INTERNAL_RESOLUTION, level.toString())
+                }
+                SingleChoiceSelector(stringResource(R.string.settings_aspect_ratio), aspectLabels[aspect], aspectLabels, !busy) { choice ->
+                    val level = aspectLabels.indexOf(choice).coerceAtLeast(0)
+                    aspect = level
+                    activity.uiSetRuntimeOption(RuntimeOptions.ASPECT_RATIO, RuntimeOptions.ASPECT_RATIOS[level])
+                }
+                SingleChoiceSelector(stringResource(R.string.settings_field_of_view), fovLabels[fov], fovLabels, !busy) { choice ->
+                    val level = fovLabels.indexOf(choice).coerceAtLeast(0)
+                    fov = level
+                    activity.uiSetRuntimeOption(RuntimeOptions.FIELD_OF_VIEW, RuntimeOptions.FIELDS_OF_VIEW[level])
                 }
                 SingleChoiceSelector(stringResource(R.string.settings_msaa), msaaLevels[msaa],
                     msaaLevels, !busy) { choice ->
@@ -1287,10 +1312,18 @@ private val SidebarWidth = 360.dp
     var aniso by remember {
         mutableStateOf(RuntimeOptions.anisoLevel(activity.uiGraphicsOption(RuntimeOptions.ANISO, "4")))
     }
+    var fov by remember {
+        mutableStateOf(RuntimeOptions.FIELDS_OF_VIEW.indexOf(activity.uiGraphicsOption(RuntimeOptions.FIELD_OF_VIEW, "100")).coerceAtLeast(0))
+    }
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         SidebarToggle(Icons.Default.Sync, stringResource(R.string.settings_vsync), vsyncOn) {
             vsyncOn = it
             activity.uiSetVsync(it)
+        }
+        SidebarChoiceText(stringResource(R.string.settings_field_of_view), fov,
+            RuntimeOptions.FIELDS_OF_VIEW.map { RuntimeOptions.fieldOfViewLabel(activity, it) }) {
+            fov = it
+            activity.uiSetGraphicsOption(RuntimeOptions.FIELD_OF_VIEW, RuntimeOptions.FIELDS_OF_VIEW[it])
         }
         SidebarChoice(stringResource(R.string.settings_internal_resolution), resolution,
             listOf(R.string.internal_resolution_full, R.string.internal_resolution_three_quarters, R.string.internal_resolution_half)) {
@@ -1331,6 +1364,11 @@ private val SidebarWidth = 360.dp
 
 /** A titled row of chips for the sidebar: one of a few levels, applied as soon as it is picked. */
 @Composable private fun SidebarChoice(title: String, selected: Int, labels: List<Int>, onSelect: (Int) -> Unit) {
+    SidebarChoiceText(title, selected, labels.map { stringResource(it) }, onSelect)
+}
+
+/** SidebarChoice with labels that are already text. */
+@Composable private fun SidebarChoiceText(title: String, selected: Int, labels: List<String>, onSelect: (Int) -> Unit) {
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF2A1C11)).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -1340,7 +1378,7 @@ private val SidebarWidth = 360.dp
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             labels.forEachIndexed { index, label ->
                 FilterChip(selected = selected == index, onClick = { onSelect(index) },
-                    label = { Text(stringResource(label), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                    label = { Text(label, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) })
             }
         }
     }
