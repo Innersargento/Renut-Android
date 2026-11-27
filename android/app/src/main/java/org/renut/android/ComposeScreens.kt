@@ -167,7 +167,7 @@ class WelcomeModel {
 
 /**
  * The in-game sidebar. The view stays on screen for the whole game and only draws what is
- * open (a small tab, the sidebar, or the paused chip), so touches elsewhere reach the game.
+ * open (the sidebar, or the paused chip), so touches elsewhere reach the game.
  * RuntimeActivity (Java) drives it; Compose observes the state below.
  */
 class GameMenu internal constructor(private val activity: RuntimeActivity) {
@@ -1076,10 +1076,9 @@ private val SidebarWidth = 360.dp
 @Composable private fun GameMenuScreen(activity: RuntimeActivity, menu: GameMenu) {
     val noRipple = remember { MutableInteractionSource() }
     Box(Modifier.fillMaxSize()) {
-        // Closed: only a small tab, or the paused chip, sits over the game.
-        if (!menu.isOpen) {
-            if (menu.isPaused) PausedChip(menu, Modifier.align(Alignment.TopCenter))
-            else MenuTab(menu, Modifier.align(Alignment.TopCenter))
+        // Closed: only the paused chip sits over the game when paused.
+        if (!menu.isOpen && menu.isPaused) {
+            PausedChip(menu, Modifier.align(Alignment.TopCenter))
         }
         AnimatedVisibility(visible = menu.isOpen, enter = fadeIn(), exit = fadeOut()) {
             Box(Modifier.fillMaxSize().background(Color(0x99000000))
@@ -1100,19 +1099,9 @@ private val SidebarWidth = 360.dp
     }
 }
 
-/** The way in for touch players; Back (system) opens it as well. Low contrast on purpose. */
 /** Width of the camera cutout on the left edge, so the panel keeps its width past it. */
 @Composable private fun cutoutStart(): androidx.compose.ui.unit.Dp =
     WindowInsets.displayCutout.asPaddingValues().calculateLeftPadding(androidx.compose.ui.unit.LayoutDirection.Ltr)
-
-@Composable private fun MenuTab(menu: GameMenu, modifier: Modifier) {
-    Box(
-        modifier.size(width = 64.dp, height = 26.dp)
-            .clip(RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp))
-            .background(Color(0x66000000)).clickable { menu.open() },
-        contentAlignment = Alignment.Center
-    ) { Icon(Icons.Default.Menu, stringResource(R.string.menu_open), tint = Color(0xB3FFFFFF), modifier = Modifier.size(18.dp)) }
-}
 
 @Composable private fun PausedChip(menu: GameMenu, modifier: Modifier) {
     Row(
