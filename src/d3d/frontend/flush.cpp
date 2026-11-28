@@ -40,6 +40,11 @@ ContainerHashes& Containers() {
   return containers;
 }
 
+// NameShader's per-thread cache: 4096 slots, indexed by the object address mixed (Fibonacci hashing).
+constexpr uint32_t kNameCacheSlots = 4096;
+inline uint32_t NameCacheSlot(uint32_t object) { return ((object >> 4) * 0x9E3779B1u) >> 20; }
+static_assert(kNameCacheSlots == 1u << (32 - 20));
+
 // What a shader load names its microcode by: the hash of the container the object was made from, or 0
 // when it is not one that was seen (a shader the game's Direct3D builds in memory, or a stale address),
 // and the GPU backend reads and watches the memory itself.
@@ -52,9 +57,11 @@ uint64_t NameShader(const Device& d, uint32_t object, bool pixel) {
     uint32_t generation = 0;
     ContainerEntry entry{};
   };
-  thread_local std::array<Cached, 128> cache{};
+  // 4096 slots (128 KB a thread): a scene cycles a few thousand shader objects, which 128 slots could not
+  // hold (A14 probe, 2026-11-28: 66% misses, all collisions). The address is mixed so neighbours spread.
+  thread_local std::array<Cached, kNameCacheSlots> cache{};
   const uint32_t generation = g_container_generation.load(std::memory_order_acquire);
-  Cached& slot = cache[(object >> 4) & 127];
+  Cached& slot = cache[NameCacheSlot(object)];
   ContainerEntry entry{};
   if (slot.object == object && slot.generation == generation) {
     entry = slot.entry;
