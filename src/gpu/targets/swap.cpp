@@ -299,14 +299,6 @@ void Swap::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     SavePlumePipelineCache();
     backend.no_shadows_ = renut::GetSettings().plume_no_shadows.Get();
     backend.no_bloom_ = renut::GetSettings().plume_no_bloom.Get();
-    if (const uint32_t rebase =
-            PlumeArmDriver() ? uint32_t(std::clamp(renut::GetSettings().plume_mali_rebase_indices.Get(), 0, 2)) : 0u;
-        rebase != rebase_indices_) {
-      rebase_indices_ = rebase;
-      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume indices sent from zero, the smallest in the vertex offset: {}",
-                  rebase == 0 ? "off" : rebase == 1 ? "the draws of shaders that fetch by the vertex index"
-                                                    : "every indexed draw");
-    }
     {
       const bool callers = renut::GetSettings().plume_draw_callers.Get();
       backend.draw.caller_trace_ = callers;
