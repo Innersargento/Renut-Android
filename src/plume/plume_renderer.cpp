@@ -5,6 +5,7 @@
 #include "frame_pacing.h"
 #include "plume_vulkan.h"
 #include "plume/shaders/host_shaders.h"
+#include "spirv_clip_distance.h"
 #include "spirv_descriptor_sets.h"
 #include "spirv_int64.h"
 #include "spirv_position_varying.h"
@@ -287,6 +288,9 @@ struct VulkanLayerState {
   std::atomic<bool> qualcomm{false};
   // ARM's own driver (VK_DRIVER_ID_ARM_PROPRIETARY, the Mali-G52).
   std::atomic<bool> arm{false};
+  // The device has no clip distances (shaderClipDistance): the modules lose their output (StripClipDistance).
+  std::atomic<bool> no_clip_distance{false};
+  std::atomic<uint64_t> unclipped{0};
   // The device's limits do not take the bindless heaps (the Mali-G52): the recompiled modules are rewritten for
   // a set of each draw's own textures (spirv_descriptor_sets.h, GpuBackend::DrawTextureSet).
   std::atomic<bool> per_draw_textures{false};
@@ -1660,6 +1664,17 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateShaderModule(VkDevice device, const Vk
                   info->codeSize / sizeof(uint32_t));
     }
   }
+  // A device without clip distances (the Mali-G68's driver): the modules lose their gl_ClipDistance output
+  // (spirv_clip_distance.h), which that driver garbled the vertex position over.
+  std::vector<uint32_t> unclipped;
+  if (layer.no_clip_distance.load(std::memory_order_relaxed) && edited.pCode &&
+      spirv::StripClipDistance(edited.pCode, edited.codeSize / sizeof(uint32_t), unclipped)) {
+    edited.pCode = unclipped.data();
+    edited.codeSize = unclipped.size() * sizeof(uint32_t);
+    if (layer.unclipped.fetch_add(1) == 0) {
+      REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume shader modules lose their clip distance output (the device has none)");
+    }
+  }
   const VkResult result = layer.create_shader_module(device, &edited, allocator, module);
   // The vertex modules' code is kept where forms of them are made: the retyped ones (a device without scaled
   // formats) and the positioned ones (Qualcomm's own driver: its geometry shaders read the position from a
@@ -1791,6 +1806,7 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, cons
     VkPhysicalDeviceFeatures features{};
     vkGetPhysicalDeviceFeatures(physical, &features);
     layer.lower_int64.store(!features.shaderInt64, std::memory_order_relaxed);
+    layer.no_clip_distance.store(!features.shaderClipDistance, std::memory_order_relaxed);
     VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     properties.pNext = &driver;
