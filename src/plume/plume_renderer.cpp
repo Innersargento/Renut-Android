@@ -1813,17 +1813,21 @@ VKAPI_ATTR VkResult VKAPI_CALL LayerCreateDevice(VkPhysicalDevice physical, cons
     vkGetPhysicalDeviceProperties2(physical, &properties);
     layer.cache_tag =
         driver.driverID == VK_DRIVER_ID_MESA_TURNIP ? std::string() : std::format("-drv{}", uint32_t(driver.driverID));
+    // std::format formats fixed char[N] arrays for their full size including trailing NULs; pass as const char*.
+    const char* device_name = properties.properties.deviceName;
+    const char* driver_name = driver.driverName;
+    const char* driver_info = driver.driverInfo;
     {
       std::lock_guard lock(layer.driver_text_mutex);
-      layer.driver_text = std::format("{}\n{} {}\nVulkan {}.{}.{}", properties.properties.deviceName, driver.driverName,
-                                      driver.driverInfo, VK_API_VERSION_MAJOR(properties.properties.apiVersion),
+      layer.driver_text = std::format("{}\n{} {}\nVulkan {}.{}.{}", device_name, driver_name, driver_info,
+                                      VK_API_VERSION_MAJOR(properties.properties.apiVersion),
                                       VK_API_VERSION_MINOR(properties.properties.apiVersion),
                                       VK_API_VERSION_PATCH(properties.properties.apiVersion));
     }
     layer.qualcomm.store(driver.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY, std::memory_order_relaxed);
     layer.arm.store(driver.driverID == VK_DRIVER_ID_ARM_PROPRIETARY, std::memory_order_relaxed);
     REXLOG_CAT_INFO(rex::log::renut, "Renut: Plume Vulkan driver {} ({}, {}): scaled vertex formats {}; 64-bit integers in shaders {}",
-                uint32_t(driver.driverID), driver.driverName, driver.driverInfo,
+                uint32_t(driver.driverID), driver_name, driver_info,
                 scaled ? "taken by the device" : "missing, the vertex modules get integer inputs",
                 features.shaderInt64 ? "available" : "missing, addresses become pairs of 32-bit integers");
   }
